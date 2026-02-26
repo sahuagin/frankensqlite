@@ -1,0 +1,41 @@
+[package]
+name = "fsqlite-vdbe"
+version = "0.1.1"
+description = "Virtual database engine bytecode interpreter"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-pager = { workspace = true }
+fsqlite-btree = { workspace = true }
+fsqlite-ast = { workspace = true }
+fsqlite-mvcc = { workspace = true }
+fsqlite-wal = { workspace = true }
+fsqlite-func = { workspace = true }
+fsqlite-parser = { workspace = true }
+tracing = { workspace = true }
+crossbeam-deque = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "vectorized_batch"
+harness = false
+
+[[bench]]
+name = "vectorized_scan"
+harness = false
+
+[[bench]]
+name = "vectorized_dispatch"
+harness = false
+
+[lints]
+workspace = true

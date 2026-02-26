@@ -1,0 +1,23 @@
+[package]
+name = "fsqlite-types"
+version = "0.1.1"
+description = "Core type definitions for FrankenSQLite"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitflags = { workspace = true }
+blake3 = { workspace = true }
+fsqlite-error = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

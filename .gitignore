@@ -1,0 +1,142 @@
+# Rust / Cargo build artifacts
+/target/
+**/target/
+target_*/
+
+# Cargo lock is committed (workspace contains binary crate fsqlite-cli)
+# Cargo.lock
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+.zed/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Rust-specific
+**/*.rs.bk
+
+# Common accidental compiler output
+a.out
+
+# Profiling and coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Benchmarking output
+criterion/
+
+# Fuzz corpus and artifacts
+fuzz/corpus/
+fuzz/artifacts/
+
+# Debug and log files
+*.log
+
+# Snapshot testing review artifacts
+*.snap.new
+
+# Source PNGs (webp versions are committed)
+*.png
+!og-image.png
+!twitter-image.png
+
+# Claude Code / AI agent ephemeral files
+.claude/
+
+# Local analysis artifacts
+spec_review_findings.md
+#
+# NOTE: `ANALYSIS_OF_SPEC_DOC_DIFFS.md` and `spec_evolution_data_v1.json.gz` are intentionally tracked:
+# they are required inputs for the spec-evolution visualization.
+
+# Local scratch SQLite DBs (never tracked)
+storage.sqlite3
+storage.sqlite3-*
+*.sqlite3.bak
+*.sqlite3-wal.bak
+*.sqlite3.corrupt-*
+
+# E2E fixture corpus (local only; DB bytes never tracked)
+sample_sqlite_db_files/golden/*
+!sample_sqlite_db_files/golden/.gitignore
+sample_sqlite_db_files/working/*
+!sample_sqlite_db_files/working/.gitignore
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# Spec evolution visualization artifacts (tracked)
+
+# Node / Playwright (local only)
+node_modules/
+test-results/
+
+# Cloudflare Pages build output
+dist/
+
+# Wrangler config (downloaded, not source of truth)
+wrangler.toml
+
+# Agent/compiler ephemeral files
+.plan.md
+screenshots_for_diagnostics/
+rustc-ice-*.txt
+reports/
+.agent-mail.yaml
+
+# Profiling and benchmark data
+perf.data
+perf.data.*
+flamegraph*.svg
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+
+# Codex build artifacts
+target-codex*/
+
+# Ephemeral agent scratch files
+bead_comment.md
+new_version
+old_version
+visible
+
+# Beads history snapshots
+.beads/.br_history/
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
+
+# Benchmark database files
+bench_*.db
+
+# One-off test scripts at repo root
+/test_hash.rs
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_REPORT.md
+SESSION_*.md
+/verify_*.sh
+!/scripts/verify_*.sh
+newfile.txt
+repro_*.rs
+
+# Nested crate build artifacts
+crates/*/target/
+
+# Archived mailbox state snapshots
+**/archived_mailbox_states/

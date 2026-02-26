@@ -1,0 +1,26 @@
+[package]
+name = "fsqlite-pager"
+version = "0.1.1"
+description = "Page cache and journal management"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-vfs = { workspace = true }
+parking_lot = { workspace = true }
+xxhash-rust = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+
+[dev-dependencies]
+asupersync.workspace = true
+proptest = { workspace = true }
+tempfile = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

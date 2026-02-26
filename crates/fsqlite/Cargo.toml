@@ -1,0 +1,40 @@
+[package]
+name = "fsqlite"
+version = "0.1.1"
+description = "Public API facade"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-core = { workspace = true }
+fsqlite-vfs = { workspace = true }
+fsqlite-ext-json = { workspace = true, optional = true }
+fsqlite-ext-fts5 = { workspace = true, optional = true }
+fsqlite-ext-fts3 = { workspace = true, optional = true }
+fsqlite-ext-rtree = { workspace = true, optional = true }
+fsqlite-ext-session = { workspace = true, optional = true }
+fsqlite-ext-icu = { workspace = true, optional = true }
+fsqlite-ext-misc = { workspace = true, optional = true }
+
+[features]
+default = ["json", "fts5", "rtree"]
+json = ["dep:fsqlite-ext-json"]
+fts5 = ["dep:fsqlite-ext-fts5"]
+fts3 = ["dep:fsqlite-ext-fts3"]
+rtree = ["dep:fsqlite-ext-rtree"]
+session = ["dep:fsqlite-ext-session"]
+icu = ["dep:fsqlite-ext-icu"]
+misc = ["dep:fsqlite-ext-misc"]
+raptorq = []
+mvcc = []
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
