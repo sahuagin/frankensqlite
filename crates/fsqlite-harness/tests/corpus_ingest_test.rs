@@ -13,9 +13,14 @@ use std::fs;
 use std::path::Path;
 
 use fsqlite_harness::corpus_ingest::{
-    CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, classify_family, derive_entry_seed,
-    generate_seed_corpus, ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
+    CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, classify_family,
+    derive_entry_seed, generate_seed_corpus, ingest_conformance_fixtures_with_report,
+    ingest_slt_files_with_report, intake_user_repro_fixture, render_user_repro_fixture_json,
+    write_user_repro_fixture,
 };
+use fsqlite_harness::differential_v2::{StatementDivergence, StmtOutcome};
+use fsqlite_harness::mismatch_minimizer::MinimizerConfig;
+use proptest::prelude::*;
 use tempfile::tempdir;
 
 // ─── Family Classification Tests ─────────────────────────────────────────
@@ -606,6 +611,253 @@ CREATE TABLE a(v INTEGER)
         assert_eq!(left_entry.family, right_entry.family);
         assert_eq!(left_entry.statements, right_entry.statements);
         assert_eq!(left_entry.content_hash(), right_entry.content_hash());
+    }
+}
+
+// ─── User Repro Intake Tests (bd-2yqp6.3.5) ─────────────────────────────
+
+#[test]
+fn user_repro_intake_produces_minimized_entry_and_source_coverage() {
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let request = UserReproIntakeRequest {
+        title: "user report: mismatch on bad()".to_owned(),
+        details: "reported via issue tracker".to_owned(),
+        trace_id: "trace-c5-001".to_owned(),
+        run_id: "run-c5-001".to_owned(),
+        scenario_id: "PARITY-C5-INTAKE".to_owned(),
+        seed: 3520,
+        reporter: Some("user@example.com".to_owned()),
+        schema: vec!["CREATE TABLE t(v INTEGER);".to_owned()],
+        workload: vec![
+            "SELECT 1;".to_owned(),
+            "SELECT bad();".to_owned(),
+            "SELECT 2;".to_owned(),
+        ],
+        taxonomy_features: vec!["F-SQL.10".to_owned()],
+    };
+
+    let minimizer = MinimizerConfig {
+        max_iterations: 128,
+        one_minimal: true,
+        max_workload_size: 128,
+    };
+    let repro_test =
+        |_schema: &[String], workload: &[String]| -> Option<Vec<StatementDivergence>> {
+            if workload.iter().any(|sql| sql.contains("SELECT bad()")) {
+                Some(vec![StatementDivergence {
+                    index: 0,
+                    sql: "SELECT bad();".to_owned(),
+                    fsqlite_outcome: StmtOutcome::Error("no such function: bad".to_owned()),
+                    csqlite_outcome: StmtOutcome::Error("no such function: bad".to_owned()),
+                }])
+            } else {
+                None
+            }
+        };
+
+    let report = intake_user_repro_fixture(&mut builder, &request, &minimizer, &repro_test)
+        .expect("user repro intake should succeed");
+
+    assert_eq!(report.artifact.trace_id, "trace-c5-001");
+    assert_eq!(report.artifact.run_id, "run-c5-001");
+    assert_eq!(report.artifact.scenario_id, "PARITY-C5-INTAKE");
+    assert_eq!(report.artifact.seed, 3520);
+    assert_eq!(report.artifact.original_statement_count, 3);
+    assert!(
+        report.artifact.minimized_statement_count <= report.artifact.original_statement_count,
+        "minimizer should not expand workload"
+    );
+    assert!(
+        report
+            .artifact
+            .minimized_replay_sql
+            .iter()
+            .any(|sql| sql.contains("SELECT bad()")),
+        "minimized replay must preserve the failing statement"
+    );
+
+    let manifest = builder.build();
+    assert_eq!(manifest.entries.len(), 1);
+    assert_eq!(manifest.coverage.user_repro_entries, 1);
+    assert_eq!(manifest.coverage.by_source.get("user_repro"), Some(&1));
+
+    let entry = &manifest.entries[0];
+    assert!(
+        matches!(
+            &entry.source,
+            CorpusSource::UserRepro { fixture_id, .. } if fixture_id == &report.artifact.fixture_id
+        ),
+        "entry source should preserve user repro fixture metadata"
+    );
+}
+
+#[test]
+fn user_repro_fixture_json_roundtrip_and_ingestability() {
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let request = UserReproIntakeRequest {
+        title: "user report: deterministic minimization".to_owned(),
+        details: String::new(),
+        trace_id: "trace-c5-002".to_owned(),
+        run_id: "run-c5-002".to_owned(),
+        scenario_id: "PARITY-C5-ROUNDTRIP".to_owned(),
+        seed: 777,
+        reporter: None,
+        schema: vec!["CREATE TABLE t(v INTEGER);".to_owned()],
+        workload: vec!["SELECT bad();".to_owned()],
+        taxonomy_features: vec![],
+    };
+    let minimizer = MinimizerConfig::default();
+    let repro_test =
+        |_schema: &[String], workload: &[String]| -> Option<Vec<StatementDivergence>> {
+            if workload.iter().any(|sql| sql.contains("bad()")) {
+                Some(vec![StatementDivergence {
+                    index: 0,
+                    sql: "SELECT bad();".to_owned(),
+                    fsqlite_outcome: StmtOutcome::Error("boom".to_owned()),
+                    csqlite_outcome: StmtOutcome::Error("boom".to_owned()),
+                }])
+            } else {
+                None
+            }
+        };
+    let report = intake_user_repro_fixture(&mut builder, &request, &minimizer, &repro_test)
+        .expect("user repro intake should succeed");
+
+    let fixture_json =
+        render_user_repro_fixture_json(&report.artifact).expect("fixture json should serialize");
+    let fixture_value: serde_json::Value =
+        serde_json::from_str(&fixture_json).expect("fixture json should parse");
+    assert_eq!(
+        fixture_value["id"].as_str(),
+        Some(report.artifact.fixture_id.as_str())
+    );
+    assert_eq!(
+        fixture_value["metadata"]["trace_id"].as_str(),
+        Some(report.artifact.trace_id.as_str())
+    );
+    assert_eq!(
+        fixture_value["metadata"]["run_id"].as_str(),
+        Some(report.artifact.run_id.as_str())
+    );
+    assert_eq!(
+        fixture_value["metadata"]["scenario_id"].as_str(),
+        Some(report.artifact.scenario_id.as_str())
+    );
+    assert_eq!(
+        fixture_value["metadata"]["seed"].as_u64(),
+        Some(report.artifact.seed)
+    );
+
+    let tmp = tempdir().expect("create temp dir");
+    let fixture_path =
+        write_user_repro_fixture(tmp.path(), &report.artifact).expect("fixture file write");
+    assert!(fixture_path.exists(), "fixture file should exist");
+
+    let mut ingest_builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let ingest_report = ingest_conformance_fixtures_with_report(tmp.path(), &mut ingest_builder)
+        .expect("fixture should be ingestable by conformance ingestion");
+    assert_eq!(ingest_report.fixture_json_files_seen, 1);
+    assert_eq!(ingest_report.fixture_entries_ingested, 1);
+    assert_eq!(ingest_report.skipped_files.len(), 0);
+}
+
+#[test]
+fn user_repro_intake_rejects_missing_structured_metadata() {
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let request = UserReproIntakeRequest {
+        title: "bad intake".to_owned(),
+        details: String::new(),
+        trace_id: String::new(),
+        run_id: "run-c5-003".to_owned(),
+        scenario_id: "PARITY-C5-INVALID".to_owned(),
+        seed: 1,
+        reporter: None,
+        schema: vec![],
+        workload: vec!["SELECT 1;".to_owned()],
+        taxonomy_features: vec![],
+    };
+    let minimizer = MinimizerConfig::default();
+    let repro_test =
+        |_schema: &[String], _workload: &[String]| -> Option<Vec<StatementDivergence>> {
+            Some(vec![StatementDivergence {
+                index: 0,
+                sql: "SELECT 1;".to_owned(),
+                fsqlite_outcome: StmtOutcome::Rows(Vec::new()),
+                csqlite_outcome: StmtOutcome::Rows(Vec::new()),
+            }])
+        };
+
+    let error = intake_user_repro_fixture(&mut builder, &request, &minimizer, &repro_test)
+        .expect_err("missing trace_id should be rejected");
+    assert!(
+        error.contains("trace_id"),
+        "error should mention missing trace_id: {error}"
+    );
+}
+
+proptest! {
+    #[test]
+    fn user_repro_intake_is_deterministic_for_identical_inputs(
+        trace_suffix in "[a-z0-9]{1,8}",
+        run_suffix in "[a-z0-9]{1,8}",
+        scenario_suffix in "[A-Z0-9_]{1,8}",
+        seed in any::<u64>(),
+        noise_len in 0usize..6,
+    ) {
+        let mut workload: Vec<String> = (0..noise_len)
+            .map(|i| format!("SELECT {};", i))
+            .collect();
+        workload.insert(noise_len / 2, "SELECT bad();".to_owned());
+
+        let request = UserReproIntakeRequest {
+            title: "property repro".to_owned(),
+            details: "determinism check".to_owned(),
+            trace_id: format!("trace-{trace_suffix}"),
+            run_id: format!("run-{run_suffix}"),
+            scenario_id: format!("SCENARIO_{scenario_suffix}"),
+            seed,
+            reporter: None,
+            schema: vec!["CREATE TABLE t(v INTEGER);".to_owned()],
+            workload,
+            taxonomy_features: vec![],
+        };
+        let minimizer = MinimizerConfig::default();
+        let repro_test =
+            |_schema: &[String], workload: &[String]| -> Option<Vec<StatementDivergence>> {
+                if workload.iter().any(|sql| sql.contains("bad()")) {
+                    Some(vec![StatementDivergence {
+                        index: 0,
+                        sql: "SELECT bad();".to_owned(),
+                        fsqlite_outcome: StmtOutcome::Error("boom".to_owned()),
+                        csqlite_outcome: StmtOutcome::Error("boom".to_owned()),
+                    }])
+                } else {
+                    None
+                }
+            };
+
+        let mut left_builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+        let mut right_builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+        let left =
+            intake_user_repro_fixture(&mut left_builder, &request, &minimizer, &repro_test)
+                .expect("left intake should succeed");
+        let right =
+            intake_user_repro_fixture(&mut right_builder, &request, &minimizer, &repro_test)
+                .expect("right intake should succeed");
+
+        prop_assert_eq!(left.artifact.fixture_id, right.artifact.fixture_id);
+        prop_assert_eq!(left.artifact.signature_hash, right.artifact.signature_hash);
+        prop_assert_eq!(
+            left.artifact.minimized_replay_sql,
+            right.artifact.minimized_replay_sql
+        );
+        prop_assert_eq!(
+            left.artifact.minimized_statement_count,
+            right.artifact.minimized_statement_count
+        );
+        prop_assert!(
+            left.artifact.minimized_statement_count <= left.artifact.original_statement_count
+        );
     }
 }
 

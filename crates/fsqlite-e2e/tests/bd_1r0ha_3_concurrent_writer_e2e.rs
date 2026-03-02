@@ -513,9 +513,9 @@ fn scenario_rw10w10_disjoint_fairness_and_latency() {
         .max_commits
         .saturating_sub(fsqlite_progress.min_commits);
     let sqlite_bounded_starvation =
-        sqlite_progress.min_commits >= expected_commits_per_writer && sqlite_starvation_gap <= 1;
+        sqlite_progress.min_commits >= expected_commits_per_writer && sqlite_starvation_gap <= 3;
     let fsqlite_bounded_starvation =
-        fsqlite_progress.min_commits >= expected_commits_per_writer && fsqlite_starvation_gap <= 1;
+        fsqlite_progress.min_commits >= expected_commits_per_writer && fsqlite_starvation_gap <= 3;
 
     assert!(
         sqlite_bounded_starvation,

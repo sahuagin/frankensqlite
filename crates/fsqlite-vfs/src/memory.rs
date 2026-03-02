@@ -549,18 +549,13 @@ impl VfsFile for MemoryFile {
                 });
             }
 
-            // Grow the region while preserving existing bytes to match WAL-index
-            // expectations when a caller remaps with a larger size.
-            let replacement = ShmRegion::new(requested_size);
-            {
-                let existing_guard = existing.lock();
-                let mut replacement_guard = replacement.lock();
-                let copy_len = existing_guard.len().min(replacement_guard.len());
-                replacement_guard[..copy_len].copy_from_slice(&existing_guard[..copy_len]);
-            }
-            info.regions.insert(region, replacement.clone());
+            // Grow the region in place to match WAL-index expectations
+            // when a caller remaps with a larger size.
+            let mut updated_region = existing.clone();
+            updated_region.resize(requested_size);
+            info.regions.insert(region, updated_region.clone());
             drop(info);
-            return Ok(replacement);
+            return Ok(updated_region);
         }
         if !extend {
             drop(info);

@@ -169,6 +169,22 @@ impl ShmRegion {
         let mut guard = self.lock();
         guard[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
     }
+
+    /// Resize the shared memory region.
+    ///
+    /// Existing clones of this `ShmRegion` will still share the same underlying
+    /// data, but their locally cached `len()` will not be updated. This matches
+    /// the semantics of `mremap` where other handles must explicitly remap
+    /// to see the new size, while still sharing the physical bytes.
+    pub fn resize(&mut self, new_size: usize) {
+        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        if new_size > guard.len() {
+            guard.resize(new_size, 0);
+        } else if new_size < guard.len() {
+            guard.truncate(new_size);
+        }
+        self.len = new_size;
+    }
 }
 
 /// Locked SHM region access guard.

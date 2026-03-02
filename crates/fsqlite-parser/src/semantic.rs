@@ -383,6 +383,8 @@ pub enum FunctionArity {
     Range(usize, usize),
     /// Any number of arguments.
     Variadic,
+    /// Minimum number of arguments.
+    VariadicMin(usize),
 }
 
 impl std::fmt::Display for SemanticError {
@@ -1146,6 +1148,7 @@ impl<'a> Resolver<'a> {
                 FunctionArity::Exact(n) => actual == *n,
                 FunctionArity::Range(lo, hi) => actual >= *lo && actual <= *hi,
                 FunctionArity::Variadic => true,
+                FunctionArity::VariadicMin(min) => actual >= *min,
             };
             if !valid {
                 self.push_error(SemanticErrorKind::FunctionArityMismatch {
@@ -1218,14 +1221,17 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         }
         "ifnull" | "nullif" | "instr" | "glob" | "likelihood" => Some(FunctionArity::Exact(2)),
         "iif" | "replace" => Some(FunctionArity::Exact(3)),
-        "count" => Some(FunctionArity::Exact(1)),
+        "count" => Some(FunctionArity::Range(0, 1)),
         "group_concat" | "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
         "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
+        "coalesce" | "json_extract" | "json_remove" => Some(FunctionArity::VariadicMin(2)),
+        "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),
         // Variadic: aggregates, scalars, date/time, and JSON functions
-        "min" | "max" | "coalesce" | "printf" | "format" | "char" | "date" | "time"
-        | "datetime" | "julianday" | "strftime" | "unixepoch" | "json" | "json_array"
-        | "json_object" | "json_type" | "json_valid" | "json_extract" | "json_insert"
-        | "json_replace" | "json_set" | "json_remove" => Some(FunctionArity::Variadic),
+        "min" | "max" | "printf" | "format" | "date" | "time" | "datetime" | "julianday"
+        | "strftime" | "unixepoch" | "json" | "json_type" | "json_valid" => {
+            Some(FunctionArity::VariadicMin(1))
+        }
+        "char" | "json_array" | "json_object" => Some(FunctionArity::Variadic),
 
         _ => None, // Unknown function — skip arity check.
     }

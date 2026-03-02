@@ -784,13 +784,18 @@ pub fn regenerate_index_ops(
 
                 // Step 6: UNIQUE enforcement.
                 if index_def.unique {
-                    if let Some(conflicting) =
-                        unique_checker.check_unique(index_def.index_id, &new_key, rowid)
-                    {
-                        return Err(IndexRegenError::UniqueConstraintViolation {
-                            index_id: index_def.index_id,
-                            conflicting_rowid: conflicting,
-                        });
+                    let has_null = parse_record(&new_key)
+                        .map(|fields| fields.iter().any(|v| matches!(v, SqliteValue::Null)))
+                        .unwrap_or(false);
+                    if !has_null {
+                        if let Some(conflicting) =
+                            unique_checker.check_unique(index_def.index_id, &new_key, rowid)
+                        {
+                            return Err(IndexRegenError::UniqueConstraintViolation {
+                                index_id: index_def.index_id,
+                                conflicting_rowid: conflicting,
+                            });
+                        }
                     }
                 }
 
@@ -815,13 +820,18 @@ pub fn regenerate_index_ops(
 
                     // Step 6: UNIQUE enforcement for the new key.
                     if index_def.unique {
-                        if let Some(conflicting) =
-                            unique_checker.check_unique(index_def.index_id, &new_key, rowid)
-                        {
-                            return Err(IndexRegenError::UniqueConstraintViolation {
-                                index_id: index_def.index_id,
-                                conflicting_rowid: conflicting,
-                            });
+                        let has_null = parse_record(&new_key)
+                            .map(|fields| fields.iter().any(|v| matches!(v, SqliteValue::Null)))
+                            .unwrap_or(false);
+                        if !has_null {
+                            if let Some(conflicting) =
+                                unique_checker.check_unique(index_def.index_id, &new_key, rowid)
+                            {
+                                return Err(IndexRegenError::UniqueConstraintViolation {
+                                    index_id: index_def.index_id,
+                                    conflicting_rowid: conflicting,
+                                });
+                            }
                         }
                     }
 

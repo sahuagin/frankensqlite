@@ -236,8 +236,8 @@ pub struct ParsedPage {
     pub page_size: PageSize,
     /// Reserved bytes per page.
     pub reserved_per_page: u8,
-    /// Table ID used for digest computation (caller-supplied context).
-    pub table_id: TableId,
+    /// B-tree reference used for digest computation (caller-supplied context).
+    pub btree_ref: BtreeRef,
 }
 
 /// Extracted cell data: (`raw_bytes`, `optional_rowid`, `key_digest`).
@@ -262,7 +262,7 @@ pub fn parse_btree_page(
     page_size: PageSize,
     reserved_per_page: u8,
     is_page1: bool,
-    table_id: TableId,
+    btree_ref: BtreeRef,
 ) -> Result<ParsedPage, MergeError> {
     let header = BTreePageHeader::parse(page, page_size, reserved_per_page, is_page1)
         .map_err(|e| MergeError::PageParseError(format!("{e}")))?;
@@ -289,7 +289,7 @@ pub fn parse_btree_page(
         }
 
         let (cell_bytes, rowid, cell_key_digest) =
-            extract_cell_with_digest(page, cell_offset, usable, header.page_type, table_id)?;
+            extract_cell_with_digest(page, cell_offset, usable, header.page_type, btree_ref)?;
 
         cells.push(ParsedCell {
             cell_key_digest,
@@ -305,7 +305,7 @@ pub fn parse_btree_page(
         cells,
         page_size,
         reserved_per_page,
-        table_id,
+        btree_ref,
     })
 }
 
@@ -316,16 +316,16 @@ fn extract_cell_with_digest(
     cell_offset: usize,
     usable: usize,
     page_type: BTreePageType,
-    table_id: TableId,
+    btree_ref: BtreeRef,
 ) -> Result<CellExtract, MergeError> {
     let remaining = &page[cell_offset..usable.min(page.len())];
 
     match page_type {
-        BTreePageType::LeafTable => parse_leaf_table_cell(remaining, table_id, usable as u32),
-        BTreePageType::LeafIndex => parse_leaf_index_cell(remaining, table_id, usable as u32),
-        BTreePageType::InteriorTable => parse_interior_table_cell(remaining, table_id),
+        BTreePageType::LeafTable => parse_leaf_table_cell(remaining, btree_ref, usable as u32),
+        BTreePageType::LeafIndex => parse_leaf_index_cell(remaining, btree_ref, usable as u32),
+        BTreePageType::InteriorTable => parse_interior_table_cell(remaining, btree_ref),
         BTreePageType::InteriorIndex => {
-            parse_interior_index_cell(remaining, table_id, usable as u32)
+            parse_interior_index_cell(remaining, btree_ref, usable as u32)
         }
     }
 }
@@ -333,7 +333,7 @@ fn extract_cell_with_digest(
 /// Parse a leaf table cell: `[varint payload_size][varint rowid][payload...][overflow?]`
 fn parse_leaf_table_cell(
     data: &[u8],
-    table_id: TableId,
+    btree_ref: BtreeRef,
     usable: u32,
 ) -> Result<CellExtract, MergeError> {
     let (payload_size, n1) =
@@ -354,11 +354,8 @@ fn parse_leaf_table_cell(
     let cell_bytes = data[..cell_end].to_vec();
 
     // Compute digest using rowid as canonical key bytes (LE i64)
-    let digest = SemanticKeyRef::compute_digest(
-        SemanticKeyKind::TableRow,
-        BtreeRef::Table(table_id),
-        &rowid.to_le_bytes(),
-    );
+    let digest =
+        SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &rowid.to_le_bytes());
 
     Ok((cell_bytes, Some(rowid), digest))
 }
@@ -366,7 +363,7 @@ fn parse_leaf_table_cell(
 /// Parse a leaf index cell: `[varint payload_size][payload...][overflow?]`
 fn parse_leaf_index_cell(
     data: &[u8],
-    table_id: TableId,
+    btree_ref: BtreeRef,
     usable: u32,
 ) -> Result<CellExtract, MergeError> {
     let (payload_size, n1) =
@@ -384,17 +381,13 @@ fn parse_leaf_index_cell(
     let payload_end = (n1 + local_payload as usize).min(data.len());
     let key_bytes = &data[payload_start..payload_end];
 
-    let digest = SemanticKeyRef::compute_digest(
-        SemanticKeyKind::IndexEntry,
-        BtreeRef::Table(table_id),
-        key_bytes,
-    );
+    let digest = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, btree_ref, key_bytes);
 
     Ok((cell_bytes, None, digest))
 }
 
 /// Parse an interior table cell: `[4-byte left_child][varint rowid]`
-fn parse_interior_table_cell(data: &[u8], table_id: TableId) -> Result<CellExtract, MergeError> {
+fn parse_interior_table_cell(data: &[u8], btree_ref: BtreeRef) -> Result<CellExtract, MergeError> {
     if data.len() < 4 {
         return Err(MergeError::InvalidPageBuffer);
     }
@@ -407,11 +400,8 @@ fn parse_interior_table_cell(data: &[u8], table_id: TableId) -> Result<CellExtra
     let cell_end = (4 + n).min(data.len());
     let cell_bytes = data[..cell_end].to_vec();
 
-    let digest = SemanticKeyRef::compute_digest(
-        SemanticKeyKind::TableRow,
-        BtreeRef::Table(table_id),
-        &rowid.to_le_bytes(),
-    );
+    let digest =
+        SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, btree_ref, &rowid.to_le_bytes());
 
     Ok((cell_bytes, Some(rowid), digest))
 }
@@ -419,7 +409,7 @@ fn parse_interior_table_cell(data: &[u8], table_id: TableId) -> Result<CellExtra
 /// Parse an interior index cell: `[4-byte left_child][varint payload_size][payload...][overflow?]`
 fn parse_interior_index_cell(
     data: &[u8],
-    table_id: TableId,
+    btree_ref: BtreeRef,
     usable: u32,
 ) -> Result<CellExtract, MergeError> {
     if data.len() < 4 {
@@ -439,11 +429,7 @@ fn parse_interior_index_cell(
     let payload_end = (payload_start + local_payload as usize).min(data.len());
     let key_bytes = &data[payload_start..payload_end];
 
-    let digest = SemanticKeyRef::compute_digest(
-        SemanticKeyKind::IndexEntry,
-        BtreeRef::Table(table_id),
-        key_bytes,
-    );
+    let digest = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, btree_ref, key_bytes);
 
     Ok((cell_bytes, None, digest))
 }
@@ -895,7 +881,7 @@ pub fn evaluate_merge_ladder(
     reserved_per_page: u8,
     is_page1: bool,
     page_kind: MergePageKind,
-    table_id: TableId,
+    btree_ref: BtreeRef,
     snapshot_schema_epoch: u64,
     current_schema_epoch: u64,
     intent_log: Option<&[IntentOp]>,
@@ -971,16 +957,16 @@ pub fn evaluate_merge_ladder(
     // Level 3: Structured page patch merge (cell-disjoint)
     if page_kind.is_sqlite_structured() {
         let base_parsed =
-            parse_btree_page(base_page, page_size, reserved_per_page, is_page1, table_id)?;
+            parse_btree_page(base_page, page_size, reserved_per_page, is_page1, btree_ref)?;
         let committed_parsed = parse_btree_page(
             committed_page,
             page_size,
             reserved_per_page,
             is_page1,
-            table_id,
+            btree_ref,
         )?;
         let txn_parsed =
-            parse_btree_page(txn_page, page_size, reserved_per_page, is_page1, table_id)?;
+            parse_btree_page(txn_page, page_size, reserved_per_page, is_page1, btree_ref)?;
 
         let patch_committed = diff_parsed_pages(&base_parsed, &committed_parsed)?;
         let patch_txn = diff_parsed_pages(&base_parsed, &txn_parsed)?;
@@ -1194,9 +1180,12 @@ mod tests {
         // T2: adds row 4
         let t2 = build_leaf_table_page(&[(1, b"hello"), (2, b"world"), (4, b"bar")], ps);
 
-        let base_parsed = parse_btree_page(&base, ps, 0, false, tid).unwrap();
-        let t1_parsed = parse_btree_page(&t1, ps, 0, false, tid).unwrap();
-        let t2_parsed = parse_btree_page(&t2, ps, 0, false, tid).unwrap();
+        let base_parsed =
+            parse_btree_page(&base, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
+        let t1_parsed =
+            parse_btree_page(&t1, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
+        let t2_parsed =
+            parse_btree_page(&t2, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
 
         assert_eq!(base_parsed.cells.len(), 2);
         assert_eq!(t1_parsed.cells.len(), 3);
@@ -1224,7 +1213,8 @@ mod tests {
             repack_btree_page(&merged_cells, BTreePageType::LeafTable, ps, 0, false, None).unwrap();
 
         // Verify round-trip: reparse and check
-        let re_parsed = parse_btree_page(&repacked, ps, 0, false, tid).unwrap();
+        let re_parsed =
+            parse_btree_page(&repacked, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
         assert_eq!(re_parsed.cells.len(), 4);
 
         // Verify idempotence: repack(parse(repacked)) == repacked
@@ -1314,7 +1304,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            table_id_1(),
+            fsqlite_types::BtreeRef::Table(table_id_1()),
             1, // snapshot epoch
             1, // current epoch (same)
             None,
@@ -1389,7 +1379,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             Some(&intent_log),
@@ -1435,7 +1425,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             None, // No intent log — skip rebase, go to structured merge
@@ -1446,7 +1436,14 @@ mod tests {
 
         match result {
             MergeLadderResult::StructuredMergeSucceeded { merged_page } => {
-                let parsed = parse_btree_page(&merged_page, ps, 0, false, tid).unwrap();
+                let parsed = parse_btree_page(
+                    &merged_page,
+                    ps,
+                    0,
+                    false,
+                    fsqlite_types::BtreeRef::Table(tid),
+                )
+                .unwrap();
                 assert_eq!(parsed.cells.len(), 3, "merged page should have 3 cells");
                 // Verify all rowids present
                 let rowids: Vec<i64> = parsed.cells.iter().filter_map(|c| c.rowid).collect();
@@ -1481,7 +1478,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             None,
@@ -1507,7 +1504,8 @@ mod tests {
         let rowid: i64 = 42;
 
         let page = build_leaf_table_page(&[(rowid, b"test_payload")], ps);
-        let parsed = parse_btree_page(&page, ps, 0, false, tid).unwrap();
+        let parsed =
+            parse_btree_page(&page, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
 
         assert_eq!(parsed.cells.len(), 1);
 
@@ -1560,9 +1558,12 @@ mod tests {
             build_leaf_table_page(&[(1, b"base"), (10, b"t1_data"), (20, b"t2_data")], ps);
 
         // Physical merge
-        let base_parsed = parse_btree_page(&base, ps, 0, false, tid).unwrap();
-        let t1_parsed = parse_btree_page(&t1, ps, 0, false, tid).unwrap();
-        let t2_parsed = parse_btree_page(&t2, ps, 0, false, tid).unwrap();
+        let base_parsed =
+            parse_btree_page(&base, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
+        let t1_parsed =
+            parse_btree_page(&t1, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
+        let t2_parsed =
+            parse_btree_page(&t2, ps, 0, false, fsqlite_types::BtreeRef::Table(tid)).unwrap();
 
         let patch_t1 = diff_parsed_pages(&base_parsed, &t1_parsed).unwrap();
         let patch_t2 = diff_parsed_pages(&base_parsed, &t2_parsed).unwrap();
@@ -1575,8 +1576,22 @@ mod tests {
             repack_btree_page(&merged_cells, BTreePageType::LeafTable, ps, 0, false, None).unwrap();
 
         // Parse both and compare semantic content (rowids + payloads)
-        let merged_parsed = parse_btree_page(&merged_page, ps, 0, false, tid).unwrap();
-        let serial_parsed = parse_btree_page(&serial_result, ps, 0, false, tid).unwrap();
+        let merged_parsed = parse_btree_page(
+            &merged_page,
+            ps,
+            0,
+            false,
+            fsqlite_types::BtreeRef::Table(tid),
+        )
+        .unwrap();
+        let serial_parsed = parse_btree_page(
+            &serial_result,
+            ps,
+            0,
+            false,
+            fsqlite_types::BtreeRef::Table(tid),
+        )
+        .unwrap();
 
         assert_eq!(merged_parsed.cells.len(), serial_parsed.cells.len());
 
@@ -1621,7 +1636,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            table_id_1(),
+            fsqlite_types::BtreeRef::Table(table_id_1()),
             1, // snapshot epoch
             2, // current epoch (different!)
             None,
@@ -1654,7 +1669,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            table_id_1(),
+            fsqlite_types::BtreeRef::Table(table_id_1()),
             1,
             1,
             None,
@@ -1686,7 +1701,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             None,
@@ -1697,7 +1712,14 @@ mod tests {
 
         match result {
             MergeLadderResult::StructuredMergeSucceeded { merged_page } => {
-                let parsed = parse_btree_page(&merged_page, ps, 0, false, tid).unwrap();
+                let parsed = parse_btree_page(
+                    &merged_page,
+                    ps,
+                    0,
+                    false,
+                    fsqlite_types::BtreeRef::Table(tid),
+                )
+                .unwrap();
                 assert_eq!(parsed.cells.len(), 1);
                 assert_eq!(parsed.cells[0].rowid, Some(2));
             }
@@ -1742,7 +1764,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1, // snapshot epoch
             1, // current epoch (same)
             None,
@@ -1753,7 +1775,14 @@ mod tests {
 
         match result {
             MergeLadderResult::StructuredMergeSucceeded { ref merged_page } => {
-                let parsed = parse_btree_page(merged_page, ps, 0, false, tid).unwrap();
+                let parsed = parse_btree_page(
+                    merged_page,
+                    ps,
+                    0,
+                    false,
+                    fsqlite_types::BtreeRef::Table(tid),
+                )
+                .unwrap();
                 assert_eq!(
                     parsed.cells.len(),
                     3,
@@ -1776,7 +1805,9 @@ mod tests {
                 // Verify result matches serial schedule (T1 then T2).
                 let serial =
                     build_leaf_table_page(&[(1, b"init"), (5, b"t1val"), (10, b"t2val")], ps);
-                let serial_parsed = parse_btree_page(&serial, ps, 0, false, tid).unwrap();
+                let serial_parsed =
+                    parse_btree_page(&serial, ps, 0, false, fsqlite_types::BtreeRef::Table(tid))
+                        .unwrap();
 
                 // Same number of cells
                 assert_eq!(parsed.cells.len(), serial_parsed.cells.len());
@@ -1825,7 +1856,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             None,
@@ -1859,7 +1890,7 @@ mod tests {
             0,
             false,
             MergePageKind::BtreeLeafTable,
-            tid,
+            fsqlite_types::BtreeRef::Table(tid),
             1,
             1,
             None,
@@ -1870,7 +1901,14 @@ mod tests {
 
         match multi_result {
             MergeLadderResult::StructuredMergeSucceeded { ref merged_page } => {
-                let parsed = parse_btree_page(merged_page, ps, 0, false, tid).unwrap();
+                let parsed = parse_btree_page(
+                    merged_page,
+                    ps,
+                    0,
+                    false,
+                    fsqlite_types::BtreeRef::Table(tid),
+                )
+                .unwrap();
                 assert_eq!(
                     parsed.cells.len(),
                     5,
@@ -1895,7 +1933,9 @@ mod tests {
                     ],
                     ps,
                 );
-                let serial_parsed = parse_btree_page(&serial, ps, 0, false, tid).unwrap();
+                let serial_parsed =
+                    parse_btree_page(&serial, ps, 0, false, fsqlite_types::BtreeRef::Table(tid))
+                        .unwrap();
                 assert_eq!(parsed.cells.len(), serial_parsed.cells.len());
                 for (mc, sc) in parsed.cells.iter().zip(serial_parsed.cells.iter()) {
                     assert_eq!(mc.cell_key_digest, sc.cell_key_digest);

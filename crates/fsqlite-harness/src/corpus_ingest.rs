@@ -22,10 +22,13 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mismatch_minimizer::{MinimizerConfig, ReproducibilityTest, minimize_workload};
 use crate::oracle::{SltKind, parse_slt};
 
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1dp9.2.1";
+/// Bead identifier for user repro intake/minimization pipeline.
+const USER_REPRO_BEAD_ID: &str = "bd-2yqp6.3.5";
 
 /// Default seed base for corpus entries (same as FRANKEN_SEED from e2e).
 pub const CORPUS_SEED_BASE: u64 = 0x0046_5241_4E4B_454E;
@@ -113,6 +116,21 @@ pub enum CorpusSource {
     Custom { author: String },
     /// Metamorphic/generated test.
     Generated { generator: String, seed: u64 },
+    /// User-reported mismatch intake reduced to deterministic replay form.
+    UserRepro {
+        /// Deterministic fixture identifier.
+        fixture_id: String,
+        /// Trace identifier for structured diagnostics.
+        trace_id: String,
+        /// Run identifier for structured diagnostics.
+        run_id: String,
+        /// Scenario identifier for structured diagnostics.
+        scenario_id: String,
+        /// Original workload statement count before minimization.
+        original_statement_count: usize,
+        /// Minimized workload statement count after minimization.
+        minimized_statement_count: usize,
+    },
 }
 
 /// Rationale for skipping a corpus entry.
@@ -178,6 +196,86 @@ pub struct CorpusManifest {
     pub coverage: CoverageReport,
 }
 
+/// Intake request for converting a user-reported mismatch into a deterministic
+/// minimized corpus fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserReproIntakeRequest {
+    /// Human-readable title for this user report.
+    pub title: String,
+    /// Optional free-form details from the reporter.
+    pub details: String,
+    /// Trace identifier required by structured log contracts.
+    pub trace_id: String,
+    /// Run identifier required by structured log contracts.
+    pub run_id: String,
+    /// Scenario identifier required by structured log contracts.
+    pub scenario_id: String,
+    /// Deterministic seed for replay/minimization.
+    pub seed: u64,
+    /// Optional reporter handle or source reference.
+    pub reporter: Option<String>,
+    /// Schema/setup SQL needed before replay workload execution.
+    pub schema: Vec<String>,
+    /// Original failing workload SQL statements.
+    pub workload: Vec<String>,
+    /// Optional taxonomy feature IDs to attach for coverage accounting.
+    pub taxonomy_features: Vec<String>,
+}
+
+/// Deterministic minimized fixture artifact emitted by user repro intake.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserReproFixtureArtifact {
+    /// Schema version for this artifact payload.
+    pub schema_version: u32,
+    /// Owning bead id.
+    pub bead_id: String,
+    /// Deterministic fixture id used for file naming/dedupe.
+    pub fixture_id: String,
+    /// Trace identifier carried through replay metadata.
+    pub trace_id: String,
+    /// Run identifier carried through replay metadata.
+    pub run_id: String,
+    /// Scenario identifier carried through replay metadata.
+    pub scenario_id: String,
+    /// Deterministic seed for replay.
+    pub seed: u64,
+    /// Signature hash produced by mismatch minimization.
+    pub signature_hash: String,
+    /// Classification text emitted by mismatch minimizer.
+    pub classification: String,
+    /// Attributed subsystem text emitted by mismatch minimizer.
+    pub subsystem: String,
+    /// Original failing workload size (without schema setup statements).
+    pub original_statement_count: usize,
+    /// Minimized workload size (without schema setup statements).
+    pub minimized_statement_count: usize,
+    /// Reduction ratio in [0.0, 1.0].
+    pub reduction_ratio: f64,
+    /// Full replay SQL for original failing behavior (schema + workload).
+    pub original_replay_sql: Vec<String>,
+    /// Full replay SQL for minimized failing behavior (schema + workload).
+    pub minimized_replay_sql: Vec<String>,
+    /// Single-line command reference for original replay.
+    pub original_replay_command: String,
+    /// Single-line command reference for minimized replay.
+    pub minimized_replay_command: String,
+    /// Divergence count captured by the minimizer on minimized replay.
+    pub divergence_count: usize,
+    /// First divergence index from minimized replay (if available).
+    pub first_divergence_index: Option<usize>,
+}
+
+/// Result from user repro intake pipeline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserReproIntakeReport {
+    /// Deterministic corpus entry identifier created by intake.
+    pub entry_id: String,
+    /// Primary family used for coverage accounting.
+    pub family: Family,
+    /// Emitted minimized fixture artifact.
+    pub artifact: UserReproFixtureArtifact,
+}
+
 /// Coverage report showing fill percentages per family.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageReport {
@@ -189,6 +287,12 @@ pub struct CoverageReport {
     pub skipped_entries: usize,
     /// Per-family coverage.
     pub by_family: BTreeMap<String, FamilyCoverage>,
+    /// Active entry counts by source type.
+    pub by_source: BTreeMap<String, usize>,
+    /// Count of active entries ingested from user repro pipeline.
+    pub user_repro_entries: usize,
+    /// Total minimized statement count across user repro entries.
+    pub user_repro_minimized_statements: usize,
     /// Families with zero entries.
     pub missing_families: Vec<String>,
     /// Families below the minimum threshold (< 5 entries).
@@ -571,6 +675,216 @@ impl CorpusBuilder {
     }
 }
 
+/// Intake a user-reported mismatch and append a minimized deterministic corpus
+/// entry, preserving both original and minimized replay scripts.
+///
+/// # Errors
+///
+/// Returns an error when request metadata is incomplete or the minimizer cannot
+/// reproduce/reduce the provided workload.
+pub fn intake_user_repro_fixture(
+    builder: &mut CorpusBuilder,
+    request: &UserReproIntakeRequest,
+    minimizer_config: &MinimizerConfig,
+    test_fn: &ReproducibilityTest,
+) -> Result<UserReproIntakeReport, String> {
+    validate_user_repro_request(request)?;
+
+    let minimal = minimize_workload(
+        &request.schema,
+        &request.workload,
+        minimizer_config,
+        test_fn,
+    )
+    .ok_or_else(|| "unable to minimize user repro: workload is not reproducible".to_owned())?;
+
+    let fixture_id = deterministic_user_repro_fixture_id(request, &minimal.signature.hash);
+    let original_replay_sql = compose_replay_sql(&request.schema, &request.workload);
+    let minimized_replay_sql = compose_replay_sql(&request.schema, &minimal.minimal_workload);
+
+    let original_replay_command = format!(
+        "RUN_ID='{}' TRACE_ID='{}' SCENARIO_ID='{}' SEED={} bash scripts/verify_corpus_ingest.sh --json",
+        request.run_id, request.trace_id, request.scenario_id, request.seed
+    );
+    let minimized_replay_command = format!(
+        "RUN_ID='{}' TRACE_ID='{}' SCENARIO_ID='{}' SEED={} bash scripts/verify_corpus_ingest.sh --json",
+        request.run_id, request.trace_id, request.scenario_id, request.seed
+    );
+
+    let (family, _) = classify_family(&compose_replay_sql(
+        &request.schema,
+        &minimal.minimal_workload,
+    ));
+
+    let entry_index = u32::try_from(builder.entries.len()).unwrap_or(u32::MAX);
+    let entry_id = format!("corpus-{family}-{entry_index:04}");
+    let description = format!("user-repro {}: {}", fixture_id, request.title);
+
+    builder.add_with_family(
+        family,
+        minimized_replay_sql.clone(),
+        CorpusSource::UserRepro {
+            fixture_id: fixture_id.clone(),
+            trace_id: request.trace_id.clone(),
+            run_id: request.run_id.clone(),
+            scenario_id: request.scenario_id.clone(),
+            original_statement_count: request.workload.len(),
+            minimized_statement_count: minimal.minimal_workload.len(),
+        },
+        description,
+    );
+    if !request.taxonomy_features.is_empty() {
+        builder.link_features(request.taxonomy_features.clone());
+    }
+
+    let artifact = UserReproFixtureArtifact {
+        schema_version: 1,
+        bead_id: USER_REPRO_BEAD_ID.to_owned(),
+        fixture_id,
+        trace_id: request.trace_id.clone(),
+        run_id: request.run_id.clone(),
+        scenario_id: request.scenario_id.clone(),
+        seed: request.seed,
+        signature_hash: minimal.signature.hash.clone(),
+        classification: minimal.signature.classification.to_string(),
+        subsystem: minimal.signature.subsystem.to_string(),
+        original_statement_count: request.workload.len(),
+        minimized_statement_count: minimal.minimal_workload.len(),
+        reduction_ratio: minimal.reduction_ratio,
+        original_replay_sql,
+        minimized_replay_sql,
+        original_replay_command,
+        minimized_replay_command,
+        divergence_count: minimal.divergences.len(),
+        first_divergence_index: minimal.first_divergence_index,
+    };
+
+    Ok(UserReproIntakeReport {
+        entry_id,
+        family,
+        artifact,
+    })
+}
+
+/// Render a deterministic fixture JSON payload for a minimized user repro.
+///
+/// The payload is ingestible by [`ingest_conformance_fixtures_with_report`].
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub fn render_user_repro_fixture_json(
+    artifact: &UserReproFixtureArtifact,
+) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "id": artifact.fixture_id,
+        "description": format!(
+            "user repro minimized fixture ({})",
+            artifact.signature_hash
+        ),
+        "ops": artifact
+            .minimized_replay_sql
+            .iter()
+            .map(|sql| serde_json::json!({ "sql": sql }))
+            .collect::<Vec<_>>(),
+        "metadata": {
+            "schema_version": artifact.schema_version,
+            "bead_id": artifact.bead_id,
+            "trace_id": artifact.trace_id,
+            "run_id": artifact.run_id,
+            "scenario_id": artifact.scenario_id,
+            "seed": artifact.seed,
+            "signature_hash": artifact.signature_hash,
+            "classification": artifact.classification,
+            "subsystem": artifact.subsystem,
+            "original_statement_count": artifact.original_statement_count,
+            "minimized_statement_count": artifact.minimized_statement_count,
+            "reduction_ratio": artifact.reduction_ratio,
+            "original_replay_sql": artifact.original_replay_sql,
+            "minimized_replay_sql": artifact.minimized_replay_sql,
+            "original_replay_command": artifact.original_replay_command,
+            "minimized_replay_command": artifact.minimized_replay_command,
+            "divergence_count": artifact.divergence_count,
+            "first_divergence_index": artifact.first_divergence_index,
+        }
+    });
+
+    serde_json::to_string_pretty(&payload)
+        .map_err(|error| format!("failed to serialize user repro fixture: {error}"))
+}
+
+/// Write a deterministic user repro fixture JSON file to `output_dir`.
+///
+/// # Errors
+///
+/// Returns an error when directory creation, serialization, or writing fails.
+pub fn write_user_repro_fixture(
+    output_dir: &Path,
+    artifact: &UserReproFixtureArtifact,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(output_dir).map_err(|error| {
+        format!(
+            "failed to create user repro output dir {}: {error}",
+            output_dir.display()
+        )
+    })?;
+
+    let fixture_json = render_user_repro_fixture_json(artifact)?;
+    let path = output_dir.join(format!("{}.json", artifact.fixture_id));
+    std::fs::write(&path, fixture_json).map_err(|error| {
+        format!(
+            "failed to write user repro fixture {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+fn validate_user_repro_request(request: &UserReproIntakeRequest) -> Result<(), String> {
+    if request.title.trim().is_empty() {
+        return Err("user repro request title cannot be empty".to_owned());
+    }
+    if request.trace_id.trim().is_empty() {
+        return Err("user repro request trace_id cannot be empty".to_owned());
+    }
+    if request.run_id.trim().is_empty() {
+        return Err("user repro request run_id cannot be empty".to_owned());
+    }
+    if request.scenario_id.trim().is_empty() {
+        return Err("user repro request scenario_id cannot be empty".to_owned());
+    }
+    if request.workload.is_empty() {
+        return Err("user repro request workload cannot be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn compose_replay_sql(schema: &[String], workload: &[String]) -> Vec<String> {
+    schema
+        .iter()
+        .chain(workload.iter())
+        .map(|sql| sql.trim().to_owned())
+        .filter(|sql| !sql.is_empty())
+        .collect()
+}
+
+fn deterministic_user_repro_fixture_id(
+    request: &UserReproIntakeRequest,
+    signature_hash: &str,
+) -> String {
+    let canonical = serde_json::json!({
+        "trace_id": request.trace_id,
+        "run_id": request.run_id,
+        "scenario_id": request.scenario_id,
+        "seed": request.seed,
+        "schema": request.schema,
+        "workload": request.workload,
+        "signature_hash": signature_hash,
+    });
+    let digest = sha256_hex(canonical.to_string().as_bytes());
+    format!("user-repro-{}", &digest[..16])
+}
+
 // ─── Coverage Computation ────────────────────────────────────────────────
 
 fn compute_coverage(
@@ -579,6 +893,22 @@ fn compute_coverage(
 ) -> CoverageReport {
     let active: Vec<_> = entries.iter().filter(|e| e.skip.is_none()).collect();
     let skipped = entries.len() - active.len();
+    let mut by_source: BTreeMap<String, usize> = BTreeMap::new();
+    let mut user_repro_entries = 0usize;
+    let mut user_repro_minimized_statements = 0usize;
+
+    for entry in &active {
+        let source_name = source_name(&entry.source).to_owned();
+        *by_source.entry(source_name).or_insert(0) += 1;
+        if let CorpusSource::UserRepro {
+            minimized_statement_count,
+            ..
+        } = &entry.source
+        {
+            user_repro_entries += 1;
+            user_repro_minimized_statements += *minimized_statement_count;
+        }
+    }
 
     let mut by_family: BTreeMap<String, FamilyCoverage> = BTreeMap::new();
 
@@ -640,8 +970,22 @@ fn compute_coverage(
         active_entries: active.len(),
         skipped_entries: skipped,
         by_family,
+        by_source,
+        user_repro_entries,
+        user_repro_minimized_statements,
         missing_families: missing,
         underrepresented_families: underrepresented,
+    }
+}
+
+fn source_name(source: &CorpusSource) -> &'static str {
+    match source {
+        CorpusSource::Slt { .. } => "slt",
+        CorpusSource::Tcl { .. } => "tcl",
+        CorpusSource::Fixture { .. } => "fixture",
+        CorpusSource::Custom { .. } => "custom",
+        CorpusSource::Generated { .. } => "generated",
+        CorpusSource::UserRepro { .. } => "user_repro",
     }
 }
 

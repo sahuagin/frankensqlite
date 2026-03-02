@@ -383,12 +383,6 @@ impl WalIndexHashSegment {
                 return Ok(one_based_index);
             }
 
-            let existing_idx = usize::from(existing.saturating_sub(1));
-            if self.page_numbers[existing_idx] == page_number {
-                self.hash_slots[slot_usize] = one_based_index;
-                return Ok(one_based_index);
-            }
-
             slot = (slot + 1) & WAL_INDEX_HASH_MASK;
             if slot == start_slot {
                 return Err(FrankenError::DatabaseFull);
@@ -401,28 +395,41 @@ impl WalIndexHashSegment {
     pub fn lookup(&self, page_number: u32) -> Option<WalHashLookup> {
         let start_slot = wal_index_hash_slot(page_number);
         let mut slot = start_slot;
+        let mut best: Option<WalHashLookup> = None;
 
         loop {
             let slot_usize = usize::try_from(slot).expect("hash slot must fit usize");
             let one_based = self.hash_slots[slot_usize];
             if one_based == 0 {
-                return None;
+                break;
             }
 
             let idx = usize::from(one_based - 1);
             if self.page_numbers[idx] == page_number {
-                return Some(WalHashLookup {
-                    slot,
-                    one_based_index: one_based,
-                    page_number,
-                });
+                if let Some(ref b) = best {
+                    if one_based > b.one_based_index {
+                        best = Some(WalHashLookup {
+                            slot,
+                            one_based_index: one_based,
+                            page_number,
+                        });
+                    }
+                } else {
+                    best = Some(WalHashLookup {
+                        slot,
+                        one_based_index: one_based,
+                        page_number,
+                    });
+                }
             }
 
             slot = (slot + 1) & WAL_INDEX_HASH_MASK;
             if slot == start_slot {
-                return None;
+                break;
             }
         }
+
+        best
     }
 }
 

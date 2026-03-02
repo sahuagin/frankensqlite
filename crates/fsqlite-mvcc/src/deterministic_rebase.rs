@@ -471,6 +471,24 @@ pub fn deterministic_rebase(
     let mut rebased_ops = Vec::with_capacity(intent_log.len());
     let mut replayed_count = 0;
 
+    let mut updated_rows: std::collections::HashMap<(TableId, RowId), Vec<u8>> =
+        std::collections::HashMap::new();
+
+    struct ChainedReader<'a> {
+        base: &'a dyn BaseRowReader,
+        updates: &'a std::collections::HashMap<(TableId, RowId), Vec<u8>>,
+    }
+
+    impl BaseRowReader for ChainedReader<'_> {
+        fn read_base_row(&self, table: TableId, key: RowId) -> Option<Vec<u8>> {
+            if let Some(record) = self.updates.get(&(table, key)) {
+                Some(record.clone())
+            } else {
+                self.base.read_base_row(table, key)
+            }
+        }
+    }
+
     for op in intent_log {
         match &op.op {
             IntentOpKind::UpdateExpression {
@@ -481,6 +499,11 @@ pub fn deterministic_rebase(
                 // Step 3: Replay UpdateExpression against new base.
                 let _indexes = schema.table_indexes(*table);
 
+                let chained_reader = ChainedReader {
+                    base: base_reader,
+                    updates: &updated_rows,
+                };
+
                 // Discard stale index ops that follow this UpdateExpression.
                 // (In a real pipeline these would be in the same intent log;
                 // here we handle each op independently.)
@@ -488,7 +511,7 @@ pub fn deterministic_rebase(
                     *table,
                     *key,
                     column_updates,
-                    base_reader,
+                    &chained_reader,
                     schema,
                     unique_checker,
                 ) {
@@ -505,6 +528,8 @@ pub fn deterministic_rebase(
                         return Err(e);
                     }
                 };
+
+                updated_rows.insert((*table, *key), result.new_record.clone());
 
                 // Emit the materialized Update op.
                 rebased_ops.push(IntentOpKind::Update {
