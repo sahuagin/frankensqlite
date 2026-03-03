@@ -220,9 +220,11 @@ pub fn balance_quick<W: PageWriter>(
     // Initialize as leaf table page with one cell.
     let cell_size = overflow_cell.len();
     let Some(content_start) = (usable_size as usize).checked_sub(cell_size) else {
+        writer.free_page(cx, new_pgno)?;
         return Ok(None);
     };
     if content_start < new_offset + BTREE_LEAF_HEADER_SIZE as usize + 2 {
+        writer.free_page(cx, new_pgno)?;
         return Ok(None); // Cell too large, falls back to standard balance.
     }
 

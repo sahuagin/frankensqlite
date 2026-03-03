@@ -549,6 +549,7 @@ pub fn load_sql_pipeline_opt_report(path: &Path) -> Result<SqlPipelineOptReport,
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn write_matrix_fixture(
         fixture_dir: &Path,
@@ -569,6 +570,12 @@ mod tests {
             )
         })?;
         Ok(fixture_path)
+    }
+
+    fn unique_fixture_dir(prefix: &str) -> PathBuf {
+        static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let suffix = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("{prefix}-{}-{suffix}", std::process::id()))
     }
 
     #[test]
@@ -643,7 +650,7 @@ mod tests {
 
     #[test]
     fn opportunity_gate_fails_when_sql_hotspots_not_selected() -> Result<(), String> {
-        let fixture_dir = std::env::temp_dir().join("fsqlite-sql-opt-matrix-gate");
+        let fixture_dir = unique_fixture_dir("fsqlite-sql-opt-matrix-gate");
         let matrix = r#"{
   "matrix": {"scenario_id":"sql-gate-fixture","threshold":2.0},
   "decisions": [
@@ -674,7 +681,7 @@ mod tests {
 
     #[test]
     fn opportunity_gate_passes_with_selected_sql_hotspot() -> Result<(), String> {
-        let fixture_dir = std::env::temp_dir().join("fsqlite-sql-opt-matrix-pass");
+        let fixture_dir = unique_fixture_dir("fsqlite-sql-opt-matrix-pass");
         let matrix = r#"{
   "matrix": {"scenario_id":"sql-gate-pass","threshold":2.0},
   "decisions": [

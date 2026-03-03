@@ -561,6 +561,11 @@ impl SharedMemoryLayout {
     /// Returns `true` if released (writer txn id matched).
     /// Per spec: clear writer txn id BEFORE releasing mutex.
     pub fn release_serialized_writer(&self, writer_txn_id_raw: u64) -> bool {
+        // Read our own aux fields before releasing the lock so we can carefully CAS them.
+        let my_pid = self.serialized_writer_pid.load(Ordering::Acquire);
+        let my_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
+        let my_lease = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
+
         if self
             .serialized_writer_txn_id
             .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -568,11 +573,12 @@ impl SharedMemoryLayout {
         {
             return false;
         }
-        // Clear auxiliary fields after the writer txn id is zeroed.
-        self.serialized_writer_pid.store(0, Ordering::Release);
-        self.serialized_writer_pid_birth.store(0, Ordering::Release);
-        self.serialized_writer_lease_expiry
-            .store(0, Ordering::Release);
+
+        // Clear auxiliary fields using CAS to avoid stomping on a new writer's
+        // fields if they managed to acquire the lock immediately after we released it.
+        let _ = self.serialized_writer_pid.compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = self.serialized_writer_pid_birth.compare_exchange(my_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = self.serialized_writer_lease_expiry.compare_exchange(my_lease, 0, Ordering::AcqRel, Ordering::Relaxed);
         true
     }
 
@@ -646,6 +652,24 @@ impl SharedMemoryLayout {
                 return Err(MvccError::Busy);
             }
 
+            // The writer appears dead. But this might be a torn read where a new writer
+            // just CAS'd txn_id but hasn't yet updated the aux fields. In this microscopic
+            // window, the aux fields belong to the previous writer.
+            // If we spin briefly, the new writer will have updated the aux fields.
+            let mut is_torn = false;
+            for _ in 0..10 {
+                std::hint::spin_loop();
+                if self.serialized_writer_txn_id.load(Ordering::Acquire) != writer_txn_id_raw ||
+                   self.serialized_writer_pid.load(Ordering::Acquire) != pid 
+                {
+                    is_torn = true;
+                    break;
+                }
+            }
+            if is_torn {
+                continue; // It was a torn read (or a completely new writer). Retry.
+            }
+
             tracing::debug!(
                 writer_txn_id_raw,
                 pid,
@@ -663,11 +687,10 @@ impl SharedMemoryLayout {
                 .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Clear auxiliary fields after the writer txn id is zeroed.
-                self.serialized_writer_pid.store(0, Ordering::Release);
-                self.serialized_writer_pid_birth.store(0, Ordering::Release);
-                self.serialized_writer_lease_expiry
-                    .store(0, Ordering::Release);
+                // Clear auxiliary fields using CAS to avoid stomping a new writer's fields.
+                let _ = self.serialized_writer_pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+                let _ = self.serialized_writer_pid_birth.compare_exchange(pid_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
+                let _ = self.serialized_writer_lease_expiry.compare_exchange(lease_expiry, 0, Ordering::AcqRel, Ordering::Relaxed);
 
                 tracing::info!(
                     writer_txn_id_raw,
