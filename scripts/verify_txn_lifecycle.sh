@@ -88,16 +88,24 @@ run_case() {
 }
 
 run_case \
-  "txn_core_suite" \
-  run_build cargo test -p fsqlite-core test_pragma_txn_ -- --nocapture
+  "txn_stats_suite" \
+  run_build cargo test -p fsqlite-core test_pragma_txn_stats_ -- --nocapture
+
+run_case \
+  "txn_advisor_suite" \
+  run_build cargo test -p fsqlite-core test_pragma_txn_advisor_ -- --nocapture
 
 run_case \
   "txn_live_table_suite" \
   run_build cargo test -p fsqlite-core test_pragma_fsqlite_transactions -- --nocapture
 
 run_case \
+  "txn_timeline_suite" \
+  run_build cargo test -p fsqlite-core test_pragma_txn_timeline_json_tracks_active_and_committed_states -- --nocapture
+
+run_case \
   "clippy_core" \
-  run_build cargo clippy -p fsqlite-core --all-targets -- -D warnings
+  run_build cargo clippy -p fsqlite-core --all-targets --no-deps -- -D warnings
 
 TOTAL_PASSED=0
 TOTAL_FAILED=0
@@ -119,13 +127,21 @@ REPORT_CONTENT=$(cat <<ENDJSON
   "timestamp": "${TIMESTAMP}",
   "verdict": "${VERDICT}",
   "cases": {
-    "txn_core_suite": {
-      "status": "${CASE_STATUS["txn_core_suite"]}",
-      "command": "${CASE_COMMAND["txn_core_suite"]}",
-      "exit_code": ${CASE_EXIT["txn_core_suite"]},
-      "duration_ms": ${CASE_DURATION_MS["txn_core_suite"]},
-      "passed": ${CASE_PASSED["txn_core_suite"]},
-      "failed": ${CASE_FAILED["txn_core_suite"]}
+    "txn_stats_suite": {
+      "status": "${CASE_STATUS["txn_stats_suite"]}",
+      "command": "${CASE_COMMAND["txn_stats_suite"]}",
+      "exit_code": ${CASE_EXIT["txn_stats_suite"]},
+      "duration_ms": ${CASE_DURATION_MS["txn_stats_suite"]},
+      "passed": ${CASE_PASSED["txn_stats_suite"]},
+      "failed": ${CASE_FAILED["txn_stats_suite"]}
+    },
+    "txn_advisor_suite": {
+      "status": "${CASE_STATUS["txn_advisor_suite"]}",
+      "command": "${CASE_COMMAND["txn_advisor_suite"]}",
+      "exit_code": ${CASE_EXIT["txn_advisor_suite"]},
+      "duration_ms": ${CASE_DURATION_MS["txn_advisor_suite"]},
+      "passed": ${CASE_PASSED["txn_advisor_suite"]},
+      "failed": ${CASE_FAILED["txn_advisor_suite"]}
     },
     "txn_live_table_suite": {
       "status": "${CASE_STATUS["txn_live_table_suite"]}",
@@ -134,6 +150,14 @@ REPORT_CONTENT=$(cat <<ENDJSON
       "duration_ms": ${CASE_DURATION_MS["txn_live_table_suite"]},
       "passed": ${CASE_PASSED["txn_live_table_suite"]},
       "failed": ${CASE_FAILED["txn_live_table_suite"]}
+    },
+    "txn_timeline_suite": {
+      "status": "${CASE_STATUS["txn_timeline_suite"]}",
+      "command": "${CASE_COMMAND["txn_timeline_suite"]}",
+      "exit_code": ${CASE_EXIT["txn_timeline_suite"]},
+      "duration_ms": ${CASE_DURATION_MS["txn_timeline_suite"]},
+      "passed": ${CASE_PASSED["txn_timeline_suite"]},
+      "failed": ${CASE_FAILED["txn_timeline_suite"]}
     },
     "clippy_core": {
       "status": "${CASE_STATUS["clippy_core"]}",
@@ -159,8 +183,10 @@ if $JSON_MODE; then
   echo "$REPORT_CONTENT"
 else
   echo "phase=complete bead_id=${BEAD_ID} run_id=${RUN_ID} verdict=${VERDICT}"
-  echo "  txn_core_suite: ${CASE_STATUS["txn_core_suite"]}"
+  echo "  txn_stats_suite: ${CASE_STATUS["txn_stats_suite"]}"
+  echo "  txn_advisor_suite: ${CASE_STATUS["txn_advisor_suite"]}"
   echo "  txn_live_table_suite: ${CASE_STATUS["txn_live_table_suite"]}"
+  echo "  txn_timeline_suite: ${CASE_STATUS["txn_timeline_suite"]}"
   echo "  clippy_core: ${CASE_STATUS["clippy_core"]}"
   echo "  report_path=${REPORT_FILE}"
   echo "  report_sha256=${REPORT_SHA}"
