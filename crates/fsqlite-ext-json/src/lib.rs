@@ -273,38 +273,27 @@ pub fn json_pretty(input: &str, indent: Option<&str>) -> Result<String> {
 }
 
 /// Quote a SQL value as JSON.
-#[must_use]
-pub fn json_quote(value: &SqliteValue) -> String {
+pub fn json_quote(value: &SqliteValue) -> Result<String> {
     match value {
-        SqliteValue::Null => "null".to_owned(),
-        SqliteValue::Integer(i) => i.to_string(),
+        SqliteValue::Null => Ok("null".to_owned()),
+        SqliteValue::Integer(i) => Ok(i.to_string()),
         SqliteValue::Float(f) => {
             if f.is_finite() {
                 // Ensure float always has a decimal point in JSON output.
                 let repr = format!("{f}");
                 if repr.contains('.') || repr.contains('e') || repr.contains('E') {
-                    repr
+                    Ok(repr)
                 } else {
-                    format!("{repr}.0")
+                    Ok(format!("{repr}.0"))
                 }
             } else {
-                "null".to_owned()
+                Ok("null".to_owned())
             }
         }
         SqliteValue::Text(text) => {
-            serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned())
+            Ok(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()))
         }
-        SqliteValue::Blob(bytes) => {
-            // SQLite emits blob values as the SQL hex literal X'...'
-            use std::fmt::Write;
-            let mut hex = String::with_capacity(bytes.len() * 2 + 4);
-            hex.push_str("X'");
-            for byte in bytes {
-                let _ = write!(hex, "{byte:02x}");
-            }
-            hex.push('\'');
-            serde_json::to_string(&hex).unwrap_or_else(|_| "\"\"".to_owned())
-        }
+        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
     }
 }
 
@@ -1361,14 +1350,9 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
             Ok(Value::Number(number))
         }
         SqliteValue::Text(text) => Ok(Value::String(text.clone())),
-        SqliteValue::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.len() * 2);
-            for byte in bytes {
-                use std::fmt::Write;
-                let _ = write!(hex, "{byte:02x}");
-            }
-            Ok(Value::String(hex))
-        }
+        SqliteValue::Blob(_) => Err(FrankenError::function_error(
+            "JSON cannot hold BLOB values",
+        )),
     }
 }
 
@@ -1873,12 +1857,15 @@ pub struct JsonExtractFunc;
 
 impl ScalarFunction for JsonExtractFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 2 {
+        if args.is_empty() {
             return Err(invalid_arity(
                 self.name(),
-                "at least 2 arguments (json, path...)",
+                "at least 1 argument (json, path...)",
                 args.len(),
             ));
+        }
+        if args.len() == 1 {
+            return Ok(SqliteValue::Null);
         }
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
@@ -1940,7 +1927,7 @@ impl ScalarFunction for JsonQuoteFunc {
         if args.len() != 1 {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
-        Ok(SqliteValue::Text(json_quote(&args[0])))
+        Ok(SqliteValue::Text(json_quote(&args[0])?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2437,14 +2424,14 @@ mod tests {
     #[test]
     fn test_json_quote_text() {
         assert_eq!(
-            json_quote(&SqliteValue::Text("hello".to_owned())),
+            json_quote(&SqliteValue::Text("hello".to_owned())).unwrap(),
             r#""hello""#
         );
     }
 
     #[test]
     fn test_json_quote_null() {
-        assert_eq!(json_quote(&SqliteValue::Null), "null");
+        assert_eq!(json_quote(&SqliteValue::Null).unwrap(), "null");
     }
 
     #[test]
@@ -2993,6 +2980,10 @@ mod tests {
     fn test_json_extract_no_paths_error() {
         let empty: &[&str] = &[];
         assert!(json_extract(r#"{"a":1}"#, empty).is_err());
+        
+        let func = JsonExtractFunc;
+        let args = vec![SqliteValue::Text(r#"{"a":1}"#.to_owned())];
+        assert_eq!(func.invoke(&args).unwrap(), SqliteValue::Null);
     }
 
     #[test]
@@ -3157,34 +3148,34 @@ mod tests {
 
     #[test]
     fn test_json_quote_integer() {
-        assert_eq!(json_quote(&SqliteValue::Integer(42)), "42");
-        assert_eq!(json_quote(&SqliteValue::Integer(-1)), "-1");
+        assert_eq!(json_quote(&SqliteValue::Integer(42)).unwrap(), "42");
+        assert_eq!(json_quote(&SqliteValue::Integer(-1)).unwrap(), "-1");
     }
 
     #[test]
     fn test_json_quote_float() {
         #[allow(clippy::approx_constant)]
-        let result = json_quote(&SqliteValue::Float(3.14));
+        let result = json_quote(&SqliteValue::Float(3.14)).unwrap();
         assert!(result.starts_with("3.14"));
     }
 
     #[test]
     fn test_json_quote_float_infinity() {
-        assert_eq!(json_quote(&SqliteValue::Float(f64::INFINITY)), "null");
-        assert_eq!(json_quote(&SqliteValue::Float(f64::NEG_INFINITY)), "null");
-        assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)), "null");
+        assert_eq!(json_quote(&SqliteValue::Float(f64::INFINITY)).unwrap(), "null");
+        assert_eq!(json_quote(&SqliteValue::Float(f64::NEG_INFINITY)).unwrap(), "null");
+        assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
     }
 
     #[test]
     fn test_json_quote_blob() {
-        // SQLite formats blob as the SQL hex literal X'...'
         let result = json_quote(&SqliteValue::Blob(vec![0xDE, 0xAD]));
-        assert_eq!(result, r#""X'dead'""#);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("JSON cannot hold BLOB values"));
     }
 
     #[test]
     fn test_json_quote_text_special_chars() {
-        let result = json_quote(&SqliteValue::Text("a\"b\\c".to_owned()));
+        let result = json_quote(&SqliteValue::Text("a\"b\\c".to_owned())).unwrap();
         assert!(result.contains("\\\""));
         assert!(result.contains("\\\\"));
     }
@@ -3513,7 +3504,7 @@ mod tests {
 
     #[test]
     fn test_json_array_with_blob() {
-        let out = json_array(&[SqliteValue::Blob(vec![0xCA, 0xFE])]).unwrap();
-        assert_eq!(out, r#"["cafe"]"#);
+        let err = json_array(&[SqliteValue::Blob(vec![0xCA, 0xFE])]).unwrap_err();
+        assert!(err.to_string().contains("JSON cannot hold BLOB values"));
     }
 }
