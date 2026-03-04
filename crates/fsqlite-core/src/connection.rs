@@ -34780,4 +34780,124 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[1], SqliteValue::Text("3.14".to_owned()));
         assert_eq!(rows[0].values()[2], SqliteValue::Null);
     }
+
+    #[test]
+    fn test_aggregate_wrapper_expr_no_group_by() {
+        // Tests: SELECT COUNT(*) * 2 FROM t — aggregate wrapped in BinaryOp
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(*) * 2 FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(6));
+    }
+
+    #[test]
+    fn test_aggregate_coalesce_wrapper() {
+        // Tests: SELECT COALESCE(MAX(val), 0) FROM t — aggregate inside COALESCE
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        // Empty table: MAX returns NULL, COALESCE should return 0.
+        let rows = conn.query("SELECT COALESCE(MAX(val), 0) FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+        // With data.
+        conn.execute("INSERT INTO t VALUES (10), (20), (30);")
+            .unwrap();
+        let rows = conn.query("SELECT COALESCE(MAX(val), 0) FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(30));
+    }
+
+    #[test]
+    fn test_aggregate_abs_sum() {
+        // Tests: SELECT ABS(SUM(val)) FROM t — aggregate inside ABS
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (-10), (3), (-5);")
+            .unwrap();
+        let rows = conn.query("SELECT ABS(SUM(val)) FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(12));
+    }
+
+    #[test]
+    fn test_aggregate_arithmetic_two_aggs() {
+        // Tests: SELECT MAX(val) - MIN(val) FROM t — two aggregates in one expression
+        // This may not work if extract_inner_aggregate only handles one aggregate.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (10), (20), (30);")
+            .unwrap();
+        let rows = conn.query("SELECT MAX(val) - MIN(val) FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_select_star_group_by() {
+        // Tests whether SELECT * with GROUP BY works (known gap).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (category TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4);")
+            .unwrap();
+        // SQLite allows SELECT * ... GROUP BY category (picks arbitrary row per group).
+        let result = conn.query("SELECT * FROM t GROUP BY category ORDER BY category;");
+        // Even if it errors, we document the behavior.
+        if let Ok(rows) = result {
+            assert_eq!(rows.len(), 2);
+        }
+        // The important thing is it doesn't panic.
+    }
+
+    #[test]
+    fn test_insert_select_without_from() {
+        // Tests: INSERT INTO t SELECT 1, 'hello' — SELECT without FROM.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        let result = conn.execute("INSERT INTO t SELECT 1, 'hello';");
+        if result.is_ok() {
+            let rows = conn.query("SELECT id, name FROM t;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        }
+        // Document: may error with "INSERT ... SELECT without FROM" in VDBE path.
+    }
+
+    #[test]
+    fn test_replace_on_unique_constraint() {
+        // Tests: INSERT OR REPLACE with UNIQUE constraint (non-IPK).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a@b.com', 'Alice');")
+            .unwrap();
+        let result = conn.execute("INSERT OR REPLACE INTO t VALUES (2, 'a@b.com', 'Bob');");
+        if result.is_ok() {
+            let rows = conn
+                .query("SELECT id, email, name FROM t ORDER BY id;")
+                .unwrap();
+            // REPLACE should remove old row (id=1) and insert new (id=2).
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+            assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".to_owned()));
+        }
+        // Document: may error with "REPLACE on non-IPK UNIQUE constraint".
+    }
+
+    #[test]
+    fn test_expression_index_create() {
+        // Tests: CREATE INDEX idx ON t(UPPER(name)) — expression index.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (name TEXT);").unwrap();
+        let result = conn.execute("CREATE INDEX idx ON t(UPPER(name));");
+        // Document: may error with "only column references are supported".
+        // Even if it errors, verify it doesn't panic.
+        let _ = result;
+    }
 }

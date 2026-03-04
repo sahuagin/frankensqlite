@@ -2077,6 +2077,13 @@ struct AggColumn {
     /// placeholder `Expr::Literal(Literal::Null, _)` marks where the
     /// aggregate result should be substituted.
     wrapper_expr: Option<Box<Expr>>,
+    /// If true, this is a hidden aggregate that doesn't map to an output column.
+    /// Used for multi-aggregate expressions like `MAX(x) - MIN(x)`.
+    hidden: bool,
+    /// For multi-aggregate wrappers: the indices (into the agg_columns vec) of
+    /// all aggregates referenced by the wrapper expression.  Placeholder columns
+    /// `__agg_0__`, `__agg_1__`, … map to these indices.
+    multi_agg_indices: Vec<usize>,
 }
 
 /// Generate VDBE bytecode for a standalone `VALUES` clause.
@@ -2255,6 +2262,10 @@ fn codegen_select_aggregate(
     // AggStep for each aggregate column.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
+        // Skip sentinel entries used for multi-aggregate wrappers.
+        if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            continue;
+        }
         let accum_reg = accum_base + i as i32;
 
         // FILTER clause: evaluate and skip AggStep if false/NULL.
@@ -2366,6 +2377,10 @@ fn codegen_select_aggregate(
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
+        // Skip sentinel entries (multi-aggregate wrappers have no function).
+        if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            continue;
+        }
         let accum_reg = accum_base + i as i32;
         b.emit_op(
             Opcode::AggFinal,
@@ -2377,20 +2392,56 @@ fn codegen_select_aggregate(
         );
     }
 
-    // Copy accumulator results to output registers.
-    // If accum_base != out_regs, copy; otherwise they're already in place.
-    if accum_base != out_regs {
-        for i in 0..out_col_count {
-            b.emit_op(Opcode::Copy, accum_base + i, out_regs + i, 0, P4::None, 0);
+    // Copy accumulator results to output registers, skipping hidden columns.
+    // For simple (non-multi-agg) cases, out_col_index tracks the output.
+    {
+        let mut out_col_index = 0_i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, agg) in agg_columns.iter().enumerate() {
+            if agg.hidden {
+                continue;
+            }
+            // Multi-agg sentinel: output slot but no direct accumulator copy.
+            if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+                out_col_index += 1;
+                continue;
+            }
+            let accum_reg = accum_base + i as i32;
+            let out_reg = out_regs + out_col_index;
+            if accum_reg != out_reg {
+                b.emit_op(Opcode::Copy, accum_reg, out_reg, 0, P4::None, 0);
+            }
+            out_col_index += 1;
         }
     }
 
-    // Apply wrapper expressions (e.g. COALESCE(MAX(x), 0)) after AggFinal.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for (i, agg) in agg_columns.iter().enumerate() {
-        if let Some(wrapper) = &agg.wrapper_expr {
-            let result_reg = out_regs + i as i32;
-            emit_agg_wrapper(b, wrapper, result_reg);
+    // Apply wrapper expressions after AggFinal.
+    {
+        let mut out_col_index = 0_i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, agg) in agg_columns.iter().enumerate() {
+            if agg.hidden {
+                continue;
+            }
+            if let Some(wrapper) = &agg.wrapper_expr {
+                let result_reg = out_regs + out_col_index;
+                if agg.multi_agg_indices.is_empty() {
+                    // Single-aggregate wrapper (existing path).
+                    emit_agg_wrapper(b, wrapper, result_reg);
+                } else {
+                    // Multi-aggregate wrapper: build fake table with columns
+                    // for each referenced accumulator.
+                    emit_multi_agg_wrapper(
+                        b,
+                        wrapper,
+                        result_reg,
+                        accum_base,
+                        &agg.multi_agg_indices,
+                    );
+                }
+            }
+            let _ = i; // suppress unused warning
+            out_col_index += 1;
         }
     }
 
@@ -2474,6 +2525,8 @@ fn parse_aggregate_columns(
                             extra_args: Vec::new(),
                             filter: filt,
                             wrapper_expr: None,
+                            hidden: false,
+                            multi_agg_indices: Vec::new(),
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2489,6 +2542,8 @@ fn parse_aggregate_columns(
                                 extra_args: Vec::new(),
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         } else {
                             // First argument: try column reference first,
@@ -2512,25 +2567,49 @@ fn parse_aggregate_columns(
                                 extra_args: extra,
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         }
                     }
                 }
             }
             ResultColumn::Expr { expr, .. } if is_aggregate_expr(expr) => {
-                // Expression wraps an aggregate (e.g. COALESCE(MAX(x), 0)).
-                // Extract the inner aggregate, push it as an AggColumn with
-                // a wrapper_expr that will be evaluated after AggFinal.
+                // Expression wraps aggregate(s).  Try single-aggregate
+                // extraction first (fast path), then multi-aggregate.
                 if let Some((inner_agg, wrapper)) = extract_inner_aggregate(expr, table) {
                     agg_cols.push(AggColumn {
                         wrapper_expr: Some(Box::new(wrapper)),
                         ..inner_agg
                     });
                 } else {
-                    return Err(CodegenError::Unsupported(
-                        "complex aggregate wrapper expression not supported without GROUP BY"
-                            .to_owned(),
-                    ));
+                    // Multi-aggregate: e.g. MAX(x) - MIN(x).
+                    let (extracted, wrapper) = extract_all_inner_aggregates(expr, table);
+                    if extracted.is_empty() {
+                        return Err(CodegenError::Unsupported(
+                            "complex aggregate wrapper expression not supported without GROUP BY"
+                                .to_owned(),
+                        ));
+                    }
+                    // Record indices of hidden agg columns for the wrapper.
+                    let base_idx = agg_cols.len();
+                    let indices: Vec<usize> = (base_idx..base_idx + extracted.len()).collect();
+                    // Push hidden aggregates.
+                    agg_cols.extend(extracted);
+                    // Push a sentinel output entry with the multi-agg wrapper.
+                    agg_cols.push(AggColumn {
+                        name: String::new(),
+                        num_args: 0,
+                        arg_col_index: None,
+                        arg_is_rowid: false,
+                        distinct: false,
+                        arg_expr: None,
+                        extra_args: Vec::new(),
+                        filter: None,
+                        wrapper_expr: Some(Box::new(wrapper)),
+                        hidden: false,
+                        multi_agg_indices: indices,
+                    });
                 }
             }
             _ => {
@@ -2582,6 +2661,68 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
     b.free_temp(temp);
 }
 
+/// Emit bytecode for a multi-aggregate wrapper expression.
+///
+/// Handles patterns like `MAX(x) - MIN(x)` where the wrapper contains
+/// placeholder columns `__agg_0__`, `__agg_1__`, … that map to accumulator
+/// registers at `accum_base + multi_agg_indices[N]`.
+fn emit_multi_agg_wrapper(
+    b: &mut ProgramBuilder,
+    wrapper: &Expr,
+    result_reg: i32,
+    accum_base: i32,
+    multi_agg_indices: &[usize],
+) {
+    // Build a fake table with N columns named `__agg_0__`, `__agg_1__`, …
+    let columns: Vec<ColumnInfo> = (0..multi_agg_indices.len())
+        .map(|i| ColumnInfo {
+            name: format!("__agg_{i}__"),
+            affinity: 'A',
+            is_ipk: false,
+            type_name: Some("ANY".to_owned()),
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        })
+        .collect();
+    let fake_table = TableSchema {
+        name: String::new(),
+        root_page: 0,
+        columns,
+        indexes: vec![],
+        strict: false,
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    };
+
+    // Copy accumulators into a contiguous register block so the fake scan
+    // context can address them via register_base + column_index.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let fake_base = b.alloc_regs(multi_agg_indices.len() as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (j, &agg_idx) in multi_agg_indices.iter().enumerate() {
+        let src = accum_base + agg_idx as i32;
+        let dst = fake_base + j as i32;
+        b.emit_op(Opcode::Copy, src, dst, 0, P4::None, 0);
+    }
+
+    let scan = ScanCtx {
+        cursor: 0,
+        table: &fake_table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(fake_base),
+    };
+    let temp = b.alloc_temp();
+    emit_expr(b, wrapper, temp, Some(&scan));
+    b.emit_op(Opcode::Copy, temp, result_reg, 0, P4::None, 0);
+    b.free_temp(temp);
+}
+
 /// Extract the single aggregate function call from a wrapper expression.
 ///
 /// Returns `(AggColumn, wrapper_expr)` where `wrapper_expr` has the aggregate
@@ -2612,6 +2753,8 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     extra_args: Vec::new(),
                     filter: filt,
                     wrapper_expr: None,
+                    hidden: false,
+                    multi_agg_indices: Vec::new(),
                 },
                 FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
                     name: canon_name,
@@ -2623,6 +2766,8 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     extra_args: Vec::new(),
                     filter: filt,
                     wrapper_expr: None,
+                    hidden: false,
+                    multi_agg_indices: Vec::new(),
                 },
                 FunctionArgs::List(exprs) => {
                     let (col_idx, is_rowid, a_expr) =
@@ -2643,22 +2788,34 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                         extra_args: extra,
                         filter: filt,
                         wrapper_expr: None,
+                        hidden: false,
+                        multi_agg_indices: Vec::new(),
                     }
                 }
             };
-            let placeholder = Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
+            let placeholder =
+                Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
             return Some((agg_col, placeholder));
         }
     }
 
     match expr {
-        Expr::FunctionCall { name, args, distinct, order_by, filter, over, span } => {
-            if let FunctionArgs::List(exprs) = args {
-                for (i, arg) in exprs.iter().enumerate() {
-                    if let Some((agg_col, new_arg)) = extract_inner_aggregate(arg, table) {
-                        let mut new_exprs = exprs.clone();
-                        new_exprs[i] = new_arg;
-                        return Some((agg_col, Expr::FunctionCall {
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(exprs),
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            for (i, arg) in exprs.iter().enumerate() {
+                if let Some((agg_col, new_arg)) = extract_inner_aggregate(arg, table) {
+                    let mut new_exprs = exprs.clone();
+                    new_exprs[i] = new_arg;
+                    return Some((
+                        agg_col,
+                        Expr::FunctionCall {
                             name: name.clone(),
                             args: FunctionArgs::List(new_exprs),
                             distinct: *distinct,
@@ -2666,36 +2823,54 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                             filter: filter.clone(),
                             over: over.clone(),
                             span: *span,
-                        }));
-                    }
+                        },
+                    ));
                 }
             }
         }
-        Expr::BinaryOp { left, op, right, span } => {
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => {
             if let Some((agg_col, new_left)) = extract_inner_aggregate(left, table) {
-                return Some((agg_col, Expr::BinaryOp {
-                    left: Box::new(new_left),
-                    op: *op,
-                    right: right.clone(),
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::BinaryOp {
+                        left: Box::new(new_left),
+                        op: *op,
+                        right: right.clone(),
+                        span: *span,
+                    },
+                ));
             }
             if let Some((agg_col, new_right)) = extract_inner_aggregate(right, table) {
-                return Some((agg_col, Expr::BinaryOp {
-                    left: left.clone(),
-                    op: *op,
-                    right: Box::new(new_right),
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::BinaryOp {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(new_right),
+                        span: *span,
+                    },
+                ));
             }
         }
-        Expr::UnaryOp { op, expr: inner, span } => {
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => {
             if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
-                return Some((agg_col, Expr::UnaryOp {
-                    op: *op,
-                    expr: Box::new(new_inner),
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::UnaryOp {
+                        op: *op,
+                        expr: Box::new(new_inner),
+                        span: *span,
+                    },
+                ));
             }
         }
         Expr::Case {
@@ -2706,77 +2881,259 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
         } => {
             if let Some(b) = operand {
                 if let Some((agg_col, new_base)) = extract_inner_aggregate(b, table) {
-                    return Some((agg_col, Expr::Case {
-                        operand: Some(Box::new(new_base)),
-                        whens: whens.clone(),
-                        else_expr: else_expr.clone(),
-                        span: *span,
-                    }));
+                    return Some((
+                        agg_col,
+                        Expr::Case {
+                            operand: Some(Box::new(new_base)),
+                            whens: whens.clone(),
+                            else_expr: else_expr.clone(),
+                            span: *span,
+                        },
+                    ));
                 }
             }
             for (i, (cond, val)) in whens.iter().enumerate() {
                 if let Some((agg_col, new_cond)) = extract_inner_aggregate(cond, table) {
                     let mut new_whens = whens.clone();
                     new_whens[i].0 = new_cond;
-                    return Some((agg_col, Expr::Case {
-                        operand: operand.clone(),
-                        whens: new_whens,
-                        else_expr: else_expr.clone(),
-                        span: *span,
-                    }));
+                    return Some((
+                        agg_col,
+                        Expr::Case {
+                            operand: operand.clone(),
+                            whens: new_whens,
+                            else_expr: else_expr.clone(),
+                            span: *span,
+                        },
+                    ));
                 }
                 if let Some((agg_col, new_val)) = extract_inner_aggregate(val, table) {
                     let mut new_whens = whens.clone();
                     new_whens[i].1 = new_val;
-                    return Some((agg_col, Expr::Case {
-                        operand: operand.clone(),
-                        whens: new_whens,
-                        else_expr: else_expr.clone(),
-                        span: *span,
-                    }));
+                    return Some((
+                        agg_col,
+                        Expr::Case {
+                            operand: operand.clone(),
+                            whens: new_whens,
+                            else_expr: else_expr.clone(),
+                            span: *span,
+                        },
+                    ));
                 }
             }
             if let Some(e) = else_expr {
                 if let Some((agg_col, new_else)) = extract_inner_aggregate(e, table) {
-                    return Some((agg_col, Expr::Case {
-                        operand: operand.clone(),
-                        whens: whens.clone(),
-                        else_expr: Some(Box::new(new_else)),
-                        span: *span,
-                    }));
+                    return Some((
+                        agg_col,
+                        Expr::Case {
+                            operand: operand.clone(),
+                            whens: whens.clone(),
+                            else_expr: Some(Box::new(new_else)),
+                            span: *span,
+                        },
+                    ));
                 }
             }
         }
-        Expr::IsNull { expr: inner, not, span } => {
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => {
             if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
-                return Some((agg_col, Expr::IsNull {
-                    expr: Box::new(new_inner),
-                    not: *not,
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::IsNull {
+                        expr: Box::new(new_inner),
+                        not: *not,
+                        span: *span,
+                    },
+                ));
             }
         }
-        Expr::Cast { expr: inner, type_name, span } => {
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => {
             if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
-                return Some((agg_col, Expr::Cast {
-                    expr: Box::new(new_inner),
-                    type_name: type_name.clone(),
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::Cast {
+                        expr: Box::new(new_inner),
+                        type_name: type_name.clone(),
+                        span: *span,
+                    },
+                ));
             }
         }
-        Expr::Collate { expr: inner, collation, span } => {
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => {
             if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
-                return Some((agg_col, Expr::Collate {
-                    expr: Box::new(new_inner),
-                    collation: collation.clone(),
-                    span: *span,
-                }));
+                return Some((
+                    agg_col,
+                    Expr::Collate {
+                        expr: Box::new(new_inner),
+                        collation: collation.clone(),
+                        span: *span,
+                    },
+                ));
             }
         }
         _ => {}
     }
     None
+}
+
+/// Extract ALL aggregate function calls from an expression, replacing each
+/// with a numbered placeholder `__agg_N__`.  Returns the list of extracted
+/// aggregates and the rewritten wrapper expression.
+///
+/// Used for expressions like `MAX(x) - MIN(x)` that contain multiple
+/// aggregate calls.
+fn extract_all_inner_aggregates(expr: &Expr, table: &TableSchema) -> (Vec<AggColumn>, Expr) {
+    let mut agg_cols = Vec::new();
+    let rewritten = rewrite_aggregates_recursive(expr, table, &mut agg_cols);
+    (agg_cols, rewritten)
+}
+
+/// Recursively rewrite an expression, replacing each aggregate function call
+/// with a `ColumnRef::bare("__agg_N__")` placeholder and collecting the
+/// corresponding `AggColumn`.
+fn rewrite_aggregates_recursive(
+    expr: &Expr,
+    table: &TableSchema,
+    agg_cols: &mut Vec<AggColumn>,
+) -> Expr {
+    // If this node IS an aggregate function call, extract it entirely.
+    if let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+        filter,
+        ..
+    } = expr
+    {
+        if is_aggregate_function(name) {
+            let idx = agg_cols.len();
+            let canon_name = name.to_ascii_uppercase();
+            let filt = filter.clone();
+            let agg_col = match args {
+                FunctionArgs::Star => AggColumn {
+                    name: canon_name,
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: *distinct,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: filt,
+                    wrapper_expr: None,
+                    hidden: true,
+                    multi_agg_indices: Vec::new(),
+                },
+                FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+                    name: canon_name,
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: *distinct,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: filt,
+                    wrapper_expr: None,
+                    hidden: true,
+                    multi_agg_indices: Vec::new(),
+                },
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                FunctionArgs::List(exprs) => {
+                    let (col_idx, is_rowid, a_expr) =
+                        match resolve_column_ref(&exprs[0], table, None) {
+                            Some(SortKeySource::Column(i)) => (Some(i), false, None),
+                            Some(SortKeySource::Rowid) => (None, true, None),
+                            _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                        };
+                    let extra: Vec<Expr> = exprs[1..].to_vec();
+                    AggColumn {
+                        name: canon_name,
+                        num_args: exprs.len() as i32,
+                        arg_col_index: col_idx,
+                        arg_is_rowid: is_rowid,
+                        distinct: *distinct,
+                        arg_expr: a_expr,
+                        extra_args: extra,
+                        filter: filt,
+                        wrapper_expr: None,
+                        hidden: true,
+                        multi_agg_indices: Vec::new(),
+                    }
+                }
+            };
+            agg_cols.push(agg_col);
+            let placeholder_name = format!("__agg_{idx}__");
+            return Expr::Column(ColumnRef::bare(&placeholder_name), fsqlite_ast::Span::ZERO);
+        }
+    }
+
+    // Recurse into child nodes.
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(rewrite_aggregates_recursive(left, table, agg_cols)),
+            op: *op,
+            right: Box::new(rewrite_aggregates_recursive(right, table, agg_cols)),
+            span: *span,
+        },
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            span: *span,
+        },
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(exprs),
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            let new_exprs: Vec<Expr> = exprs
+                .iter()
+                .map(|e| rewrite_aggregates_recursive(e, table, agg_cols))
+                .collect();
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: FunctionArgs::List(new_exprs),
+                distinct: *distinct,
+                order_by: order_by.clone(),
+                filter: filter.clone(),
+                over: over.clone(),
+                span: *span,
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(rewrite_aggregates_recursive(inner, table, agg_cols)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        // For all other expression types, return as-is (no aggregates inside).
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,6 +3227,8 @@ fn parse_group_by_output(
                             extra_args: Vec::new(),
                             filter: filt,
                             wrapper_expr: None,
+                            hidden: false,
+                            multi_agg_indices: Vec::new(),
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2884,6 +3243,8 @@ fn parse_group_by_output(
                                 extra_args: Vec::new(),
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         } else {
                             // Try column reference first, fall back to expression.
@@ -2905,6 +3266,8 @@ fn parse_group_by_output(
                                 extra_args: extra,
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         }
                     }
@@ -3016,6 +3379,8 @@ fn collect_having_aggregates(
                             extra_args: Vec::new(),
                             filter: filt,
                             wrapper_expr: None,
+                            hidden: false,
+                            multi_agg_indices: Vec::new(),
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -3030,6 +3395,8 @@ fn collect_having_aggregates(
                                 extra_args: Vec::new(),
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         } else {
                             let (col_idx, is_rowid, arg_e) =
@@ -3050,6 +3417,8 @@ fn collect_having_aggregates(
                                 extra_args: extra,
                                 filter: filt,
                                 wrapper_expr: None,
+                                hidden: false,
+                                multi_agg_indices: Vec::new(),
                             });
                         }
                     }
