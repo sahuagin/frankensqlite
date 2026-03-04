@@ -12689,4 +12689,105 @@ mod tests {
         });
         assert_eq!(rows, vec![vec![SqliteValue::Integer(55)]]);
     }
+
+    // ── Time-travel (SetSnapshot) tests ──────────────────────────────────
+
+    #[test]
+    fn test_set_snapshot_stores_time_travel_marker() {
+        // Verify that SetSnapshot stores a TimeTravelMarker on the engine
+        // even without a VersionStore (marker-only behavior).
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        // SetSnapshot with commit sequence 5 on cursor 0.
+        b.emit_op(
+            Opcode::SetSnapshot,
+            0,
+            0,
+            0,
+            P4::TimeTravelCommitSeq(5),
+            0,
+        );
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.enable_storage_read_cursors(true);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        // The marker should be recorded.
+        let marker = engine.time_travel_marker(0);
+        assert!(marker.is_some(), "time-travel marker should be set on cursor 0");
+        match marker.unwrap() {
+            TimeTravelMarker::CommitSeq(seq) => assert_eq!(*seq, 5),
+            _ => panic!("expected CommitSeq marker"),
+        }
+    }
+
+    #[test]
+    fn test_set_snapshot_upgrades_txn_cursor_to_time_travel() {
+        // Verify that when a VersionStore is available, SetSnapshot replaces
+        // the cursor backend with TimeTravelPageIo.
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(99)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(
+            Opcode::SetSnapshot,
+            0,
+            0,
+            0,
+            P4::TimeTravelCommitSeq(3),
+            0,
+        );
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let vs = Rc::new(RefCell::new(VersionStore::new(
+            fsqlite_types::PageSize::DEFAULT,
+        )));
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+        engine.set_version_store(Rc::clone(&vs));
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        // Verify the cursor was upgraded to a TimeTravel backend.
+        let sc = engine
+            .storage_cursors
+            .get(&0)
+            .expect("cursor 0 should exist");
+        assert!(
+            sc.cursor.is_time_travel(),
+            "cursor should be upgraded to TimeTravel backend"
+        );
+        // The cursor should be marked read-only.
+        assert!(!sc.writable, "time-travel cursor should be read-only");
+    }
 }

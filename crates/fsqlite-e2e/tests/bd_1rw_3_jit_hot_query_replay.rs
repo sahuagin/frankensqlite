@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use fsqlite_types::value::SqliteValue;
@@ -13,6 +14,8 @@ const BEAD_ID: &str = "bd-1rw.3";
 const LOG_STANDARD_REF: &str = "AGENTS.md#cross-cutting-quality-contract";
 const DEFAULT_SEED: u64 = 1_003_202_603;
 const REPLAY_COMMAND: &str = "cargo test -p fsqlite-e2e --test bd_1rw_3_jit_hot_query_replay -- --nocapture --test-threads=1";
+
+static JIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn scalar_i64(conn: &fsqlite::Connection, sql: &str) -> i64 {
     let row = conn.query_row(sql).expect("query_row");
@@ -135,6 +138,7 @@ fn write_artifact(artifact_path: &Path, replay: &ReplayArtifact<'_>) {
 
 #[test]
 fn bd_1rw_3_jit_hot_query_matches_interpreter_semantics() {
+    let _guard = JIT_TEST_LOCK.lock().unwrap();
     let run_id = "bd-1rw.3-hot-query";
     let trace_id = 1_003_202_631_u64;
     let scenario_id = "JIT-HOT-QUERY";
@@ -165,6 +169,7 @@ fn bd_1rw_3_jit_hot_query_matches_interpreter_semantics() {
 
 #[test]
 fn bd_1rw_3_jit_compile_failure_falls_back_cleanly() {
+    let _guard = JIT_TEST_LOCK.lock().unwrap();
     let run_id = "bd-1rw.3-fallback";
     let trace_id = 1_003_202_632_u64;
     let scenario_id = "JIT-FALLBACK-UNSUPPORTED";
@@ -194,6 +199,7 @@ fn bd_1rw_3_jit_compile_failure_falls_back_cleanly() {
 
 #[test]
 fn bd_1rw_3_jit_e2e_replay_emits_artifact() {
+    let _guard = JIT_TEST_LOCK.lock().unwrap();
     let seed = env::var("SEED")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())

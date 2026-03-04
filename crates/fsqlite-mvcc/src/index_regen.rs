@@ -34,11 +34,6 @@ pub enum IndexRegenError {
     },
     /// The record bytes could not be parsed.
     MalformedRecord,
-    /// A column index in an index definition is out of bounds.
-    ColumnOutOfBounds {
-        column_idx: u32,
-        record_columns: usize,
-    },
     /// A `RebaseExpr` referenced a column that doesn't exist.
     ExprEvalError { detail: &'static str },
 }
@@ -56,13 +51,6 @@ impl std::fmt::Display for IndexRegenError {
                 conflicting_rowid.get()
             ),
             Self::MalformedRecord => write!(f, "malformed record bytes"),
-            Self::ColumnOutOfBounds {
-                column_idx,
-                record_columns,
-            } => write!(
-                f,
-                "column index {column_idx} out of bounds (record has {record_columns} columns)"
-            ),
             Self::ExprEvalError { detail } => write!(f, "expression eval error: {detail}"),
         }
     }
@@ -162,12 +150,7 @@ pub fn eval_rebase_expr(
     match expr {
         RebaseExpr::ColumnRef(idx) => {
             let i = idx.get() as usize;
-            row.get(i)
-                .cloned()
-                .ok_or_else(|| IndexRegenError::ColumnOutOfBounds {
-                    column_idx: idx.get(),
-                    record_columns: row.len(),
-                })
+            Ok(row.get(i).cloned().unwrap_or(SqliteValue::Null))
         }
         RebaseExpr::Literal(val) => Ok(val.clone()),
         RebaseExpr::UnaryOp { op, operand } => {
@@ -589,10 +572,7 @@ pub fn compute_index_key(
                 let v = row
                     .get(i)
                     .cloned()
-                    .ok_or_else(|| IndexRegenError::ColumnOutOfBounds {
-                        column_idx: col_idx.get(),
-                        record_columns: row.len(),
-                    })?;
+                    .unwrap_or(SqliteValue::Null);
                 (v, *affinity, *collation)
             }
             IndexKeyPart::Expression {
@@ -670,10 +650,7 @@ pub fn apply_column_updates(
     for (col_idx, expr) in column_updates {
         let i = col_idx.get() as usize;
         if i >= updated.len() {
-            return Err(IndexRegenError::ColumnOutOfBounds {
-                column_idx: col_idx.get(),
-                record_columns: updated.len(),
-            });
+            updated.resize(i + 1, SqliteValue::Null);
         }
         let new_val = eval_rebase_expr(expr, base_row)?;
         // Apply table column affinity.
@@ -1312,7 +1289,7 @@ mod tests {
 
     // Test 10: Schema epoch mismatch (column out of bounds).
     #[test]
-    fn test_column_out_of_bounds_error() {
+    fn test_column_out_of_bounds_resolves_to_null() {
         let base = record_bytes(&[SqliteValue::Integer(1)]);
 
         let indexes = vec![ordinary_index(
@@ -1332,8 +1309,8 @@ mod tests {
             regenerate_index_ops(&base, &updates, &indexes, RowId::new(1), &NoOpUniqueChecker);
 
         assert!(
-            matches!(result, Err(IndexRegenError::ColumnOutOfBounds { .. })),
-            "bead_id={BEAD_ID} col_oob"
+            result.is_ok(),
+            "bead_id={BEAD_ID} col_oob_now_ok"
         );
     }
 

@@ -156,7 +156,8 @@ impl MigrationRunner {
         conn.execute("BEGIN;")?;
 
         // Execute each statement in the migration SQL.
-        let result = Self::execute_statements(conn, migration.up_sql);
+        use crate::compat::BatchExt;
+        let result = conn.execute_batch(migration.up_sql);
 
         if let Err(e) = result {
             // Best-effort rollback; ignore rollback errors since
@@ -175,20 +176,6 @@ impl MigrationRunner {
         )?;
 
         conn.execute("COMMIT;")?;
-        Ok(())
-    }
-
-    /// Splits SQL on semicolons and executes each non-empty statement.
-    fn execute_statements(conn: &Connection, sql: &str) -> Result<(), FrankenError> {
-        for stmt in sql.split(';') {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Re-append semicolon for statement termination.
-            let full_stmt = format!("{trimmed};");
-            conn.execute(&full_stmt)?;
-        }
         Ok(())
     }
 }

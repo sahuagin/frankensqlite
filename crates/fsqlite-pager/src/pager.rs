@@ -441,6 +441,14 @@ where
         Ok(())
     }
 
+    /// Number of frames currently in the WAL for this pager.
+    pub fn wal_frame_count(&self) -> usize {
+        let Ok(inner) = self.inner.lock() else {
+            return 0;
+        };
+        inner.wal_backend.as_ref().map_or(0, |wal| wal.frame_count())
+    }
+
     /// Compute the journal path from the database path.
     fn journal_path(db_path: &Path) -> PathBuf {
         let mut jp = db_path.as_os_str().to_owned();

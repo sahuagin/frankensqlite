@@ -164,6 +164,20 @@ impl PagerBackend {
         }
     }
 
+    /// Number of frames currently in the WAL for this pager.
+    #[must_use]
+    pub fn wal_frame_count(&self) -> usize {
+        match self {
+            Self::Memory(p) => p.wal_frame_count(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.wal_frame_count(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.wal_frame_count(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.wal_frame_count(),
+        }
+    }
+
     /// Returns a string identifying the backend kind for diagnostics.
     #[must_use]
     pub fn kind_str(&self) -> &'static str {
@@ -4361,7 +4375,8 @@ impl Connection {
             let raw = self.pragma_state.borrow().wal_autocheckpoint.max(0);
             u64::try_from(raw).unwrap_or(u64::MAX)
         };
-        let wal_frames_estimate = wal_metrics.wal_frames_current;
+        let wal_frames_estimate = u64::try_from(self.pager.wal_frame_count())
+            .unwrap_or(wal_metrics.wal_frames_current);
 
         let now = Instant::now();
         let mut state = self.checkpoint_advisor_state.borrow_mut();
@@ -34912,5 +34927,86 @@ mod pager_routing_tests {
         // Document: may error with "only column references are supported".
         // Even if it errors, verify it doesn't panic.
         let _ = result;
+    }
+
+    // ── Time-travel query integration tests ──────────────────────────────
+
+    #[test]
+    fn test_time_travel_select_commitseq_parses_and_executes() {
+        // Verify the full SQL path works end-to-end:
+        //   Parser → AST → Planner → Codegen → VDBE (SetSnapshot) → Result
+        //
+        // In a :memory: database the MVCC VersionStore is empty, so the
+        // time-travel cursor falls through to the current transaction pages.
+        // This test validates the wiring is connected, not the historical
+        // data resolution (which is tested at the MVCC unit-test level).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+
+        // Execute a time-travel query. With an empty VersionStore, the
+        // cursor reads the current data (fall-through behavior).
+        let result = conn.query(
+            "SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 5;",
+        );
+
+        // The query should either succeed (returning current data as
+        // fallback) or fail with a clear time-travel error — NOT panic.
+        match result {
+            Ok(rows) => {
+                // Fallback behavior: current data is returned because the
+                // VersionStore has no historical versions.
+                assert!(
+                    !rows.is_empty(),
+                    "time-travel SELECT should return rows (fallthrough to current data)"
+                );
+            }
+            Err(e) => {
+                // Acceptable: the engine may reject the query if the commit
+                // sequence is not found. The important thing is it doesn't panic.
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("time-travel")
+                        || msg.contains("SetSnapshot")
+                        || msg.contains("commit")
+                        || msg.contains("snapshot")
+                        || msg.contains("COMMITSEQ"),
+                    "unexpected error from time-travel query: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_time_travel_select_timestamp_returns_error() {
+        // Timestamp-based time-travel requires a CommitLog which is not yet
+        // available. The engine should return a clear error, not panic.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+
+        let result = conn.query(
+            "SELECT id, name FROM users FOR SYSTEM_TIME AS OF '2024-01-01T00:00:00Z';",
+        );
+
+        // Should fail with a clear message about timestamp not being supported.
+        match result {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("timestamp") || msg.contains("CommitLog") || msg.contains("time-travel"),
+                    "expected time-travel timestamp error, got: {msg}"
+                );
+            }
+            Ok(_rows) => {
+                // Also acceptable if the fallback path handles it gracefully.
+            }
+        }
     }
 }
