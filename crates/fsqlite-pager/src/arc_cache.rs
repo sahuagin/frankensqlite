@@ -727,6 +727,32 @@ impl ArcCacheInner {
     pub fn set_gc_horizon(&mut self, horizon: CommitSeq) {
         self.gc_horizon = horizon;
         self.coalesce_all_versions();
+        self.prune_ghosts_below_horizon();
+    }
+
+    /// Prune ghost keys from B1 and B2 that are below or equal to the GC horizon.
+    fn prune_ghosts_below_horizon(&mut self) {
+        let mut b1_victims = Vec::new();
+        for (idx, key) in self.b1.iter() {
+            if key.commit_seq != CommitSeq::ZERO && key.commit_seq <= self.gc_horizon {
+                b1_victims.push(idx);
+            }
+        }
+        for idx in b1_victims {
+            let key = self.b1.remove(idx);
+            self.directory.remove(&key);
+        }
+
+        let mut b2_victims = Vec::new();
+        for (idx, key) in self.b2.iter() {
+            if key.commit_seq != CommitSeq::ZERO && key.commit_seq <= self.gc_horizon {
+                b2_victims.push(idx);
+            }
+        }
+        for idx in b2_victims {
+            let key = self.b2.remove(idx);
+            self.directory.remove(&key);
+        }
     }
 
     /// Apply SQLite `PRAGMA cache_size` mapping (§6.10).

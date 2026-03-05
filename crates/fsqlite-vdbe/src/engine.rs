@@ -3509,6 +3509,7 @@ impl VdbeEngine {
                     self.cursors.remove(&op.p1);
                     self.storage_cursors.remove(&op.p1);
                     self.sorters.remove(&op.p1);
+                    self.vtab_cursors.remove(&op.p1);
                     self.pending_next_after_delete.remove(&op.p1);
                     pc += 1;
                 }
@@ -4802,6 +4803,8 @@ impl VdbeEngine {
                     // Jump to p2 if cursor p1 is not open.
                     if self.cursors.contains_key(&op.p1)
                         || self.storage_cursors.contains_key(&op.p1)
+                        || self.vtab_cursors.contains_key(&op.p1)
+                        || self.sorters.contains_key(&op.p1)
                     {
                         pc += 1;
                     } else {
@@ -6937,9 +6940,9 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
         } else {
             match a.checked_div(*b) {
                 Some(result) => SqliteValue::Integer(result),
-                // i64::MIN / -1 overflows; promote to float like SQLite.
-                #[allow(clippy::cast_precision_loss)]
-                None => SqliteValue::Float(*a as f64 / *b as f64),
+                // i64::MIN / -1 overflows; C SQLite wraps via two's complement
+                // (-iA == i64::MIN), so we return Integer(i64::MIN) for parity.
+                None => SqliteValue::Integer(i64::MIN),
             }
         }
     } else {

@@ -547,6 +547,14 @@ pub fn integrity_check_level1_page(
                     "page {page_number}: cell pointer array exceeds page bounds (cells={cell_count})"
                 ),
             );
+        } else if header_size + pointer_bytes > cell_content_offset {
+            report.push(
+                IntegrityCheckLevel::Page,
+                Some(page_number),
+                format!(
+                    "page {page_number}: cell pointer array overlaps cell content area (cells={cell_count}, offset={cell_content_offset})"
+                ),
+            );
         }
 
         let fragmented = page[7];

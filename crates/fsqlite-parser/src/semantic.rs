@@ -225,6 +225,7 @@ impl Scope {
     #[must_use]
     pub fn resolve_column(
         &self,
+        schema: &Schema,
         table_qualifier: Option<&str>,
         column_name: &str,
     ) -> ResolveResult {
@@ -236,11 +237,22 @@ impl Scope {
                 if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
                     return ResolveResult::Resolved(key);
                 }
+                if let Some(table_name) = self.aliases.get(&key) {
+                    if let Some(table_def) = schema.find_table(table_name) {
+                        if table_def.is_rowid_alias(&col_lower) {
+                            return ResolveResult::Resolved(key);
+                        }
+                    }
+                }
+                // Check parent scope.
+                if let Some(ref parent) = self.parent {
+                    return parent.resolve_column(schema, table_qualifier, column_name);
+                }
                 return ResolveResult::ColumnNotFound;
             }
             // Check parent scope.
             if let Some(ref parent) = self.parent {
-                return parent.resolve_column(table_qualifier, column_name);
+                return parent.resolve_column(schema, table_qualifier, column_name);
             }
             return ResolveResult::TableNotFound;
         }
@@ -250,10 +262,20 @@ impl Scope {
         let mut unknown_matches = Vec::new();
 
         for (alias, cols) in &self.columns {
-            match cols {
-                Some(c) if c.contains(&col_lower) => known_matches.push(alias.clone()),
-                None => unknown_matches.push(alias.clone()),
-                _ => {}
+            let is_match = match cols {
+                Some(c) => c.contains(&col_lower) || {
+                    self.aliases.get(alias)
+                        .and_then(|t| schema.find_table(t))
+                        .is_some_and(|td| td.is_rowid_alias(&col_lower))
+                },
+                None => true,
+            };
+            if is_match {
+                if cols.is_some() {
+                    known_matches.push(alias.clone());
+                } else {
+                    unknown_matches.push(alias.clone());
+                }
             }
         }
 
@@ -262,7 +284,7 @@ impl Scope {
                 0 => {
                     // Check parent scope.
                     if let Some(ref parent) = self.parent {
-                        return parent.resolve_column(None, column_name);
+                        return parent.resolve_column(schema, None, column_name);
                     }
                     ResolveResult::ColumnNotFound
                 }
@@ -670,7 +692,7 @@ impl<'a> Resolver<'a> {
                 } = col
                 {
                     // Add the output column alias so ORDER BY can reference it.
-                    order_by_scope.add_alias(&alias_id, "<output>", None);
+                    order_by_scope.add_alias(alias_id, "<output>", None);
                 }
             }
         }
@@ -1083,7 +1105,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_column_ref(&mut self, col_ref: &ColumnRef, scope: &Scope) {
-        let result = scope.resolve_column(col_ref.table.as_deref(), &col_ref.column);
+        let result = scope.resolve_column(self.schema, col_ref.table.as_deref(), &col_ref.column);
         match result {
             ResolveResult::Resolved(_) => {
                 self.columns_bound += 1;
@@ -1128,7 +1150,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_unqualified_column(&mut self, name: &str, scope: &Scope, is_using_clause: bool) {
-        let result = scope.resolve_column(None, name);
+        let result = scope.resolve_column(self.schema, None, name);
         match result {
             ResolveResult::Resolved(_) => {
                 self.columns_bound += 1;
@@ -1403,6 +1425,7 @@ mod tests {
     #[test]
     fn test_scope_resolve_qualified_column() {
         let mut scope = Scope::root();
+        let schema = make_schema();
         let cols: HashSet<String> = ["id", "name", "email"]
             .iter()
             .map(ToString::to_string)
@@ -1410,15 +1433,15 @@ mod tests {
         scope.add_alias("u", "users", Some(cols));
 
         assert_eq!(
-            scope.resolve_column(Some("u"), "id"),
+            scope.resolve_column(&schema, Some("u"), "id"),
             ResolveResult::Resolved("u".to_string())
         );
         assert_eq!(
-            scope.resolve_column(Some("u"), "nonexistent"),
+            scope.resolve_column(&schema, Some("u"), "nonexistent"),
             ResolveResult::ColumnNotFound
         );
         assert_eq!(
-            scope.resolve_column(Some("x"), "id"),
+            scope.resolve_column(&schema, Some("x"), "id"),
             ResolveResult::TableNotFound
         );
     }
@@ -1426,6 +1449,7 @@ mod tests {
     #[test]
     fn test_scope_resolve_unqualified_column() {
         let mut scope = Scope::root();
+        let schema = make_schema();
         scope.add_alias(
             "u",
             "users",
@@ -1439,18 +1463,18 @@ mod tests {
 
         // "name" is unique → resolved to "u"
         assert_eq!(
-            scope.resolve_column(None, "name"),
+            scope.resolve_column(&schema, None, "name"),
             ResolveResult::Resolved("u".to_string())
         );
 
         // "user_id" is unique → resolved to "o"
         assert_eq!(
-            scope.resolve_column(None, "user_id"),
+            scope.resolve_column(&schema, None, "user_id"),
             ResolveResult::Resolved("o".to_string())
         );
 
         // "id" is ambiguous
-        match scope.resolve_column(None, "id") {
+        match scope.resolve_column(&schema, None, "id") {
             ResolveResult::Ambiguous(candidates) => {
                 assert_eq!(candidates.len(), 2);
             }
@@ -1459,7 +1483,7 @@ mod tests {
 
         // "nonexistent" not found
         assert_eq!(
-            scope.resolve_column(None, "nonexistent"),
+            scope.resolve_column(&schema, None, "nonexistent"),
             ResolveResult::ColumnNotFound
         );
     }
@@ -1467,6 +1491,7 @@ mod tests {
     #[test]
     fn test_scope_child_inherits_parent() {
         let mut parent = Scope::root();
+        let schema = make_schema();
         parent.add_alias(
             "u",
             "users",
@@ -1476,7 +1501,7 @@ mod tests {
 
         // Child can see parent's columns.
         assert_eq!(
-            child.resolve_column(Some("u"), "id"),
+            child.resolve_column(&schema, Some("u"), "id"),
             ResolveResult::Resolved("u".to_string())
         );
     }
@@ -1612,6 +1637,15 @@ mod tests {
             errors[0].kind,
             SemanticErrorKind::UnresolvedTable { .. }
         ));
+    }
+
+    #[test]
+    fn test_resolve_rowid_column() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT rowid, _rowid_, oid FROM users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 
     // ── Metrics tests ──

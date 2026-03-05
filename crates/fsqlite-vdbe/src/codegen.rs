@@ -338,9 +338,12 @@ fn emit_upsert_assignments(
 
 /// Emit an expression that may reference both `excluded.*` and existing row columns.
 ///
-/// Walks the expression looking for `excluded.col` references (resolved via
-/// `excluded_ctx`) and plain column references (resolved via `existing_ctx`).
-/// For non-column expressions, delegates to the standard `emit_expr`.
+/// Recursively walks the expression tree, dispatching `excluded.col` references
+/// to `excluded_ctx` and all other column references to `existing_ctx`.  This
+/// ensures that expressions like `CASE WHEN excluded.val > val THEN excluded.val
+/// ELSE val END` or `coalesce(excluded.val, val)` resolve correctly in UPSERT
+/// DO UPDATE SET clauses.
+#[allow(clippy::too_many_lines)]
 fn emit_upsert_expr(
     b: &mut ProgramBuilder,
     expr: &Expr,
@@ -350,63 +353,381 @@ fn emit_upsert_expr(
     _table: &TableSchema,
 ) {
     match expr {
+        // ── Leaf: column reference — dispatch to correct context ────────
         Expr::Column(col_ref, _) => {
             if col_ref
                 .table
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
             {
-                // excluded.col → read from excluded registers (val_regs).
                 emit_expr(b, expr, reg, Some(excluded_ctx));
             } else {
-                // Plain column ref → read from existing row registers.
                 emit_expr(b, expr, reg, Some(existing_ctx));
             }
         }
+
+        // ── Leaf: literals & placeholders — no column refs ─────────────
+        Expr::Literal(..) | Expr::Placeholder(..) => {
+            emit_expr(b, expr, reg, Some(existing_ctx));
+        }
+
+        // ── Binary operations ──────────────────────────────────────────
         Expr::BinaryOp {
             left, op, right, ..
         } => {
             use fsqlite_ast::BinaryOp;
+
+            // Pre-emit both operands with dual-context resolution.
+            let left_reg = b.alloc_reg();
+            let right_reg = b.alloc_reg();
+            emit_upsert_expr(b, left, left_reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(b, right, right_reg, existing_ctx, excluded_ctx, _table);
+
             match op {
-                // Arithmetic and string concat: emit inline with dual-context
-                // resolution so `excluded.*` refs in operands work correctly.
+                // Value-producing ops: arithmetic, concat, bitwise, AND, OR.
                 BinaryOp::Add
                 | BinaryOp::Subtract
                 | BinaryOp::Multiply
                 | BinaryOp::Divide
                 | BinaryOp::Modulo
-                | BinaryOp::Concat => {
-                    let left_reg = b.alloc_reg();
-                    let right_reg = b.alloc_reg();
-                    emit_upsert_expr(b, left, left_reg, existing_ctx, excluded_ctx, _table);
-                    emit_upsert_expr(b, right, right_reg, existing_ctx, excluded_ctx, _table);
-                    let opcode = match op {
-                        BinaryOp::Add => Opcode::Add,
-                        BinaryOp::Subtract => Opcode::Subtract,
-                        BinaryOp::Multiply => Opcode::Multiply,
-                        BinaryOp::Divide => Opcode::Divide,
-                        BinaryOp::Modulo => Opcode::Remainder,
-                        BinaryOp::Concat => Opcode::Concat,
-                        _ => unreachable!(),
-                    };
-                    // Arithmetic opcodes: P3 = P2 op P1.
-                    // P1=right operand, P2=left operand, P3=destination register.
+                | BinaryOp::Concat
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::And
+                | BinaryOp::Or => {
+                    let opcode = binary_op_to_opcode(*op);
+                    // VDBE: P3 = P2 op P1 → dest=reg, lhs=left, rhs=right.
                     b.emit_op(opcode, right_reg, left_reg, reg, P4::None, 0);
                 }
-                // Comparisons (Lt, Le, Gt, Ge, Eq, Ne, Is, IsNot) are JUMP
-                // instructions — not value-producing arithmetic.  Delegate to
-                // the standard `emit_expr` which uses the proper jump-based
-                // boolean encoding (1/0/NULL).  Also handles AND, OR, LIKE,
-                // GLOB, IN, BETWEEN, bit ops, etc.
-                _ => {
-                    emit_expr(b, expr, reg, Some(existing_ctx));
+
+                // Comparison ops: jump-based boolean (1/0/NULL).
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge => {
+                    let cmp_opcode = match op {
+                        BinaryOp::Eq => Opcode::Eq,
+                        BinaryOp::Ne => Opcode::Ne,
+                        BinaryOp::Lt => Opcode::Lt,
+                        BinaryOp::Le => Opcode::Le,
+                        BinaryOp::Gt => Opcode::Gt,
+                        BinaryOp::Ge => Opcode::Ge,
+                        _ => unreachable!(),
+                    };
+                    let p4 = extract_collation(left)
+                        .or_else(|| extract_collation(right))
+                        .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+
+                    let null_label = b.emit_label();
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IsNull, left_reg, 0, null_label, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, right_reg, 0, null_label, P4::None, 0);
+                    b.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, p4, 0);
+                    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(null_label);
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
+
+                // IS / IS NOT: NULLEQ semantics (NULL IS NULL = TRUE).
+                BinaryOp::Is | BinaryOp::IsNot => {
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    let cmp = if matches!(op, BinaryOp::Is) {
+                        Opcode::Eq
+                    } else {
+                        Opcode::Ne
+                    };
+                    b.emit_jump_to_label(cmp, right_reg, left_reg, true_label, P4::None, 0x80);
+                    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
                 }
             }
         }
+
+        // ── Unary operations ───────────────────────────────────────────
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
+            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            match op {
+                fsqlite_ast::UnaryOp::Negate => {
+                    let tmp = b.alloc_temp();
+                    b.emit_op(Opcode::Integer, -1, tmp, 0, P4::None, 0);
+                    b.emit_op(Opcode::Multiply, tmp, reg, reg, P4::None, 0);
+                    b.free_temp(tmp);
+                }
+                fsqlite_ast::UnaryOp::Plus => {}
+                fsqlite_ast::UnaryOp::BitNot => {
+                    b.emit_op(Opcode::BitNot, reg, reg, 0, P4::None, 0);
+                }
+                fsqlite_ast::UnaryOp::Not => {
+                    b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+                }
+            }
+        }
+
+        // ── CAST ───────────────────────────────────────────────────────
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            let affinity = type_name_to_affinity(type_name);
+            b.emit_op(Opcode::Cast, reg, i32::from(affinity), 0, P4::None, 0);
+        }
+
+        // ── IS [NOT] NULL ──────────────────────────────────────────────
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            let lbl_null = b.emit_label();
+            let lbl_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, lbl_null, P4::None, 0);
+            b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+            b.resolve_label(lbl_null);
+            b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+            b.resolve_label(lbl_done);
+        }
+
+        // ── COLLATE ────────────────────────────────────────────────────
+        Expr::Collate { expr: inner, .. } => {
+            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+        }
+
+        // ── Scalar function calls ──────────────────────────────────────
+        Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
+            let canon = name.to_ascii_uppercase();
+            match args {
+                fsqlite_ast::FunctionArgs::Star => {
+                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
+                }
+                fsqlite_ast::FunctionArgs::List(arg_list) => {
+                    let Ok(nargs) = u16::try_from(arg_list.len()) else {
+                        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                        return;
+                    };
+                    let arg_base = b.alloc_regs(i32::from(nargs));
+                    for (i, arg_expr) in arg_list.iter().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        emit_upsert_expr(
+                            b,
+                            arg_expr,
+                            arg_base + i as i32,
+                            existing_ctx,
+                            excluded_ctx,
+                            _table,
+                        );
+                    }
+                    b.emit_op(
+                        Opcode::PureFunc,
+                        0,
+                        arg_base,
+                        reg,
+                        P4::FuncName(canon),
+                        nargs,
+                    );
+                }
+            }
+        }
+
+        // ── CASE expression ────────────────────────────────────────────
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let done_label = b.emit_label();
+            let r_operand = operand.as_deref().map(|op_expr| {
+                let r = b.alloc_temp();
+                emit_upsert_expr(b, op_expr, r, existing_ctx, excluded_ctx, _table);
+                r
+            });
+
+            for (when_expr, then_expr) in whens {
+                let next_when = b.emit_label();
+                if let Some(r_op) = r_operand {
+                    let r_when = b.alloc_temp();
+                    emit_upsert_expr(b, when_expr, r_when, existing_ctx, excluded_ctx, _table);
+                    b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
+                    b.free_temp(r_when);
+                } else {
+                    emit_upsert_expr(b, when_expr, reg, existing_ctx, excluded_ctx, _table);
+                    b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
+                }
+                emit_upsert_expr(b, then_expr, reg, existing_ctx, excluded_ctx, _table);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(next_when);
+            }
+
+            if let Some(el) = else_expr.as_deref() {
+                emit_upsert_expr(b, el, reg, existing_ctx, excluded_ctx, _table);
+            } else {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+            b.resolve_label(done_label);
+            if let Some(r_op) = r_operand {
+                b.free_temp(r_op);
+            }
+        }
+
+        // ── LIKE / GLOB / MATCH / REGEXP ───────────────────────────────
+        Expr::Like {
+            expr: operand,
+            pattern,
+            escape,
+            op: like_op,
+            not,
+            ..
+        } => {
+            let func_name = match like_op {
+                fsqlite_ast::LikeOp::Like => "LIKE",
+                fsqlite_ast::LikeOp::Glob => "GLOB",
+                fsqlite_ast::LikeOp::Match => "MATCH",
+                fsqlite_ast::LikeOp::Regexp => "REGEXP",
+            };
+            let nargs: u16 = if escape.is_some() { 3 } else { 2 };
+            let arg_base = b.alloc_regs(i32::from(nargs));
+            emit_upsert_expr(b, pattern, arg_base, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(b, operand, arg_base + 1, existing_ctx, excluded_ctx, _table);
+            if let Some(esc) = escape {
+                emit_upsert_expr(b, esc, arg_base + 2, existing_ctx, excluded_ctx, _table);
+            }
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                reg,
+                P4::FuncName(func_name.to_owned()),
+                nargs,
+            );
+            if *not {
+                b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+            }
+        }
+
+        // ── BETWEEN ────────────────────────────────────────────────────
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            let r_operand = b.alloc_temp();
+            let r_low = b.alloc_temp();
+            let r_high = b.alloc_temp();
+            emit_upsert_expr(b, operand, r_operand, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(b, low, r_low, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(b, high, r_high, existing_ctx, excluded_ctx, _table);
+            let false_label = b.emit_label();
+            let null_label = b.emit_label();
+            let done_label = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
+            b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(false_label);
+            b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(null_label);
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            b.resolve_label(done_label);
+            b.free_temp(r_high);
+            b.free_temp(r_low);
+            b.free_temp(r_operand);
+        }
+
+        // ── IN (list) ──────────────────────────────────────────────────
+        Expr::In {
+            expr: operand,
+            set,
+            not,
+            ..
+        } => {
+            if let fsqlite_ast::InSet::List(values) = set {
+                if values.is_empty() {
+                    b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                    return;
+                }
+                let r_operand = b.alloc_temp();
+                emit_upsert_expr(b, operand, r_operand, existing_ctx, excluded_ctx, _table);
+                let null_label = b.emit_label();
+                let true_label = b.emit_label();
+                let done_label = b.emit_label();
+                b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+                let r_saw_null = b.alloc_temp();
+                b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
+                let r_val = b.alloc_temp();
+                for val_expr in values {
+                    emit_upsert_expr(b, val_expr, r_val, existing_ctx, excluded_ctx, _table);
+                    b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
+                    let next_val = b.emit_label();
+                    let set_flag = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IsNull, r_val, 0, set_flag, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_val, P4::None, 0);
+                    b.resolve_label(set_flag);
+                    b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+                    b.resolve_label(next_val);
+                }
+                b.free_temp(r_val);
+                b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+                b.free_temp(r_saw_null);
+                b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(null_label);
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(true_label);
+                b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+                b.resolve_label(done_label);
+                b.free_temp(r_operand);
+            } else {
+                // Subquery IN — unlikely in UPSERT SET, fall back to existing_ctx.
+                emit_expr(b, expr, reg, Some(existing_ctx));
+            }
+        }
+
+        // ── JSON access ────────────────────────────────────────────────
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            let arg_base = b.alloc_regs(2);
+            emit_upsert_expr(b, inner, arg_base, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(b, path, arg_base + 1, existing_ctx, excluded_ctx, _table);
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                reg,
+                P4::FuncName("JSON_EXTRACT".to_owned()),
+                2,
+            );
+        }
+
+        // ── Fallback: subqueries, EXISTS, aggregates, etc. ─────────────
         _ => {
-            // For literals, function calls, etc. — no column refs to resolve.
-            // Use existing_ctx as default so any unqualified column refs
-            // resolve to the existing row.
             emit_expr(b, expr, reg, Some(existing_ctx));
         }
     }
@@ -4174,9 +4495,35 @@ pub fn codegen_insert(
         }
         InsertSource::Select(select_stmt) => {
             // INSERT ... SELECT: columns arrive in SELECT output order.
-            // When a column list is present, remap the IPK index from
-            // table-schema position to SELECT output position.
-            let select_ctx = if stmt.columns.is_empty() {
+            // When an explicit column list is provided, build a mapping
+            // from table-schema position → SELECT output position so the
+            // inner function can reorder values before MakeRecord.
+            let col_mapping: Option<Vec<Option<usize>>> = if stmt.columns.is_empty() {
+                None
+            } else {
+                let mut mapping = vec![None; table.columns.len()];
+                for (select_pos, col_name) in stmt.columns.iter().enumerate() {
+                    if is_rowid_alias(col_name) {
+                        // rowid aliases handled separately via IPK logic.
+                        continue;
+                    }
+                    let tbl_pos = table.column_index(col_name).ok_or_else(|| {
+                        CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: col_name.clone(),
+                        }
+                    })?;
+                    mapping[tbl_pos] = Some(select_pos);
+                }
+                Some(mapping)
+            };
+
+            // When a column mapping is present, IPK index should reference
+            // the table-schema position (reordering puts it there).
+            // When no mapping, remap IPK from schema to SELECT output pos.
+            let select_ctx = if col_mapping.is_some() {
+                // After reordering, columns are in table-schema order;
+                // rowid_alias_col_idx already points to the right position.
                 ctx.clone()
             } else if let Some(ipk_schema_idx) = ctx.rowid_alias_col_idx {
                 let ipk_col_name = &table.columns[ipk_schema_idx].name;
@@ -4208,6 +4555,7 @@ pub fn codegen_insert(
                 &select_ctx,
                 oe_flag,
                 expected_cols,
+                col_mapping.as_deref(),
             )?;
         }
         InsertSource::DefaultValues => {
@@ -4612,10 +4960,10 @@ fn codegen_insert_values(
                     b.emit_jump_to_label(
                         Opcode::IfNot,
                         where_reg,
-                        0,
+                        1, // p3=1: jump on NULL (treat NULL as false)
                         skip_update_label,
                         P4::None,
-                        1, // P5=1: treat NULL as false
+                        0,
                     );
                     // Evaluate assignments into existing_regs.
                     emit_upsert_assignments(
@@ -4804,6 +5152,7 @@ fn codegen_insert_select(
     ctx: &CodegenContext,
     oe_flag: u16,
     expected_cols: Option<usize>,
+    col_mapping: Option<&[Option<usize>]>,
 ) -> Result<(), CodegenError> {
     // Extract columns, FROM, and WHERE from the inner SELECT.
     let (columns, from, where_clause) = match &select_stmt.body.select {
@@ -4910,10 +5259,29 @@ fn codegen_insert_select(
         val_regs,
     )?;
 
+    // When an explicit column list is provided, reorder from SELECT output
+    // order to table-schema order, filling unmentioned columns with defaults.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let (final_regs, final_n_cols) = if let Some(mapping) = col_mapping {
+        let n_table_cols = target_table.columns.len() as i32;
+        let table_regs = b.alloc_regs(n_table_cols);
+        for (tbl_idx, src) in mapping.iter().enumerate() {
+            let dest = table_regs + tbl_idx as i32;
+            if let Some(sel_pos) = src {
+                b.emit_op(Opcode::Copy, val_regs + *sel_pos as i32, dest, 0, P4::None, 0);
+            } else {
+                emit_default_value(b, &target_table.columns[tbl_idx], dest);
+            }
+        }
+        (table_regs, n_table_cols)
+    } else {
+        (val_regs, n_cols)
+    };
+
     // Rowid determination: use IPK column value if present, else auto-generate.
     if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let ipk_reg = val_regs + ipk_idx as i32;
+        let ipk_reg = final_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
         let done_rowid = b.emit_label();
 
@@ -4948,17 +5316,17 @@ fn codegen_insert_select(
     }
 
     // Evaluate STORED generated columns before packing the record.
-    emit_stored_generated_columns(b, target_table, val_regs);
+    emit_stored_generated_columns(b, target_table, final_regs);
 
     // Apply column type affinities before packing the record.
     // STRICT type check before affinity.
-    emit_strict_type_check(b, target_table, val_regs);
+    emit_strict_type_check(b, target_table, final_regs);
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
         Opcode::Affinity,
-        val_regs,
-        n_cols,
+        final_regs,
+        final_n_cols,
         0,
         P4::Affinity(aff_str.clone()),
         0,
@@ -4967,8 +5335,8 @@ fn codegen_insert_select(
     // MakeRecord from the read column values.
     b.emit_op(
         Opcode::MakeRecord,
-        val_regs,
-        n_cols,
+        final_regs,
+        final_n_cols,
         rec_reg,
         P4::Affinity(aff_str),
         0,
@@ -4985,7 +5353,7 @@ fn codegen_insert_select(
     );
 
     // Index maintenance: insert into each index (bd-so1h).
-    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg, oe_flag);
+    emit_index_inserts(b, target_table, write_cursor, final_regs, rowid_reg, oe_flag);
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {

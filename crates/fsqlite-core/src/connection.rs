@@ -648,6 +648,13 @@ impl PreparedStatement {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        if self.dml_statement.is_some() {
+            return Err(FrankenError::Internal(
+                "DML prepared statements must be executed through \
+                 Connection::execute_prepared() or Connection::execute_prepared_with_params()"
+                    .to_owned(),
+            ));
+        }
         let mut rows = if let Some(db) = self.db.as_ref() {
             let Some(registry) = self.func_registry.as_ref() else {
                 return Err(FrankenError::Internal(
@@ -1728,6 +1735,20 @@ impl Connection {
         let txn_was_open = *self.in_transaction.get_mut() || active_txn.is_some();
 
         if txn_was_open {
+            // Clean up MVCC concurrent session before rolling back the pager
+            // transaction.  Without this, dropping a Connection with an active
+            // concurrent transaction leaks the session in the registry, which
+            // permanently skews the GC horizon and blocks version pruning.
+            if *self.concurrent_txn.get_mut() {
+                if let Some(session_id) = self.concurrent_session_id.get_mut().take() {
+                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    }
+                    registry.remove(session_id);
+                }
+            }
+
             if let Some(mut txn) = active_txn.take() {
                 if best_effort {
                     let _ = txn.rollback(&cx);
@@ -5071,17 +5092,29 @@ impl Connection {
         };
         if auto {
             let mut guard = self.active_txn.borrow_mut();
-            if let Some(txn) = guard.as_deref_mut() {
+            let finalize_err = if let Some(txn) = guard.as_deref_mut() {
                 if result.is_ok() {
                     let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-                    txn.commit(&cx)?;
-                    let _ = self.advance_commit_clock();
-                    auto_commit_succeeded = true;
+                    match txn.commit(&cx) {
+                        Ok(()) => {
+                            let _ = self.advance_commit_clock();
+                            auto_commit_succeeded = true;
+                            None
+                        }
+                        Err(e) => Some(e),
+                    }
                 } else {
-                    txn.rollback(&cx)?;
+                    // Best-effort rollback; propagate error only if result was Ok.
+                    let _ = txn.rollback(&cx);
+                    None
                 }
-            }
+            } else {
+                None
+            };
             *guard = None;
+            if let Some(e) = finalize_err {
+                return Err(e);
+            }
         }
         if auto_commit_succeeded {
             self.maybe_run_adaptive_autocheckpoint();
@@ -8269,14 +8302,16 @@ impl Connection {
             (idx, savepoints[idx].name.clone())
         };
 
-        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.release_savepoint(&cx, &canonical_name)?;
-        }
-
-        // If no savepoints remain and we started implicitly, `RELEASE` behaves
-        // like `COMMIT`, including MVCC commit finalization/cleanup.
+        // If this is the outermost savepoint of an implicit transaction,
+        // RELEASE behaves like COMMIT.  Delegate directly to execute_commit
+        // without calling pager release_savepoint first — this avoids leaving
+        // the pager savepoint stack out of sync if the commit fails.
         if idx == 0 && *self.implicit_txn.borrow() {
             return self.execute_commit();
+        }
+
+        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+            txn.release_savepoint(&cx, &canonical_name)?;
         }
 
         let mut savepoints = self.savepoints.borrow_mut();

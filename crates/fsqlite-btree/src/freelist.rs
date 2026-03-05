@@ -263,6 +263,9 @@ impl PtrMapEntry {
     }
 }
 
+/// Byte offset of the 1 GiB pending byte region.
+const PENDING_BYTE_OFFSET: u32 = 0x4000_0000;
+
 /// Number of pointer-map entries per pointer-map page for a usable page size.
 #[must_use]
 pub const fn ptrmap_entries_per_page(usable_size: u32) -> u32 {
@@ -275,26 +278,41 @@ pub const fn ptrmap_group_size(usable_size: u32) -> u32 {
     ptrmap_entries_per_page(usable_size) + 1
 }
 
+/// Compute the logical pointer map page for a given `pgno`.
+#[must_use]
+const fn compute_ptrmap_page(pgno: u32, usable_size: u32, page_size: u32) -> u32 {
+    if pgno < 2 {
+        return 0;
+    }
+    let group = ptrmap_group_size(usable_size);
+    if group == 0 {
+        return 0;
+    }
+    let i_ptr_map = (pgno - 2) / group;
+    let mut ret = (i_ptr_map * group) + 2;
+    let pending_byte_page = (PENDING_BYTE_OFFSET / page_size) + 1;
+    if ret == pending_byte_page {
+        ret += 1;
+    }
+    ret
+}
+
 /// Whether `pgno` is itself a pointer-map page.
 #[must_use]
-pub const fn is_ptrmap_page(pgno: PageNumber, usable_size: u32) -> bool {
+pub const fn is_ptrmap_page(pgno: PageNumber, usable_size: u32, page_size: u32) -> bool {
     let raw = pgno.get();
     if raw < 2 {
         return false;
     }
-    let group = ptrmap_group_size(usable_size);
-    if group == 0 {
-        return false;
-    }
-    (raw - 2) % group == 0
+    compute_ptrmap_page(raw, usable_size, page_size) == raw
 }
 
 /// Pointer-map page that stores metadata for `pgno`.
 ///
 /// Returns `None` when `pgno` is itself a pointer-map page.
 #[must_use]
-pub const fn ptrmap_page_for(pgno: PageNumber, usable_size: u32) -> Option<PageNumber> {
-    if is_ptrmap_page(pgno, usable_size) {
+pub const fn ptrmap_page_for(pgno: PageNumber, usable_size: u32, page_size: u32) -> Option<PageNumber> {
+    if is_ptrmap_page(pgno, usable_size, page_size) {
         return None;
     }
     let raw = pgno.get();
@@ -303,22 +321,27 @@ pub const fn ptrmap_page_for(pgno: PageNumber, usable_size: u32) -> Option<PageN
         return None;
     }
 
-    let group = ptrmap_group_size(usable_size);
-    if group == 0 {
+    let ptrmap = compute_ptrmap_page(raw, usable_size, page_size);
+    if ptrmap == 0 {
         return None;
     }
-    let base = 2 + ((raw - 2) / group) * group;
-    PageNumber::new(base)
+    PageNumber::new(ptrmap)
 }
 
 /// Byte offset of `pgno`'s pointer-map entry within its pointer-map page.
 ///
-/// Returns `None` when `pgno` is itself a pointer-map page.
+/// Returns `None` when `pgno` is itself a pointer-map page, or if `pgno` is the
+/// pending byte page itself (which has no pointer-map entry).
 #[must_use]
-pub const fn ptrmap_entry_offset(pgno: PageNumber, usable_size: u32) -> Option<u32> {
-    let Some(ptrmap_page) = ptrmap_page_for(pgno, usable_size) else {
+pub const fn ptrmap_entry_offset(pgno: PageNumber, usable_size: u32, page_size: u32) -> Option<u32> {
+    let Some(ptrmap_page) = ptrmap_page_for(pgno, usable_size, page_size) else {
         return None;
     };
+    if pgno.get() <= ptrmap_page.get() {
+        // This handles the pending byte page: its computed ptrmap_page is P+1,
+        // so pgno (P) < ptrmap_page. The pending byte page has no entry.
+        return None;
+    }
     let index = pgno.get() - ptrmap_page.get() - 1;
     Some(index * PTRMAP_ENTRY_SIZE_BYTES)
 }
@@ -578,10 +601,10 @@ mod tests {
 
     #[test]
     fn test_ptrmap_page_locations_4096() {
-        assert!(is_ptrmap_page(PageNumber::new(2).unwrap(), 4096));
-        assert!(is_ptrmap_page(PageNumber::new(822).unwrap(), 4096));
-        assert!(is_ptrmap_page(PageNumber::new(1642).unwrap(), 4096));
-        assert!(!is_ptrmap_page(PageNumber::new(3).unwrap(), 4096));
+        assert!(is_ptrmap_page(PageNumber::new(2).unwrap(), 4096, 4096));
+        assert!(is_ptrmap_page(PageNumber::new(822).unwrap(), 4096, 4096));
+        assert!(is_ptrmap_page(PageNumber::new(1642).unwrap(), 4096, 4096));
+        assert!(!is_ptrmap_page(PageNumber::new(3).unwrap(), 4096, 4096));
     }
 
     #[test]
@@ -590,18 +613,40 @@ mod tests {
         let p821 = PageNumber::new(821).unwrap();
         let p823 = PageNumber::new(823).unwrap();
 
-        assert_eq!(ptrmap_page_for(p3, 4096).unwrap().get(), 2);
-        assert_eq!(ptrmap_entry_offset(p3, 4096).unwrap(), 0);
+        assert_eq!(ptrmap_page_for(p3, 4096, 4096).unwrap().get(), 2);
+        assert_eq!(ptrmap_entry_offset(p3, 4096, 4096).unwrap(), 0);
 
-        assert_eq!(ptrmap_page_for(p821, 4096).unwrap().get(), 2);
-        assert_eq!(ptrmap_entry_offset(p821, 4096).unwrap(), 818 * 5);
+        assert_eq!(ptrmap_page_for(p821, 4096, 4096).unwrap().get(), 2);
+        assert_eq!(ptrmap_entry_offset(p821, 4096, 4096).unwrap(), 818 * 5);
 
-        assert_eq!(ptrmap_page_for(p823, 4096).unwrap().get(), 822);
-        assert_eq!(ptrmap_entry_offset(p823, 4096).unwrap(), 0);
+        assert_eq!(ptrmap_page_for(p823, 4096, 4096).unwrap().get(), 822);
+        assert_eq!(ptrmap_entry_offset(p823, 4096, 4096).unwrap(), 0);
 
         // Pointer-map pages do not have entries in themselves.
-        assert!(ptrmap_page_for(PageNumber::new(822).unwrap(), 4096).is_none());
-        assert!(ptrmap_entry_offset(PageNumber::new(822).unwrap(), 4096).is_none());
+        assert!(ptrmap_page_for(PageNumber::new(822).unwrap(), 4096, 4096).is_none());
+        assert!(ptrmap_entry_offset(PageNumber::new(822).unwrap(), 4096, 4096).is_none());
+    }
+
+    #[test]
+    fn test_ptrmap_pending_byte_page_collision() {
+        // For 1024 byte pages, the pending byte page is 1_048_577.
+        // It falls exactly on what would normally be a pointer map page.
+        let pending_byte_pgno = 1_048_577;
+        let usable_size = 1024;
+        let page_size = 1024;
+
+        // The pointer map page is pushed to the next page.
+        assert!(!is_ptrmap_page(PageNumber::new(pending_byte_pgno).unwrap(), usable_size, page_size));
+        assert!(is_ptrmap_page(PageNumber::new(pending_byte_pgno + 1).unwrap(), usable_size, page_size));
+
+        // The pending byte page itself has no pointer map entry.
+        assert!(ptrmap_entry_offset(PageNumber::new(pending_byte_pgno).unwrap(), usable_size, page_size).is_none());
+
+        // The page right after the pointer map page has offset 0.
+        assert_eq!(
+            ptrmap_entry_offset(PageNumber::new(pending_byte_pgno + 2).unwrap(), usable_size, page_size),
+            Some(0)
+        );
     }
 
     #[test]

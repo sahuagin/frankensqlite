@@ -4378,4 +4378,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_real_cursor_revives_from_eof() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+        
+        // Insert a few records into a leaf
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor.table_insert(&cx, 1, b"one").unwrap();
+        cursor.table_insert(&cx, 2, b"two").unwrap();
+
+        cursor.first(&cx).unwrap();
+        cursor.next(&cx).unwrap(); // at 2
+        assert!(!cursor.next(&cx).unwrap()); // now at EOF
+
+        assert!(cursor.eof());
+        
+        // REVIVE FROM EOF
+        let revived = cursor.prev(&cx).unwrap();
+        assert!(revived, "Real cursor should revive from EOF");
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+    }
 }

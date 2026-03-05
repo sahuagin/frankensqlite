@@ -246,7 +246,11 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
         return Ok(());
     }
 
-    let freelist = normalize_freelist(&inner.freelist, inner.db_size);
+    // Use next_page as the upper bound to preserve pages allocated from EOF by
+    // rolled-back concurrent transactions.  Those pages have numbers > db_size
+    // (never flushed to disk) but < next_page (validly allocated space).
+    let upper_bound = inner.next_page.saturating_sub(1).max(inner.db_size);
+    let freelist = normalize_freelist(&inner.freelist, upper_bound);
     inner.freelist.clone_from(&freelist);
 
     let ps = inner.page_size.as_usize();
@@ -578,7 +582,9 @@ where
             db_path: path.to_owned(),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
-                cache: PageCache::new(page_size, 1024),
+                // Generous cache size (65536 pages = 256MB) to support large
+                // in-memory transactions (like 1M inserts) without OutOfMemory.
+                cache: PageCache::new(page_size, 65_536),
                 page_size,
                 db_size,
                 next_page,

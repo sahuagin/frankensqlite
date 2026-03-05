@@ -2084,7 +2084,7 @@ mod tests {
         let header = BtreePageHeader {
             page_type: BtreePageType::InteriorTable,
             first_freeblock: 0,
-            cell_count: 0,
+            cell_count: 1, // must be > 0 for content_offset to use cell_content_offset
             cell_content_offset: 20, // artificially low
             fragmented_free_bytes: 0,
             right_child: Some(pn(3)),
