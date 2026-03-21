@@ -615,11 +615,7 @@ impl ShardedPageCache {
     pub fn with_page<R>(&self, page_no: PageNumber, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        if let Some(data) = shard.get(page_no) {
-            Some(f(data))
-        } else {
-            None
-        }
+        shard.get(page_no).map(f)
     }
 
     /// Access a cached page mutably via a callback.
@@ -631,11 +627,7 @@ impl ShardedPageCache {
     ) -> Option<R> {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        if let Some(data) = shard.get_mut(page_no) {
-            Some(f(data))
-        } else {
-            None
-        }
+        shard.get_mut(page_no).map(f)
     }
 
     /// Read a page from a VFS file into the cache.
@@ -835,11 +827,7 @@ impl ShardedPageCache {
     pub fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        if let Some(data) = shard.get(page_no) {
-            Some(data.to_vec())
-        } else {
-            None
-        }
+        shard.get(page_no).map(|data| data.to_vec())
     }
 }
 

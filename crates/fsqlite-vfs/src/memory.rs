@@ -693,7 +693,7 @@ mod tests {
             .map(|idx| u8::try_from(idx % 251).expect("mod value must fit in u8"))
             .collect::<Vec<_>>();
 
-        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, &payload, 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), payload.len() as u64);
 
@@ -727,7 +727,7 @@ mod tests {
         let path = Path::new("empty.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         let mut buf = [0xFFu8; 4];
         let n = file.read(&cx, &mut buf, 0).unwrap();

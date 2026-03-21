@@ -388,7 +388,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// `PartialIndexFallback*` is a bounded slow-path used only when the capped
     /// index is known to be incomplete.
     fn resolve_visible_frame(
-        &mut self,
+        &self,
         cx: &Cx,
         snapshot: &WalPublishedSnapshot,
         page_number: u32,
@@ -415,7 +415,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Since we scan forward, later frames naturally overwrite earlier entries
     /// for the same page number, ensuring "newest frame wins" semantics.
     fn build_index_range(
-        &mut self,
+        &self,
         cx: &Cx,
         page_index: &mut HashMap<u32, usize>,
         index_is_partial: &mut bool,
@@ -441,7 +441,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     /// Count commit frames within the visible range `start..=end`.
-    fn count_commit_frames_in_range(&mut self, cx: &Cx, start: usize, end: usize) -> Result<u64> {
+    fn count_commit_frames_in_range(&self, cx: &Cx, start: usize, end: usize) -> Result<u64> {
         if start > end {
             return Ok(0);
         }
@@ -462,7 +462,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// of the first (i.e., most recent) frame containing `page_number`, or
     /// `None` if the page is not in the WAL at all.
     fn scan_backwards_for_page(
-        &mut self,
+        &self,
         cx: &Cx,
         page_number: u32,
         last_commit_frame: usize,
@@ -531,7 +531,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     fn prepared_batch_matches_disk_state(
-        &mut self,
+        &self,
         cx: &Cx,
         prepared: &PreparedWalFrameBatch,
     ) -> Result<bool> {

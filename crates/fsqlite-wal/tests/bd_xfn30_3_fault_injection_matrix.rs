@@ -247,11 +247,7 @@ fn expected_for_kind(kind: FaultKind) -> ExpectedOutcome {
     }
 }
 
-fn validate_recovered_prefix(
-    spec: ScenarioSpec,
-    wal: &mut WalFile<<MemoryVfs as Vfs>::File>,
-    cx: &Cx,
-) {
+fn validate_recovered_prefix(spec: ScenarioSpec, wal: &WalFile<<MemoryVfs as Vfs>::File>, cx: &Cx) {
     assert_eq!(
         wal.frame_count(),
         spec.expected.committed_frames,
@@ -299,8 +295,8 @@ fn run_scenario(spec: ScenarioSpec) -> ObservedOutcome {
     let mut observed_frames = Vec::with_capacity(spec.restart_iterations);
     for _ in 0..spec.restart_iterations {
         let file = open_wal_file(&vfs, &cx);
-        let mut wal = WalFile::open(&cx, file).expect("open wal after fault");
-        validate_recovered_prefix(spec, &mut wal, &cx);
+        let wal = WalFile::open(&cx, file).expect("open wal after fault");
+        validate_recovered_prefix(spec, &wal, &cx);
         observed_frames.push(wal.frame_count());
         wal.close(&cx).expect("close wal after verification");
     }

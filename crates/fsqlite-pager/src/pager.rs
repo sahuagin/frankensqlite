@@ -336,7 +336,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// connection has committed. The local cache may still reflect an older
     /// generation, so committed-state refresh must bypass it.
     fn read_committed_page_copy(
-        &mut self,
+        &self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
         page_no: PageNumber,
@@ -375,7 +375,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// commit count on top. Metadata such as db_size/freelist still comes from
     /// [`Self::read_committed_page_copy`], which includes the current visible
     /// WAL snapshot.
-    fn read_database_file_page_copy(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+    fn read_database_file_page_copy(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
         let file_size = self.db_file.file_size(cx)?;
@@ -548,12 +548,12 @@ fn return_pages_to_freelist(
     }
     // Sort descending so that pop() and rposition() yield the lowest page numbers first,
     // which keeps the database file compact and reduces file size growth.
-    freelist.sort_unstable_by(|a, b| b.get().cmp(&a.get()));
+    freelist.sort_unstable_by_key(|page| std::cmp::Reverse(page.get()));
 }
 
 fn load_freelist_from_disk<F: VfsFile>(
     cx: &Cx,
-    db_file: &mut F,
+    db_file: &F,
     page_size: PageSize,
     db_size: u32,
     first_trunk: u32,
@@ -636,7 +636,7 @@ fn load_freelist_from_disk<F: VfsFile>(
 
 fn load_freelist_from_committed_state<F: VfsFile>(
     cx: &Cx,
-    inner: &mut PagerInner<F>,
+    inner: &PagerInner<F>,
     wal_backend: &SharedWalBackend,
     db_size: u32,
     first_trunk: u32,
@@ -2618,7 +2618,7 @@ where
         } else {
             load_freelist_from_disk(
                 cx,
-                &mut db_file,
+                &db_file,
                 page_size,
                 db_size,
                 header.freelist_trunk,

@@ -2143,25 +2143,17 @@ pub fn prepare_concurrent_commit_with_ssi(
         registry.committed_writers.len(),
     );
 
-    let mut abort_reason = None;
-    if has_in_rw && has_out_rw {
-        abort_reason = Some(SsiAbortReason::Pivot);
+    let abort_reason = if has_in_rw && has_out_rw {
+        Some(SsiAbortReason::Pivot)
+    } else if incoming_edges
+        .iter()
+        .chain(&outgoing_edges)
+        .any(|edge| !edge.source_is_active && edge.source_has_in_rw)
+    {
+        Some(SsiAbortReason::CommittedPivot)
     } else {
-        for edge in &incoming_edges {
-            if !edge.source_is_active && edge.source_has_in_rw {
-                abort_reason = Some(SsiAbortReason::CommittedPivot);
-                break;
-            }
-        }
-        if abort_reason.is_none() {
-            for edge in &outgoing_edges {
-                if !edge.source_is_active && edge.source_has_in_rw {
-                    abort_reason = Some(SsiAbortReason::CommittedPivot);
-                    break;
-                }
-            }
-        }
-    }
+        None
+    };
 
     if let Some(reason) = abort_reason {
         tracing::warn!(

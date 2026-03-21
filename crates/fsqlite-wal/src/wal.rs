@@ -804,7 +804,7 @@ impl<F: VfsFile> WalFile<F> {
     /// pass. If the generation identity and frame count still match, no other
     /// writer could have changed the append seed or target offset.
     pub fn prepared_append_window_still_current(
-        &mut self,
+        &self,
         cx: &Cx,
         generation: WalGenerationIdentity,
         start_frame_index: usize,
@@ -2328,7 +2328,7 @@ mod tests {
 
         // Reopen and verify all frames are valid (checksum chain intact).
         let file2 = open_wal_file(&vfs, &cx);
-        let wal2 = WalFile::open(&cx, file2).expect("reopen");
+        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
         assert_eq!(wal2.frame_count(), 6);
 
         // Verify each frame's content.
@@ -3128,7 +3128,7 @@ mod tests {
 
         // Reopen and verify all 50 frames survived (single commit at end).
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
+        let wal2 = WalFile::open(&cx, file2).expect("reopen");
         assert_eq!(wal2.frame_count(), usize::try_from(n).unwrap());
         assert_eq!(wal2.running_checksum(), final_checksum);
 

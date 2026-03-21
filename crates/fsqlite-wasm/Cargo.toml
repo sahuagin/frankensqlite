@@ -29,13 +29,13 @@ js-sys = "0.3"
 wasm-bindgen = "0.2"
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "linux"))'.dependencies]
-fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
+fsqlite-core = { version = "0.1.2", path = "../fsqlite-core", default-features = false, features = ["linux-asupersync-uring"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))'.dependencies]
-fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["native"] }
+fsqlite-core = { version = "0.1.2", path = "../fsqlite-core", default-features = false, features = ["native"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-fsqlite-core = { version = "0.1.1", path = "../fsqlite-core", default-features = false, features = ["wasm"] }
+fsqlite-core = { version = "0.1.2", path = "../fsqlite-core", default-features = false, features = ["wasm"] }
 tracing-wasm = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

@@ -1115,7 +1115,7 @@ where
     match pager.set_wal_backend_owned(adapter) {
         Ok(()) => Ok(()),
         Err((err, adapter)) => {
-            let mut wal = adapter.into_inner();
+            let wal = adapter.into_inner();
             let _ = wal.close(cx);
             Err(err)
         }

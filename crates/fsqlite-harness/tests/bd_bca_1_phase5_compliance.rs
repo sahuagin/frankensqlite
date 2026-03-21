@@ -618,7 +618,7 @@ fn test_wal_checksum_corruption() -> Result<(), String> {
     wal_bytes[corrupt_offset] ^= 0x40;
 
     {
-        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         wal_file
             .write(&cx, &wal_bytes, 0)
             .map_err(|error| format!("write_corrupted_wal_bytes_failed error={error}"))?;
@@ -835,7 +835,7 @@ fn test_wal_frame_checksum_excludes_salt_header_bytes() -> Result<(), String> {
     }
 
     let wal_bytes = {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         let file_size = wal_file
             .file_size(&cx)
             .map_err(|error| format!("read_wal_size_failed error={error}"))?;
