@@ -2133,10 +2133,7 @@ where
     ///
     /// This lets callers explicitly close any underlying VFS resources when
     /// the pager rejects installation.
-    pub fn set_wal_backend_owned<B>(
-        &self,
-        backend: B,
-    ) -> std::result::Result<(), (FrankenError, B)>
+    pub fn set_wal_backend_owned<B>(&self, backend: B) -> std::result::Result<(), (FrankenError, B)>
     where
         B: WalBackend + 'static,
     {
@@ -13243,7 +13240,10 @@ mod tests {
         let (err, backend) = pager
             .set_wal_backend_owned(backend)
             .expect_err("checkpoint-active pager must reject WAL backend install");
-        assert!(matches!(err, FrankenError::Busy), "unexpected error: {err:?}");
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "unexpected error: {err:?}"
+        );
         assert!(
             !*dropped
                 .lock()
