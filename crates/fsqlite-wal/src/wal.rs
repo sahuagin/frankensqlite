@@ -495,7 +495,7 @@ impl<F: VfsFile> WalFile<F> {
     /// then scanning frames to determine the valid frame count and
     /// running checksum.
     #[allow(clippy::too_many_lines)]
-    pub fn open(cx: &Cx, mut file: F) -> Result<Self> {
+    pub fn open(cx: &Cx, file: F) -> Result<Self> {
         // Read and parse the 32-byte header.
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let bytes_read = file.read(cx, &mut header_buf, 0)?;
@@ -1608,7 +1608,7 @@ mod tests {
 
         // Reopen and verify all frames are valid (checksum chain intact).
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("open WAL");
+        let wal2 = WalFile::open(&cx, file2).expect("open WAL");
         assert_eq!(wal2.frame_count(), 5);
 
         // Verify each frame's content.
@@ -1850,7 +1850,7 @@ mod tests {
 
         // Reopen: only the 3 fully-written frames should be recovered.
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("open WAL after truncation");
+        let wal2 = WalFile::open(&cx, file2).expect("open WAL after truncation");
         assert_eq!(
             wal2.frame_count(),
             3,
@@ -1964,7 +1964,7 @@ mod tests {
         // Reopen: chain breaks at frame 5 (index 4). The last commit
         // boundary is frame 3 (db_size=3), so only 3 committed frames remain.
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("open WAL after corruption");
+        let wal2 = WalFile::open(&cx, file2).expect("open WAL after corruption");
         assert_eq!(
             wal2.frame_count(),
             3,
@@ -2328,7 +2328,7 @@ mod tests {
 
         // Reopen and verify all frames are valid (checksum chain intact).
         let file2 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
+        let wal2 = WalFile::open(&cx, file2).expect("reopen");
         assert_eq!(wal2.frame_count(), 6);
 
         // Verify each frame's content.
@@ -3347,7 +3347,7 @@ mod tests {
 
         // Verify the new transaction persists.
         let f3 = open_wal_file(&vfs, &cx);
-        let mut wal2 = WalFile::open(&cx, f3).expect("reopen");
+        let wal2 = WalFile::open(&cx, f3).expect("reopen");
         assert_eq!(wal2.frame_count(), 5);
         assert_eq!(wal2.running_checksum(), checksum_after);
 

@@ -1564,6 +1564,43 @@ fn stale_main_header_change_counter_under_wal(
     Some(u64::from(change_counter_from_header_bytes(header_bytes)))
 }
 
+fn wal_contains_valid_database_page1<F: VfsFile>(
+    cx: &Cx,
+    wal: &mut WalFile<F>,
+    expected_page_size: PageSize,
+) -> bool {
+    let Ok(expected_page_size_usize) = usize::try_from(expected_page_size.get()) else {
+        return false;
+    };
+    if wal.page_size() != expected_page_size_usize {
+        return false;
+    }
+
+    // Trust only the committed WAL prefix. Valid trailing frames after the
+    // last commit are not visible to readers and must not affect recovery.
+    let Some(last_commit_frame) = wal.last_commit_frame(cx).ok().flatten() else {
+        return false;
+    };
+
+    for frame_index in (0..=last_commit_frame).rev() {
+        let Ok((frame_header, page_data)) = wal.read_frame(cx, frame_index) else {
+            return false;
+        };
+        if frame_header.page_number != PageNumber::ONE.get() {
+            continue;
+        }
+        if page_data.len() < DATABASE_HEADER_SIZE {
+            return false;
+        }
+
+        let mut page1_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+        page1_header_bytes.copy_from_slice(&page_data[..DATABASE_HEADER_SIZE]);
+        return DatabaseHeader::from_bytes(&page1_header_bytes).is_ok();
+    }
+
+    false
+}
+
 fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     cx: &Cx,
     vfs: &V,
@@ -1586,22 +1623,30 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
         return Ok(false);
     }
 
-    let Ok((wal_file, _)) = vfs.open(
+    let (wal_file, _) = match vfs.open(
         cx,
         Some(&wal_path),
         VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
-    ) else {
+    ) {
+        Ok(opened) => opened,
+        Err(_) => {
+            let Ok(opened) = vfs.open(
+                cx,
+                Some(&wal_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+            ) else {
+                return Ok(false);
+            };
+            opened
+        }
+    };
+    let Ok(mut wal) = WalFile::open(cx, wal_file) else {
         return Ok(false);
     };
-    let Ok(wal) = WalFile::open(cx, wal_file) else {
-        return Ok(false);
-    };
-    let wal_page_size_matches = u32::try_from(wal.page_size())
-        .ok()
-        .and_then(PageSize::new)
-        .is_some_and(|wal_page_size| wal_page_size == expected_page_size);
+    let wal_contains_valid_page1 =
+        wal_contains_valid_database_page1(cx, &mut wal, expected_page_size);
     let _ = wal.close(cx);
-    Ok(wal_page_size_matches)
+    Ok(wal_contains_valid_page1)
 }
 
 fn bootstrap_header_from_stale_main_file(
@@ -2082,6 +2127,42 @@ where
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
+    }
+
+    /// Install a concrete WAL backend while preserving ownership on failure.
+    ///
+    /// This lets callers explicitly close any underlying VFS resources when
+    /// the pager rejects installation.
+    pub fn set_wal_backend_owned<B>(
+        &self,
+        backend: B,
+    ) -> std::result::Result<(), (FrankenError, B)>
+    where
+        B: WalBackend + 'static,
+    {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return Err((FrankenError::internal("SimplePager lock poisoned"), backend));
+            }
+        };
+        if inner.checkpoint_active {
+            return Err((FrankenError::Busy, backend));
+        }
+        drop(inner);
+
+        let mut wal_guard = match self.wal_backend.write() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err((
+                    FrankenError::internal("SharedWalBackend lock poisoned"),
+                    backend,
+                ));
+            }
+        };
+        *wal_guard = Some(Box::new(backend));
+        drop(wal_guard);
+        Ok(())
     }
 
     /// Return the current WAL commit sync policy.
@@ -3549,7 +3630,7 @@ where
                         })
                         .collect();
 
-                    let mut prepared_batch = with_wal_backend(wal_backend, |wal| {
+                    let _prepared_batch = with_wal_backend(wal_backend, |wal| {
                         wal.prepare_append_frames(&frame_refs)
                     })?;
 
@@ -5362,6 +5443,59 @@ mod tests {
             0.0
         } else {
             (cache_hits.saturating_add(published_hits) as f64 * 100.0) / total_reads as f64
+        }
+    }
+
+    struct DropAwareWalBackend {
+        dropped: Arc<Mutex<bool>>,
+    }
+
+    impl Drop for DropAwareWalBackend {
+        fn drop(&mut self) {
+            *self
+                .dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        }
+    }
+
+    impl crate::traits::WalBackend for DropAwareWalBackend {
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+            _page_data: &[u8],
+            _db_size_if_commit: u32,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            0
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> Result<crate::traits::CheckpointResult> {
+            Ok(crate::traits::CheckpointResult {
+                total_frames: 0,
+                frames_backfilled: 0,
+                completed: false,
+                wal_was_reset: false,
+            })
         }
     }
 
@@ -13033,6 +13167,100 @@ mod tests {
             refreshed_reader.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
             "bead_id={BEAD_ID} case=publication_refresh_reads_latest_committed_page"
+        );
+    }
+
+    #[test]
+    fn test_stale_main_header_recovery_ignores_uncommitted_wal_page1_tail() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = PathBuf::from("/stale-main-header-uncommitted-tail.db");
+        let wal_path = PathBuf::from("/stale-main-header-uncommitted-tail.db-wal");
+        let page_size = PageSize::DEFAULT;
+
+        let valid_header = DatabaseHeader {
+            page_size,
+            page_count: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut committed_page1 = vec![0_u8; page_size.as_usize()];
+        committed_page1[..DATABASE_HEADER_SIZE]
+            .copy_from_slice(&valid_header.to_bytes().expect("valid page-1 header"));
+
+        let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
+        stale_header_bytes[44..48].fill(0);
+        let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
+            .expect_err("schema format 0 must be treated as a stale main-file header");
+
+        let mut uncommitted_page1 = committed_page1.clone();
+        uncommitted_page1[..DATABASE_HEADER_SIZE].copy_from_slice(&stale_header_bytes);
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let mut wal = fsqlite_wal::WalFile::create(
+            &cx,
+            file,
+            page_size.get(),
+            0,
+            fsqlite_wal::WalSalts::default(),
+        )
+        .unwrap();
+        wal.append_frame(&cx, PageNumber::ONE.get(), &committed_page1, 1)
+            .expect("append committed page-1 frame");
+        wal.append_frame(&cx, PageNumber::ONE.get(), &uncommitted_page1, 0)
+            .expect("append uncommitted page-1 tail");
+        wal.close(&cx).unwrap();
+
+        let recoverable = stale_main_header_can_be_recovered_from_live_wal(
+            &cx,
+            &vfs,
+            &db_path,
+            &stale_header_bytes,
+            &stale_error,
+        )
+        .expect("probe stale-header recovery");
+        assert!(
+            recoverable,
+            "recovery must use the committed WAL horizon, not an uncommitted tail frame"
+        );
+    }
+
+    #[test]
+    fn test_set_wal_backend_owned_returns_backend_when_install_is_rejected() {
+        let (pager, _) = test_pager();
+        let dropped = Arc::new(Mutex::new(false));
+        {
+            let mut inner = pager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.checkpoint_active = true;
+        }
+
+        let backend = DropAwareWalBackend {
+            dropped: Arc::clone(&dropped),
+        };
+        let (err, backend) = pager
+            .set_wal_backend_owned(backend)
+            .expect_err("checkpoint-active pager must reject WAL backend install");
+        assert!(matches!(err, FrankenError::Busy), "unexpected error: {err:?}");
+        assert!(
+            !*dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "rejected install must return the backend instead of dropping it"
+        );
+        assert!(
+            !has_wal_backend(&pager.wal_backend).unwrap(),
+            "failed install must not publish a backend"
+        );
+
+        drop(backend);
+        assert!(
+            *dropped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "caller should own backend cleanup after a rejected install"
         );
     }
 

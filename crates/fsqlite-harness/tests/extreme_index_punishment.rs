@@ -1,5 +1,4 @@
 use fsqlite::Connection;
-use fsqlite::compat::BatchExt;
 use std::sync::{Arc, Barrier};
 use std::thread;
 

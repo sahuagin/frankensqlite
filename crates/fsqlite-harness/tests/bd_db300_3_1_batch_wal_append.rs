@@ -347,7 +347,7 @@ fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
     let after_commit = GLOBAL_VFS_METRICS.snapshot();
 
     let reader_file = open_memory_wal_file(&vfs, &cx, &wal_path, false)?;
-    let mut wal_reader = WalFile::open(&cx, reader_file)
+    let wal_reader = WalFile::open(&cx, reader_file)
         .map_err(|error| format!("bead_id={BEAD_ID} case=wal_reopen error={error}"))?;
     let wal_frame_count = wal_reader.frame_count();
     let mut commit_frame_count = 0_usize;

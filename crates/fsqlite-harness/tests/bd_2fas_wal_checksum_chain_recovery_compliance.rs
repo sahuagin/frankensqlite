@@ -162,7 +162,7 @@ fn open_wal_file(
 }
 
 fn read_wal_bytes(vfs: &MemoryVfs, cx: &Cx, wal_path: &Path) -> Result<Vec<u8>, String> {
-    let mut wal_file = open_wal_file(vfs, cx, wal_path)?;
+    let wal_file = open_wal_file(vfs, cx, wal_path)?;
     let file_size = wal_file
         .file_size(cx)
         .map_err(|error| format!("read_wal_size_failed error={error}"))?;

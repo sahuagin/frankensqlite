@@ -1092,6 +1092,36 @@ fn wal_path_for_db_path(path: &str) -> PathBuf {
     PathBuf::from(db_path)
 }
 
+fn install_opened_wal_backend<V>(
+    pager: &Arc<SimplePager<V>>,
+    cx: &Cx,
+    wal: WalFile<V::File>,
+) -> Result<()>
+where
+    V: Vfs + Send + Sync + 'static,
+    V::File: Send + Sync + 'static,
+{
+    let expected_page_size = pager.page_size().get();
+    if u32::try_from(wal.page_size()).ok() != Some(expected_page_size) {
+        let actual_page_size = wal.page_size();
+        let _ = wal.close(cx);
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "WAL page size {actual_page_size} does not match database page size {expected_page_size}"
+            ),
+        });
+    }
+    let adapter = WalBackendAdapter::new(wal);
+    match pager.set_wal_backend_owned(adapter) {
+        Ok(()) => Ok(()),
+        Err((err, adapter)) => {
+            let mut wal = adapter.into_inner();
+            let _ = wal.close(cx);
+            Err(err)
+        }
+    }
+}
+
 fn install_wal_backend_with_vfs<V>(
     pager: &Arc<SimplePager<V>>,
     vfs: &V,
@@ -1107,10 +1137,7 @@ where
         let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
             match WalFile::open(cx, file) {
-                Ok(wal) => {
-                    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
-                    return Ok(());
-                }
+                Ok(wal) => return install_opened_wal_backend(pager, cx, wal),
                 Err(err) => return Err(err),
             }
         }
@@ -1120,7 +1147,7 @@ where
     let create_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
     let (file, _) = vfs.open(cx, Some(wal_path), create_flags)?;
     let wal = WalFile::create(cx, file, pager.page_size().get(), 0, WalSalts::default())?;
-    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
+    install_opened_wal_backend(pager, cx, wal)
 }
 
 fn install_existing_wal_backend_with_vfs<V>(
@@ -1155,7 +1182,7 @@ where
     }
 
     let wal = WalFile::open(cx, file)?;
-    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))?;
+    install_opened_wal_backend(pager, cx, wal)?;
     Ok(true)
 }
 
@@ -56074,6 +56101,36 @@ mod tests {
 
         let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
             .expect_err("header-sized corrupt WAL should be surfaced");
+        assert!(
+            matches!(err, FrankenError::WalCorrupt { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_install_wal_backend_rejects_existing_wal_with_page_size_mismatch() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = Path::new("/wal_page_size_mismatch.db");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/wal_page_size_mismatch.db");
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        let mismatched_page_size = PageSize::new(8192).unwrap();
+        let wal = fsqlite_wal::WalFile::create(
+            &cx,
+            file,
+            mismatched_page_size.get(),
+            0,
+            fsqlite_wal::WalSalts::default(),
+        )
+        .unwrap();
+        wal.close(&cx).unwrap();
+
+        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path)
+            .expect_err("existing WAL with mismatched page size must be rejected");
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
             "unexpected error: {err:?}"

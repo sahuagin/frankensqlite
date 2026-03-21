@@ -693,7 +693,7 @@ mod tests {
             .map(|idx| u8::try_from(idx % 251).expect("mod value must fit in u8"))
             .collect::<Vec<_>>();
 
-        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (file, _) = vfs.open(&cx, Some(path), flags).unwrap();
         file.write(&cx, &payload, 0).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), payload.len() as u64);
 
@@ -875,7 +875,7 @@ mod tests {
         file1.write(&cx, b"shared data", 0).unwrap();
 
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut file2, _) = vfs.open(&cx, Some(path), open_flags).unwrap();
+        let (file2, _) = vfs.open(&cx, Some(path), open_flags).unwrap();
         let mut buf = [0u8; 11];
         let n = file2.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(n, 11);
@@ -1002,7 +1002,7 @@ mod tests {
 
         // vfs2 should see the same file since they share inner state.
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut file2, _) = vfs2
+        let (file2, _) = vfs2
             .open(&cx, Some(Path::new("shared.db")), open_flags)
             .unwrap();
         let mut buf = [0u8; 9];

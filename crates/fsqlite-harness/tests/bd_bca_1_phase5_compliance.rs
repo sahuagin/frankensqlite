@@ -592,7 +592,7 @@ fn test_wal_checksum_corruption() -> Result<(), String> {
     }
 
     let mut wal_bytes = {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         let file_size = wal_file
             .file_size(&cx)
             .map_err(|error| format!("read_wal_size_failed error={error}"))?;
@@ -618,7 +618,7 @@ fn test_wal_checksum_corruption() -> Result<(), String> {
     wal_bytes[corrupt_offset] ^= 0x40;
 
     {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         wal_file
             .write(&cx, &wal_bytes, 0)
             .map_err(|error| format!("write_corrupted_wal_bytes_failed error={error}"))?;
@@ -670,7 +670,7 @@ fn test_wal_recovery_stops_at_first_invalid_frame() -> Result<(), String> {
     }
 
     let mut wal_bytes = {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         let file_size = wal_file
             .file_size(&cx)
             .map_err(|error| format!("read_wal_size_failed error={error}"))?;
@@ -753,7 +753,7 @@ fn test_wal_recovery_salt_mismatch_stops_at_frame() -> Result<(), String> {
     }
 
     let mut wal_bytes = {
-        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
         let file_size = wal_file
             .file_size(&cx)
             .map_err(|error| format!("read_wal_size_failed error={error}"))?;
@@ -1438,7 +1438,7 @@ fn test_wal_concurrent_readers_writer() -> Result<(), String> {
             .map_err(|error| format!("close_initial_writer_wal_failed error={error}"))?;
     }
 
-    let mut reader_snapshot = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+    let reader_snapshot = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
         .map_err(|error| format!("open_reader_snapshot_failed error={error}"))?;
     if reader_snapshot.frame_count() != 1 {
         return Err(format!(
@@ -1474,7 +1474,7 @@ fn test_wal_concurrent_readers_writer() -> Result<(), String> {
         ));
     }
 
-    let mut reader_latest = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
+    let reader_latest = WalFile::open(&cx, open_wal_file(&vfs, &cx, &wal_path)?)
         .map_err(|error| format!("open_latest_reader_failed error={error}"))?;
     if reader_latest.frame_count() != 2 {
         return Err(format!(
