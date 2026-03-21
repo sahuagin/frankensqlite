@@ -433,6 +433,9 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     /// Return the current journal mode.
     fn journal_mode(&self) -> JournalMode;
 
+    /// Whether this pager was opened read-only.
+    fn is_readonly(&self) -> bool;
+
     /// Switch the journal mode.
     ///
     /// Switching from `Delete` to `Wal` requires providing a [`WalBackend`]
@@ -691,6 +694,10 @@ impl MvccPager for MockMvccPager {
         JournalMode::Delete
     }
 
+    fn is_readonly(&self) -> bool {
+        false
+    }
+
     fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         Ok(mode)
     }
@@ -806,6 +813,10 @@ impl MvccPager for MemoryMockMvccPager {
 
     fn journal_mode(&self) -> JournalMode {
         JournalMode::Delete
+    }
+
+    fn is_readonly(&self) -> bool {
+        false
     }
 
     fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {

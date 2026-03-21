@@ -899,6 +899,18 @@ impl PagerBackend {
         }
     }
 
+    fn is_readonly(&self) -> bool {
+        match self {
+            Self::Memory(p) => p.is_readonly(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.is_readonly(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.is_readonly(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.is_readonly(),
+        }
+    }
+
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode),
@@ -1092,14 +1104,7 @@ where
 {
     if vfs.access(cx, wal_path, AccessFlags::EXISTS)? {
         let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
-        let (mut file, _) = match vfs.open(cx, Some(wal_path), open_flags) {
-            Ok(opened) => opened,
-            Err(_) => vfs.open(
-                cx,
-                Some(wal_path),
-                VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
-            )?,
-        };
+        let (mut file, _) = vfs.open(cx, Some(wal_path), open_flags)?;
         if file.file_size(cx)? >= u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
             match WalFile::open(cx, file) {
                 Ok(wal) => {
@@ -5302,6 +5307,7 @@ impl Connection {
         }
 
         if self.pager.journal_mode() == JournalMode::Wal
+            && !self.pager.is_readonly()
             && !self.wal_checkpoint_blocked_by_active_concurrent_txns()
         {
             if best_effort {
@@ -55808,6 +55814,12 @@ mod tests {
         size: u64,
     }
 
+    #[derive(Debug, Clone)]
+    struct ReadWriteWalInstallProbeVfs {
+        inner: MemoryVfs,
+        readonly_open_attempted: Arc<std::sync::atomic::AtomicBool>,
+    }
+
     impl Vfs for ReadOnlyWalProbeVfs {
         type File = ReadOnlyWalProbeFile;
 
@@ -55954,6 +55966,63 @@ mod tests {
         }
     }
 
+    impl Vfs for ReadWriteWalInstallProbeVfs {
+        type File = fsqlite_vfs::MemoryFile;
+
+        fn name(&self) -> &'static str {
+            "read_write_wal_install_probe"
+        }
+
+        fn open(
+            &self,
+            _cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> std::result::Result<(Self::File, VfsOpenFlags), FrankenError> {
+            let resolved = path.unwrap_or_else(|| Path::new("/install-probe.db-wal"));
+            let is_wal_path = resolved == Path::new("/install-probe.db-wal");
+            if is_wal_path && flags.contains(VfsOpenFlags::READONLY) {
+                self.readonly_open_attempted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if is_wal_path && flags.contains(VfsOpenFlags::READWRITE) {
+                return Err(FrankenError::CannotOpen {
+                    path: resolved.to_path_buf(),
+                });
+            }
+            self.inner.open(_cx, Some(resolved), flags)
+        }
+
+        fn delete(
+            &self,
+            cx: &Cx,
+            path: &Path,
+            sync_dir: bool,
+        ) -> std::result::Result<(), FrankenError> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(
+            &self,
+            cx: &Cx,
+            path: &Path,
+            flags: AccessFlags,
+        ) -> std::result::Result<bool, FrankenError> {
+            if path == Path::new("/install-probe.db-wal") && flags == AccessFlags::READWRITE {
+                return Ok(false);
+            }
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(
+            &self,
+            cx: &Cx,
+            path: &Path,
+        ) -> std::result::Result<PathBuf, FrankenError> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
     #[test]
     fn test_wal_file_present_with_vfs_accepts_read_only_probe_open() {
         let cx = Cx::new();
@@ -56008,6 +56077,37 @@ mod tests {
         assert!(
             matches!(err, FrankenError::WalCorrupt { .. }),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_install_wal_backend_does_not_fallback_to_read_only_open() {
+        let cx = Cx::new();
+        let readonly_open_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vfs = ReadWriteWalInstallProbeVfs {
+            inner: MemoryVfs::new(),
+            readonly_open_attempted: Arc::clone(&readonly_open_attempted),
+        };
+        let db_path = Path::new("/install-probe.db");
+        let pager = Arc::new(
+            SimplePager::open_with_cx(&cx, vfs.clone(), db_path, PageSize::DEFAULT).unwrap(),
+        );
+        let wal_path = wal_path_for_db_path("/install-probe.db");
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut wal_file, _) = vfs.inner.open(&cx, Some(&wal_path), open_flags).unwrap();
+        wal_file.write(&cx, &[0_u8; 32], 0).unwrap();
+        wal_file.close(&cx).unwrap();
+
+        let err = super::install_wal_backend_with_vfs(&pager, &vfs, &cx, &wal_path).expect_err(
+            "read-write WAL install should fail instead of silently retrying read-only",
+        );
+        assert!(
+            matches!(err, FrankenError::CannotOpen { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert!(
+            !readonly_open_attempted.load(std::sync::atomic::Ordering::SeqCst),
+            "read-write WAL install must not retry with a read-only open"
         );
     }
 
@@ -60211,7 +60311,8 @@ mod schema_loading_tests {
             .expect("schema-only query should read through the read-only WAL sidecar");
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
-        drop(conn);
+        conn.close()
+            .expect("explicit close should not try to checkpoint through a read-only WAL handle");
         drop(rconn);
     }
 

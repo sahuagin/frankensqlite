@@ -30,7 +30,7 @@ use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, Transaction
 
 use fsqlite_wal::{
     FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
-    SubmitOutcome, TransactionFrameBatch,
+    SubmitOutcome, TransactionFrameBatch, WalFile,
 };
 
 // ---------------------------------------------------------------------------
@@ -1575,9 +1575,9 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
         return Ok(false);
     }
 
-    if page_size_from_header_bytes(header_bytes).is_none() {
+    let Some(expected_page_size) = page_size_from_header_bytes(header_bytes) else {
         return Ok(false);
-    }
+    };
 
     let mut wal_path = path.to_owned().into_os_string();
     wal_path.push("-wal");
@@ -1586,14 +1586,22 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
         return Ok(false);
     }
 
-    let flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
-    let Ok((mut wal_file, _)) = vfs.open(cx, Some(&wal_path), flags) else {
+    let Ok((wal_file, _)) = vfs.open(
+        cx,
+        Some(&wal_path),
+        VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
+    ) else {
         return Ok(false);
     };
-    let wal_len = wal_file.file_size(cx).ok();
-    let _ = wal_file.close(cx);
-
-    Ok(wal_len.is_some_and(|len| len >= u64::from(fsqlite_types::limits::WAL_HEADER_SIZE)))
+    let Ok(wal) = WalFile::open(cx, wal_file) else {
+        return Ok(false);
+    };
+    let wal_page_size_matches = u32::try_from(wal.page_size())
+        .ok()
+        .and_then(PageSize::new)
+        .is_some_and(|wal_page_size| wal_page_size == expected_page_size);
+    let _ = wal.close(cx);
+    Ok(wal_page_size_matches)
 }
 
 fn bootstrap_header_from_stale_main_file(
@@ -1973,6 +1981,14 @@ where
 
     fn journal_mode(&self) -> JournalMode {
         self.published.snapshot().journal_mode
+    }
+
+    fn is_readonly(&self) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.access_mode.is_readonly()
     }
 
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
