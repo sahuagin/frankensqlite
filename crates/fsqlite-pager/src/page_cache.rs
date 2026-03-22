@@ -1868,7 +1868,7 @@ mod tests {
                             );
                         }
                         None => {
-                            assert!(cache.evict_any(), "cold-page admission must free capacity")
+                            assert!(cache.evict_any(), "cold-page admission must free capacity");
                         }
                     }
                 }

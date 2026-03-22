@@ -439,7 +439,7 @@ impl<F: VfsFile> PagerInner<F> {
     /// avoids page-1 materialization and freelist reconstruction unless the
     /// visible state actually changed.
     fn probe_visible_commit_seq(
-        &mut self,
+        &self,
         cx: &Cx,
         wal_backend: &SharedWalBackend,
     ) -> Result<(CommitSeq, u64, bool)> {
