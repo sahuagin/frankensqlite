@@ -29,7 +29,7 @@ pub struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     fn new(conn: &'a Connection) -> Result<Self, FrankenError> {
-        conn.execute("BEGIN")?;
+        conn.begin_transaction()?;
         Ok(Self {
             conn,
             finalized: false,
@@ -41,7 +41,7 @@ impl<'a> Transaction<'a> {
     /// If `COMMIT` fails, the transaction remains active so the caller can
     /// inspect the error and choose whether to retry or roll back.
     pub fn commit(&mut self) -> Result<(), FrankenError> {
-        self.conn.execute("COMMIT")?;
+        self.conn.commit_transaction()?;
         self.finalized = true;
         Ok(())
     }
@@ -51,7 +51,7 @@ impl<'a> Transaction<'a> {
     /// If `ROLLBACK` fails, the transaction remains active and drop will make a
     /// best-effort rollback later.
     pub fn rollback(&mut self) -> Result<(), FrankenError> {
-        self.conn.execute("ROLLBACK")?;
+        self.conn.rollback_transaction()?;
         self.finalized = true;
         Ok(())
     }
@@ -164,7 +164,7 @@ impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.finalized {
             // Best-effort rollback; ignore errors since we're in drop.
-            let _ = self.conn.execute("ROLLBACK");
+            let _ = self.conn.rollback_transaction();
         }
     }
 }

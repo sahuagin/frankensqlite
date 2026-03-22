@@ -457,20 +457,20 @@ impl<F: VfsFile> PagerInner<F> {
         let base_change_counter = if self.journal_mode == JournalMode::Wal {
             match DatabaseHeader::from_bytes(&base_header_bytes) {
                 Ok(base_header) => u64::from(base_header.change_counter),
-                Err(error) => stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "invalid database-file header during WAL refresh: {error}"
-                        ),
-                    })?,
+                Err(error) => {
+                    stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "invalid database-file header during WAL refresh: {error}"
+                            ),
+                        })?
+                }
             }
         } else {
             u64::from(
                 DatabaseHeader::from_bytes(&base_header_bytes)
                     .map_err(|error| FrankenError::DatabaseCorrupt {
-                        detail: format!(
-                            "invalid database header during pager refresh: {error}"
-                        ),
+                        detail: format!("invalid database header during pager refresh: {error}"),
                     })?
                     .change_counter,
             )
@@ -11160,8 +11160,7 @@ mod tests {
         drop(reader);
 
         assert_eq!(
-            read_page_calls_after_begin,
-            read_page_calls_before_begin,
+            read_page_calls_after_begin, read_page_calls_before_begin,
             "bead_id={BEAD_ID} case=wal_begin_skips_page1_reload_when_commit_seq_and_file_size_match"
         );
     }

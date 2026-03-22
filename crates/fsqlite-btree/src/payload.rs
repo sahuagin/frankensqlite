@@ -100,8 +100,13 @@ where
     let local_data = payload[..local_size].to_vec();
     let overflow_data = &payload[local_size..];
 
-    let first_overflow =
-        overflow::write_overflow_chain(overflow_data, usable_size, full_page_size, allocate_page, write_page)?;
+    let first_overflow = overflow::write_overflow_chain(
+        overflow_data,
+        usable_size,
+        full_page_size,
+        allocate_page,
+        write_page,
+    )?;
 
     debug!(
         cell_type = ?page_type,

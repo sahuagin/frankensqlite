@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, PageWriter};
 use fsqlite_error::FrankenError;
-use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record};
+use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record_into};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{Cx, PageNumber};
 
@@ -184,6 +184,8 @@ where
     batch_capacity: usize,
     predicate: Option<RowPredicate>,
     morsel: Option<PageMorsel>,
+    payload_buf: Vec<u8>,
+    row_buffers: Vec<Vec<SqliteValue>>,
     started: bool,
     finished: bool,
     last_prefetched_page: Option<PageNumber>,
@@ -215,6 +217,8 @@ where
             batch_capacity,
             predicate: None,
             morsel: None,
+            payload_buf: Vec::new(),
+            row_buffers: Vec::with_capacity(batch_capacity),
             started: false,
             finished: false,
             last_prefetched_page: None,
@@ -259,13 +263,14 @@ where
             }
         }
 
-        let mut rows = Vec::with_capacity(self.batch_capacity);
         let mut selection_indices = Vec::with_capacity(self.batch_capacity);
         let mut last_page_seen = None;
         let mut pages_touched = Vec::new();
         let mut prefetch_hints_issued = 0usize;
+        let mut row_count = 0usize;
+        let predicate = self.predicate.clone();
 
-        while rows.len() < self.batch_capacity {
+        while row_count < self.batch_capacity {
             if self.cursor.eof() {
                 self.finished = true;
                 break;
@@ -304,19 +309,30 @@ where
             }
 
             let rowid = self.cursor.rowid(&self.cx)?;
-            let payload = self.cursor.payload(&self.cx)?;
-            let row = parse_record(&payload).ok_or(VectorizedScanError::RecordDecode {
+            self.cursor.payload_into(&self.cx, &mut self.payload_buf)?;
+            let row = if row_count < self.row_buffers.len() {
+                &mut self.row_buffers[row_count]
+            } else {
+                self.row_buffers.push(Vec::new());
+                self.row_buffers
+                    .last_mut()
+                    .expect("row buffer push must yield a buffer")
+            };
+            parse_record_into(&self.payload_buf, row).ok_or(VectorizedScanError::RecordDecode {
                 rowid,
-                payload_len: payload.len(),
+                payload_len: self.payload_buf.len(),
             })?;
 
-            let row_index = rows.len();
-            if self.predicate_matches(rowid, &row) {
+            let row_index = row_count;
+            if predicate
+                .as_ref()
+                .is_none_or(|predicate| predicate(rowid, row))
+            {
                 let selected = u16::try_from(row_index)
                     .map_err(|_| VectorizedScanError::SelectionIndexOverflow(row_index))?;
                 selection_indices.push(selected);
             }
-            rows.push(row);
+            row_count += 1;
 
             if !self.cursor.next(&self.cx)? {
                 self.finished = true;
@@ -324,29 +340,27 @@ where
             }
         }
 
-        if rows.is_empty() {
+        if row_count == 0 {
             return Ok(None);
         }
 
-        let mut batch = Batch::from_rows(&rows, &self.specs, self.batch_capacity)?;
-        if selection_indices.len() != rows.len() {
+        let mut batch = Batch::from_rows(
+            &self.row_buffers[..row_count],
+            &self.specs,
+            self.batch_capacity,
+        )?;
+        if selection_indices.len() != row_count {
             batch.apply_selection(SelectionVector::from_indices(selection_indices))?;
         }
 
         let stats = ScanBatchStats {
-            rows_scanned: rows.len(),
+            rows_scanned: row_count,
             rows_selected: batch.selection().len(),
             pages_touched,
             prefetch_hints_issued,
         };
 
         Ok(Some(ScanBatch { batch, stats }))
-    }
-
-    fn predicate_matches(&self, rowid: i64, row: &[SqliteValue]) -> bool {
-        self.predicate
-            .as_ref()
-            .is_none_or(|predicate| predicate(rowid, row))
     }
 
     fn current_page_or_internal_error(&self) -> ScanResult<PageNumber> {
@@ -493,7 +507,10 @@ mod tests {
 
     use fsqlite_btree::{MemPageStore, PageReader};
     use fsqlite_types::WitnessKey;
-    use fsqlite_types::record::serialize_record;
+    use fsqlite_types::record::{
+        parse_record, record_profile_enabled, record_profile_snapshot, reset_record_profile,
+        serialize_record, set_record_profile_enabled,
+    };
 
     use super::*;
     use crate::vectorized::{ColumnSpec, ColumnVectorType, DEFAULT_BATCH_ROW_CAPACITY};
@@ -842,5 +859,71 @@ mod tests {
                 row_count: 1,
             } if column == "c0"
         ));
+    }
+
+    #[test]
+    fn scan_reuses_decode_scratch_and_avoids_full_record_parse_calls() {
+        let (io, root_page) = build_fixture(257);
+        let prev_record_profile_enabled = record_profile_enabled();
+        reset_record_profile();
+        set_record_profile_enabled(true);
+
+        let cx = Cx::new();
+        let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
+        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 64)
+            .expect("scan should initialize");
+
+        let first_batch = scan
+            .next_batch()
+            .expect("first batch should scan successfully")
+            .expect("first batch should exist");
+        assert_eq!(first_batch.stats.rows_scanned, 64);
+        let first_row_buf_ptr = scan.row_buffers[0].as_ptr() as usize;
+        let first_payload_buf_ptr = scan.payload_buf.as_ptr() as usize;
+
+        let second_batch = scan
+            .next_batch()
+            .expect("second batch should scan successfully")
+            .expect("second batch should exist");
+        assert_eq!(second_batch.stats.rows_scanned, 64);
+        assert_eq!(
+            scan.row_buffers[0].as_ptr() as usize,
+            first_row_buf_ptr,
+            "bead_id={BEAD_ID} first row buffer should be reused across batches"
+        );
+        assert_eq!(
+            scan.payload_buf.as_ptr() as usize,
+            first_payload_buf_ptr,
+            "bead_id={BEAD_ID} payload buffer should be reused across batches"
+        );
+
+        let mut total_rows = first_batch.stats.rows_scanned + second_batch.stats.rows_scanned;
+        while let Some(output) = scan
+            .next_batch()
+            .expect("scan should continue successfully")
+        {
+            total_rows += output.stats.rows_scanned;
+        }
+
+        let snapshot = record_profile_snapshot();
+        assert_eq!(total_rows, 257);
+        assert_eq!(
+            snapshot
+                .callsite_breakdown
+                .vdbe_vectorized_scan
+                .parse_record_calls,
+            0,
+            "bead_id={BEAD_ID} vectorized scan should avoid full parse_record calls"
+        );
+        assert_eq!(
+            snapshot
+                .callsite_breakdown
+                .vdbe_vectorized_scan
+                .parse_record_into_calls,
+            257,
+            "bead_id={BEAD_ID} vectorized scan should decode through reusable parse_record_into scratch"
+        );
+
+        set_record_profile_enabled(prev_record_profile_enabled);
     }
 }

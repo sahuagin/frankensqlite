@@ -666,6 +666,9 @@ pub struct GroupCommitConsolidator {
     next_epoch_batches: VecDeque<TransactionFrameBatch>,
     /// Total frames across next_epoch_batches.
     next_epoch_frame_count: usize,
+    /// Whether a promoted epoch in FILLING currently has pending work but no
+    /// explicitly claimed flusher because the previous flusher may have stopped.
+    promoted_epoch_flusher_vacant: bool,
 }
 
 impl GroupCommitConsolidator {
@@ -683,6 +686,7 @@ impl GroupCommitConsolidator {
             completed_epoch: 0,
             next_epoch_batches: VecDeque::new(),
             next_epoch_frame_count: 0,
+            promoted_epoch_flusher_vacant: false,
         }
     }
 
@@ -749,6 +753,7 @@ impl GroupCommitConsolidator {
 
         if is_first {
             self.filling_started = Some(Instant::now());
+            self.promoted_epoch_flusher_vacant = false;
         }
 
         self.pending_frame_count += batch.frame_count();
@@ -821,6 +826,7 @@ impl GroupCommitConsolidator {
         }
 
         self.phase = ConsolidationPhase::Flushing;
+        self.promoted_epoch_flusher_vacant = false;
         self.epoch += 1;
 
         let batches: Vec<_> = self.pending_batches.drain(..).collect();
@@ -844,8 +850,9 @@ impl GroupCommitConsolidator {
     ///
     /// Returns `Err` if not in FLUSHING phase.
     /// Returns `true` if pipelined batches were promoted and the caller
-    /// should flush again (the caller is the only thread that knows it
-    /// must be the flusher for the promoted epoch).
+    /// should flush again. If the original flusher does not continue,
+    /// a fresh submitter may explicitly claim the promoted epoch via
+    /// [`Self::claim_flusher_vacancy`].
     pub fn complete_flush(&mut self) -> Result<bool> {
         if self.phase != ConsolidationPhase::Flushing {
             return Err(FrankenError::Internal(format!(
@@ -864,6 +871,7 @@ impl GroupCommitConsolidator {
         // current flusher can immediately begin_flush() again.
         if self.next_epoch_batches.is_empty() {
             self.phase = ConsolidationPhase::Complete;
+            self.promoted_epoch_flusher_vacant = false;
             debug!(
                 target: "fsqlite_wal::group_commit",
                 epoch = self.epoch,
@@ -878,6 +886,7 @@ impl GroupCommitConsolidator {
             self.next_epoch_frame_count = 0;
             self.phase = ConsolidationPhase::Filling;
             self.filling_started = Some(Instant::now());
+            self.promoted_epoch_flusher_vacant = true;
 
             debug!(
                 target: "fsqlite_wal::group_commit",
@@ -894,6 +903,29 @@ impl GroupCommitConsolidator {
     #[must_use]
     pub fn has_pipelined_batches(&self) -> bool {
         !self.next_epoch_batches.is_empty()
+    }
+
+    /// Whether a promoted epoch in `Filling` currently needs an explicit
+    /// flusher claim before a replacement flusher takes over.
+    #[must_use]
+    pub const fn has_flusher_vacancy(&self) -> bool {
+        self.promoted_epoch_flusher_vacant
+    }
+
+    /// Claim the promoted-epoch flusher vacancy after the original flusher
+    /// stopped before calling `begin_flush()` again.
+    ///
+    /// Returns `true` if the caller successfully claimed the vacancy.
+    #[must_use]
+    pub fn claim_flusher_vacancy(&mut self) -> bool {
+        if self.phase == ConsolidationPhase::Filling
+            && self.promoted_epoch_flusher_vacant
+            && !self.pending_batches.is_empty()
+        {
+            self.promoted_epoch_flusher_vacant = false;
+            return true;
+        }
+        false
     }
 
     /// Abort the current flush after the flusher observed an I/O error.
@@ -918,12 +950,14 @@ impl GroupCommitConsolidator {
         if self.next_epoch_batches.is_empty() {
             self.phase = ConsolidationPhase::Complete;
             self.filling_started = None;
+            self.promoted_epoch_flusher_vacant = false;
         } else {
             self.pending_batches = std::mem::take(&mut self.next_epoch_batches);
             self.pending_frame_count = self.next_epoch_frame_count;
             self.next_epoch_frame_count = 0;
             self.phase = ConsolidationPhase::Filling;
             self.filling_started = Some(Instant::now());
+            self.promoted_epoch_flusher_vacant = true;
             // Keep filling_started set — promoted batches need the timeout
         }
 
@@ -941,6 +975,7 @@ impl GroupCommitConsolidator {
     fn transition_to_filling(&mut self) {
         self.phase = ConsolidationPhase::Filling;
         self.filling_started = None;
+        self.promoted_epoch_flusher_vacant = false;
         trace!(
             target: "fsqlite_wal::group_commit",
             epoch = self.epoch,
@@ -1131,18 +1166,27 @@ mod tests {
         assert_eq!(c.epoch(), 1);
         assert_eq!(c.pending_frame_count(), 0);
 
-        // Cannot submit during FLUSHING.
+        // Pipelined submissions during FLUSHING become waiters for the next epoch.
         let batch_extra = TransactionFrameBatch::new(vec![FrameSubmission {
             page_number: 10,
             page_data: sample_page(0x10),
             db_size_if_commit: 0,
         }]);
-        assert!(c.submit_batch(batch_extra).is_err());
+        assert_eq!(c.submit_batch(batch_extra).unwrap(), SubmitOutcome::Waiter);
 
-        // Complete flush: FLUSHING → COMPLETE.
-        c.complete_flush().unwrap();
-        assert_eq!(c.phase(), ConsolidationPhase::Complete);
+        // Complete flush: FLUSHING → FILLING with a promoted next epoch.
+        let promoted = c.complete_flush().unwrap();
+        assert!(promoted);
+        assert_eq!(c.phase(), ConsolidationPhase::Filling);
         assert_eq!(c.completed_epoch(), 1);
+        assert_eq!(c.pending_batch_count(), 1);
+        assert!(c.has_flusher_vacancy());
+
+        // The original flusher may continue immediately without an explicit claim.
+        let batches = c.begin_flush().unwrap();
+        assert_eq!(c.phase(), ConsolidationPhase::Flushing);
+        assert_eq!(c.epoch(), 2);
+        assert_eq!(batches.len(), 1);
     }
 
     #[test]
@@ -1237,7 +1281,7 @@ mod tests {
         c.begin_flush().unwrap();
         c.abort_flush().unwrap();
         assert_eq!(c.phase(), ConsolidationPhase::Complete);
-        assert_eq!(c.completed_epoch(), 1);
+        assert_eq!(c.completed_epoch(), 0);
 
         let outcome = c
             .submit_batch(TransactionFrameBatch::new(vec![FrameSubmission {
@@ -1250,6 +1294,63 @@ mod tests {
         assert_eq!(c.phase(), ConsolidationPhase::Filling);
         assert_eq!(c.pending_batch_count(), 1);
         assert_eq!(c.epoch(), 1);
+    }
+
+    #[test]
+    fn test_consolidator_promoted_epoch_exposes_flusher_takeover_claim_if_original_stops() {
+        let mut c = GroupCommitConsolidator::new(GroupCommitConfig::default());
+
+        let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: sample_page(0x01),
+            db_size_if_commit: 1,
+        }]);
+        assert_eq!(c.submit_batch(batch1).unwrap(), SubmitOutcome::Flusher);
+
+        let _flushing_batches = c.begin_flush().unwrap();
+        assert_eq!(c.epoch(), 1);
+        assert_eq!(c.phase(), ConsolidationPhase::Flushing);
+
+        let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 2,
+            page_data: sample_page(0x02),
+            db_size_if_commit: 2,
+        }]);
+        assert_eq!(
+            c.submit_batch(pipelined_batch).unwrap(),
+            SubmitOutcome::Waiter
+        );
+
+        let promoted = c.complete_flush().unwrap();
+        assert!(
+            promoted,
+            "pipelined epoch must be promoted back to FILLING for the next flush"
+        );
+        assert_eq!(c.phase(), ConsolidationPhase::Filling);
+        assert_eq!(c.pending_batch_count(), 1);
+        assert_eq!(c.pending_frame_count(), 1);
+        assert_eq!(c.epoch(), 1);
+        assert_eq!(c.completed_epoch(), 1);
+        assert!(c.has_flusher_vacancy());
+
+        let takeover_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 3,
+            page_data: sample_page(0x03),
+            db_size_if_commit: 3,
+        }]);
+        assert_eq!(
+            c.submit_batch(takeover_batch).unwrap(),
+            SubmitOutcome::Waiter,
+            "promoted work stays queued until someone explicitly claims the flusher vacancy"
+        );
+        assert!(c.claim_flusher_vacancy());
+        assert!(!c.has_flusher_vacancy());
+        assert!(!c.claim_flusher_vacancy());
+
+        let takeover_batches = c.begin_flush().unwrap();
+        assert_eq!(c.phase(), ConsolidationPhase::Flushing);
+        assert_eq!(c.epoch(), 2);
+        assert_eq!(takeover_batches.len(), 2);
     }
 
     // ── Consolidated write tests ──

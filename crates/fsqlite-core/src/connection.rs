@@ -5774,10 +5774,7 @@ impl Connection {
     pub fn rollback_transaction(&self) -> Result<()> {
         self.background_status()?;
         let cx = self.op_cx_after_background_status();
-        self.execute_rollback_with_cx(
-            &cx,
-            &fsqlite_ast::RollbackStatement { to_savepoint: None },
-        )
+        self.execute_rollback_with_cx(&cx, &fsqlite_ast::RollbackStatement { to_savepoint: None })
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
@@ -11627,6 +11624,7 @@ impl Connection {
                         self.txn_metrics_mark_finished();
                         // Invalidate read snapshot — it's stale after a write.
                         self.invalidate_cached_read_snapshot(cx);
+                        self.advance_commit_clock();
                         return Ok(());
                     }
                     Ok(false) => {} // Not retained — fall through to normal commit
@@ -25822,7 +25820,12 @@ impl Connection {
 
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
-        self.reload_memdb_from_txn_with_mode(cx, txn.as_mut(), bound_visible_commit_seq, hydrate_rows)
+        self.reload_memdb_from_txn_with_mode(
+            cx,
+            txn.as_mut(),
+            bound_visible_commit_seq,
+            hydrate_rows,
+        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -32124,14 +32127,24 @@ fn evaluate_having_value(
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(lv.to_integer().wrapping_shl(rv.to_integer() as u32))
+                        let shift = rv.to_integer();
+                        if shift < 0 || shift >= 64 {
+                            SqliteValue::Integer(0)
+                        } else {
+                            SqliteValue::Integer(lv.to_integer().wrapping_shl(shift as u32))
+                        }
                     }
                 }
                 fsqlite_ast::BinaryOp::ShiftRight => {
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(lv.to_integer().wrapping_shr(rv.to_integer() as u32))
+                        let shift = rv.to_integer();
+                        if shift < 0 || shift >= 64 {
+                            SqliteValue::Integer(0)
+                        } else {
+                            SqliteValue::Integer(lv.to_integer().wrapping_shr(shift as u32))
+                        }
                     }
                 }
                 _ => SqliteValue::Null,
@@ -38799,14 +38812,24 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
             if left.is_null() || right.is_null() {
                 SqliteValue::Null
             } else {
-                SqliteValue::Integer(left.to_integer().wrapping_shl(right.to_integer() as u32))
+                let shift = right.to_integer();
+                if shift < 0 || shift >= 64 {
+                    SqliteValue::Integer(0)
+                } else {
+                    SqliteValue::Integer(left.to_integer().wrapping_shl(shift as u32))
+                }
             }
         }
         BinaryOp::ShiftRight => {
             if left.is_null() || right.is_null() {
                 SqliteValue::Null
             } else {
-                SqliteValue::Integer(left.to_integer().wrapping_shr(right.to_integer() as u32))
+                let shift = right.to_integer();
+                if shift < 0 || shift >= 64 {
+                    SqliteValue::Integer(0)
+                } else {
+                    SqliteValue::Integer(left.to_integer().wrapping_shr(shift as u32))
+                }
             }
         }
     }
@@ -39586,6 +39609,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
         "zeroblob" => {
             let n = args.first().map_or(0, |v| v.to_integer().max(0)) as usize;
+            let n = n.min(fsqlite_types::limits::MAX_LENGTH as usize);
             SqliteValue::Blob(vec![0u8; n].into())
         }
         "round" => match args.first() {
@@ -70484,7 +70508,9 @@ mod pager_routing_tests {
         let conn1 = Connection::open(&db).unwrap();
         conn1.set_reject_mem_fallback(true);
         conn1.set_strict_mem_fallback_rejection(true);
-        conn1.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn1
+            .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+            .unwrap();
         conn1
             .execute("CREATE TABLE prep_pub_single (id INTEGER PRIMARY KEY, val TEXT);")
             .unwrap();
@@ -70495,7 +70521,9 @@ mod pager_routing_tests {
         let conn2 = Connection::open(&db).unwrap();
         conn2.set_reject_mem_fallback(true);
         conn2.set_strict_mem_fallback_rejection(true);
-        conn2.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn2
+            .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+            .unwrap();
         conn2
             .execute("INSERT INTO prep_pub_single VALUES (1, 'from_conn2');")
             .unwrap();
@@ -71105,13 +71133,19 @@ mod pager_routing_tests {
         conn_a.set_strict_mem_fallback_rejection(true);
         conn_b.set_reject_mem_fallback(true);
         conn_b.set_strict_mem_fallback_rejection(true);
-        conn_a.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
-        conn_b.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn_a
+            .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+            .unwrap();
+        conn_b
+            .execute("PRAGMA fsqlite.concurrent_mode=OFF;")
+            .unwrap();
         conn_a
             .execute("CREATE TABLE sw_begin_reload (id INTEGER PRIMARY KEY, val TEXT);")
             .unwrap();
 
-        let initial_rows = conn_b.query("SELECT val FROM sw_begin_reload ORDER BY id;").unwrap();
+        let initial_rows = conn_b
+            .query("SELECT val FROM sw_begin_reload ORDER BY id;")
+            .unwrap();
         assert!(initial_rows.is_empty(), "fresh table should start empty");
 
         conn_a
@@ -71119,8 +71153,14 @@ mod pager_routing_tests {
             .unwrap();
 
         conn_b.execute("BEGIN;").unwrap();
-        let rows = conn_b.query("SELECT val FROM sw_begin_reload ORDER BY id;").unwrap();
-        assert_eq!(rows.len(), 1, "serialized BEGIN should see the external commit");
+        let rows = conn_b
+            .query("SELECT val FROM sw_begin_reload ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "serialized BEGIN should see the external commit"
+        );
         assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
         conn_b.execute("ROLLBACK;").unwrap();
     }

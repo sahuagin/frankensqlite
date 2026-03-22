@@ -1335,7 +1335,7 @@ fn execute_batch_with_executor(
     let begin_started = Instant::now();
     executor
         .conn
-        .execute("BEGIN;")
+        .begin_transaction()
         .map_err(|err| classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin))?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
@@ -1378,9 +1378,13 @@ fn execute_batch_with_executor(
         }
     }
 
-    let finalize = if batch.commit { "COMMIT;" } else { "ROLLBACK;" };
     let finalize_started = Instant::now();
-    match executor.conn.execute(finalize) {
+    let finalize_result = if batch.commit {
+        executor.conn.commit_transaction()
+    } else {
+        executor.conn.rollback_transaction()
+    };
+    match finalize_result {
         Ok(_) => {
             let finalize_time_ns = duration_to_u64_ns(finalize_started.elapsed());
             if batch.commit {
@@ -1522,7 +1526,7 @@ fn run_records_with_retry(
 }
 
 fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
-    match conn.execute("ROLLBACK;") {
+    match conn.rollback_transaction() {
         Ok(_) | Err(FrankenError::NoActiveTransaction) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
@@ -1560,17 +1564,17 @@ impl<'conn> PreparedOpExecutor<'conn> {
             }
             OpKind::Begin => self
                 .conn
-                .execute("BEGIN;")
+                .begin_transaction()
                 .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Commit => self
                 .conn
-                .execute("COMMIT;")
+                .commit_transaction()
                 .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Rollback => self
                 .conn
-                .execute("ROLLBACK;")
+                .rollback_transaction()
                 .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
         }

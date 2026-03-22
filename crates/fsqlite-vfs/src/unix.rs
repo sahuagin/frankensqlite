@@ -1758,13 +1758,7 @@ impl VfsFile for UnixFile {
             if info.n_shared == 0 {
                 // Readers must pass through the PENDING byte so a waiting
                 // writer can block new SHARED acquisitions while upgrading.
-                if !posix_lock_with_timeout(
-                    &*info.file,
-                    libc::F_RDLCK,
-                    PENDING_BYTE,
-                    1,
-                    timeout,
-                )? {
+                if !posix_lock_with_timeout(&*info.file, libc::F_RDLCK, PENDING_BYTE, 1, timeout)? {
                     return Err(FrankenError::Busy);
                 }
                 let shared_locked = posix_lock_with_timeout(
@@ -1807,13 +1801,7 @@ impl VfsFile for UnixFile {
         // This blocks new shared-lock acquisitions from other processes.
         if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
             if info.n_pending == 0
-                && !posix_lock_with_timeout(
-                    &*info.file,
-                    libc::F_WRLCK,
-                    PENDING_BYTE,
-                    1,
-                    timeout,
-                )?
+                && !posix_lock_with_timeout(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1, timeout)?
             {
                 rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);

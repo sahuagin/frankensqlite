@@ -540,6 +540,15 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// writes, even if the transaction had previously upgraded to writer mode.
     fn has_pending_writes(&self) -> bool;
 
+    /// Visible commit sequence bound to this transaction's current snapshot.
+    ///
+    /// Pager-backed transactions can expose this so upper layers reuse the
+    /// transaction's own visibility boundary instead of re-binding against the
+    /// global published plane mid-transaction.
+    fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
+        None
+    }
+
     /// Return the full set of pages this transaction would mutate if it
     /// committed right now, including commit-time metadata synthesis such as
     /// freelist trunk rewrites.
