@@ -65,6 +65,15 @@ struct GroupCommitQueue {
     failed_epochs: Mutex<HashMap<u64, String>>,
 }
 
+#[derive(Debug)]
+enum WaitForEpochOutcome {
+    Completed,
+    TakeOverFlusher {
+        batches: Vec<TransactionFrameBatch>,
+        flush_epoch: u64,
+    },
+}
+
 impl GroupCommitQueue {
     fn new(config: GroupCommitConfig) -> Self {
         Self {
@@ -76,13 +85,28 @@ impl GroupCommitQueue {
     }
 
     /// Publish a completed epoch and wake all waiters.
+    ///
+    /// We take the consolidator mutex before publishing so a waiter cannot
+    /// observe an incomplete epoch, race with notify, and then go to sleep
+    /// forever on a lost wakeup.
     fn publish_completed_epoch(&self, epoch: u64) {
+        let _guard = self
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.completed_epoch.store(epoch, AtomicOrdering::Release);
         self.flush_complete.notify_all();
     }
 
     /// Publish a failed epoch and wake all waiters.
+    ///
+    /// This uses the same mutex discipline as `publish_completed_epoch` so
+    /// waiter condition checks and condvar parking stay synchronized.
     fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError) {
+        let _guard = self
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut failed_epochs = self
             .failed_epochs
             .lock()
@@ -97,12 +121,13 @@ impl GroupCommitQueue {
         self.completed_epoch.load(AtomicOrdering::Acquire) >= epoch
     }
 
-    /// Wait for the target epoch to either complete successfully or fail.
+    /// Wait for the target epoch to either complete successfully, fail, or be
+    /// taken over by this waiter if the promoted epoch lost its original flusher.
     fn wait_for_epoch_outcome(
         &self,
         mut guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
         target_epoch: u64,
-    ) -> Result<()> {
+    ) -> Result<WaitForEpochOutcome> {
         loop {
             let failed_detail = self
                 .failed_epochs
@@ -117,7 +142,18 @@ impl GroupCommitQueue {
             }
 
             if self.is_epoch_complete(target_epoch) {
-                return Ok(());
+                return Ok(WaitForEpochOutcome::Completed);
+            }
+
+            if guard.has_flusher_vacancy()
+                && guard.epoch().checked_add(1) == Some(target_epoch)
+                && guard.claim_flusher_vacancy()
+            {
+                let batches = guard.begin_flush()?;
+                return Ok(WaitForEpochOutcome::TakeOverFlusher {
+                    flush_epoch: guard.epoch(),
+                    batches,
+                });
             }
 
             guard = self
@@ -273,6 +309,11 @@ pub(crate) struct PagerInner<F: VfsFile> {
     // NOTE: wal_backend moved to SharedWalBackend on SimplePager/SimpleTransaction (D1-CRITICAL)
     /// Monotonic commit sequence for MVCC version tracking.
     commit_seq: CommitSeq,
+    /// Main database-file size observed when committed metadata was last fully
+    /// refreshed. A stable `(commit_seq, file_size)` pair lets later begins
+    /// skip the expensive committed-page metadata reload when no durable state
+    /// changed underneath this pager.
+    committed_db_file_size_bytes: u64,
 }
 
 impl<F: VfsFile> PagerInner<F> {
@@ -368,32 +409,75 @@ impl<F: VfsFile> PagerInner<F> {
         Ok(out)
     }
 
-    /// Read a page directly from the main database file, bypassing WAL state.
-    ///
-    /// WAL-mode refresh uses this to obtain the durable database-header
-    /// change-counter as the base commit sequence, then layers the visible WAL
-    /// commit count on top. Metadata such as db_size/freelist still comes from
-    /// [`Self::read_committed_page_copy`], which includes the current visible
-    /// WAL snapshot.
-    fn read_database_file_page_copy(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        let page_size = self.page_size.as_usize();
-        let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
-        let file_size = self.db_file.file_size(cx)?;
-        if offset >= file_size {
-            return Ok(vec![0_u8; page_size]);
+    /// Read just the database header bytes directly from the main database
+    /// file, bypassing WAL state.
+    fn read_database_file_header_bytes(
+        &self,
+        cx: &Cx,
+        file_size: u64,
+    ) -> Result<[u8; DATABASE_HEADER_SIZE]> {
+        if file_size == 0 {
+            return Ok([0_u8; DATABASE_HEADER_SIZE]);
         }
 
-        let mut out = vec![0_u8; page_size];
-        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
-        if bytes_read < page_size {
+        let mut out = [0_u8; DATABASE_HEADER_SIZE];
+        let bytes_read = self.db_file.read(cx, &mut out, 0)?;
+        if bytes_read < DATABASE_HEADER_SIZE {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "short read fetching database-file page {page}: got {bytes_read} of {page_size}",
-                    page = page_no.get()
+                    "short read fetching database-file header: got {bytes_read} of {DATABASE_HEADER_SIZE}"
                 ),
             });
         }
         Ok(out)
+    }
+
+    /// Probe the latest visible commit sequence using only durable header/WAL
+    /// metadata.
+    ///
+    /// This is intentionally cheaper than a full committed-state refresh: it
+    /// avoids page-1 materialization and freelist reconstruction unless the
+    /// visible state actually changed.
+    fn probe_visible_commit_seq(
+        &mut self,
+        cx: &Cx,
+        wal_backend: &SharedWalBackend,
+    ) -> Result<(CommitSeq, u64, bool)> {
+        let file_size = self.db_file.file_size(cx)?;
+        let wal_visible_commit_count = if self.journal_mode == JournalMode::Wal {
+            with_wal_backend(wal_backend, |wal| {
+                wal.begin_transaction(cx)?;
+                wal.committed_txn_count(cx)
+            })?
+        } else {
+            0
+        };
+        let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
+        let base_header_bytes = self.read_database_file_header_bytes(cx, file_size)?;
+        let base_change_counter = if self.journal_mode == JournalMode::Wal {
+            match DatabaseHeader::from_bytes(&base_header_bytes) {
+                Ok(base_header) => u64::from(base_header.change_counter),
+                Err(error) => stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "invalid database-file header during WAL refresh: {error}"
+                        ),
+                    })?,
+            }
+        } else {
+            u64::from(
+                DatabaseHeader::from_bytes(&base_header_bytes)
+                    .map_err(|error| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "invalid database header during pager refresh: {error}"
+                        ),
+                    })?
+                    .change_counter,
+            )
+        };
+        let visible_commit_seq =
+            CommitSeq::new(base_change_counter.saturating_add(wal_visible_commit_count));
+        Ok((visible_commit_seq, file_size, wal_snapshot_initialized))
     }
 
     /// Refresh connection-local pager metadata from the latest committed state.
@@ -406,15 +490,13 @@ impl<F: VfsFile> PagerInner<F> {
         cache: &ShardedPageCache,
         wal_backend: &SharedWalBackend,
     ) -> Result<bool> {
-        let wal_visible_commit_count = if self.journal_mode == JournalMode::Wal {
-            with_wal_backend(wal_backend, |wal| {
-                wal.begin_transaction(cx)?;
-                wal.committed_txn_count(cx)
-            })?
-        } else {
-            0
-        };
-        let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
+        let (new_commit_seq, current_file_size, wal_snapshot_initialized) =
+            self.probe_visible_commit_seq(cx, wal_backend)?;
+        if new_commit_seq == self.commit_seq
+            && current_file_size == self.committed_db_file_size_bytes
+        {
+            return Ok(wal_snapshot_initialized);
+        }
 
         let page1 = self.read_committed_page_copy(cx, wal_backend, PageNumber::ONE)?;
         if page1.len() < DATABASE_HEADER_SIZE {
@@ -467,37 +549,6 @@ impl<F: VfsFile> PagerInner<F> {
             2
         };
         self.freelist = freelist;
-
-        let wal_base_change_counter = if self.journal_mode == JournalMode::Wal {
-            let base_page1 = self.read_database_file_page_copy(cx, PageNumber::ONE)?;
-            if base_page1.len() < DATABASE_HEADER_SIZE {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "database-file page 1 too small for header during WAL refresh: got {}, need {}",
-                        base_page1.len(),
-                        DATABASE_HEADER_SIZE
-                    ),
-                });
-            }
-            let mut base_header_bytes = [0_u8; DATABASE_HEADER_SIZE];
-            base_header_bytes.copy_from_slice(&base_page1[..DATABASE_HEADER_SIZE]);
-            match DatabaseHeader::from_bytes(&base_header_bytes) {
-                Ok(base_header) => u64::from(base_header.change_counter),
-                Err(error) => {
-                    stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: format!(
-                                "invalid database-file header during WAL refresh: {error}"
-                            ),
-                        })?
-                }
-            }
-        } else {
-            u64::from(header.change_counter)
-        };
-
-        let new_commit_seq =
-            CommitSeq::new(wal_base_change_counter.saturating_add(wal_visible_commit_count));
         // Only clear the cache if the database was modified by another
         // connection. In WAL mode this uses the latest visible page-1
         // durable header baseline plus the visible WAL commit horizon.
@@ -505,6 +556,7 @@ impl<F: VfsFile> PagerInner<F> {
             cache.clear();
         }
         self.commit_seq = new_commit_seq;
+        self.committed_db_file_size_bytes = current_file_size;
 
         Ok(wal_snapshot_initialized)
     }
@@ -1623,22 +1675,15 @@ fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
         return Ok(false);
     }
 
-    let (wal_file, _) = match vfs.open(
+    // Probe WAL content with a write-capable handle first. On the Unix VFS,
+    // a READONLY-opened WAL can become the canonical inode-table fd, poisoning
+    // later writer paths with EBADF if they clone that descriptor.
+    let Ok((wal_file, _)) = vfs.open(
         cx,
         Some(&wal_path),
-        VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
-    ) {
-        Ok(opened) => opened,
-        Err(_) => {
-            let Ok(opened) = vfs.open(
-                cx,
-                Some(&wal_path),
-                VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
-            ) else {
-                return Ok(false);
-            };
-            opened
-        }
+        VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+    ) else {
+        return Ok(false);
     };
     let Ok(mut wal) = WalFile::open(cx, wal_file) else {
         return Ok(false);
@@ -2127,6 +2172,15 @@ where
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
+    }
+
+    /// Propagate the connection's busy-timeout to the underlying VFS file so
+    /// that `posix_lock` retries with backoff instead of returning BUSY
+    /// immediately on cross-process contention.
+    pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.db_file.set_busy_timeout_ms(ms);
+        }
     }
 
     /// Install a concrete WAL backend while preserving ownership on failure.
@@ -2647,6 +2701,7 @@ where
                 wal_commit_sync_policy: WalCommitSyncPolicy::PerCommit,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 commit_seq: initial_commit_seq,
+                committed_db_file_size_bytes: file_size,
             })),
             cache: Arc::new(cache),
             pool,
@@ -2781,6 +2836,7 @@ where
                 access_mode: PagerAccessMode::ReadOnly,
                 rollback_journal_recovery_state: RollbackJournalRecoveryState::Clean,
                 commit_seq: initial_commit_seq,
+                committed_db_file_size_bytes: file_size,
             })),
             cache: Arc::new(cache),
             pool,
@@ -3556,248 +3612,250 @@ where
             (outcome, epoch, lock_wait_us, flushing_wait)
         };
 
-        match outcome {
-            SubmitOutcome::Flusher => {
-                // Step 3a: FLUSHER path with epoch pipelining loop.
-                //
-                // The flusher writes all pending batches, then checks if
-                // threads submitted during the flush (pipelined to next
-                // epoch). If so, the flusher loops to write those too.
-                // This eliminates the 1-2.7ms flushing_wait bottleneck.
-                let mut is_first_iteration = true;
-                let mut arrival_wait_us: u64 = 0;
+        let run_flusher_loop = |mut record_initial_metrics: bool,
+                                mut needs_arrival_wait: bool,
+                                mut prefetched_flush: Option<(Vec<TransactionFrameBatch>, u64)>|
+         -> Result<()> {
+            let mut arrival_wait_us = 0u64;
 
-                'flusher_loop: loop {
-                    // Wait for more arrivals only on the first iteration,
-                    // and only if there aren't already multiple batches queued.
-                    // With epoch pipelining, batches accumulate during FLUSHING,
-                    // so subsequent iterations have batches pre-queued.
-                    if is_first_iteration {
-                        let t_arrival_wait_start = Instant::now();
-                        // Check if we already have enough batches to flush immediately.
-                        let already_full = {
-                            let consolidator = queue
-                                .consolidator
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            consolidator.pending_batch_count() > 1
-                                || consolidator.should_flush_now()
-                        };
-                        if !already_full {
-                            // Brief wait for concurrent submitters (reduced from 50µs to 20µs).
-                            let deadline = Instant::now() + Duration::from_micros(20);
-                            loop {
-                                let should_flush = {
-                                    let consolidator = queue
-                                        .consolidator
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    consolidator.should_flush_now()
-                                };
-                                if should_flush || Instant::now() >= deadline {
-                                    break;
-                                }
-                                std::hint::spin_loop();
+            'flusher_loop: loop {
+                if prefetched_flush.is_none() && needs_arrival_wait {
+                    let t_arrival_wait_start = Instant::now();
+                    let already_full = {
+                        let consolidator = queue
+                            .consolidator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        consolidator.pending_batch_count() > 1 || consolidator.should_flush_now()
+                    };
+                    if !already_full {
+                        let deadline = Instant::now() + Duration::from_micros(20);
+                        loop {
+                            let should_flush = {
+                                let consolidator = queue
+                                    .consolidator
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                consolidator.should_flush_now()
+                            };
+                            if should_flush || Instant::now() >= deadline {
+                                break;
                             }
+                            std::hint::spin_loop();
                         }
-                        arrival_wait_us = Instant::now()
-                            .duration_since(t_arrival_wait_start)
-                            .as_micros() as u64;
                     }
+                    arrival_wait_us = Instant::now()
+                        .duration_since(t_arrival_wait_start)
+                        .as_micros() as u64;
+                }
 
-                    // Transition to FLUSHING phase and take all pending batches.
-                    let (batches, flush_epoch) = {
+                let (batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
+                    prefetched
+                } else {
+                    let maybe_flush = {
                         let mut consolidator = queue
                             .consolidator
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let batches = consolidator.begin_flush()?;
-                        (batches, consolidator.epoch())
+                        if !record_initial_metrics
+                            && consolidator.phase() != fsqlite_wal::ConsolidationPhase::Filling
+                        {
+                            None
+                        } else {
+                            let batches = consolidator.begin_flush()?;
+                            Some((batches, consolidator.epoch()))
+                        }
                     };
+                    let Some(flush) = maybe_flush else {
+                        break;
+                    };
+                    flush
+                };
 
-                    // Build WalFrameRef slice from all batches.
-                    let all_frames: Vec<&FrameSubmission> =
-                        batches.iter().flat_map(|b| &b.frames).collect();
-                    let frame_refs: Vec<traits::WalFrameRef<'_>> = all_frames
-                        .iter()
-                        .map(|f| traits::WalFrameRef {
-                            page_number: f.page_number,
-                            page_data: &f.page_data,
-                            db_size_if_commit: f.db_size_if_commit,
-                        })
-                        .collect();
+                let all_frames: Vec<&FrameSubmission> =
+                    batches.iter().flat_map(|batch| &batch.frames).collect();
+                let frame_refs: Vec<traits::WalFrameRef<'_>> = all_frames
+                    .iter()
+                    .map(|frame| traits::WalFrameRef {
+                        page_number: frame.page_number,
+                        page_data: &frame.page_data,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    })
+                    .collect();
 
-                    let _prepared_batch = with_wal_backend(wal_backend, |wal| {
-                        wal.prepare_append_frames(&frame_refs)
-                    })?;
+                let _prepared_batch =
+                    with_wal_backend(wal_backend, |wal| wal.prepare_append_frames(&frame_refs))?;
 
-                    // Compute final db_size: max of all commit frame db_size values.
-                    let final_db_size = all_frames
-                        .iter()
-                        .map(|f| f.db_size_if_commit)
-                        .filter(|&s| s > 0)
-                        .max()
-                        .unwrap_or(current_db_size);
+                let final_db_size = all_frames
+                    .iter()
+                    .map(|frame| frame.db_size_if_commit)
+                    .filter(|&size| size > 0)
+                    .max()
+                    .unwrap_or(current_db_size);
 
-                    // Record metrics.
-                    let batch_count = batches.len();
-                    let frame_count = frame_refs.len();
-                    GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
-                        u64::try_from(batch_count).unwrap_or(u64::MAX),
-                        AtomicOrdering::Relaxed,
-                    );
+                let batch_count = batches.len();
+                let frame_count = frame_refs.len();
+                GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
+                    u64::try_from(batch_count).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
 
-                    // Retry with exponential backoff on Busy errors.
-                    const MAX_FLUSH_RETRIES: u32 = 10;
-                    let mut flush_result: Result<()> = Ok(());
-                    let mut inner_lock_wait_us: u64 = 0;
-                    let mut exclusive_lock_us: u64 = 0;
-                    let mut wal_append_us: u64 = 0;
-                    let mut wal_sync_us: u64 = 0;
+                const MAX_FLUSH_RETRIES: u32 = 10;
+                let mut flush_result: Result<()> = Ok(());
+                let mut inner_lock_wait_us: u64 = 0;
+                let mut exclusive_lock_us: u64 = 0;
+                let mut wal_append_us: u64 = 0;
+                let mut wal_sync_us: u64 = 0;
 
-                    for attempt in 0..MAX_FLUSH_RETRIES {
-                        let t_inner_lock_start = Instant::now();
-                        flush_result = (|| -> Result<()> {
-                            let mut inner = inner_arc.lock().map_err(|_| {
-                                FrankenError::internal("SimpleTransaction lock poisoned")
+                for attempt in 0..MAX_FLUSH_RETRIES {
+                    let t_inner_lock_start = Instant::now();
+                    flush_result = (|| -> Result<()> {
+                        let mut inner = inner_arc.lock().map_err(|_| {
+                            FrankenError::internal("SimpleTransaction lock poisoned")
+                        })?;
+                        inner_lock_wait_us = Instant::now()
+                            .duration_since(t_inner_lock_start)
+                            .as_micros() as u64;
+
+                        let t_excl_start = Instant::now();
+                        inner.db_file.lock(cx, LockLevel::Exclusive)?;
+                        exclusive_lock_us =
+                            Instant::now().duration_since(t_excl_start).as_micros() as u64;
+
+                        let t_append_start = Instant::now();
+                        let flush_io_result = (|| -> Result<()> {
+                            with_wal_backend(wal_backend, |wal| {
+                                wal.append_frames(cx, &frame_refs)
                             })?;
-                            inner_lock_wait_us = Instant::now()
-                                .duration_since(t_inner_lock_start)
-                                .as_micros()
-                                as u64;
+                            wal_append_us =
+                                Instant::now().duration_since(t_append_start).as_micros() as u64;
 
-                            let t_excl_start = Instant::now();
-                            inner.db_file.lock(cx, LockLevel::Exclusive)?;
-                            exclusive_lock_us =
-                                Instant::now().duration_since(t_excl_start).as_micros() as u64;
-
-                            let t_append_start = Instant::now();
-                            let flush_io_result = (|| -> Result<()> {
-                                with_wal_backend(wal_backend, |wal| {
-                                    wal.append_frames(cx, &frame_refs)
-                                })?;
-                                wal_append_us =
-                                    Instant::now().duration_since(t_append_start).as_micros()
-                                        as u64;
-
-                                if sync_policy.should_sync_on_commit() {
-                                    let t_sync_start = Instant::now();
-                                    with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
-                                    wal_sync_us =
-                                        Instant::now().duration_since(t_sync_start).as_micros()
-                                            as u64;
-                                    GLOBAL_CONSOLIDATION_METRICS
-                                        .fsyncs_total
-                                        .fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-
-                                inner.db_size = final_db_size;
-                                Ok(())
-                            })();
-
-                            let restore_result = inner.db_file.unlock(cx, LockLevel::Reserved);
-                            match (flush_io_result, restore_result) {
-                                (Ok(()), Ok(())) => Ok(()),
-                                (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-                                (Err(e1), Err(e2)) => Err(FrankenError::internal(format!(
-                                    "flush failed and could not restore RESERVED lock: flush={e1}; restore={e2}"
-                                ))),
+                            if sync_policy.should_sync_on_commit() {
+                                let t_sync_start = Instant::now();
+                                with_wal_backend(wal_backend, |wal| wal.sync(cx))?;
+                                wal_sync_us =
+                                    Instant::now().duration_since(t_sync_start).as_micros() as u64;
+                                GLOBAL_CONSOLIDATION_METRICS
+                                    .fsyncs_total
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
                             }
+
+                            inner.db_size = final_db_size;
+                            Ok(())
                         })();
 
-                        match &flush_result {
-                            Err(
-                                FrankenError::Busy
-                                | FrankenError::BusyRecovery
-                                | FrankenError::BusySnapshot { .. },
-                            ) if attempt + 1 < MAX_FLUSH_RETRIES => {
-                                let base_delay_ms = 1u64 << attempt;
-                                let jitter_nanos =
-                                    std::time::Instant::now().elapsed().subsec_nanos() as u64;
-                                let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
-                                let delay_ms = base_delay_ms.saturating_add(jitter_ms);
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                                GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
+                        let restore_result = inner.db_file.unlock(cx, LockLevel::Reserved);
+                        match (flush_io_result, restore_result) {
+                            (Ok(()), Ok(())) => Ok(()),
+                            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                            (Err(flush_error), Err(restore_error)) => {
+                                Err(FrankenError::internal(format!(
+                                    "flush failed and could not restore RESERVED lock: flush={flush_error}; restore={restore_error}"
+                                )))
                             }
-                            _ => break,
                         }
-                    }
+                    })();
 
-                    match flush_result {
-                        Ok(()) => {
-                            GLOBAL_CONSOLIDATION_METRICS
-                                .groups_flushed
-                                .fetch_add(1, AtomicOrdering::Relaxed);
-                            GLOBAL_CONSOLIDATION_METRICS.frames_consolidated.fetch_add(
+                    match &flush_result {
+                        Err(
+                            FrankenError::Busy
+                            | FrankenError::BusyRecovery
+                            | FrankenError::BusySnapshot { .. },
+                        ) if attempt + 1 < MAX_FLUSH_RETRIES => {
+                            let base_delay_ms = 1u64 << attempt;
+                            let jitter_nanos =
+                                std::time::Instant::now().elapsed().subsec_nanos() as u64;
+                            let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
+                            let delay_ms = base_delay_ms.saturating_add(jitter_ms);
+                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
+                        }
+                        _ => break,
+                    }
+                }
+
+                match flush_result {
+                    Ok(()) => {
+                        GLOBAL_CONSOLIDATION_METRICS
+                            .groups_flushed
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        GLOBAL_CONSOLIDATION_METRICS.frames_consolidated.fetch_add(
+                            u64::try_from(frame_count).unwrap_or(u64::MAX),
+                            AtomicOrdering::Relaxed,
+                        );
+                        GLOBAL_CONSOLIDATION_METRICS
+                            .max_group_size_observed
+                            .fetch_max(
                                 u64::try_from(frame_count).unwrap_or(u64::MAX),
                                 AtomicOrdering::Relaxed,
                             );
-                            GLOBAL_CONSOLIDATION_METRICS
-                                .max_group_size_observed
-                                .fetch_max(
-                                    u64::try_from(frame_count).unwrap_or(u64::MAX),
-                                    AtomicOrdering::Relaxed,
-                                );
 
-                            // Record phase timing for flusher
-                            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                                if is_first_iteration { prepare_us } else { 0 },
-                                if is_first_iteration {
-                                    consolidator_lock_wait_us
-                                } else {
-                                    0
-                                },
-                                flushing_wait_us,
-                                true, // is_flusher
-                                arrival_wait_us,
-                                inner_lock_wait_us,
-                                exclusive_lock_us,
-                                wal_append_us,
-                                wal_sync_us,
-                                0, // waiter_epoch_wait_us (N/A for flusher)
-                            );
+                        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                            if record_initial_metrics {
+                                prepare_us
+                            } else {
+                                0
+                            },
+                            if record_initial_metrics {
+                                consolidator_lock_wait_us
+                            } else {
+                                0
+                            },
+                            flushing_wait_us,
+                            true,
+                            arrival_wait_us,
+                            inner_lock_wait_us,
+                            exclusive_lock_us,
+                            wal_append_us,
+                            wal_sync_us,
+                            0,
+                        );
 
-                            // Complete flush, check for pipelined batches.
-                            let (completed_epoch, has_promoted) = {
-                                let mut consolidator = queue
-                                    .consolidator
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let promoted = consolidator.complete_flush()?;
-                                (consolidator.epoch(), promoted)
-                            };
+                        let (completed_epoch, has_promoted) = {
+                            let mut consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let promoted = consolidator.complete_flush()?;
+                            (consolidator.epoch(), promoted)
+                        };
 
-                            // Notify waiters for this epoch.
-                            queue.publish_completed_epoch(completed_epoch);
+                        queue.publish_completed_epoch(completed_epoch);
 
-                            // If pipelined batches were promoted, loop to flush them.
-                            // Those threads are waiting for the NEXT epoch.
-                            if has_promoted {
-                                is_first_iteration = false;
-                                arrival_wait_us = 0;
-                                continue 'flusher_loop;
-                            }
-                        }
-                        Err(error) => {
-                            let abort_result = {
-                                let mut consolidator = queue
-                                    .consolidator
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                consolidator.abort_flush()
-                            };
-                            queue.publish_failed_epoch(flush_epoch, &error);
-                            if let Err(abort_error) = abort_result {
-                                return Err(FrankenError::internal(format!(
-                                    "group commit flush failed for epoch {flush_epoch} and abort_flush also failed: flush={error}; abort={abort_error}"
-                                )));
-                            }
-                            return Err(error);
+                        if has_promoted {
+                            record_initial_metrics = false;
+                            needs_arrival_wait = false;
+                            arrival_wait_us = 0;
+                            continue 'flusher_loop;
                         }
                     }
+                    Err(error) => {
+                        let abort_result = {
+                            let mut consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            consolidator.abort_flush()
+                        };
+                        queue.publish_failed_epoch(flush_epoch, &error);
+                        if let Err(abort_error) = abort_result {
+                            return Err(FrankenError::internal(format!(
+                                "group commit flush failed for epoch {flush_epoch} and abort_flush also failed: flush={error}; abort={abort_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                }
 
-                    break; // No promoted batches, done
-                } // end 'flusher_loop
+                break;
+            }
+
+            Ok(())
+        };
+
+        match outcome {
+            SubmitOutcome::Flusher => {
+                run_flusher_loop(true, true, None)?;
             }
 
             SubmitOutcome::Waiter => {
@@ -3816,26 +3874,37 @@ where
                     .consolidator
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                queue.wait_for_epoch_outcome(guard, target_epoch)?;
+                let wait_outcome = queue.wait_for_epoch_outcome(guard, target_epoch)?;
                 let waiter_epoch_wait_us =
                     Instant::now().duration_since(t_waiter_start).as_micros() as u64;
 
-                // Record phase timing for waiter
-                GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                    prepare_us,
-                    consolidator_lock_wait_us,
-                    flushing_wait_us,
-                    false, // is_flusher
-                    0,     // arrival_wait_us (N/A for waiter)
-                    0,     // inner_lock_wait_us (N/A for waiter)
-                    0,     // exclusive_lock_us (N/A for waiter)
-                    0,     // wal_append_us (N/A for waiter)
-                    0,     // wal_sync_us (N/A for waiter)
-                    waiter_epoch_wait_us,
-                );
+                match wait_outcome {
+                    WaitForEpochOutcome::Completed => {
+                        // Record phase timing for waiter
+                        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                            prepare_us,
+                            consolidator_lock_wait_us,
+                            flushing_wait_us,
+                            false, // is_flusher
+                            0,     // arrival_wait_us (N/A for waiter)
+                            0,     // inner_lock_wait_us (N/A for waiter)
+                            0,     // exclusive_lock_us (N/A for waiter)
+                            0,     // wal_append_us (N/A for waiter)
+                            0,     // wal_sync_us (N/A for waiter)
+                            waiter_epoch_wait_us,
+                        );
 
-                // The flusher already updated inner.db_size.
-                // Our frames are now durable in the WAL.
+                        // The flusher already updated inner.db_size.
+                        // Our frames are now durable in the WAL.
+                    }
+                    WaitForEpochOutcome::TakeOverFlusher {
+                        batches,
+                        flush_epoch,
+                    } => {
+                        let _ = waiter_epoch_wait_us;
+                        run_flusher_loop(true, false, Some((batches, flush_epoch)))?;
+                    }
+                }
             }
         }
 
@@ -4449,6 +4518,9 @@ where
                 inner.db_size = committed_db_size;
             }
             inner.commit_seq = inner.commit_seq.next();
+            if let Ok(file_size) = inner.db_file.file_size(cx) {
+                inner.committed_db_file_size_bytes = file_size;
+            }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
@@ -4638,6 +4710,9 @@ where
                 inner.db_size = committed_db_size;
             }
             inner.commit_seq = inner.commit_seq.next();
+            if let Ok(file_size) = inner.db_file.file_size(cx) {
+                inner.committed_db_file_size_bytes = file_size;
+            }
             // NOTE: We intentionally do NOT decrement active_transactions or
             // set writer_active=false — the transaction stays "active" for reuse.
             let publish_update = PublishedPagerUpdate {
@@ -4677,6 +4752,10 @@ where
 
     fn has_pending_writes(&self) -> bool {
         !self.write_set.is_empty() || self.freelist_metadata_dirty()
+    }
+
+    fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
+        Some(self.published_visible_commit_seq.get())
     }
 
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
@@ -5371,6 +5450,7 @@ mod tests {
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     const BEAD_ID: &str = "bd-bca.1";
@@ -5402,6 +5482,16 @@ mod tests {
         let path = PathBuf::from("/test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, path)
+    }
+
+    fn sample_page(seed: u8) -> Vec<u8> {
+        let page_size = PageSize::DEFAULT.as_usize();
+        let mut page = vec![0u8; page_size];
+        for (i, byte) in page.iter_mut().enumerate() {
+            let reduced = u8::try_from(i % 251).expect("modulo fits u8");
+            *byte = reduced ^ seed;
+        }
+        page
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -5531,6 +5621,67 @@ mod tests {
                     "simulated journal delete failure".to_owned(),
                 ));
             }
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct WalReadonlyFallbackProbeVfs {
+        inner: MemoryVfs,
+        readonly_wal_open_attempted: Arc<AtomicBool>,
+    }
+
+    impl WalReadonlyFallbackProbeVfs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                readonly_wal_open_attempted: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn readonly_wal_open_attempted(&self) -> bool {
+            self.readonly_wal_open_attempted
+                .load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl Vfs for WalReadonlyFallbackProbeVfs {
+        type File = MemoryFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&std::path::Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let is_wal = flags.contains(VfsOpenFlags::WAL);
+            if is_wal && flags.contains(VfsOpenFlags::READONLY) {
+                self.readonly_wal_open_attempted
+                    .store(true, AtomicOrdering::Relaxed);
+            }
+            if is_wal && flags.contains(VfsOpenFlags::READWRITE) {
+                return Err(FrankenError::CannotOpen {
+                    path: path
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("<wal-probe>")),
+                });
+            }
+            self.inner.open(cx, path, flags)
+        }
+
+        fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
             self.inner.delete(cx, path, sync_dir)
         }
 
@@ -7885,6 +8036,7 @@ mod tests {
         begin_calls: SharedCounter,
         batch_calls: SharedCounter,
         sync_calls: SharedCounter,
+        read_page_calls: SharedCounter,
     }
 
     impl MockWalBackend {
@@ -7893,12 +8045,14 @@ mod tests {
             let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames: StdArc::clone(&frames),
                     begin_calls: StdArc::clone(&begin_calls),
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls,
+                    read_page_calls,
                 },
                 frames,
                 begin_calls,
@@ -7917,12 +8071,14 @@ mod tests {
             let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames: StdArc::clone(&frames),
                     begin_calls: StdArc::clone(&begin_calls),
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls: StdArc::clone(&sync_calls),
+                    read_page_calls,
                 },
                 frames,
                 begin_calls,
@@ -7935,15 +8091,44 @@ mod tests {
             let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames,
                     begin_calls: StdArc::clone(&begin_calls),
                     batch_calls: StdArc::clone(&batch_calls),
                     sync_calls,
+                    read_page_calls,
                 },
                 begin_calls,
                 batch_calls,
+            )
+        }
+
+        fn new_with_read_tracking() -> (
+            Self,
+            SharedFrames,
+            SharedCounter,
+            SharedCounter,
+            SharedCounter,
+        ) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let sync_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let read_page_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    begin_calls: StdArc::clone(&begin_calls),
+                    batch_calls: StdArc::clone(&batch_calls),
+                    sync_calls,
+                    read_page_calls: StdArc::clone(&read_page_calls),
+                },
+                frames,
+                begin_calls,
+                batch_calls,
+                read_page_calls,
             )
         }
     }
@@ -8793,6 +8978,7 @@ mod tests {
             _cx: &Cx,
             page_number: u32,
         ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            *self.read_page_calls.lock().unwrap() += 1;
             let frames = self.frames.lock().unwrap();
             // Scan backwards for the latest version of the page.
             let result = frames
@@ -9119,6 +9305,24 @@ mod tests {
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
         (pager, frames, begin_calls, batch_calls)
+    }
+
+    fn wal_pager_with_read_tracking() -> (
+        SimplePager<MemoryVfs>,
+        SharedFrames,
+        SharedCounter,
+        SharedCounter,
+        SharedCounter,
+    ) {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_read_tracking.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, begin_calls, batch_calls, read_page_calls) =
+            MockWalBackend::new_with_read_tracking();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        (pager, frames, begin_calls, batch_calls, read_page_calls)
     }
 
     fn wal_pager_pair_with_shared_backend()
@@ -9884,7 +10088,107 @@ mod tests {
             .consolidator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.wait_for_epoch_outcome(guard, 2).unwrap();
+        assert!(matches!(
+            queue.wait_for_epoch_outcome(guard, 2).unwrap(),
+            WaitForEpochOutcome::Completed
+        ));
+    }
+
+    #[test]
+    fn test_group_commit_queue_publish_synchronizes_with_waiter_mutex() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let publish_queue = Arc::clone(&queue);
+
+        let handle = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("publisher thread should signal start");
+            publish_queue.publish_completed_epoch(1);
+            done_tx
+                .send(())
+                .expect("publisher thread should signal completion");
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("publisher thread should start while waiter holds the mutex");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=group_commit_publish_must_block_behind_waiter_mutex"
+        );
+
+        drop(guard);
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("publisher thread should complete once the waiter mutex is released");
+        handle.join().unwrap();
+
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(
+            queue.wait_for_epoch_outcome(guard, 1).unwrap(),
+            WaitForEpochOutcome::Completed
+        ));
+    }
+
+    #[test]
+    fn test_group_commit_queue_waiter_takes_over_promoted_epoch_vacancy() {
+        let queue = GroupCommitQueue::new(GroupCommitConfig::default());
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x01),
+                db_size_if_commit: 1,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(batch1).unwrap(),
+                SubmitOutcome::Flusher
+            );
+            let _ = consolidator.begin_flush().unwrap();
+            let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x02),
+                db_size_if_commit: 2,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(pipelined_batch).unwrap(),
+                SubmitOutcome::Waiter
+            );
+            assert!(consolidator.complete_flush().unwrap());
+        }
+
+        queue.publish_completed_epoch(1);
+
+        let guard = queue
+            .consolidator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = queue.wait_for_epoch_outcome(guard, 2).unwrap();
+        let WaitForEpochOutcome::TakeOverFlusher {
+            flush_epoch,
+            batches,
+        } = outcome
+        else {
+            panic!("promoted epoch waiter should take over the flusher vacancy");
+        };
+        assert_eq!(flush_epoch, 2);
+        assert_eq!(batches.len(), 1);
     }
 
     #[test]
@@ -10817,6 +11121,48 @@ mod tests {
             frames.lock().unwrap().len(),
             0,
             "bead_id={BEAD_ID} case=wal_rollback_no_frames"
+        );
+    }
+
+    #[test]
+    fn test_wal_begin_skips_committed_page1_reload_when_seq_and_file_size_hold() {
+        let (pager, frames, _, _, read_page_calls) = wal_pager_with_read_tracking();
+        let cx = Cx::new();
+
+        let page1 = {
+            let inner = pager.inner.lock().unwrap();
+            let mut page = vec![0_u8; inner.page_size.as_usize()];
+            let bytes_read = inner.db_file.read(&cx, &mut page, 0).unwrap();
+            assert_eq!(
+                bytes_read,
+                inner.page_size.as_usize(),
+                "bead_id={BEAD_ID} case=wal_begin_read_tracking_reads_page1"
+            );
+            page
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, PageNumber::ONE, &page1).unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert!(
+            frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(page_number, _, _)| *page_number == PageNumber::ONE.get()),
+            "bead_id={BEAD_ID} case=wal_begin_read_tracking_commits_page1_into_wal"
+        );
+
+        let read_page_calls_before_begin = *read_page_calls.lock().unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let read_page_calls_after_begin = *read_page_calls.lock().unwrap();
+        drop(reader);
+
+        assert_eq!(
+            read_page_calls_after_begin,
+            read_page_calls_before_begin,
+            "bead_id={BEAD_ID} case=wal_begin_skips_page1_reload_when_commit_seq_and_file_size_match"
         );
     }
 
@@ -13219,6 +13565,46 @@ mod tests {
         assert!(
             recoverable,
             "recovery must use the committed WAL horizon, not an uncommitted tail frame"
+        );
+    }
+
+    #[test]
+    fn test_stale_main_header_recovery_never_falls_back_to_readonly_wal_probe() {
+        let cx = Cx::new();
+        let vfs = WalReadonlyFallbackProbeVfs::new();
+        let db_path = PathBuf::from("/stale-main-header-readonly-fallback.db");
+        let wal_path = PathBuf::from("/stale-main-header-readonly-fallback.db-wal");
+        let page_size = PageSize::DEFAULT;
+
+        let valid_header = DatabaseHeader {
+            page_size,
+            page_count: 1,
+            ..DatabaseHeader::default()
+        };
+        let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
+        stale_header_bytes[44..48].fill(0);
+        let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
+            .expect_err("schema format 0 must be treated as a stale main-file header");
+
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (mut wal_file, _) = vfs.inner.open(&cx, Some(&wal_path), open_flags).unwrap();
+        wal_file.close(&cx).unwrap();
+
+        let recoverable = stale_main_header_can_be_recovered_from_live_wal(
+            &cx,
+            &vfs,
+            &db_path,
+            &stale_header_bytes,
+            &stale_error,
+        )
+        .expect("probe stale-header recovery");
+        assert!(
+            !recoverable,
+            "readwrite probe failure must stop recovery instead of retrying READONLY"
+        );
+        assert!(
+            !vfs.readonly_wal_open_attempted(),
+            "bead_id={BEAD_ID} case=stale_header_recovery_must_not_probe_wal_readonly"
         );
     }
 

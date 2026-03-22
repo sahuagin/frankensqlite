@@ -174,6 +174,16 @@ pub trait VfsFile: Send + Sync {
     /// the underlying SHM file.
     /// (Equivalent to sqlite3_io_methods.xShmUnmap)
     fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()>;
+
+    /// Set the busy-timeout for cross-process file-lock contention.
+    ///
+    /// When `ms > 0`, the VFS should retry `F_SETLK` with exponential
+    /// backoff instead of returning `SQLITE_BUSY` immediately on
+    /// `EAGAIN`/`EACCES`. A value of `0` disables retries (fail-fast).
+    ///
+    /// Default implementation is a no-op (memory and stub VFS backends
+    /// have no OS-level lock contention).
+    fn set_busy_timeout_ms(&mut self, _ms: u64) {}
 }
 
 #[cfg(test)]

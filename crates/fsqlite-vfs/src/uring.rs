@@ -843,6 +843,10 @@ impl VfsFile for IoUringFile {
     fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
         self.inner.shm_unmap(cx, delete)
     }
+
+    fn set_busy_timeout_ms(&mut self, ms: u64) {
+        self.inner.set_busy_timeout_ms(ms);
+    }
 }
 
 #[cfg(test)]

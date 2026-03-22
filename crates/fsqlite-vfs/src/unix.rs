@@ -25,6 +25,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
@@ -265,6 +266,56 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
             Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
             Err(e) => return Err(FrankenError::Io(e.into())),
         }
+    }
+}
+
+/// Like [`posix_lock`], but retries with exponential backoff when the lock
+/// would block (`EAGAIN`/`EACCES`) and a non-zero `timeout` is provided.
+///
+/// The backoff starts at 1 ms and doubles each iteration, capped at 100 ms,
+/// matching the strategy used by C SQLite's busy handler. If the cumulative
+/// elapsed time exceeds `timeout`, the function gives up and returns
+/// `Ok(false)`.
+///
+/// When `timeout` is zero the function delegates directly to [`posix_lock`]
+/// with no retry, preserving the original fail-fast behavior.
+fn posix_lock_with_timeout(
+    file: &impl AsFd,
+    lock_type: impl Into<i32> + Copy,
+    start: u64,
+    len: u64,
+    timeout: Duration,
+) -> Result<bool> {
+    // Fast path: no timeout configured -- fail immediately on contention.
+    if timeout.is_zero() {
+        return posix_lock(file, lock_type, start, len);
+    }
+
+    // First attempt -- no sleeping.
+    if posix_lock(file, lock_type, start, len)? {
+        return Ok(true);
+    }
+
+    let started = Instant::now();
+    let mut backoff = Duration::from_millis(1);
+    let max_backoff = Duration::from_millis(100);
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Ok(false);
+        }
+
+        // Sleep for the lesser of `backoff` and the remaining budget.
+        let remaining = timeout - elapsed;
+        std::thread::sleep(backoff.min(remaining));
+
+        if posix_lock(file, lock_type, start, len)? {
+            return Ok(true);
+        }
+
+        // Exponential backoff, capped at 100 ms.
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -643,6 +694,7 @@ impl Vfs for UnixVfs {
                         shm_owner_id: next_shm_owner_id(),
                         shm_path,
                         shm_info: None,
+                        busy_timeout_ms: 0,
                     };
 
                     let mut out_flags = flags;
@@ -706,6 +758,7 @@ impl Vfs for UnixVfs {
             shm_owner_id: next_shm_owner_id(),
             shm_path,
             shm_info: None,
+            busy_timeout_ms: 0,
         };
 
         Ok((unix_file, out_flags))
@@ -817,6 +870,10 @@ pub struct UnixFile {
     shm_owner_id: u64,
     shm_path: PathBuf,
     shm_info: Option<Arc<Mutex<ShmInfo>>>,
+    /// Busy timeout for cross-process lock contention (milliseconds).
+    /// When > 0, `posix_lock` retries with exponential backoff instead of
+    /// returning `Ok(false)` immediately on `EAGAIN`/`EACCES`.
+    busy_timeout_ms: u64,
 }
 
 impl UnixFile {
@@ -1664,6 +1721,7 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
+        let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
         let mut info = self
             .inode_info
@@ -1700,11 +1758,22 @@ impl VfsFile for UnixFile {
             if info.n_shared == 0 {
                 // Readers must pass through the PENDING byte so a waiting
                 // writer can block new SHARED acquisitions while upgrading.
-                if !posix_lock(&*info.file, libc::F_RDLCK, PENDING_BYTE, 1)? {
+                if !posix_lock_with_timeout(
+                    &*info.file,
+                    libc::F_RDLCK,
+                    PENDING_BYTE,
+                    1,
+                    timeout,
+                )? {
                     return Err(FrankenError::Busy);
                 }
-                let shared_locked =
-                    posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+                let shared_locked = posix_lock_with_timeout(
+                    &*info.file,
+                    libc::F_RDLCK,
+                    SHARED_FIRST,
+                    SHARED_SIZE,
+                    timeout,
+                )?;
                 let pending_unlock = posix_unlock(&*info.file, PENDING_BYTE, 1);
                 if !shared_locked {
                     pending_unlock?;
@@ -1726,7 +1795,7 @@ impl VfsFile for UnixFile {
                 rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
-            if !posix_lock(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
+            if !posix_lock_with_timeout(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1, timeout)? {
                 rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
@@ -1737,7 +1806,15 @@ impl VfsFile for UnixFile {
         // Reserved -> Pending: acquire F_WRLCK on the pending byte.
         // This blocks new shared-lock acquisitions from other processes.
         if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
-            if info.n_pending == 0 && !posix_lock(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1)? {
+            if info.n_pending == 0
+                && !posix_lock_with_timeout(
+                    &*info.file,
+                    libc::F_WRLCK,
+                    PENDING_BYTE,
+                    1,
+                    timeout,
+                )?
+            {
                 rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
@@ -1749,7 +1826,13 @@ impl VfsFile for UnixFile {
         // replacing the existing shared read lock. This will only succeed when
         // all other processes have released their shared locks.
         if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
-            if !posix_lock(&*info.file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)? {
+            if !posix_lock_with_timeout(
+                &*info.file,
+                libc::F_WRLCK,
+                SHARED_FIRST,
+                SHARED_SIZE,
+                timeout,
+            )? {
                 rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
@@ -1987,6 +2070,10 @@ impl VfsFile for UnixFile {
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
         self.release_shm_owner_state(delete)
+    }
+
+    fn set_busy_timeout_ms(&mut self, ms: u64) {
+        self.busy_timeout_ms = ms;
     }
 }
 

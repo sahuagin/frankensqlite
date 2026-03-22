@@ -709,6 +709,19 @@ impl PagerBackend {
         }
     }
 
+    /// Propagate busy-timeout to the VFS file for cross-process lock retry.
+    pub fn set_vfs_busy_timeout_ms(&self, ms: u64) {
+        match self {
+            Self::Memory(p) => p.set_vfs_busy_timeout_ms(ms),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.set_vfs_busy_timeout_ms(ms),
+            #[cfg(unix)]
+            Self::Unix(p) => p.set_vfs_busy_timeout_ms(ms),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.set_vfs_busy_timeout_ms(ms),
+        }
+    }
+
     /// Number of frames currently in the WAL for this pager.
     #[must_use]
     pub fn wal_frame_count(&self) -> usize {
@@ -720,6 +733,20 @@ impl PagerBackend {
             Self::Unix(p) => p.wal_frame_count(),
             #[cfg(target_os = "windows")]
             Self::Windows(p) => p.wal_frame_count(),
+        }
+    }
+
+    /// Number of published metadata writes applied to this pager.
+    #[must_use]
+    pub fn publication_write_count(&self) -> u64 {
+        match self {
+            Self::Memory(p) => p.publication_write_count(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.publication_write_count(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.publication_write_count(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.publication_write_count(),
         }
     }
 
@@ -1171,18 +1198,16 @@ where
         return Ok(false);
     }
 
-    let (mut file, _) = match vfs.open(
+    // bd-zna34 fix: Always open the WAL file READWRITE. Opening READONLY
+    // first would install a read-only canonical fd in the global InodeInfo
+    // table (unix.rs). All subsequent connections that clone this fd via the
+    // fast path inherit the read-only fd and fail with EBADF on WAL writes
+    // (pwrite on a read-only fd returns EBADF on Linux).
+    let (mut file, _) = vfs.open(
         cx,
         Some(wal_path),
-        VfsOpenFlags::READONLY | VfsOpenFlags::WAL,
-    ) {
-        Ok(opened) => opened,
-        Err(_) => vfs.open(
-            cx,
-            Some(wal_path),
-            VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
-        )?,
-    };
+        VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+    )?;
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
         let _ = file.close(cx);
         return Ok(false);
@@ -1204,9 +1229,21 @@ where
         return false;
     }
 
-    let open_flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+    // bd-zna34 fix: Open READWRITE instead of READONLY for the WAL probe.
+    // A READONLY open would install a read-only canonical fd in the global
+    // InodeInfo table. If another thread clones that fd before the probe
+    // closes, all WAL writes through that fd will fail with EBADF (pwrite
+    // on a read-only fd returns EBADF on Linux).
+    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
     let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), open_flags) else {
-        return false;
+        // Fall back to READONLY if READWRITE fails (e.g., read-only filesystem).
+        let ro_flags = VfsOpenFlags::READONLY | VfsOpenFlags::WAL;
+        let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), ro_flags) else {
+            return false;
+        };
+        let size = file.file_size(cx).ok();
+        let _ = file.close(cx);
+        return size.is_some_and(|len| len >= 32);
     };
     let size = file.file_size(cx).ok();
     let _ = file.close(cx);
@@ -3346,6 +3383,11 @@ impl Connection {
         conn.bootstrap_pragma_state_from_storage();
         conn.apply_current_journal_mode_to_pager_readonly()?;
         conn.apply_current_synchronous_to_pager()?;
+        // Propagate the default busy_timeout to the VFS layer.
+        {
+            let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+            conn.pager.set_vfs_busy_timeout_ms(ms);
+        }
         let op_cx = conn.op_cx()?;
         // Explicitly load schema only — never hydrate row data.
         conn.reload_memdb_from_pager_with_mode(&op_cx, false)?;
@@ -3487,6 +3529,12 @@ impl Connection {
         conn.bootstrap_pragma_state_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
         conn.apply_current_synchronous_to_pager()?;
+        // Propagate the default busy_timeout to the VFS layer so posix_lock
+        // retries with backoff on cross-process contention from the start.
+        {
+            let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+            conn.pager.set_vfs_busy_timeout_ms(ms);
+        }
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
         let op_cx = conn.op_cx()?;
@@ -5703,6 +5751,33 @@ impl Connection {
             return Ok(());
         }
         self.execute(sql).map(|_| ())
+    }
+
+    /// Begin a transaction without going through SQL parsing/dispatch.
+    ///
+    /// This follows the same mode selection as plain `BEGIN`: explicit mode is
+    /// absent, so `concurrent_mode_default` still controls whether the
+    /// transaction auto-promotes to concurrent mode.
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.background_status()?;
+        self.execute_begin(fsqlite_ast::BeginStatement { mode: None })
+    }
+
+    /// Commit the active transaction without reparsing a `COMMIT` statement.
+    pub fn commit_transaction(&self) -> Result<()> {
+        self.background_status()?;
+        let cx = self.op_cx_after_background_status();
+        self.execute_commit_with_cx(&cx)
+    }
+
+    /// Roll back the active transaction without reparsing a `ROLLBACK` statement.
+    pub fn rollback_transaction(&self) -> Result<()> {
+        self.background_status()?;
+        let cx = self.op_cx_after_background_status();
+        self.execute_rollback_with_cx(
+            &cx,
+            &fsqlite_ast::RollbackStatement { to_savepoint: None },
+        )
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
@@ -11317,12 +11392,10 @@ impl Connection {
             return Ok(true);
         }
 
-        let publication = if is_concurrent {
-            if let Some(publication) = prebound_publication {
-                publication
-            } else {
-                self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin")?
-            }
+        let publication = if let Some(publication) = prebound_publication {
+            publication
+        } else if is_concurrent {
+            self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin")?
         } else {
             self.refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check")?
         };
@@ -15869,7 +15942,6 @@ impl Connection {
         let prebound_publication = if is_concurrent {
             Some(self.refresh_memdb_if_stale_with_publication(&cx, "explicit_begin")?)
         } else {
-            self.refresh_memdb_if_stale(&cx)?;
             None
         };
         // Bind the MVCC snapshot to the pager's published visibility plane
@@ -15879,6 +15951,19 @@ impl Connection {
         let concurrent_snapshot = prebound_publication
             .map(|publication| self.concurrent_snapshot_from_publication(publication));
         let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
+        if !is_concurrent
+            && let Some(bound_visible_commit_seq) = txn.published_visible_commit_seq_hint()
+            && bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+            && let Err(error) = self.reload_memdb_from_txn_with_mode(
+                &cx,
+                txn.as_mut(),
+                bound_visible_commit_seq,
+                self.should_eagerly_hydrate_memdb_rows(),
+            )
+        {
+            let _ = txn.rollback(&cx);
+            return Err(error);
+        }
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
@@ -18332,6 +18417,12 @@ impl Connection {
                             Some(application_id as u32),
                         )?;
                     }
+                }
+                "busy_timeout" => {
+                    // Propagate busy_timeout to the VFS file so posix_lock
+                    // retries with backoff on cross-process lock contention.
+                    let ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+                    self.pager.set_vfs_busy_timeout_ms(ms);
                 }
                 _ => {}
             }
@@ -25731,7 +25822,17 @@ impl Connection {
 
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+        self.reload_memdb_from_txn_with_mode(cx, txn.as_mut(), bound_visible_commit_seq, hydrate_rows)
+    }
 
+    #[allow(clippy::too_many_lines)]
+    fn reload_memdb_from_txn_with_mode(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        bound_visible_commit_seq: CommitSeq,
+        hydrate_rows: bool,
+    ) -> Result<()> {
         let page_size = self.pager.page_size();
         let usable_size = u32::try_from(page_size.as_usize())
             .map_err(|_| FrankenError::internal("page size exceeds u32"))?;
@@ -25766,7 +25867,7 @@ impl Connection {
             let mut max_rowid = 0_i64;
             let master_root = PageNumber::ONE;
             let mut cursor = fsqlite_btree::BtCursor::new(
-                TransactionPageIo::new(txn.as_mut()),
+                TransactionPageIo::new(txn),
                 master_root,
                 usable_size,
                 true, // sqlite_master is a table b-tree even during read-only reloads
@@ -26105,7 +26206,7 @@ impl Connection {
                     .unwrap_or(PageNumber::ONE);
 
                 let mut cursor = fsqlite_btree::BtCursor::new(
-                    TransactionPageIo::new(txn.as_mut()),
+                    TransactionPageIo::new(txn),
                     file_root,
                     usable_size,
                     true, // user tables remain table b-trees even during read-only reloads
@@ -70372,6 +70473,72 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_prepared_file_backed_single_writer_insert_reuses_schema_bound_publication() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("prepared_insert_single_writer_publication_reuse.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db).unwrap();
+        conn1.set_reject_mem_fallback(true);
+        conn1.set_strict_mem_fallback_rejection(true);
+        conn1.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn1
+            .execute("CREATE TABLE prep_pub_single (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let stmt = conn1
+            .prepare("INSERT INTO prep_pub_single (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        let conn2 = Connection::open(&db).unwrap();
+        conn2.set_reject_mem_fallback(true);
+        conn2.set_strict_mem_fallback_rejection(true);
+        conn2.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn2
+            .execute("INSERT INTO prep_pub_single VALUES (1, 'from_conn2');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("from_conn1".into()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(profile.prepared_schema_refreshes, 1);
+        assert_eq!(
+            profile.prepared_schema_lightweight_refreshes, 1,
+            "schema-stable external DML should still use the lightweight prepared refresh path in single-writer mode: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_schema_full_reloads, 0,
+            "schema-stable single-writer external DML should avoid a full MemDB reload: {profile:?}"
+        );
+        assert_eq!(
+            profile.pager_publication_refreshes, 1,
+            "single-writer prepared insert should reuse the schema-bound publication instead of rebinding during autocommit begin: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_insert_fast_lane_hits, 1,
+            "simple single-writer prepared insert should stay on the fast lane while reusing the schema-bound publication: {profile:?}"
+        );
+
+        let rows = conn1
+            .query("SELECT id, val FROM prep_pub_single ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("from_conn2".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
+    }
+
+    #[test]
     fn test_memory_autocommit_insert_skips_pager_publication_refresh() {
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
@@ -70864,6 +71031,128 @@ mod pager_routing_tests {
             "file-backed concurrent BEGIN should still bind pager publication exactly once: {profile:?}"
         );
         conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_begin_transaction_api_skips_sql_parse() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("direct_begin_api_no_parse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE direct_begin_api (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+
+        reset_hot_path_profile();
+        conn.begin_transaction().unwrap();
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.parse_single_calls, 0,
+            "direct begin API should bypass SQL parsing entirely: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.parse_multi_calls, 0,
+            "direct begin API should bypass multi-statement parsing entirely: {profile:?}"
+        );
+        assert_eq!(
+            profile.op_cx_background_gates, 0,
+            "direct begin API should reuse the background-status gate without minting an extra op_cx: {profile:?}"
+        );
+        assert_eq!(
+            profile.pager_publication_refreshes, 0,
+            "single-writer direct begin API should inherit the open-txn publication reuse path: {profile:?}"
+        );
+        conn.rollback_transaction().unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_single_writer_begin_avoids_prebegin_publication_rebind() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("single_writer_begin_publication_writes.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE sw_begin_fast (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+
+        let publication_writes_before = conn.pager.publication_write_count();
+        reset_hot_path_profile();
+        conn.execute("BEGIN;").unwrap();
+        let profile = hot_path_profile_snapshot();
+        let publication_writes_after = conn.pager.publication_write_count();
+        assert_eq!(
+            profile.pager_publication_refreshes, 0,
+            "single-writer BEGIN should reuse the pager transaction's published visibility instead of rebinding beforehand: {profile:?}"
+        );
+        assert_eq!(
+            publication_writes_after.saturating_sub(publication_writes_before),
+            1,
+            "single-writer BEGIN should publish once via pager.begin, not once before and once during begin"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_single_writer_begin_reloads_stale_memdb_from_open_txn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("single_writer_begin_stale_reload.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn_a = Connection::open(&db_path).unwrap();
+        let conn_b = Connection::open(&db_path).unwrap();
+        conn_a.set_reject_mem_fallback(true);
+        conn_a.set_strict_mem_fallback_rejection(true);
+        conn_b.set_reject_mem_fallback(true);
+        conn_b.set_strict_mem_fallback_rejection(true);
+        conn_a.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn_b.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        conn_a
+            .execute("CREATE TABLE sw_begin_reload (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let initial_rows = conn_b.query("SELECT val FROM sw_begin_reload ORDER BY id;").unwrap();
+        assert!(initial_rows.is_empty(), "fresh table should start empty");
+
+        conn_a
+            .execute("INSERT INTO sw_begin_reload (id, val) VALUES (1, 'alpha');")
+            .unwrap();
+
+        conn_b.execute("BEGIN;").unwrap();
+        let rows = conn_b.query("SELECT val FROM sw_begin_reload ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1, "serialized BEGIN should see the external commit");
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        conn_b.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_commit_transaction_api_skips_sql_parse() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("direct_commit_api_no_parse.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE direct_commit_api (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.begin_transaction().unwrap();
+        conn.execute("INSERT INTO direct_commit_api (id, val) VALUES (1, 'alpha');")
+            .unwrap();
+
+        reset_hot_path_profile();
+        conn.commit_transaction().unwrap();
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.parser.parse_single_calls, 0,
+            "direct commit API should bypass SQL parsing entirely: {profile:?}"
+        );
+        assert_eq!(
+            profile.parser.parse_multi_calls, 0,
+            "direct commit API should bypass multi-statement parsing entirely: {profile:?}"
+        );
+        assert_eq!(
+            profile.op_cx_background_gates, 0,
+            "direct commit API should reuse the background-status gate without minting an extra op_cx: {profile:?}"
+        );
     }
 
     #[test]
