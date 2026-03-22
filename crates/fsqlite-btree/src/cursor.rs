@@ -2141,11 +2141,14 @@ impl<P: PageWriter> BtCursor<P> {
         let local_size = local_size.min(new_payload.len());
 
         new_cell.extend_from_slice(&new_payload[..local_size]);
-        if local_size < new_payload.len() {
+        let new_overflow_head = if local_size < new_payload.len() {
             let first_overflow =
                 self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
             new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
-        }
+            Some(first_overflow)
+        } else {
+            None
+        };
         instrumentation::record_interior_cell_rebuild(new_cell.len());
 
         // Remove old cell from page and try to insert new cell.
@@ -2273,7 +2276,13 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         // Now we must insert `new_cell` at `cell_idx`, which will trigger a structural rebalance.
-        self.balance_for_insert(cx, &new_cell, cell_idx)?;
+        let balance_result = self.balance_for_insert(cx, &new_cell, cell_idx);
+        if balance_result.is_err() {
+            if let Some(first) = new_overflow_head {
+                let _ = self.free_overflow_chain(cx, first);
+            }
+        }
+        balance_result?;
 
         Ok(true)
     }
@@ -2741,7 +2750,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         });
                     }
 
-                    let top_after_seek = cursor.stack.last().expect("cursor stack empty").clone();
+                    let top_after_seek = cursor.stack.last().ok_or_else(|| {
+                        FrankenError::internal("cursor stack empty after reseek in delete")
+                    })?.clone();
                     if !top_after_seek.header.page_type.is_leaf() {
                         // The seek found the interior node separator we just inserted.
                         // We must advance to the next logical entry to reach the duplicate in the leaf.
