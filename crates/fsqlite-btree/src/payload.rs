@@ -75,6 +75,7 @@ pub fn write_payload<A, W>(
     payload: &[u8],
     page_type: BtreePageType,
     usable_size: u32,
+    full_page_size: u32,
     allocate_page: &mut A,
     write_page: &mut W,
 ) -> Result<(Vec<u8>, Option<PageNumber>)>
@@ -100,7 +101,7 @@ where
     let overflow_data = &payload[local_size..];
 
     let first_overflow =
-        overflow::write_overflow_chain(overflow_data, usable_size, allocate_page, write_page)?;
+        overflow::write_overflow_chain(overflow_data, usable_size, full_page_size, allocate_page, write_page)?;
 
     debug!(
         cell_type = ?page_type,
@@ -203,6 +204,7 @@ mod tests {
             payload,
             BtreePageType::LeafTable,
             usable_size,
+            usable_size, // full_page_size == usable_size when reserved_bytes == 0
             &mut || Err(FrankenError::internal("should not allocate")),
             &mut |_, _| Err(FrankenError::internal("should not write overflow")),
         )
@@ -225,6 +227,7 @@ mod tests {
         let (local, overflow) = write_payload(
             &payload,
             BtreePageType::LeafTable,
+            usable_size,
             usable_size,
             &mut || {
                 let pgno = PageNumber::new(next_page).unwrap();
@@ -273,6 +276,7 @@ mod tests {
         let (local, overflow_pgno) = write_payload(
             &payload,
             BtreePageType::LeafTable,
+            usable_size,
             usable_size,
             &mut || {
                 let pgno = PageNumber::new(next_page).unwrap();
@@ -366,6 +370,7 @@ mod tests {
         let (local, overflow) = write_payload(
             &payload,
             BtreePageType::LeafIndex,
+            usable_size,
             usable_size,
             &mut || {
                 let pgno = PageNumber::new(next_page).unwrap();

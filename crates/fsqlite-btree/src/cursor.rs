@@ -1587,7 +1587,7 @@ impl<P: PageWriter> BtCursor<P> {
             });
         }
         #[allow(clippy::cast_possible_truncation)]
-        let page_size = self.usable_size as usize;
+        let page_size = self.page_size as usize;
         let num_pages = overflow_data.len().div_ceil(bytes_per_page);
         if num_pages > overflow::MAX_OVERFLOW_CHAIN {
             return Err(FrankenError::TooBig);

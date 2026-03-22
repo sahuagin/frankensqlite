@@ -153,7 +153,9 @@ where
 /// Write a payload to an overflow chain, allocating pages as needed.
 ///
 /// `overflow_data` is the portion of the payload that doesn't fit locally.
-/// `usable_size` is the usable page size.
+/// `usable_size` is the usable page size (page_size - reserved_bytes).
+/// `full_page_size` is the on-disk page size. Overflow page buffers are
+/// allocated at this size so stock SQLite sees correctly-sized pages.
 /// `allocate_page` allocates a new page and returns its number.
 /// `write_page` writes data to a given page number.
 ///
@@ -161,6 +163,7 @@ where
 pub fn write_overflow_chain<A, W>(
     overflow_data: &[u8],
     usable_size: u32,
+    full_page_size: u32,
     allocate_page: &mut A,
     write_page: &mut W,
 ) -> Result<PageNumber>
@@ -188,7 +191,7 @@ where
             detail: "usable page size too small for overflow data".to_owned(),
         });
     }
-    let page_size = usable_size as usize;
+    let page_size = full_page_size as usize;
 
     // Calculate number of overflow pages needed.
     let num_pages = overflow_data.len().div_ceil(bytes_per_page);
@@ -329,6 +332,7 @@ mod tests {
         let first = write_overflow_chain(
             overflow_data,
             usable,
+            usable,
             &mut || {
                 let pgno = PageNumber::new(next_page).unwrap();
                 next_page += 1;
@@ -359,6 +363,7 @@ mod tests {
 
         let first = write_overflow_chain(
             &overflow_data,
+            usable,
             usable,
             &mut || {
                 let pgno = PageNumber::new(next_page).unwrap();
@@ -431,6 +436,7 @@ mod tests {
     fn test_write_overflow_empty_data_errors() {
         let result = write_overflow_chain(
             &[],
+            4096,
             4096,
             &mut || Ok(PageNumber::new(1).unwrap()),
             &mut |_, _| Ok(()),
