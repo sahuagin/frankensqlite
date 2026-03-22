@@ -302,12 +302,11 @@ fn posix_lock_with_timeout(
 
     loop {
         let elapsed = started.elapsed();
-        if elapsed >= timeout {
+        let Some(remaining) = timeout.checked_sub(elapsed) else {
             return Ok(false);
-        }
+        };
 
         // Sleep for the lesser of `backoff` and the remaining budget.
-        let remaining = timeout - elapsed;
         std::thread::sleep(backoff.min(remaining));
 
         if posix_lock(file, lock_type, start, len)? {
@@ -2504,6 +2503,53 @@ mod tests {
         assert!(
             another_reader.status.success(),
             "failed exclusive upgrade must not strand the PENDING byte; stderr={}",
+            String::from_utf8_lossy(&another_reader.stderr)
+        );
+
+        finish_sqlite3_transaction(reader);
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_exclusive_upgrade_honors_busy_timeout_against_legacy_reader() {
+        if !sqlite3_available() {
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("exclusive_upgrade_busy_timeout.db");
+        setup_sqlite_delete_journal_db(&path);
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.set_busy_timeout_ms(200);
+
+        let reader = spawn_sqlite3_reader_transaction(&path);
+        let started = Instant::now();
+        let err = file.lock(&cx, LockLevel::Exclusive).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "exclusive upgrade should still fail once the timeout budget is exhausted"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "busy timeout should wait before failing; elapsed={elapsed:?}"
+        );
+        assert_eq!(
+            file.lock_level,
+            LockLevel::Reserved,
+            "timed-out upgrade should roll back to the prior lock level"
+        );
+
+        let another_reader = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT COUNT(*) FROM t;");
+        assert!(
+            another_reader.status.success(),
+            "timed-out exclusive upgrade must not strand the PENDING byte; stderr={}",
             String::from_utf8_lossy(&another_reader.stderr)
         );
 
