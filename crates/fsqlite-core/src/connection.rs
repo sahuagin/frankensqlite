@@ -5271,6 +5271,13 @@ impl Connection {
         self.close_internal(false)
     }
 
+    /// Close the connection using the same best-effort shutdown path used by
+    /// `Drop`, but mark it closed so dropping the handle is not reported as an
+    /// API misuse.
+    pub fn close_best_effort_in_place(&mut self) {
+        let _ = self.close_internal(true);
+    }
+
     fn close_internal(&mut self, best_effort: bool) -> Result<()> {
         if *self.closed.get_mut() {
             return Ok(());
@@ -9902,6 +9909,7 @@ impl Connection {
             FrankenError::Internal(format!("virtual table not found: {table_name}"))
         })?;
         self.begin_live_vtab_transaction_if_needed(table_name, instance.as_mut(), &cx)?;
+        let patch_first_column_with_rowid = instance.as_any().is::<RtreeVirtualTable>();
 
         let mut inserted_rowids = Vec::with_capacity(rows.len());
         for row in rows {
@@ -9925,8 +9933,69 @@ impl Connection {
             inserted_rowids.push(rowid);
             self.record_last_insert_rowid(rowid);
         }
+        drop(instances);
+
+        self.persist_materialized_live_vtab_rows(
+            table_name,
+            rows,
+            &inserted_rowids,
+            patch_first_column_with_rowid,
+        )?;
 
         Ok(inserted_rowids)
+    }
+
+    fn persist_materialized_live_vtab_rows(
+        &self,
+        table_name: &str,
+        rows: &[LiveVtabInsertRow],
+        inserted_rowids: &[i64],
+        patch_first_column_with_rowid: bool,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if rows.len() != inserted_rowids.len() {
+            return Err(FrankenError::Internal(format!(
+                "live virtual-table insert row count mismatch for {table_name}: {} rows vs {} rowids",
+                rows.len(),
+                inserted_rowids.len()
+            )));
+        }
+
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+
+        self.with_pager_write_txn(|cx, txn| {
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                root,
+                PageSize::DEFAULT.get(),
+                true,
+            );
+
+            for (row, rowid) in rows.iter().zip(inserted_rowids.iter().copied()) {
+                let mut persisted_values = row.values.clone();
+                if patch_first_column_with_rowid
+                    && persisted_values.first().is_some_and(SqliteValue::is_null)
+                {
+                    persisted_values[0] = SqliteValue::Integer(rowid);
+                }
+                if cursor.table_move_to(cx, rowid)?.is_found() {
+                    cursor.delete(cx)?;
+                }
+                let record = serialize_record(&persisted_values);
+                cursor.table_insert(cx, rowid, &record)?;
+            }
+            Ok(())
+        })
     }
 
     #[allow(clippy::unused_self)]
@@ -25718,6 +25787,38 @@ impl Connection {
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
         // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
+        let materialized_virtual_tables: HashSet<String> = master_entries
+            .iter()
+            .filter_map(|entry| {
+                if entry.len() < 5 {
+                    return None;
+                }
+                let entry_type = match &entry[0] {
+                    SqliteValue::Text(s) => s,
+                    _ => return None,
+                };
+                if !entry_type.eq_ignore_ascii_case("table") {
+                    return None;
+                }
+                let name = match &entry[1] {
+                    SqliteValue::Text(s) => s,
+                    _ => return None,
+                };
+                let root_page_num = match &entry[3] {
+                    SqliteValue::Integer(n) => *n,
+                    _ => return None,
+                };
+                let create_sql = match &entry[4] {
+                    SqliteValue::Text(s) => s,
+                    _ => return None,
+                };
+                if root_page_num > 0 && is_virtual_table_sql(create_sql) {
+                    Some(name.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut new_schema = Vec::new();
         let mut new_db = MemDatabase::new();
         let mut new_triggers = Vec::new();
@@ -25853,19 +25954,13 @@ impl Connection {
             };
             new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
 
-            // Detect virtual tables by either of two patterns:
-            //   1. rootpage=0 — the stock SQLite convention (FTS5, rtree, etc.)
-            //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
-            //      virtual tables that are assigned a positive rootpage number.
-            // Using AND here was the same bug as PR #33 (fixed in compat_persist.rs):
-            // a positive-rootpage virtual table would fail condition 1, fall through,
-            // and be reloaded as an ordinary B-tree table, silently breaking FTS5 etc.
-            let is_virtual = root_page_num == 0 || is_virtual_table_sql(&create_sql);
-            if is_virtual {
-                tracing::warn!(
+            let is_virtual_sql = is_virtual_table_sql(&create_sql);
+            if root_page_num == 0 && is_virtual_sql {
+                tracing::debug!(
                     table = %name,
-                    rootpage = root_page_num,
-                    "skipping virtual table from sqlite_master (module not loaded)"
+                    shadowed_by_materialized = materialized_virtual_tables
+                        .contains(&name.to_ascii_lowercase()),
+                    "ignoring legacy rootpage=0 virtual table entry during schema reload"
                 );
                 continue;
             }
@@ -34750,17 +34845,13 @@ fn should_ignore_actual_master_row_for_integrity(row: &[SqliteValue]) -> Result<
     if entry_type == "index" && is_implicit_autoindex_name(&name) {
         return Ok(true);
     }
-    // Detect virtual tables by either of two patterns (same logic as the
-    // schema-reload paths fixed in a1cee5a8 and 72e43013):
-    //   1. rootpage=0 — stock SQLite convention (FTS5, rtree, etc.)
-    //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
-    //      virtual tables with a positive rootpage number.
-    // Using AND was the same bug: a positive-rootpage virtual table would
-    // fail condition 1, appear in actual_signatures but not in
-    // expected_signatures (since the schema loader already skips it), and
-    // trigger a false "unexpected entry" integrity error.
+    // Stock SQLite records virtual tables with rootpage=0. Those legacy
+    // declarations are skipped during schema reload and should not count as
+    // integrity mismatches. Materialized positive-rootpage virtual tables are
+    // now kept in the schema, so they must remain visible to integrity checks.
     if entry_type == "table"
-        && (root_page == 0 || sqlite_master_sql_text(row)?.is_some_and(is_virtual_table_sql))
+        && root_page == 0
+        && sqlite_master_sql_text(row)?.is_some_and(is_virtual_table_sql)
     {
         return Ok(true);
     }
@@ -59794,6 +59885,56 @@ mod schema_loading_tests {
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
         assert_eq!(rows[1].values()[1], SqliteValue::Text("Other".into()));
         assert_eq!(rows[1].values()[2], SqliteValue::Text("Nothing".into()));
+    }
+
+    #[test]
+    fn test_reopen_prefers_materialized_virtual_table_over_legacy_rootpage_zero_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("materialized_vtab_shadowed.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    PRAGMA writable_schema = ON;
+                    INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                    VALUES(
+                        'table',
+                        'docs',
+                        'docs',
+                        0,
+                        'CREATE VIRTUAL TABLE docs USING fts5(subject, body)'
+                    );
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let schema = conn.schema.borrow();
+        let docs_tables: Vec<&TableSchema> = schema
+            .iter()
+            .filter(|table| table.name.eq_ignore_ascii_case("docs"))
+            .collect();
+        assert_eq!(
+            docs_tables.len(),
+            1,
+            "schema reload should keep the materialized virtual table exactly once"
+        );
+        assert!(
+            docs_tables[0].root_page > 0,
+            "schema reload should prefer the positive-rootpage materialized entry"
+        );
     }
 
     #[test]

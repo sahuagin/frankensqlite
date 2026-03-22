@@ -10,6 +10,7 @@
 //! On **load**, a real `.db` file is read via B-tree cursors and its
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
+use std::collections::HashSet;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -263,6 +264,38 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
     // Parse each sqlite_master row.
     // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
+    let materialized_virtual_tables: HashSet<String> = master_entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.len() < 5 {
+                return None;
+            }
+            let entry_type = match &entry[0] {
+                SqliteValue::Text(s) => s,
+                _ => return None,
+            };
+            if !entry_type.eq_ignore_ascii_case("table") {
+                return None;
+            }
+            let name = match &entry[1] {
+                SqliteValue::Text(s) => s,
+                _ => return None,
+            };
+            let root_page_num = match &entry[3] {
+                SqliteValue::Integer(n) => *n,
+                _ => return None,
+            };
+            let create_sql = match &entry[4] {
+                SqliteValue::Text(s) => s,
+                _ => return None,
+            };
+            if root_page_num > 0 && is_virtual_table_sql(create_sql) {
+                Some(name.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut schema = Vec::new();
     let mut db = MemDatabase::new();
 
@@ -291,14 +324,13 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             _ => continue,
         };
 
-        // Detect virtual tables by either of two patterns:
-        //   1. rootpage=0 — the stock SQLite convention (FTS5, rtree, etc.)
-        //   2. CREATE SQL starts with CREATE VIRTUAL TABLE — FrankenSQLite-native
-        //      virtual tables that are assigned a positive rootpage number.
-        // Using AND here was the bug (PR #33): a positive-rootpage virtual table
-        // would fail condition 1, fall through, and be reloaded as an ordinary
-        // B-tree table on reopen, silently breaking FTS5 and other vtab modules.
-        if root_page_num == 0 || is_virtual_table_sql(&create_sql) {
+        // Stock SQLite records virtual tables with rootpage=0. Those legacy
+        // declarations have no materialized root page to load, so skip them.
+        // Positive-rootpage virtual tables are real B-trees and must remain
+        // visible on reopen just like ordinary tables.
+        if root_page_num == 0 && is_virtual_table_sql(&create_sql) {
+            let _shadowed_by_materialized =
+                materialized_virtual_tables.contains(&name.to_ascii_lowercase());
             continue;
         }
         let root_page_u32 = validate_sqlite_master_root_page(&name, root_page_num)?;

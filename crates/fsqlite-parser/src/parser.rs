@@ -380,7 +380,7 @@ impl Parser {
 
     pub(crate) fn parse_identifier(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+            TokenKind::Id(s) | TokenKind::QuotedId(s, _) | TokenKind::String(s) => {
                 self.advance();
                 Ok(s)
             }
@@ -8081,6 +8081,24 @@ mod tests {
             "persistence dump with reserved-word columns should parse cleanly: {errs:?}"
         );
         assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn create_table_with_single_quoted_name_parses_cleanly() {
+        let sql = "CREATE TABLE 'fts_messages_data'(id INTEGER PRIMARY KEY, block BLOB);";
+        let mut p = Parser::from_sql(sql);
+        let (stmts, errs) = p.parse_all();
+        assert!(
+            errs.is_empty(),
+            "single-quoted sqlite_master shadow-table SQL should parse cleanly: {errs:?}"
+        );
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::CreateTable(stmt) => {
+                assert_eq!(stmt.name.name, "fts_messages_data");
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
     }
 
     #[test]

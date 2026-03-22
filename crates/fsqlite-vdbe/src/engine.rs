@@ -357,12 +357,8 @@ struct SorterCursor {
     position: Option<usize>,
     /// Position for which the lazy output decode cache is currently valid.
     cached_row_position: Option<usize>,
-    /// Pre-parsed record header offsets for the current output row.
-    cached_row_header_offsets: Vec<fsqlite_types::record::ColumnOffset>,
-    /// Lazily materialized decoded output values for the current output row.
-    cached_row_values: Vec<SqliteValue>,
-    /// Bitmask tracking which `cached_row_values` entries are decoded.
-    cached_row_decoded_mask: u64,
+    /// Sorter-owned decode/materialization scratch for the current output row.
+    cached_row_decode: RowDecodeScratch,
     /// Estimated bytes consumed by `rows` (approximate).
     memory_used: usize,
     /// Memory limit before spilling to disk (default 100 MiB).
@@ -489,9 +485,7 @@ impl SorterCursor {
             rows: Vec::new(),
             position: None,
             cached_row_position: None,
-            cached_row_header_offsets: Vec::new(),
-            cached_row_values: Vec::new(),
-            cached_row_decoded_mask: 0,
+            cached_row_decode: RowDecodeScratch::default(),
             memory_used: 0,
             spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
             spill_runs: Vec::new(),
@@ -518,10 +512,7 @@ impl SorterCursor {
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
         self.memory_used += Self::estimate_row_size(&values, &blob);
         self.rows.push(SorterRow { values, blob });
-        self.cached_row_position = None;
-        self.cached_row_header_offsets.clear();
-        self.cached_row_values.clear();
-        self.cached_row_decoded_mask = 0;
+        self.invalidate_output_row_cache();
 
         if self.memory_used >= self.spill_threshold {
             self.spill_to_disk()?;
@@ -609,10 +600,7 @@ impl SorterCursor {
 
         self.rows_sorted_total += record_count;
         self.rows.clear();
-        self.cached_row_position = None;
-        self.cached_row_header_offsets.clear();
-        self.cached_row_values.clear();
-        self.cached_row_decoded_mask = 0;
+        self.invalidate_output_row_cache();
         self.memory_used = 0;
         Ok(())
     }
@@ -743,10 +731,7 @@ impl SorterCursor {
         }
         self.spill_runs.clear();
         self.rows = merged;
-        self.cached_row_position = None;
-        self.cached_row_header_offsets.clear();
-        self.cached_row_values.clear();
-        self.cached_row_decoded_mask = 0;
+        self.invalidate_output_row_cache();
         self.memory_used = 0;
         Ok(())
     }
@@ -755,16 +740,18 @@ impl SorterCursor {
     fn reset(&mut self) {
         self.rows.clear();
         self.position = None;
-        self.cached_row_position = None;
-        self.cached_row_header_offsets.clear();
-        self.cached_row_values.clear();
-        self.cached_row_decoded_mask = 0;
+        self.invalidate_output_row_cache();
         self.memory_used = 0;
         // Clean up temp files.
         for run in &self.spill_runs {
             let _ = std::fs::remove_file(&run.path);
         }
         self.spill_runs.clear();
+    }
+
+    fn invalidate_output_row_cache(&mut self) {
+        self.cached_row_position = None;
+        self.cached_row_decode.invalidate();
     }
 }
 
@@ -2499,6 +2486,74 @@ impl CursorBackend {
 /// In Phase 5, `cursor` may be backed by either an in-memory [`MemPageStore`]
 /// (for tests / Phase 4 fallback) or a real pager transaction via
 /// [`SharedTxnPageIo`] (production path, bd-2a3y).
+///
+/// Decode/materialization scratch is owned by the cursor and reused only while
+/// the cursor remains positioned on the same physical row image. Position
+/// changes or write-path mutations invalidate it explicitly; nothing is shared
+/// across cursors, statements, or transactions.
+#[derive(Debug, Default, Clone)]
+struct RowDecodeScratch {
+    header_offsets: Vec<fsqlite_types::record::ColumnOffset>,
+    values: Vec<SqliteValue>,
+    decoded_mask: u64,
+}
+
+impl RowDecodeScratch {
+    fn prepare_for_record(
+        &mut self,
+        record: &[u8],
+        malformed_header_detail: &'static str,
+        malformed_payload_detail: &'static str,
+    ) -> Result<bool> {
+        let col_count = fsqlite_types::record::parse_record_header_into(
+            record,
+            &mut self.header_offsets,
+        )
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: malformed_header_detail.to_owned(),
+        })?;
+
+        if col_count > 64 {
+            self.values.clear();
+            fsqlite_types::record::parse_record_into(record, &mut self.values).ok_or_else(
+                || FrankenError::DatabaseCorrupt {
+                    detail: malformed_payload_detail.to_owned(),
+                },
+            )?;
+            self.decoded_mask = u64::MAX;
+            Ok(true)
+        } else {
+            self.values.resize(col_count, SqliteValue::Null);
+            self.decoded_mask = 0;
+            Ok(false)
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.header_offsets.clear();
+        self.values.clear();
+        self.decoded_mask = 0;
+    }
+
+    fn cached_value_ready(&self, idx: usize) -> bool {
+        if idx < 64 {
+            self.decoded_mask & (1_u64 << idx) != 0
+        } else {
+            self.decoded_mask == u64::MAX
+        }
+    }
+
+    fn cache_decoded(&mut self, idx: usize, value: SqliteValue) {
+        if idx >= self.values.len() {
+            self.values.resize(idx + 1, SqliteValue::Null);
+        }
+        self.values[idx] = value;
+        if idx < 64 {
+            self.decoded_mask |= 1_u64 << idx;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StorageCursor {
     cursor: CursorBackend,
@@ -2515,24 +2570,8 @@ struct StorageCursor {
     target_vals_buf: Vec<SqliteValue>,
     /// Scratch buffer for parsing current index keys.
     cur_vals_buf: Vec<SqliteValue>,
-    /// Lazily-populated decoded columns for the current row.
-    ///
-    /// Unlike the original eager-decode path, columns are decoded on demand
-    /// from `header_offsets` + `payload_buf`.  The `decoded_mask` tracks
-    /// which slots contain materialized values (up to 64 columns; records
-    /// wider than 64 columns fall back to eager full-decode).
-    row_vals_buf: Vec<SqliteValue>,
-    /// Pre-parsed record header offset table for lazy column access.
-    ///
-    /// Populated when the cursor moves to a new position.  Individual
-    /// columns are then decoded on demand via
-    /// [`fsqlite_types::record::decode_column_from_offset`].
-    header_offsets: Vec<fsqlite_types::record::ColumnOffset>,
-    /// Bitmask tracking which columns in `row_vals_buf` have been decoded.
-    ///
-    /// Bit *i* is set when `row_vals_buf[i]` contains a materialized value.
-    /// For records with >64 columns, all bits are pre-set (eager decode).
-    decoded_mask: u64,
+    /// Cursor-owned decode/materialization scratch for the current row image.
+    row_decode: RowDecodeScratch,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<(u32, u16)>,
     /// Last rowid successfully inserted via this cursor (bd-p666i).
@@ -5503,9 +5542,7 @@ impl VdbeEngine {
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
-                            row_vals_buf: Vec::new(),
-                            header_offsets: Vec::new(),
-                            decoded_mask: 0,
+                            row_decode: RowDecodeScratch::default(),
                             last_position_stamp: None,
                             last_successful_insert_rowid: None,
                         },
@@ -6198,9 +6235,7 @@ impl VdbeEngine {
                                 payload_buf: Vec::new(),
                                 target_vals_buf: Vec::new(),
                                 cur_vals_buf: Vec::new(),
-                                row_vals_buf: Vec::new(),
-                                header_offsets: Vec::new(),
-                                decoded_mask: 0,
+                                row_decode: RowDecodeScratch::default(),
                                 last_position_stamp: None,
                                 last_successful_insert_rowid: None,
                             },
@@ -9520,10 +9555,8 @@ impl VdbeEngine {
             .copied();
         let payload_includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
             payload_includes_rowid_alias_lazy(
-                &cursor.header_offsets,
+                &mut cursor.row_decode,
                 &cursor.payload_buf,
-                &mut cursor.row_vals_buf,
-                &mut cursor.decoded_mask,
                 rowid,
                 ipk,
                 self.table_column_count_by_root_page.get(&rp).copied(),
@@ -9547,15 +9580,11 @@ impl VdbeEngine {
         // ── Lazy decode + zero-clone register write ────────────────
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
 
-        if payload_idx < cursor.header_offsets.len() {
+        if payload_idx < cursor.row_decode.header_offsets.len() {
             // Already decoded? Write from cache to register with buffer reuse.
-            let cached_value_ready = if payload_idx < 64 {
-                cursor.decoded_mask & (1u64 << payload_idx) != 0
-            } else {
-                cursor.decoded_mask == u64::MAX
-            };
+            let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
             if cached_value_ready {
-                if let Some(cached) = cursor.row_vals_buf.get(payload_idx) {
+                if let Some(cached) = cursor.row_decode.values.get(payload_idx) {
                     if refresh_state.refreshed && refresh_state.eager_values_ready {
                         note_decode_cache_miss(collect_vdbe_metrics);
                     } else {
@@ -9594,7 +9623,7 @@ impl VdbeEngine {
             note_decode_cache_miss(collect_vdbe_metrics);
             let val = fsqlite_types::record::decode_column_from_offset(
                 &cursor.payload_buf,
-                &cursor.header_offsets[payload_idx],
+                &cursor.row_decode.header_offsets[payload_idx],
                 collect_vdbe_metrics,
             )
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -9607,16 +9636,7 @@ impl VdbeEngine {
             }
 
             // Cache the decoded value with buffer reuse.
-            if payload_idx >= cursor.row_vals_buf.len() {
-                cursor
-                    .row_vals_buf
-                    .resize(payload_idx + 1, SqliteValue::Null);
-            }
-            let cache_slot = &mut cursor.row_vals_buf[payload_idx];
-            *cache_slot = val.clone();
-            if payload_idx < 64 {
-                cursor.decoded_mask |= 1u64 << payload_idx;
-            }
+            cursor.row_decode.cache_decoded(payload_idx, val.clone());
 
             // Write freshly decoded value to register (owned, no clone needed).
             self.set_reg_fast(target, val);
@@ -9671,10 +9691,8 @@ impl VdbeEngine {
                     .zip(ipk_col_idx)
                     .is_some_and(|(root_page, ipk_col_idx)| {
                         payload_includes_rowid_alias_lazy(
-                            &cursor.header_offsets,
+                            &mut cursor.row_decode,
                             &cursor.payload_buf,
-                            &mut cursor.row_vals_buf,
-                            &mut cursor.decoded_mask,
                             rowid,
                             ipk_col_idx,
                             self.table_column_count_by_root_page
@@ -9696,16 +9714,12 @@ impl VdbeEngine {
             };
 
             // ── Lazy column decode: decode on demand ─────────────────
-            if payload_idx < cursor.header_offsets.len() {
+            if payload_idx < cursor.row_decode.header_offsets.len() {
                 // Check if already decoded via bitmask.
-                let cached_value_ready = if payload_idx < 64 {
-                    cursor.decoded_mask & (1u64 << payload_idx) != 0
-                } else {
-                    cursor.decoded_mask == u64::MAX
-                };
+                let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
                 if cached_value_ready {
                     // Already materialized — return cached value.
-                    if let Some(val) = cursor.row_vals_buf.get(payload_idx).cloned() {
+                    if let Some(val) = cursor.row_decode.values.get(payload_idx).cloned() {
                         if refresh_state.refreshed && refresh_state.eager_values_ready {
                             note_decode_cache_miss(collect_vdbe_metrics);
                         } else {
@@ -9722,7 +9736,7 @@ impl VdbeEngine {
                 note_decode_cache_miss(collect_vdbe_metrics);
                 let val = fsqlite_types::record::decode_column_from_offset(
                     &cursor.payload_buf,
-                    &cursor.header_offsets[payload_idx],
+                    &cursor.row_decode.header_offsets[payload_idx],
                     collect_vdbe_metrics,
                 )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -9743,10 +9757,7 @@ impl VdbeEngine {
                     FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                     record_decoded_value_metrics(&val);
                 }
-                cursor.row_vals_buf[payload_idx] = val.clone();
-                if payload_idx < 64 {
-                    cursor.decoded_mask |= 1u64 << payload_idx;
-                }
+                cursor.row_decode.cache_decoded(payload_idx, val.clone());
                 return Ok(val);
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
@@ -9861,44 +9872,31 @@ impl VdbeEngine {
                     return Ok(value);
                 }
                 let refresh_state = ensure_sorter_row_cache(sorter, collect_vdbe_metrics, pos)?;
-                let (rows, cached_row_header_offsets, cached_row_values, cached_row_decoded_mask) = (
-                    &sorter.rows,
-                    &sorter.cached_row_header_offsets,
-                    &mut sorter.cached_row_values,
-                    &mut sorter.cached_row_decoded_mask,
-                );
+                let rows = &sorter.rows;
+                let cached_row_decode = &mut sorter.cached_row_decode;
                 let row = rows.get(pos).ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: format!("missing sorter row at position {pos}"),
                 })?;
-                let value = if col_idx < cached_row_header_offsets.len() {
-                    let cached_value_ready = if col_idx < 64 {
-                        *cached_row_decoded_mask & (1u64 << col_idx) != 0
-                    } else {
-                        *cached_row_decoded_mask == u64::MAX
-                    };
+                let value = if col_idx < cached_row_decode.header_offsets.len() {
+                    let cached_value_ready = cached_row_decode.cached_value_ready(col_idx);
                     if cached_value_ready {
                         if refresh_state.refreshed && refresh_state.eager_values_ready {
                             note_decode_cache_miss(collect_vdbe_metrics);
                         } else {
                             note_decode_cache_hit(collect_vdbe_metrics);
                         }
-                        cached_row_values
+                        cached_row_decode
+                            .values
                             .get(col_idx)
                             .cloned()
                             .unwrap_or(SqliteValue::Null)
                     } else if let Some(value) = fsqlite_types::record::decode_column_from_offset(
                         &row.blob,
-                        &cached_row_header_offsets[col_idx],
+                        &cached_row_decode.header_offsets[col_idx],
                         collect_vdbe_metrics,
                     ) {
                         note_decode_cache_miss(collect_vdbe_metrics);
-                        if col_idx >= cached_row_values.len() {
-                            cached_row_values.resize(col_idx + 1, SqliteValue::Null);
-                        }
-                        cached_row_values[col_idx] = value.clone();
-                        if col_idx < 64 {
-                            *cached_row_decoded_mask |= 1u64 << col_idx;
-                        }
+                        cached_row_decode.cache_decoded(col_idx, value.clone());
                         value
                     } else {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -10088,9 +10086,7 @@ impl VdbeEngine {
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
-                            row_vals_buf: Vec::new(),
-                            header_offsets: Vec::new(),
-                            decoded_mask: 0,
+                            row_decode: RowDecodeScratch::default(),
                             last_position_stamp: None,
                         },
                     );
@@ -10171,9 +10167,7 @@ impl VdbeEngine {
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
-                            row_vals_buf: Vec::new(),
-                            header_offsets: Vec::new(),
-                            decoded_mask: 0,
+                            row_decode: RowDecodeScratch::default(),
                             last_position_stamp: None,
                         },
                     );
@@ -10294,9 +10288,7 @@ impl VdbeEngine {
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
-                row_vals_buf: Vec::new(),
-                header_offsets: Vec::new(),
-                decoded_mask: 0,
+                row_decode: RowDecodeScratch::default(),
                 last_position_stamp: None,
             },
         );
@@ -10618,18 +10610,15 @@ fn payload_includes_rowid_alias(
 ///
 /// For the common `NULL`-at-IPK case, only the serial type is inspected
 /// (zero-decode).  For the integer-match case, a single column is decoded
-/// on demand and cached in `row_vals_buf` + `decoded_mask`.
-#[allow(clippy::too_many_arguments)]
+/// on demand and cached in the caller-owned scratch buffer.
 fn payload_includes_rowid_alias_lazy(
-    header_offsets: &[fsqlite_types::record::ColumnOffset],
+    row_decode: &mut RowDecodeScratch,
     payload_buf: &[u8],
-    row_vals_buf: &mut Vec<SqliteValue>,
-    decoded_mask: &mut u64,
     rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
 ) -> bool {
-    let payload_cols = header_offsets.len();
+    let payload_cols = row_decode.header_offsets.len();
     if let Some(table_cols) = table_column_count
         && payload_cols >= table_cols
     {
@@ -10639,7 +10628,7 @@ fn payload_includes_rowid_alias_lazy(
         return false;
     }
 
-    let col = &header_offsets[ipk_col_idx];
+    let col = &row_decode.header_offsets[ipk_col_idx];
     use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
 
     match classify_serial_type(col.serial_type) {
@@ -10652,9 +10641,9 @@ fn payload_includes_rowid_alias_lazy(
         // Integer: decode just this one column to compare.
         SerialTypeClass::Integer => {
             // Lazily decode and cache.
-            if ipk_col_idx < 64 && *decoded_mask & (1u64 << ipk_col_idx) != 0 {
+            if row_decode.cached_value_ready(ipk_col_idx) {
                 // Already decoded.
-                match row_vals_buf.get(ipk_col_idx) {
+                match row_decode.values.get(ipk_col_idx) {
                     Some(SqliteValue::Integer(v)) => *v == rowid,
                     _ => false,
                 }
@@ -10662,14 +10651,7 @@ fn payload_includes_rowid_alias_lazy(
                 fsqlite_types::record::decode_column_from_offset(payload_buf, col, false)
             {
                 let result = matches!(&val, SqliteValue::Integer(v) if *v == rowid);
-                // Cache the decoded value.
-                if ipk_col_idx >= row_vals_buf.len() {
-                    row_vals_buf.resize(ipk_col_idx + 1, SqliteValue::Null);
-                }
-                row_vals_buf[ipk_col_idx] = val;
-                if ipk_col_idx < 64 {
-                    *decoded_mask |= 1u64 << ipk_col_idx;
-                }
+                row_decode.cache_decoded(ipk_col_idx, val);
                 result
             } else {
                 false
@@ -10702,27 +10684,12 @@ fn ensure_storage_cursor_row_cache(
     cursor
         .cursor
         .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
-    let col_count = fsqlite_types::record::parse_record_header_into(
+    let eager_values_ready = cursor.row_decode.prepare_for_record(
         &cursor.payload_buf,
-        &mut cursor.header_offsets,
+        "malformed record header in cursor payload",
+        "malformed record payload in cursor (>64-column eager decode)",
     )
-    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-        detail: "malformed record header in cursor payload".to_owned(),
-    })?;
-
-    let eager_values_ready = if col_count > 64 {
-        cursor.row_vals_buf.clear();
-        fsqlite_types::record::parse_record_into(&cursor.payload_buf, &mut cursor.row_vals_buf)
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "malformed record payload in cursor (>64-column eager decode)".to_owned(),
-            })?;
-        cursor.decoded_mask = u64::MAX;
-        true
-    } else {
-        cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
-        cursor.decoded_mask = 0;
-        false
-    };
+    ?;
     cursor.last_position_stamp = position_stamp;
     Ok(DecodeCacheRefreshState {
         refreshed: true,
@@ -10735,18 +10702,10 @@ fn ensure_sorter_row_cache(
     collect_vdbe_metrics: bool,
     position: usize,
 ) -> Result<DecodeCacheRefreshState> {
-    let (
-        rows,
-        cached_row_position,
-        cached_row_header_offsets,
-        cached_row_values,
-        cached_row_decoded_mask,
-    ) = (
+    let (rows, cached_row_position, cached_row_decode) = (
         &sorter.rows,
         &mut sorter.cached_row_position,
-        &mut sorter.cached_row_header_offsets,
-        &mut sorter.cached_row_values,
-        &mut sorter.cached_row_decoded_mask,
+        &mut sorter.cached_row_decode,
     );
     if *cached_row_position == Some(position) {
         return Ok(DecodeCacheRefreshState::default());
@@ -10762,25 +10721,11 @@ fn ensure_sorter_row_cache(
             DecodeCacheInvalidationReason::PositionChange,
         );
     }
-    let col_count =
-        fsqlite_types::record::parse_record_header_into(&row.blob, cached_row_header_offsets)
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: "malformed sorter record header".to_owned(),
-            })?;
-    let eager_values_ready = if col_count > 64 {
-        cached_row_values.clear();
-        fsqlite_types::record::parse_record_into(&row.blob, cached_row_values).ok_or_else(
-            || FrankenError::DatabaseCorrupt {
-                detail: "malformed sorter record payload (>64-column eager decode)".to_owned(),
-            },
-        )?;
-        *cached_row_decoded_mask = u64::MAX;
-        true
-    } else {
-        cached_row_values.resize(col_count, SqliteValue::Null);
-        *cached_row_decoded_mask = 0;
-        false
-    };
+    let eager_values_ready = cached_row_decode.prepare_for_record(
+        &row.blob,
+        "malformed sorter record header",
+        "malformed sorter record payload (>64-column eager decode)",
+    )?;
     *cached_row_position = Some(position);
     Ok(DecodeCacheRefreshState {
         refreshed: true,
@@ -10793,12 +10738,10 @@ fn invalidate_storage_cursor_row_cache_with_reason(
     collect_vdbe_metrics: bool,
     reason: DecodeCacheInvalidationReason,
 ) {
-    if cursor.last_position_stamp.is_some() || !cursor.header_offsets.is_empty() {
+    if cursor.last_position_stamp.is_some() || !cursor.row_decode.header_offsets.is_empty() {
         note_decode_cache_invalidation(collect_vdbe_metrics, reason);
     }
-    cursor.row_vals_buf.clear();
-    cursor.header_offsets.clear();
-    cursor.decoded_mask = 0;
+    cursor.row_decode.invalidate();
     cursor.last_position_stamp = None;
 }
 
