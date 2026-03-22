@@ -191,6 +191,11 @@ where
             detail: "usable page size too small for overflow data".to_owned(),
         });
     }
+    if full_page_size < usable_size {
+        return Err(FrankenError::internal(format!(
+            "full_page_size ({full_page_size}) < usable_size ({usable_size})"
+        )));
+    }
     let page_size = full_page_size as usize;
 
     // Calculate number of overflow pages needed.
