@@ -14,6 +14,7 @@
 //! └───────────────────────────────────┘
 //! ```
 
+use crate::instrumentation;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::limits::MAX_ALLOCATION_SIZE;
@@ -42,6 +43,9 @@ where
     F: FnMut(PageNumber) -> Result<P>,
     P: AsRef<[u8]>,
 {
+    instrumentation::record_owned_payload_materialization(
+        usize::try_from(total_payload_size).unwrap_or(usize::MAX),
+    );
     let mut payload = Vec::new();
     read_overflow_chain_into(
         local_data,
@@ -136,6 +140,12 @@ where
             ),
         });
     }
+
+    instrumentation::record_overflow_chain_reassembly(
+        local_data.len(),
+        total_size.saturating_sub(local_data.len()),
+        chain_length,
+    );
 
     Ok(())
 }

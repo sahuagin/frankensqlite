@@ -33,8 +33,11 @@ use fsqlite_ast::{
     ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
     TableConstraintKind, TableOrSubquery, TimeTravelTarget, UnaryOp, WindowSpec,
 };
-use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
+use fsqlite_btree::{
+    BtreeCopyProfileSnapshot, BtreeCursorOps, btree_copy_profile_snapshot,
+    reset_btree_copy_profile, set_btree_copy_profile_enabled,
+};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_ext_fts5::{
     Fts5Expr, Fts5Table, InvertedIndex, bm25_score, build_expr, highlight as fts5_highlight,
@@ -313,6 +316,7 @@ pub struct HotPathProfileSnapshot {
     pub prepared_table_dml_affected_only_runs: u64,
     pub autoincrement_sequence_fast_path_updates: u64,
     pub autoincrement_sequence_scan_refreshes: u64,
+    pub btree_copy_kernels: BtreeCopyProfileSnapshot,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -324,6 +328,7 @@ pub fn hot_path_profile_enabled() -> bool {
 
 pub fn set_hot_path_profile_enabled(enabled: bool) {
     FSQLITE_HOT_PATH_PROFILE_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+    set_btree_copy_profile_enabled(enabled);
     set_record_profile_enabled(enabled);
     set_vdbe_metrics_enabled(enabled);
 }
@@ -368,6 +373,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PREPARED_TABLE_DML_AFFECTED_ONLY_RUNS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_FAST_PATH_UPDATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES.store(0, AtomicOrdering::Relaxed);
+    reset_btree_copy_profile();
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -439,6 +445,7 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         autoincrement_sequence_scan_refreshes: FSQLITE_AUTOINCREMENT_SEQUENCE_SCAN_REFRESHES
             .load(AtomicOrdering::Relaxed),
+        btree_copy_kernels: btree_copy_profile_snapshot(),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
     }

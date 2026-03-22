@@ -566,6 +566,94 @@ pub fn decode_column_from_offset(
     decode_value(col.serial_type, &data[start..end], profile_enabled)
 }
 
+/// Caller-owned scratch for lazy record decode and row materialization.
+///
+/// This scratch is intended to be owned by a single cursor-like object and
+/// reused only while that owner remains positioned on the same physical record
+/// image. Callers must invalidate it when the row image changes.
+///
+/// The scratch chooses a cursor-local reusable buffer model rather than an
+/// arena model:
+/// - `header_offsets` caches the parsed record layout for lazy decode
+/// - `values` reuses existing `SqliteValue` backing storage across decodes
+/// - `decoded_mask` tracks which columns have been materialized for narrow rows
+///
+/// Nothing in this type is shared across cursors, statements, or transactions.
+#[derive(Debug, Default, Clone)]
+pub struct RecordDecodeScratch {
+    header_offsets: Vec<ColumnOffset>,
+    values: Vec<SqliteValue>,
+    decoded_mask: u64,
+}
+
+impl RecordDecodeScratch {
+    /// Prepare the scratch for a new serialized record.
+    ///
+    /// Returns `Some(true)` when the record is eagerly decoded because it has
+    /// more than 64 columns, `Some(false)` when lazy decode remains active, or
+    /// `None` when the record is malformed.
+    #[must_use]
+    pub fn prepare_for_record(&mut self, record: &[u8]) -> Option<bool> {
+        let col_count = parse_record_header_into(record, &mut self.header_offsets)?;
+        if col_count > 64 {
+            self.values.clear();
+            parse_record_into(record, &mut self.values)?;
+            self.decoded_mask = u64::MAX;
+            Some(true)
+        } else {
+            self.values.resize(col_count, SqliteValue::Null);
+            self.decoded_mask = 0;
+            Some(false)
+        }
+    }
+
+    /// Drop the cached layout and decoded values while preserving capacity for reuse.
+    pub fn invalidate(&mut self) {
+        self.header_offsets.clear();
+        self.values.clear();
+        self.decoded_mask = 0;
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.header_offsets.is_empty()
+    }
+
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.header_offsets.len()
+    }
+
+    #[must_use]
+    pub fn column_offset(&self, idx: usize) -> Option<&ColumnOffset> {
+        self.header_offsets.get(idx)
+    }
+
+    #[must_use]
+    pub fn cached_value(&self, idx: usize) -> Option<&SqliteValue> {
+        self.values.get(idx)
+    }
+
+    #[must_use]
+    pub fn cached_value_ready(&self, idx: usize) -> bool {
+        if idx < 64 {
+            self.decoded_mask & (1_u64 << idx) != 0
+        } else {
+            self.decoded_mask == u64::MAX
+        }
+    }
+
+    pub fn cache_decoded(&mut self, idx: usize, value: SqliteValue) {
+        if idx >= self.values.len() {
+            self.values.resize(idx + 1, SqliteValue::Null);
+        }
+        self.values[idx] = value;
+        if idx < 64 {
+            self.decoded_mask |= 1_u64 << idx;
+        }
+    }
+}
+
 /// Decode only the first `n` columns from a serialized record.
 ///
 /// This is the sort-key extraction path: for ORDER BY on 2 columns of a
@@ -986,6 +1074,61 @@ mod tests {
 
         parse_record_into(&second, &mut values).expect("second decode");
         assert_eq!(values[0].as_blob(), Some(&[9u8, 10, 11][..]));
+    }
+
+    #[test]
+    fn record_decode_scratch_reuses_small_record_state() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(7),
+            SqliteValue::Text(Arc::from("scratch-owned")),
+        ]);
+        let mut scratch = RecordDecodeScratch::default();
+
+        let eager = scratch
+            .prepare_for_record(&record)
+            .expect("record layout should decode");
+        assert!(!eager);
+        assert_eq!(scratch.column_count(), 2);
+        assert!(!scratch.cached_value_ready(1));
+
+        let decoded = decode_column_from_offset(
+            &record,
+            scratch
+                .column_offset(1)
+                .expect("column offset should exist"),
+            false,
+        )
+        .expect("column should decode");
+        scratch.cache_decoded(1, decoded);
+
+        assert!(scratch.cached_value_ready(1));
+        assert_eq!(
+            scratch.cached_value(1).and_then(SqliteValue::as_text),
+            Some("scratch-owned")
+        );
+
+        scratch.invalidate();
+        assert!(scratch.is_empty());
+        assert!(!scratch.cached_value_ready(1));
+        assert!(scratch.cached_value(1).is_none());
+    }
+
+    #[test]
+    fn record_decode_scratch_eagerly_materializes_wide_records() {
+        let values: Vec<_> = (0_i64..65).map(SqliteValue::Integer).collect();
+        let record = serialize_record(&values);
+        let mut scratch = RecordDecodeScratch::default();
+
+        let eager = scratch
+            .prepare_for_record(&record)
+            .expect("wide record layout should decode");
+        assert!(eager);
+        assert_eq!(scratch.column_count(), 65);
+        assert!(scratch.cached_value_ready(64));
+        assert_eq!(
+            scratch.cached_value(64).and_then(SqliteValue::as_integer),
+            Some(64)
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! of where the bytes live.
 
 use crate::cell::{self, BtreePageType, CellRef};
+use crate::instrumentation;
 use crate::overflow;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
@@ -40,6 +41,7 @@ where
             read_page,
         )
     } else {
+        instrumentation::record_owned_payload_materialization(local.len());
         Ok(local.to_vec())
     }
 }

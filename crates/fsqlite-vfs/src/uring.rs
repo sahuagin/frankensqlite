@@ -105,6 +105,25 @@ fn next_chunk_end(total: usize, len: usize) -> usize {
     total + remaining.min(IO_URING_MAX_RW_CHUNK_BYTES)
 }
 
+/// Returns whether this open participates in SQLite's lock-sensitive fd topology.
+///
+/// `UnixVfs` preserves SQLite/FrankenSQLite locking semantics by ensuring the
+/// process keeps a single canonical fd per inode. The asupersync io_uring path
+/// opens an independent fd, which is not safe for these files because closing
+/// any same-inode fd can perturb process-scoped POSIX locks.
+fn uses_sqlite_lock_sensitive_fd_topology(flags: VfsOpenFlags) -> bool {
+    flags.intersects(
+        VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::MAIN_JOURNAL
+            | VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::TEMP_JOURNAL
+            | VfsOpenFlags::SUBJOURNAL
+            | VfsOpenFlags::SUPER_JOURNAL
+            | VfsOpenFlags::WAL
+            | VfsOpenFlags::DELETEONCLOSE,
+    )
+}
+
 fn enforce_conformal_breach_policy(
     runtime: &IoUringRuntime,
     operation: &'static str,
@@ -367,6 +386,11 @@ pub struct IoUringFile {
 }
 
 impl IoUringFile {
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn has_uring_data_path(&self) -> bool {
+        self.runtime.is_available() && self.asupersync_backend.is_some()
+    }
+
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
     fn read_via_uring(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
@@ -638,7 +662,14 @@ impl Vfs for IoUringVfs {
         let (file, out_flags) = self.unix.open(cx, path, flags)?;
 
         #[cfg(feature = "linux-asupersync-uring")]
-        let asupersync_backend = if self.runtime.is_available() {
+        // Lock-sensitive SQLite opens must stay on the canonical Unix fd.
+        // Opening a second same-inode fd for the io_uring backend breaks the
+        // invariant that `UnixVfs` relies on to keep process-scoped locks
+        // stable across multiple file handles.
+        let asupersync_backend = if self.runtime.is_available()
+            && path.is_some()
+            && !uses_sqlite_lock_sensitive_fd_topology(flags)
+        {
             if let Some(requested_path) = path {
                 let full_path = self.unix.full_pathname(cx, requested_path)?;
                 match open_asupersync_backend(&full_path, out_flags) {
@@ -699,7 +730,8 @@ impl VfsFile for IoUringFile {
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
-        if self.runtime.is_available() {
+        #[cfg(feature = "linux-asupersync-uring")]
+        if self.has_uring_data_path() {
             let start = Instant::now();
             match self.read_via_uring(cx, buf, offset) {
                 Ok(bytes) => {
@@ -732,7 +764,8 @@ impl VfsFile for IoUringFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
-        if self.runtime.is_available() {
+        #[cfg(feature = "linux-asupersync-uring")]
+        if self.has_uring_data_path() {
             let start = Instant::now();
             match self.write_via_uring(cx, buf, offset) {
                 Ok(()) => {
@@ -826,6 +859,10 @@ mod tests {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
     }
 
+    fn open_flags_create_unlocked() -> VfsOpenFlags {
+        VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
     #[cfg(feature = "linux-asupersync-uring")]
     struct ScopedAtomicFlag<'a> {
         flag: &'a AtomicBool,
@@ -867,7 +904,7 @@ mod tests {
         let path = dir.path().join("uring_roundtrip.db");
 
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
         file.write(&cx, b"hello io_uring", 0)
             .expect("write should succeed");
@@ -890,7 +927,7 @@ mod tests {
         let path = dir.path().join("uring_metrics.db");
 
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
         file.write(&cx, b"metrics", 0)
             .expect("write should succeed");
@@ -923,7 +960,7 @@ mod tests {
         let path = dir.path().join("uring_disabled_runtime_metrics.db");
 
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed via unix fallback");
         file.write(&cx, b"fallback-metrics", 0)
             .expect("write should succeed via unix path");
@@ -1048,6 +1085,86 @@ mod tests {
 
     #[cfg(feature = "linux-asupersync-uring")]
     #[test]
+    fn test_main_db_open_skips_secondary_io_uring_fd() {
+        let _guard = io_uring_test_guard();
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("main_db_direct_unix.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+
+        assert!(
+            file.asupersync_backend.is_none(),
+            "main-db opens must not create a second fd while unix lock coalescing is active"
+        );
+
+        file.write(&cx, b"main-db", 0)
+            .expect("write should succeed via unix path");
+        let mut buf = [0_u8; 7];
+        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        assert_eq!(n, 7);
+        assert_eq!(&buf, b"main-db");
+        assert!(
+            vfs.is_available(),
+            "skipping io_uring fd should not disable runtime"
+        );
+
+        let snapshot = io_uring_latency_snapshot();
+        assert!(
+            snapshot.unix_fallbacks_total >= 2,
+            "main-db direct unix path should avoid io_uring and record unix-path ops"
+        );
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_wal_open_skips_secondary_io_uring_fd() {
+        let _guard = io_uring_test_guard();
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("main.db-wal");
+        let wal_flags = VfsOpenFlags::WAL | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), wal_flags)
+            .expect("open should succeed");
+
+        assert!(
+            file.asupersync_backend.is_none(),
+            "wal opens must not create a second fd while unix lock coalescing is active"
+        );
+
+        file.write(&cx, b"wal", 0)
+            .expect("write should succeed via unix path");
+        let mut buf = [0_u8; 3];
+        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"wal");
+        assert!(vfs.is_available(), "skipping io_uring fd should not disable runtime");
+
+        let snapshot = io_uring_latency_snapshot();
+        assert!(
+            snapshot.unix_fallbacks_total >= 2,
+            "wal direct unix path should avoid io_uring and record unix-path ops"
+        );
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
     fn test_write_abort_propagates_without_disabling_runtime_or_fallback() {
         let _guard = io_uring_test_guard();
         reset_io_uring_latency_metrics();
@@ -1061,7 +1178,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_abort_propagation.db");
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_ABORT);
@@ -1137,7 +1254,7 @@ mod tests {
 
         let _force_init_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_INIT_FAIL);
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed via unix fallback");
 
         assert!(vfs.runtime.is_disabled());
@@ -1174,7 +1291,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_write_failure.db");
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         let _force_write_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_FAIL);
@@ -1204,7 +1321,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_read_failure.db");
         let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
+            .open(&cx, Some(&path), open_flags_create_unlocked())
             .expect("open should succeed");
 
         file.write(&cx, b"fallback", 0)

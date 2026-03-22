@@ -2886,9 +2886,19 @@ mod tests {
         let parent = build_interior_table(&[(pn(3), 40), (pn(4), 80)], pn(5));
         store.inner.pages.insert(2, parent.clone());
 
-        let outcome =
-            apply_child_replacement(&cx, &mut store, pn(2), USABLE, USABLE, 1, 1, &[pn(4)], &[], false)
-                .expect("no-op replacement should succeed");
+        let outcome = apply_child_replacement(
+            &cx,
+            &mut store,
+            pn(2),
+            USABLE,
+            USABLE,
+            1,
+            1,
+            &[pn(4)],
+            &[],
+            false,
+        )
+        .expect("no-op replacement should succeed");
 
         assert!(matches!(outcome, BalanceResult::Done));
         assert_eq!(

@@ -1235,6 +1235,7 @@ impl<P: PageReader> BtCursor<P> {
             )
         } else {
             out.clear();
+            instrumentation::record_local_payload_copy(local.len());
             out.extend_from_slice(local);
             Ok(())
         }
@@ -1253,6 +1254,9 @@ impl<P: PageReader> BtCursor<P> {
             ));
         }
 
+        instrumentation::record_owned_payload_materialization(
+            usize::try_from(cell.payload_size).unwrap_or(usize::MAX),
+        );
         let mut payload = Vec::new();
         self.read_cell_payload_into(cx, entry, cell, &mut payload)?;
         Ok(Cow::Owned(payload))
@@ -1712,8 +1716,10 @@ impl<P: PageWriter> BtCursor<P> {
             let first_overflow =
                 self.write_overflow_chain_for_insert(cx, &payload[local_size..])?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
+            instrumentation::record_table_leaf_cell_assembly(out.len());
             Ok(Some(first_overflow))
         } else {
+            instrumentation::record_table_leaf_cell_assembly(out.len());
             Ok(None)
         }
     }
@@ -1757,8 +1763,10 @@ impl<P: PageWriter> BtCursor<P> {
         if local_size < key.len() {
             let first_overflow = self.write_overflow_chain_for_insert(cx, &key[local_size..])?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
+            instrumentation::record_index_leaf_cell_assembly(out.len());
             Ok(Some(first_overflow))
         } else {
+            instrumentation::record_index_leaf_cell_assembly(out.len());
             Ok(None)
         }
     }
@@ -2138,6 +2146,7 @@ impl<P: PageWriter> BtCursor<P> {
                 self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
             new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
         }
+        instrumentation::record_interior_cell_rebuild(new_cell.len());
 
         // Remove old cell from page and try to insert new cell.
         let mut page_data = self.pager.read_page_data(cx, page_no)?;
@@ -2836,7 +2845,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
-        Ok(self.read_cell_payload(cx, top, &cell)?.into_owned())
+        match self.read_cell_payload(cx, top, &cell)? {
+            Cow::Borrowed(bytes) => {
+                instrumentation::record_owned_payload_materialization(bytes.len());
+                Ok(bytes.to_vec())
+            }
+            Cow::Owned(bytes) => Ok(bytes),
+        }
     }
 
     fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
