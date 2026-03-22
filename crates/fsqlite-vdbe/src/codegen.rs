@@ -4074,7 +4074,7 @@ fn codegen_join_select(
     if let Some((sort_cursor, sort_regs, sort_key_count)) = sorter {
         let sort_loop = b.emit_label();
         let sort_done = b.emit_label();
-        b.emit_op(Opcode::SorterSort, sort_cursor, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
         b.resolve_label(sort_loop);
         b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
         // Extract output columns from sorter data.
