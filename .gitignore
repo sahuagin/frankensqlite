@@ -106,9 +106,12 @@ flamegraph*.svg
 # FastEmbed model caches (downloaded at runtime)
 .fastembed_cache/
 
-# Codex build artifacts
+# Codex build artifacts and ephemeral directories
 target-codex*/
 .codex-target-arc/
+.codex-local-check/
+.codex-bench/
+.codex-tmp/
 
 # Ephemeral agent scratch files
 bead_comment.md
