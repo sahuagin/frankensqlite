@@ -497,8 +497,17 @@ fn init_leaf_table_page(
     // cell_count = 0 (bytes 3..5)
     page[3..5].copy_from_slice(&0u16.to_be_bytes());
     // cell content area starts at end of page
-    #[allow(clippy::cast_possible_truncation)]
-    let content_start = page_size as u16;
+    // SQLite encodes a content offset of 65536 as 0 in the 2-byte header field.
+    // For all other valid page sizes (512..=32768), the value fits in u16 directly.
+    let content_start: u16 = if page_size == 65536 {
+        0
+    } else {
+        u16::try_from(page_size).map_err(|_| {
+            FrankenError::internal(format!(
+                "page_size {page_size} does not fit in u16 and is not 65536"
+            ))
+        })?
+    };
     page[5..7].copy_from_slice(&content_start.to_be_bytes());
     txn.write_page(cx, page_no, &page)
 }
