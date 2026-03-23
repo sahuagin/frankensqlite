@@ -2121,13 +2121,30 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
             }
         }
         let header = WalFecPragmaHeader::new(value);
-        fs::write(sidecar_path, header.to_bytes())?;
-        info!(
-            sidecar = %sidecar_path.display(),
-            raptorq_repair_symbols = value,
-            "persisted wal-fec repair symbol setting (new file)"
-        );
-        return Ok(());
+        // Use create_new (O_EXCL) to atomically create the file, avoiding a
+        // TOCTOU race where another process could create the sidecar between
+        // our exists() check and the write.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(sidecar_path)
+        {
+            Ok(mut file) => {
+                file.write_all(&header.to_bytes())?;
+                file.sync_all()?;
+                info!(
+                    sidecar = %sidecar_path.display(),
+                    raptorq_repair_symbols = value,
+                    "persisted wal-fec repair symbol setting (new file)"
+                );
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process created the sidecar first — fall through
+                // to the read-modify-write path below.
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
 
     let mut file = fs::OpenOptions::new()
