@@ -5956,6 +5956,10 @@ impl Connection {
             } else {
                 Some(params)
             };
+            // Schema validation must happen before EITHER path — a DDL change
+            // after prepare would make both fast and slow paths execute against
+            // a stale schema.
+            stmt.ensure_schema_unchanged(&op_cx)?;
             if stmt.dispatch_precompiled_program().is_some()
                 && let Some(fast_path) = stmt.prepared_update_delete_fast_path()
                 && fast_path.supports_direct_dispatch_now(self)
@@ -5984,7 +5988,6 @@ impl Connection {
                 path = "slow",
                 reason = "deferred_dml",
             );
-            stmt.ensure_schema_unchanged(&op_cx)?;
             let rows = self.execute_statement_impl_after_background_status(
                 dml,
                 p,
