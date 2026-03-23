@@ -1147,7 +1147,7 @@ impl SharedTxnPageIo {
                 return Err(error);
             }
 
-            match write_result.expect("write result must exist when snapshot is valid") {
+            match write_result.ok_or_else(|| FrankenError::Internal("write result must exist when snapshot is valid".to_owned()))? {
                 Ok(()) => {
                     tracing::debug!(
                         txn_id,
@@ -1363,7 +1363,7 @@ impl SharedTxnPageIo {
                 return Err(error);
             }
 
-            match write_result.expect("write result must exist when snapshot is valid") {
+            match write_result.ok_or_else(|| FrankenError::Internal("write result must exist when snapshot is valid".to_owned()))? {
                 Ok(()) => {
                     tracing::debug!(
                         txn_id,
@@ -1735,7 +1735,7 @@ fn track_concurrent_conflict_only_page(
             });
         }
 
-        match track_result.expect("track result must exist when snapshot is valid") {
+        match track_result.ok_or_else(|| FrankenError::Internal("track result must exist when snapshot is valid".to_owned()))? {
             Ok(()) => {
                 add_vdbe_counter_if(
                     metrics_enabled,
@@ -2005,7 +2005,7 @@ impl PageWriter for SharedTxnPageIo {
                         });
                     }
 
-                    match free_result.expect("free result must exist when snapshot is valid") {
+                    match free_result.ok_or_else(|| FrankenError::Internal("free result must exist when snapshot is valid".to_owned()))? {
                         Ok(()) => {
                             tracing::debug!(
                                 txn_id,
@@ -8314,6 +8314,12 @@ impl VdbeEngine {
 
                 Opcode::Yield => {
                     let saved = self.get_reg(op.p1).to_integer();
+                    if saved < 0 || saved as usize >= ops.len() {
+                        return Err(FrankenError::Internal(format!(
+                            "Yield: coroutine address {} out of bounds",
+                            saved
+                        )));
+                    }
                     let current = (pc + 1) as i32;
                     self.set_reg(op.p1, SqliteValue::Integer(i64::from(current)));
                     pc = saved as usize;
@@ -8321,6 +8327,12 @@ impl VdbeEngine {
 
                 Opcode::EndCoroutine => {
                     let saved = self.get_reg(op.p1).to_integer();
+                    if saved < 0 || saved as usize >= ops.len() {
+                        return Err(FrankenError::Internal(format!(
+                            "EndCoroutine: coroutine address {} out of bounds",
+                            saved
+                        )));
+                    }
                     pc = saved as usize;
                 }
 
