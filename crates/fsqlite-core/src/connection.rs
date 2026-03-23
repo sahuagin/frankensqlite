@@ -71904,6 +71904,7 @@ mod pager_routing_tests {
     #[cfg(test)]
     struct StatementReuseHotPathProfileGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
+        previous_enabled: bool,
     }
 
     #[cfg(test)]
@@ -71913,17 +71914,21 @@ mod pager_routing_tests {
                 std::sync::OnceLock::new();
             let lock = HOT_PATH_PROFILE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));
             let guard = lock_unpoisoned(lock);
+            let previous_enabled = hot_path_profile_enabled();
             reset_hot_path_profile();
             set_hot_path_profile_enabled(true);
-            Self { _lock: guard }
+            Self {
+                _lock: guard,
+                previous_enabled,
+            }
         }
     }
 
     #[cfg(test)]
     impl Drop for StatementReuseHotPathProfileGuard {
         fn drop(&mut self) {
-            set_hot_path_profile_enabled(false);
             reset_hot_path_profile();
+            set_hot_path_profile_enabled(self.previous_enabled);
         }
     }
 
@@ -71931,6 +71936,31 @@ mod pager_routing_tests {
     fn reset_statement_reuse_measurement(conn: &Connection) {
         reset_hot_path_profile();
         *conn.cached_vdbe_engine.borrow_mut() = None;
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn test_statement_reuse_hot_path_profile_guard_restores_previous_state() {
+        set_hot_path_profile_enabled(false);
+        {
+            let _guard = StatementReuseHotPathProfileGuard::new();
+            assert!(hot_path_profile_enabled());
+        }
+        assert!(
+            !hot_path_profile_enabled(),
+            "guard should restore disabled profiling state after drop"
+        );
+
+        set_hot_path_profile_enabled(true);
+        {
+            let _guard = StatementReuseHotPathProfileGuard::new();
+            assert!(hot_path_profile_enabled());
+        }
+        assert!(
+            hot_path_profile_enabled(),
+            "guard should preserve enabled profiling state after drop"
+        );
+        set_hot_path_profile_enabled(false);
     }
 
     #[cfg(test)]

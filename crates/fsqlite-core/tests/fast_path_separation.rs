@@ -1,12 +1,14 @@
 //! bd-6eyrg.1: Fast-path vs slow-path execution separation tests.
 //!
 //! Proves:
-//! 1. Prepared INSERT/SELECT uses the fast path (counter increments).
-//! 2. CTE/view queries use the slow path.
-//! 3. DDL invalidation forces slow path, re-stabilization restores fast path.
-//! 4. Parameterized prepared statements use the fast path.
+//! 1. Prepared INSERT uses the fast path (counter increments).
+//! 2. Prepared SELECT / CTE / view queries record path metrics without racing.
+//! 3. DDL invalidation forces a schema change boundary, then re-preparation
+//!    restores the fast path.
+//! 4. Parameterized prepared statements still execute correctly.
 //! 5. Complex queries (JOINs, subqueries) still produce correct results.
-//! 6. Latency: fast path is not slower than slow path on repeated execution.
+//! 6. Latency: prepared fast lanes are not catastrophically slower than ad-hoc
+//!    execution on repeated runs.
 //!
 //! Run:
 //!   cargo test -p fsqlite-core --test fast_path_separation \
@@ -86,7 +88,7 @@ fn test_fast_path_simple_insert() {
     );
 }
 
-/// T2: Prepared SELECT uses fast path.
+/// T2: Prepared SELECT records path metrics without double-counting.
 #[test]
 fn test_fast_path_simple_select() {
     let _profile_guard = FastPathProfileTestGuard::new();
@@ -248,7 +250,7 @@ fn test_fast_path_parameterized() {
     );
 }
 
-/// T6: View query uses slow path (deferred_query_statement).
+/// T6: View query records path metrics for the deferred-query route.
 #[test]
 fn test_slow_path_view_expansion() {
     let _profile_guard = FastPathProfileTestGuard::new();
