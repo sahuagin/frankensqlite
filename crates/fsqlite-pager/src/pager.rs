@@ -292,6 +292,50 @@ impl RollbackJournalRecoveryState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Immutable committed-state snapshot (bd-db300.5.3.3.1 / Card 1: M6)
+// ---------------------------------------------------------------------------
+
+/// Frozen read-only snapshot of pager committed state.
+///
+/// Published atomically on every commit via `RwLock<Arc<...>>`.  Readers
+/// clone the `Arc` (nanosecond RwLock-read hold) then inspect fields without
+/// touching the `PagerInner` Mutex.  This eliminates the #1 hot-path Mutex
+/// acquisition for read-only begin checks and staleness probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerCommittedSnapshot {
+    /// Monotonic commit sequence at publication time.
+    pub commit_seq: CommitSeq,
+    /// Database size in pages.
+    pub db_size: u32,
+    /// Active journal mode.
+    pub journal_mode: JournalMode,
+    /// Number of pages on the freelist.
+    pub freelist_count: usize,
+    /// Whether a checkpoint was active when this snapshot was taken.
+    pub checkpoint_active: bool,
+    /// Whether a writer transaction was active when this snapshot was taken.
+    pub writer_active: bool,
+    /// File size in bytes at snapshot time (for staleness detection).
+    pub db_file_size_bytes: u64,
+}
+
+impl PagerCommittedSnapshot {
+    /// Build a snapshot from the current `PagerInner` state.
+    /// Caller must hold the PagerInner Mutex.
+    fn from_inner<F: VfsFile>(inner: &PagerInner<F>) -> Self {
+        Self {
+            commit_seq: inner.commit_seq,
+            db_size: inner.db_size,
+            journal_mode: inner.journal_mode,
+            freelist_count: inner.freelist.len(),
+            checkpoint_active: inner.checkpoint_active,
+            writer_active: inner.writer_active,
+            db_file_size_bytes: inner.committed_db_file_size_bytes,
+        }
+    }
+}
+
 /// The inner mutable pager state protected by a mutex.
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
@@ -792,6 +836,7 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     write_set: &mut HashMap<PageNumber, StagedPage>,
     write_pages_sorted: &mut Vec<PageNumber>,
     committed_db_size: u32,
+    pending_freed_pages: &[PageNumber],
 ) -> Result<()> {
     if committed_db_size == 0 {
         inner.freelist.clear();
@@ -803,9 +848,17 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     // never part of the durable file image, so they must not be serialized
     // into page-1 freelist metadata until db_size grows to include them.
     let upper_bound = inner.next_page.saturating_sub(1).max(committed_db_size);
+    // Build the predicted freelist from the committed freelist plus pending
+    // freed pages WITHOUT mutating inner.freelist. This prevents concurrent
+    // transactions from observing uncommitted freelist changes during the
+    // window between Phase A (prepare) and Phase B (WAL I/O) of the split-
+    // lock commit path. Freed pages are only promoted into inner.freelist
+    // after Phase B succeeds (in Phase C). See beads_rust#138.
+    let mut predicted_freelist = inner.freelist.clone();
+    return_pages_to_freelist(&mut predicted_freelist, pending_freed_pages.iter().copied());
+    let predicted_normalized = normalize_freelist(&predicted_freelist, upper_bound);
     inner.freelist = normalize_freelist(&inner.freelist, upper_bound);
-    let durable_freelist: Vec<PageNumber> = inner
-        .freelist
+    let durable_freelist: Vec<PageNumber> = predicted_normalized
         .iter()
         .copied()
         .filter(|page| page.get() <= committed_db_size)
@@ -1602,6 +1655,10 @@ pub struct SimplePager<V: Vfs> {
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
     /// This enables Thread B to start its prepare phase while Thread A does WAL I/O.
     wal_backend: SharedWalBackend,
+    /// Immutable committed-state snapshot (bd-db300.5.3.3.1 / Card 1: M6).
+    /// Readers clone the Arc via a brief RwLock-read to inspect committed state
+    /// without taking the PagerInner Mutex.  Published on every commit.
+    committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -1920,6 +1977,7 @@ where
                 cache: Arc::clone(&self.cache),
                 published: Arc::clone(&self.published),
                 wal_backend: Arc::clone(&self.wal_backend),
+                committed_snapshot: Arc::clone(&self.committed_snapshot),
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
                 published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: HashMap::new(),
@@ -2080,6 +2138,7 @@ where
             cache: Arc::clone(&self.cache),
             published: Arc::clone(&self.published),
             wal_backend: Arc::clone(&self.wal_backend),
+            committed_snapshot: Arc::clone(&self.committed_snapshot),
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
             write_set: HashMap::new(),
@@ -2461,6 +2520,34 @@ where
         inner.page_size
     }
 
+    /// Read the committed-state snapshot without taking the PagerInner Mutex.
+    ///
+    /// Returns a cheap `Arc` clone — the RwLock read-hold is ~nanoseconds.
+    /// Use this for staleness checks, visibility probes, and begin-path
+    /// fast-path gating instead of locking `PagerInner`.
+    #[must_use]
+    pub fn committed_snapshot(&self) -> Arc<PagerCommittedSnapshot> {
+        Arc::clone(
+            &self
+                .committed_snapshot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Publish a new committed-state snapshot (called from commit paths).
+    ///
+    /// Takes the RwLock write-hold (~nanoseconds), swaps the Arc pointer.
+    /// Old snapshot is reclaimed when all readers drop their Arc.
+    pub(crate) fn publish_committed_snapshot_from_inner<F: VfsFile>(&self, inner: &PagerInner<F>) {
+        let new = Arc::new(PagerCommittedSnapshot::from_inner(inner));
+        let mut guard = self
+            .committed_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = new;
+    }
+
     /// Number of page reads satisfied directly from the publication plane.
     #[must_use]
     pub fn published_page_hits(&self) -> u64 {
@@ -2745,6 +2832,15 @@ where
                 freelist_count,
             )),
             wal_backend: new_shared_wal_backend(),
+            committed_snapshot: Arc::new(RwLock::new(Arc::new(PagerCommittedSnapshot {
+                commit_seq: initial_commit_seq,
+                db_size,
+                journal_mode: JournalMode::Delete,
+                freelist_count,
+                checkpoint_active: false,
+                writer_active: false,
+                db_file_size_bytes: file_size,
+            }))),
         })
     }
 
@@ -2880,6 +2976,15 @@ where
                 0, // freelist_count = 0 for read-only
             )),
             wal_backend: new_shared_wal_backend(),
+            committed_snapshot: Arc::new(RwLock::new(Arc::new(PagerCommittedSnapshot {
+                commit_seq: initial_commit_seq,
+                db_size,
+                journal_mode: JournalMode::Delete,
+                freelist_count: 0,
+                checkpoint_active: false,
+                writer_active: false,
+                db_file_size_bytes: file_size,
+            }))),
         })
     }
 
@@ -3113,6 +3218,8 @@ pub struct SimpleTransaction<V: Vfs> {
     published: Arc<PublishedPagerState>,
     /// WAL backend for WAL-mode operation (D1-CRITICAL: separate lock for split-lock commit).
     wal_backend: SharedWalBackend,
+    /// Shared committed-state snapshot (bd-db300.5.3.3.1 / M6).
+    committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
     /// Visible commit sequence at snapshot capture. Uses `Cell` for interior
     /// mutability so `get_page` (which takes `&self`) can refresh the snapshot
     /// when encountering pages beyond the current db_size boundary.
@@ -4454,12 +4561,31 @@ where
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
+        // Declared outside the block so it survives to Phase C where freed
+        // pages are promoted into inner.freelist after successful WAL commit.
+        let pending_freed: Vec<PageNumber>;
         {
             // ShardedPageCache uses per-shard internal locking
+            //
+            // Compute freelist_dirty BEFORE draining freed_pages, because
+            // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
             let freelist_dirty = self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
-            for page_no in self.freed_pages.drain(..) {
-                inner.freelist.push(page_no);
-            }
+            // CRITICAL FIX (beads_rust#138): Do NOT push freed_pages into
+            // inner.freelist during Phase A. In the split-lock WAL commit
+            // path, inner.lock() is released between Phase A and Phase B.
+            // If freed pages are pushed here, a concurrent transaction's
+            // Phase A can observe them and serialize a conflicting freelist
+            // into its write_set. When both batches reach the WAL, the
+            // last writer's page 1 (with stale/inconsistent freelist
+            // trunk pointer and count) overwrites the first writer's,
+            // creating orphaned pages ("page N is never used").
+            //
+            // Instead, we drain freed_pages into a local vec and pass it
+            // to the serializer which builds a predicted freelist from
+            // inner.freelist + pending_freed without mutating inner.freelist.
+            // The actual promotion into inner.freelist is deferred to
+            // Phase C (after WAL success).
+            pending_freed = self.freed_pages.drain(..).collect();
             if freelist_dirty {
                 serialize_freelist_to_write_set(
                     cx,
@@ -4470,6 +4596,7 @@ where
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     committed_db_size,
+                    &pending_freed,
                 )?;
             }
 
@@ -4571,6 +4698,11 @@ where
 
         if commit_result.is_ok() {
             // Phase C1 (FAST, under inner.lock): Update metadata only.
+            // CRITICAL FIX (beads_rust#138): Now that WAL I/O has succeeded,
+            // promote the pending freed pages into inner.freelist. This is
+            // the deferred half of the Phase A fix — freed pages are only
+            // visible to other transactions after the WAL commit is durable.
+            return_pages_to_freelist(&mut inner.freelist, pending_freed.into_iter());
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4589,6 +4721,15 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
+            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
+            {
+                let snap = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
+                let mut guard = self
+                    .committed_snapshot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = snap;
+            }
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
@@ -4648,6 +4789,12 @@ where
         } else {
             // Keep the writer lock held on commit failure so no other writer
             // can interleave while the caller decides to retry or roll back.
+            //
+            // CRITICAL FIX (beads_rust#138): Restore pending freed pages so
+            // a retry or rollback can still observe them. In the old code
+            // they leaked into inner.freelist regardless of commit outcome;
+            // now we only promote on success and restore on failure.
+            self.freed_pages.extend(pending_freed);
             drop(inner);
         }
         commit_result
@@ -4679,12 +4826,17 @@ where
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
+        // Compute freelist_dirty BEFORE draining freed_pages, because
+        // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
+        let freelist_dirty_for_retain =
+            self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+        // CRITICAL FIX (beads_rust#138): Drain freed_pages AFTER dirty check
+        // but do NOT push into inner.freelist. Pass to serializer as
+        // pending_freed so inner.freelist remains untouched until Phase C
+        // (after successful commit).
+        let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
         let commit_result = {
-            // ShardedPageCache uses per-shard internal locking
-            let freelist_dirty = self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
-            for page_no in self.freed_pages.drain(..) {
-                inner.freelist.push(page_no);
-            }
+            let freelist_dirty = freelist_dirty_for_retain;
             if freelist_dirty {
                 serialize_freelist_to_write_set(
                     cx,
@@ -4695,6 +4847,7 @@ where
                     &mut self.write_set,
                     &mut self.write_pages_sorted,
                     committed_db_size,
+                    &pending_freed,
                 )?;
             }
 
@@ -4772,6 +4925,7 @@ where
             // For journal mode, update db_size from our computed value.
             // For WAL mode with group commit, the flusher already set inner.db_size
             // to the consolidated max across all batched transactions - don't revert it.
+            return_pages_to_freelist(&mut inner.freelist, pending_freed.into_iter());
             if self.journal_mode != JournalMode::Wal {
                 inner.db_size = committed_db_size;
             }
@@ -4789,6 +4943,15 @@ where
                 checkpoint_active: inner.checkpoint_active,
             };
             self.publish_committed_state(cx, publish_update);
+            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
+            {
+                let snap = Arc::new(PagerCommittedSnapshot::from_inner(&inner));
+                let mut guard = self
+                    .committed_snapshot
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = snap;
+            }
             drop(inner);
 
             // Clear write set for reuse (no allocation — just clears existing maps).
@@ -4806,6 +4969,9 @@ where
             // Transaction stays active — committed/finished remain false.
             Ok(true)
         } else {
+            // CRITICAL FIX (beads_rust#138): Restore pending freed pages on
+            // commit failure so rollback can still see them.
+            self.freed_pages.extend(pending_freed);
             drop(inner);
             commit_result?;
             unreachable!()
@@ -12342,6 +12508,154 @@ mod tests {
                 .unwrap(),
             "bead_id={BEAD_ID} case=net_zero_free_skips_page_one_conflict_tracking"
         );
+    }
+
+    /// Regression test for beads_rust#138: concurrent freelist corruption.
+    ///
+    /// Before the fix, two transactions committing concurrently could push
+    /// freed pages into the shared `inner.freelist` during Phase A, then
+    /// each serialize a different freelist snapshot into their write_set.
+    /// When the WAL flusher wrote both batches, the last writer's page 1
+    /// (with potentially stale freelist trunk/count) would overwrite the
+    /// first writer's, creating orphaned pages.
+    ///
+    /// This test verifies that after two sequential commits that free
+    /// different pages, the inner.freelist is consistent (contains exactly
+    /// the freed pages) and the page 1 freelist metadata matches.
+    #[test]
+    fn test_concurrent_freelist_no_orphaned_pages_after_sequential_free_commits() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Seed: allocate pages 2..5, commit.
+        let (p2, p3, p4, p5) = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p2 = seed.allocate_page(&cx).unwrap();
+            let p3 = seed.allocate_page(&cx).unwrap();
+            let p4 = seed.allocate_page(&cx).unwrap();
+            let p5 = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, p2, &vec![0x22; ps]).unwrap();
+            seed.write_page(&cx, p3, &vec![0x33; ps]).unwrap();
+            seed.write_page(&cx, p4, &vec![0x44; ps]).unwrap();
+            seed.write_page(&cx, p5, &vec![0x55; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (p2, p3, p4, p5)
+        };
+
+        // Transaction 1: free p2
+        {
+            let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn1.free_page(&cx, p2).unwrap();
+            txn1.commit(&cx).unwrap();
+        }
+
+        // Verify p2 is in the freelist after T1 commits.
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&p2),
+                "bead_id={BEAD_ID} case=freed_page_promoted_to_freelist_after_commit p2={}",
+                p2.get()
+            );
+        }
+
+        // Transaction 2: free p3
+        {
+            let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn2.free_page(&cx, p3).unwrap();
+            txn2.commit(&cx).unwrap();
+        }
+
+        // Verify both p2 and p3 are in the freelist.
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&p2),
+                "bead_id={BEAD_ID} case=p2_still_in_freelist_after_second_commit p2={}",
+                p2.get()
+            );
+            assert!(
+                inner.freelist.contains(&p3),
+                "bead_id={BEAD_ID} case=p3_in_freelist_after_commit p3={}",
+                p3.get()
+            );
+            assert!(
+                !inner.freelist.contains(&p4),
+                "bead_id={BEAD_ID} case=p4_not_freed p4={}",
+                p4.get()
+            );
+            assert!(
+                !inner.freelist.contains(&p5),
+                "bead_id={BEAD_ID} case=p5_not_freed p5={}",
+                p5.get()
+            );
+        }
+
+        // Verify the pages can be re-allocated and read correctly.
+        {
+            let mut txn3 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let reused1 = txn3.allocate_page(&cx).unwrap();
+            let reused2 = txn3.allocate_page(&cx).unwrap();
+            // Should get p2 and p3 back (from freelist).
+            assert!(
+                [p2, p3].contains(&reused1) || [p2, p3].contains(&reused2),
+                "bead_id={BEAD_ID} case=freed_pages_reusable reused1={} reused2={}",
+                reused1.get(),
+                reused2.get()
+            );
+            txn3.rollback(&cx).unwrap();
+        }
+    }
+
+    /// Regression test for beads_rust#138: freed pages must not leak into
+    /// inner.freelist when commit fails.
+    ///
+    /// Before the fix, freed pages were pushed into inner.freelist during
+    /// Phase A regardless of whether Phase B (WAL I/O) succeeded. If the
+    /// commit failed, those pages remained in the freelist and could be
+    /// allocated by subsequent transactions even though the free was never
+    /// committed to the WAL.
+    #[test]
+    fn test_freed_pages_not_in_freelist_before_commit_success() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Seed: allocate p2
+        let p2 = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p2 = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, p2, &vec![0xAA; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            p2
+        };
+
+        // Begin a transaction that frees p2 but DON'T commit yet.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.free_page(&cx, p2).unwrap();
+
+        // Before commit, p2 should NOT be in inner.freelist
+        // (it's only in the transaction's local freed_pages).
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                !inner.freelist.contains(&p2),
+                "bead_id={BEAD_ID} case=freed_page_not_leaked_before_commit p2={}",
+                p2.get()
+            );
+        }
+
+        // Now commit — p2 should appear in freelist only after success.
+        txn.commit(&cx).unwrap();
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(
+                inner.freelist.contains(&p2),
+                "bead_id={BEAD_ID} case=freed_page_promoted_after_successful_commit p2={}",
+                p2.get()
+            );
+        }
     }
 
     #[test]
