@@ -1,0 +1,413 @@
+# DB300 Regime Atlas / Activation-Frontier Contract v1.0.0
+#
+# Bead: bd-db300.7.5.5
+# Purpose: define the shared regime atlas and activation-frontier contract for
+# aggressive fast paths and policy-bearing storage levers so defaults stay
+# regime-safe across the benchmark matrix instead of pretending one global
+# setting wins everywhere.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.5.5"
+track_id = "bd-db300.7.5"
+generated_at = "2026-03-23"
+contract_owner = "db300-track-g-regime-atlas"
+
+[global_defaults]
+default_activation_state = "shadow_only"
+unclassified_regime_action = "fallback_to_conservative"
+hostile_regime_action = "fallback_to_conservative"
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; no regime classification or activation frontier may serialize writers or flip MVCC defaults."
+evidence_promotion_rule = "A surface may advance beyond shadow_only only after the named proof pack, matrix cells, and shadow-oracle obligations stay green for the claimed regime."
+baseline_comparator_rule = "Every activation decision must name its baseline_comparator and breakpoint_metric so the frontier is anchored to measured break-even evidence rather than a global default guess."
+gap_conversion_rule = "Missing matrix evidence, unstable breakpoint data, unknown topology classes, or incomplete logs become tracked work rather than guessed activation states."
+safe_mode_policy = "If a regime is unclassified or hostile, remain on deterministic conservative behavior, emit fallback_state=active, and surface the missing-evidence reason in structured logs."
+
+[logging]
+common_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "pillar_id",
+  "regime_id",
+  "activation_state",
+  "frontier_reason",
+  "breakpoint_metric",
+  "placement_profile",
+  "topology_class",
+  "fallback_state",
+  "baseline_comparator",
+]
+first_failure_fields = [
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "replay_command",
+  "diagnostic_json_pointer",
+]
+rendered_artifacts = [
+  "regime_atlas_manifest.json",
+  "activation_frontiers.json",
+  "structured_logs.ndjson",
+  "summary.md",
+]
+
+[[regime_axis]]
+axis_id = "engine_mode"
+description = "Baseline engine posture for the cell: SQLite, MVCC concurrent default, or forced single-writer control mode."
+examples = ["sqlite", "mvcc", "forced_single_writer"]
+
+[[regime_axis]]
+axis_id = "workload_family"
+description = "Named workload family or suite cell used to place the result in the benchmark matrix."
+examples = ["micro_insert", "mixed_oltp", "scan_heavy"]
+
+[[regime_axis]]
+axis_id = "key_shape_class"
+description = "Shape of the key distribution that influences locality, hot-set reuse, and conflict geometry."
+examples = ["monotonic", "uniform_random", "zipf_hotspot"]
+
+[[regime_axis]]
+axis_id = "read_write_mix"
+description = "Relative read/write balance and whether the surface is dominated by write-path or mixed-path pressure."
+examples = ["write_heavy", "balanced", "read_heavy"]
+
+[[regime_axis]]
+axis_id = "transaction_shape"
+description = "Transaction structure such as autocommit singleton, short batched DML, or explicit multi-statement transaction."
+examples = ["autocommit_singleton", "short_batch", "explicit_transaction"]
+
+[[regime_axis]]
+axis_id = "hot_page_pressure"
+description = "How strongly the workload concentrates writes on the same logical pages or metadata lanes."
+examples = ["cold", "moderate", "hot"]
+
+[[regime_axis]]
+axis_id = "conflict_topology"
+description = "Conflict geometry seen by MVCC, publication, or WAL lanes for the measured cell."
+examples = ["disjoint", "shared_index_root", "metadata_hotspot"]
+
+[[regime_axis]]
+axis_id = "concurrency_level"
+description = "Writer or mixed-client concurrency class taken from the benchmark matrix."
+examples = ["c1", "c4", "c8"]
+
+[[regime_axis]]
+axis_id = "process_thread_split"
+description = "Whether the workload is single-process threaded, multi-process, or mixed ownership across both."
+examples = ["single_process_threads", "multi_process", "hybrid"]
+
+[[regime_axis]]
+axis_id = "placement_profile"
+description = "Placement profile used for the run, including pinned, adversarial, or neutral host placement."
+examples = ["pinned", "adversarial", "neutral"]
+
+[[regime_axis]]
+axis_id = "topology_class"
+description = "Hardware or host-topology class such as same-core, cross-CCD, or remote ownership."
+examples = ["same_core", "cross_ccd", "remote_owner"]
+
+[[regime_axis]]
+axis_id = "durability_shape"
+description = "Persistence posture of the workload cell, especially file-backed versus memory-backed behavior."
+examples = ["memory_backed", "file_backed", "checkpoint_stressed"]
+
+[[regime_axis]]
+axis_id = "control_mode_override"
+description = "Runtime control or safe-mode override that can force fallback, shadow execution, or operator-only enablement."
+examples = ["auto", "forced_fallback", "shadow_compare", "operator_override"]
+
+[[activation_state]]
+state_id = "universal_default"
+promotion_rule = "Allowed only when the named proof pack stays green and the lever remains beneficial and safe across the required matrix cells, placement profiles, and topology classes."
+fallback_behavior = "No local override is required once the regime is classified and healthy."
+operator_story = "This is the ordinary default for measured healthy cells."
+
+[[activation_state]]
+state_id = "regime_gated_default"
+promotion_rule = "Allowed only for the explicit regime slice named by the atlas; other cells stay at shadow_only or conservative fallback."
+fallback_behavior = "Cells outside the measured slice fall back to the conservative path with an explicit frontier_reason."
+operator_story = "Operators get the fast path automatically only in the measured regime set."
+
+[[activation_state]]
+state_id = "shadow_only"
+promotion_rule = "Use when the candidate path is still collecting evidence or depends on the shadow-oracle contract for safety."
+fallback_behavior = "The conservative path remains authoritative."
+operator_story = "Evidence is still being collected; results are not yet candidate-authoritative."
+
+[[activation_state]]
+state_id = "operator_opt_in"
+promotion_rule = "Use only when there is a measured upside but the evidence is incomplete or the host/workload is too narrow for automatic enablement."
+fallback_behavior = "The conservative path stays default until the operator explicitly opts in."
+operator_story = "Advanced users may enable the lever explicitly with clear caveats and rollback."
+
+[[activation_state]]
+state_id = "rejected"
+promotion_rule = "Use when the lever is harmful, unsafe, or dominated in the measured cells."
+fallback_behavior = "The conservative path is mandatory and the lever must not auto-enable."
+operator_story = "Do not enable this lever in the named regime; the atlas records why."
+
+[[frontier_rule]]
+rule_id = "throughput_break_even"
+target_metric = "throughput_vs_baseline"
+decision_rule = "Promote only when the candidate remains at or above the named baseline comparator by the required threshold across the claimed regime slice."
+stability_requirement = "Two consecutive reruns with no contradictory weak-cell regression."
+fallback_on_failure = "Downgrade to shadow_only or operator_opt_in and record the failing breakpoint."
+
+[[frontier_rule]]
+rule_id = "tail_latency_guardrail"
+target_metric = "p95_or_p99_latency"
+decision_rule = "Reject or downgrade the lever if tail latency exceeds the allowed budget even when throughput improves."
+stability_requirement = "Tail guardrail must hold across the named placement and topology profiles."
+fallback_on_failure = "Force conservative fallback and record the tail guardrail breach."
+
+[[frontier_rule]]
+rule_id = "hot_page_conflict_breakpoint"
+target_metric = "hot_page_or_conflict_pressure"
+decision_rule = "When hot-page pressure or conflict topology crosses the named breakpoint, the atlas must reclassify the cell rather than extending the same activation state by default."
+stability_requirement = "Breakpoint must be stable across the representative concurrency levels used by the proof pack."
+fallback_on_failure = "Fail closed to the conservative path until the breakpoint is re-measured."
+
+[[frontier_rule]]
+rule_id = "topology_stability"
+target_metric = "placement_and_topology_delta"
+decision_rule = "The activation decision must stay valid across the claimed placement profile and topology class instead of assuming a pinned single-host result generalizes."
+stability_requirement = "Pinned and adversarial placement reruns must agree on the activation classification or the cell becomes regime_gated_default at most."
+fallback_on_failure = "Downgrade to operator_opt_in or shadow_only for the unstable topology slice."
+
+[[frontier_rule]]
+rule_id = "shadow_oracle_clearance"
+target_metric = "shadow_divergence_rate"
+decision_rule = "Any candidate-authoritative activation state requires the corresponding shadow-oracle contract to stay free of blocker divergences for the named surface."
+stability_requirement = "Forced and sampled shadow suites must both stay green for the claimed regime slice."
+fallback_on_failure = "Remain shadow_only and record the shadow-oracle dependency as unsatisfied."
+
+[[gap_conversion_rule]]
+gap_id = "missing_matrix_cell"
+trigger = "A required benchmark matrix cell has no measured evidence for the surface."
+required_action = "Create or preserve a tracked bead for the missing cell before promotion."
+
+[[gap_conversion_rule]]
+gap_id = "unstable_breakpoint"
+trigger = "The breakpoint metric flips classification across reruns, placements, or topology classes."
+required_action = "Downgrade the activation state and open a frontier-stability bead rather than guessing."
+
+[[gap_conversion_rule]]
+gap_id = "unknown_topology_class"
+trigger = "The host or placement profile is outside the atlas or cannot be classified deterministically."
+required_action = "Use conservative fallback, record topology_class=unknown, and convert the missing classification into tracked work."
+
+[[gap_conversion_rule]]
+gap_id = "missing_structured_logs"
+trigger = "Required atlas or proof-pack log fields are absent for a classification or rerun."
+required_action = "Treat the run as evidence-incomplete, fail the gate, and open a logging-contract follow-up bead."
+
+[[named_script]]
+script_id = "g5_5_regime_atlas_suite"
+path = "scripts/verify_g5_5_regime_atlas.sh"
+surfaces = ["e2_fused_entry", "e3_metadata_publication", "d1_parallel_wal"]
+artifact_outputs = [
+  "regime_atlas_manifest.json",
+  "activation_frontiers.json",
+  "structured_logs.ndjson",
+  "summary.md",
+]
+
+[[named_script]]
+script_id = "e2_fused_entry_suite"
+path = "scripts/verify_e2_2_fused_entry.sh"
+surfaces = ["e2_fused_entry"]
+artifact_outputs = ["report.json", "events.jsonl", "summary.md"]
+
+[[named_script]]
+script_id = "e3_metadata_publication_suite"
+path = "scripts/verify_e3_3_metadata_publication.sh"
+surfaces = ["e3_metadata_publication"]
+artifact_outputs = ["metadata_publication_report.json", "events.jsonl", "summary.md"]
+
+[[named_script]]
+script_id = "d1_parallel_wal_suite"
+path = "scripts/verify_d1_parallel_wal_matrix.sh"
+surfaces = ["d1_parallel_wal"]
+artifact_outputs = ["parallel_wal_report.json", "events.jsonl", "summary.md"]
+
+[[surface_contract]]
+surface_id = "e2_fused_entry"
+pillar_id = "E2"
+title = "Fused prepared-DML entry and fallback routing"
+baseline_comparator = "prepared_dml_conservative_dispatch"
+candidate_lever = "Fused prepared-DML transaction entry on the common path."
+regime_axes = [
+  "engine_mode",
+  "workload_family",
+  "key_shape_class",
+  "read_write_mix",
+  "transaction_shape",
+  "hot_page_pressure",
+  "conflict_topology",
+  "concurrency_level",
+  "process_thread_split",
+  "placement_profile",
+  "topology_class",
+  "durability_shape",
+  "control_mode_override",
+]
+supported_activation_states = [
+  "universal_default",
+  "regime_gated_default",
+  "shadow_only",
+  "operator_opt_in",
+  "rejected",
+]
+frontier_rules = [
+  "throughput_break_even",
+  "tail_latency_guardrail",
+  "topology_stability",
+  "shadow_oracle_clearance",
+]
+named_scripts = ["g5_5_regime_atlas_suite", "e2_fused_entry_suite"]
+required_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "regime_id",
+  "activation_state",
+  "frontier_reason",
+  "breakpoint_metric",
+  "placement_profile",
+  "topology_class",
+  "fallback_state",
+  "baseline_comparator",
+]
+deterministic_fallback = "If statement shape, schema identity, publication binding, or regime evidence is outside the atlas, use the conservative dispatcher and record fallback_reason explicitly."
+operator_story = "Auto-enable only in measured healthy cells; file-backed or adversarial topology cells remain regime-gated or shadow-only until the proof pack says otherwise."
+unit_test_obligations = [
+  "crates/fsqlite-core/src/connection.rs::tests::regime_atlas_fused_entry_unclassified_cells_fail_closed",
+  "crates/fsqlite-core/src/connection.rs::tests::regime_atlas_fused_entry_requires_stable_break_even_before_auto_enable",
+]
+e2e_obligations = [
+  "scripts/verify_e2_2_fused_entry.sh --engine-mode mvcc --durability-shape memory_backed --control-mode auto",
+  "scripts/verify_e2_2_fused_entry.sh --engine-mode mvcc --durability-shape file_backed --control-mode shadow_compare",
+]
+
+[[surface_contract]]
+surface_id = "e3_metadata_publication"
+pillar_id = "E3"
+title = "Immutable metadata publication and read-side binding"
+baseline_comparator = "conservative_metadata_publication"
+candidate_lever = "Immutable metadata publication bundles with explicit retry and reclamation tracking."
+regime_axes = [
+  "engine_mode",
+  "workload_family",
+  "read_write_mix",
+  "transaction_shape",
+  "hot_page_pressure",
+  "conflict_topology",
+  "concurrency_level",
+  "process_thread_split",
+  "placement_profile",
+  "topology_class",
+  "durability_shape",
+  "control_mode_override",
+]
+supported_activation_states = [
+  "universal_default",
+  "regime_gated_default",
+  "shadow_only",
+  "operator_opt_in",
+  "rejected",
+]
+frontier_rules = [
+  "throughput_break_even",
+  "tail_latency_guardrail",
+  "hot_page_conflict_breakpoint",
+  "topology_stability",
+  "shadow_oracle_clearance",
+]
+named_scripts = ["g5_5_regime_atlas_suite", "e3_metadata_publication_suite"]
+required_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "regime_id",
+  "activation_state",
+  "frontier_reason",
+  "breakpoint_metric",
+  "placement_profile",
+  "topology_class",
+  "fallback_state",
+  "baseline_comparator",
+]
+deterministic_fallback = "If publication lineage, topology evidence, or reclaim/retry behavior leaves the measured atlas, keep the conservative publication path authoritative."
+operator_story = "Promotion requires stable read-side binding and retry/reclamation behavior across the claimed topology slice."
+unit_test_obligations = [
+  "crates/fsqlite-core/src/connection.rs::tests::regime_atlas_metadata_publication_rejects_unknown_topology_cells",
+  "crates/fsqlite-pager/src/pager.rs::tests::regime_atlas_metadata_publication_breakpoint_stability_preserves_fail_closed_defaults",
+]
+e2e_obligations = [
+  "scripts/verify_e3_3_metadata_publication.sh --placement-profile pinned --control-mode auto",
+  "scripts/verify_e3_3_metadata_publication.sh --placement-profile adversarial --control-mode shadow_compare",
+]
+
+[[surface_contract]]
+surface_id = "d1_parallel_wal"
+pillar_id = "D1"
+title = "Per-core parallel WAL append and publication"
+baseline_comparator = "ordered_single_lane_wal_publish"
+candidate_lever = "Per-core parallel WAL append lanes with ordered visibility publication."
+regime_axes = [
+  "engine_mode",
+  "workload_family",
+  "read_write_mix",
+  "transaction_shape",
+  "hot_page_pressure",
+  "conflict_topology",
+  "concurrency_level",
+  "process_thread_split",
+  "placement_profile",
+  "topology_class",
+  "durability_shape",
+  "control_mode_override",
+]
+supported_activation_states = [
+  "universal_default",
+  "regime_gated_default",
+  "shadow_only",
+  "operator_opt_in",
+  "rejected",
+]
+frontier_rules = [
+  "throughput_break_even",
+  "tail_latency_guardrail",
+  "hot_page_conflict_breakpoint",
+  "topology_stability",
+  "shadow_oracle_clearance",
+]
+named_scripts = ["g5_5_regime_atlas_suite", "d1_parallel_wal_suite"]
+required_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "regime_id",
+  "activation_state",
+  "frontier_reason",
+  "breakpoint_metric",
+  "placement_profile",
+  "topology_class",
+  "fallback_state",
+  "baseline_comparator",
+]
+deterministic_fallback = "If the concurrency, topology, or durability cell is outside measured support, keep the conservative ordered WAL path authoritative and do not serialize writers just to chase a benchmark."
+operator_story = "Promotion is expected to be regime-gated by concurrency, topology, and checkpoint pressure rather than assumed universal from a single strong-cell win."
+unit_test_obligations = [
+  "crates/fsqlite-wal/src/lib.rs::tests::regime_atlas_parallel_wal_unknown_topology_fails_closed",
+  "crates/fsqlite-wal/src/lib.rs::tests::regime_atlas_parallel_wal_requires_tail_guardrail_and_shadow_clearance",
+]
+e2e_obligations = [
+  "scripts/verify_d1_parallel_wal_matrix.sh --concurrency c1,c4,c8 --placement-profile pinned",
+  "scripts/verify_d1_parallel_wal_matrix.sh --concurrency c4,c8 --placement-profile adversarial",
+]

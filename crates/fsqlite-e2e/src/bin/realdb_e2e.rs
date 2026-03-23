@@ -38,7 +38,8 @@ use fsqlite_e2e::fixture_metadata::{
 };
 use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, BenchmarkArtifactCommand,
-    BenchmarkArtifactToolVersion, BenchmarkMode, PLACEMENT_PROFILE_BASELINE_UNPINNED,
+    BenchmarkArtifactToolVersion, BenchmarkMode, PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
+    PLACEMENT_PROFILE_BASELINE_UNPINNED, PLACEMENT_PROFILE_RECOMMENDED_PINNED,
     load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
@@ -63,6 +64,240 @@ const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bund
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
 const HOT_PATH_COMMAND_PACK_SCHEMA_V2: &str = "fsqlite-e2e.hot_path_command_pack.v2";
 const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
+const VERIFY_SUITE_PACKAGE_SCHEMA_V1: &str = "fsqlite-e2e.verify_suite_package.v1";
+const VERIFY_SUITE_INLINE_BUNDLE_PREFIX: &str = "VERIFY_SUITE_BUNDLE_JSON=";
+const VERIFY_SUITE_PACKAGE_NAME: &str = "suite_package.json";
+const VERIFY_SUITE_SUMMARY_NAME: &str = "suite_summary.md";
+const VERIFY_SUITE_RERUN_NAME: &str = "rerun_entrypoint.sh";
+const VERIFY_SUITE_FOCUSED_RERUN_NAME: &str = "focused_rerun_entrypoint.sh";
+const VERIFY_SUITE_LOG_NAME: &str = "logs/verify_suite.jsonl";
+const VERIFY_SUITE_COUNTEREXAMPLE_NAME: &str = "counterexamples/shadow_counterexample_bundle.json";
+const DEFAULT_VERIFY_SUITE_ID: &str = "db300_verification";
+const VERIFY_SUITE_REGIME_RED_PATH_CORRECTNESS: &str = "red_path_correctness";
+const VERIFY_SUITE_REGIME_LOW_CONCURRENCY_FIXED_COST: &str = "low_concurrency_fixed_cost";
+const VERIFY_SUITE_REGIME_MID_CONCURRENCY_SCALING: &str = "mid_concurrency_scaling";
+const VERIFY_SUITE_REGIME_MANY_CORE_PARALLEL: &str = "many_core_parallel";
+const VERIFY_SUITE_REGIME_HOSTILE_OR_UNCLASSIFIED: &str = "hostile_or_unclassified";
+const VERIFY_SUITE_VALID_ACTIVATION_REGIMES: [&str; 5] = [
+    VERIFY_SUITE_REGIME_RED_PATH_CORRECTNESS,
+    VERIFY_SUITE_REGIME_LOW_CONCURRENCY_FIXED_COST,
+    VERIFY_SUITE_REGIME_MID_CONCURRENCY_SCALING,
+    VERIFY_SUITE_REGIME_MANY_CORE_PARALLEL,
+    VERIFY_SUITE_REGIME_HOSTILE_OR_UNCLASSIFIED,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteExecutionContext {
+    Local,
+    Ci,
+}
+
+impl VerifySuiteExecutionContext {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Ci => "ci",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "local" => Some(Self::Local),
+            "ci" => Some(Self::Ci),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteMode {
+    SqliteReference,
+    FsqliteMvcc,
+    FsqliteSingleWriter,
+}
+
+impl VerifySuiteMode {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SqliteReference => "sqlite_reference",
+            Self::FsqliteMvcc => "fsqlite_mvcc",
+            Self::FsqliteSingleWriter => "fsqlite_single_writer",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "sqlite_reference" => Some(Self::SqliteReference),
+            "fsqlite_mvcc" => Some(Self::FsqliteMvcc),
+            "fsqlite_single_writer" => Some(Self::FsqliteSingleWriter),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteDepth {
+    Quick,
+    Full,
+}
+
+impl VerifySuiteDepth {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Full => "full",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "quick" => Some(Self::Quick),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteShadowMode {
+    Off,
+    Forced,
+    Sampled,
+    ShadowCanary,
+}
+
+impl VerifySuiteShadowMode {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Forced => "forced",
+            Self::Sampled => "sampled",
+            Self::ShadowCanary => "shadow_canary",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "off" => Some(Self::Off),
+            "forced" => Some(Self::Forced),
+            "sampled" => Some(Self::Sampled),
+            "shadow_canary" => Some(Self::ShadowCanary),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteShadowVerdict {
+    NotRun,
+    PendingExecution,
+    Clean,
+    Diverged,
+}
+
+impl VerifySuiteShadowVerdict {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRun => "not_run",
+            Self::PendingExecution => "pending_execution",
+            Self::Clean => "clean",
+            Self::Diverged => "diverged",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "not_run" => Some(Self::NotRun),
+            "pending_execution" => Some(Self::PendingExecution),
+            "clean" => Some(Self::Clean),
+            "diverged" => Some(Self::Diverged),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifySuiteKillSwitchState {
+    Disarmed,
+    Armed,
+    Tripped,
+}
+
+impl VerifySuiteKillSwitchState {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disarmed => "disarmed",
+            Self::Armed => "armed",
+            Self::Tripped => "tripped",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "disarmed" => Some(Self::Disarmed),
+            "armed" => Some(Self::Armed),
+            "tripped" => Some(Self::Tripped),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VerifySuitePackage {
+    schema_version: String,
+    trace_id: String,
+    scenario_id: String,
+    suite_id: String,
+    execution_context: VerifySuiteExecutionContext,
+    mode: VerifySuiteMode,
+    placement_profile_id: String,
+    verification_depth: VerifySuiteDepth,
+    activation_regime: String,
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+    db_selector: String,
+    workload_selector: String,
+    concurrency_selector: String,
+    artifact_root: String,
+    retention_class: String,
+    rerun_entrypoint: String,
+    contract_entrypoint: String,
+    local_entrypoint: String,
+    ci_entrypoint: String,
+    focused_rerun_entrypoint: String,
+    counterexample_bundle: Option<String>,
+    pass_fail_signature: String,
+    first_failure_diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VerifySuiteCounterexampleBundle {
+    schema_version: String,
+    trace_id: String,
+    scenario_id: String,
+    suite_id: String,
+    mode: VerifySuiteMode,
+    activation_regime: String,
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+    rerun_entrypoint: String,
+    focused_rerun_entrypoint: String,
+    first_failure_diagnostics: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BenchCampaignDefaults {
@@ -1393,6 +1628,486 @@ fn serialize_run_output(
     }
 }
 
+fn validate_verify_suite_activation_regime(raw: &str) -> Result<String, String> {
+    if VERIFY_SUITE_VALID_ACTIVATION_REGIMES.contains(&raw) {
+        Ok(raw.to_owned())
+    } else {
+        Err(format!(
+            "invalid --activation-regime `{raw}` (expected one of: {})",
+            VERIFY_SUITE_VALID_ACTIVATION_REGIMES.join(", ")
+        ))
+    }
+}
+
+fn validate_verify_suite_placement_profile(raw: &str) -> Result<String, String> {
+    match raw {
+        PLACEMENT_PROFILE_BASELINE_UNPINNED
+        | PLACEMENT_PROFILE_RECOMMENDED_PINNED
+        | PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE => Ok(raw.to_owned()),
+        _ => Err(format!(
+            "invalid --placement-profile `{raw}` (expected one of: {PLACEMENT_PROFILE_BASELINE_UNPINNED}, {PLACEMENT_PROFILE_RECOMMENDED_PINNED}, {PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE})"
+        )),
+    }
+}
+
+fn default_verify_suite_shadow_verdict(
+    shadow_mode: VerifySuiteShadowMode,
+) -> VerifySuiteShadowVerdict {
+    match shadow_mode {
+        VerifySuiteShadowMode::Off => VerifySuiteShadowVerdict::NotRun,
+        VerifySuiteShadowMode::Forced
+        | VerifySuiteShadowMode::Sampled
+        | VerifySuiteShadowMode::ShadowCanary => VerifySuiteShadowVerdict::PendingExecution,
+    }
+}
+
+fn default_verify_suite_kill_switch_state(
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+) -> VerifySuiteKillSwitchState {
+    match (shadow_mode, shadow_verdict) {
+        (VerifySuiteShadowMode::Off, _) | (_, VerifySuiteShadowVerdict::NotRun) => {
+            VerifySuiteKillSwitchState::Disarmed
+        }
+        (_, VerifySuiteShadowVerdict::Diverged) => VerifySuiteKillSwitchState::Tripped,
+        _ => VerifySuiteKillSwitchState::Armed,
+    }
+}
+
+fn validate_verify_suite_shadow_contract(
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+    counterexample_bundle: Option<&Path>,
+) -> Result<(), String> {
+    if shadow_mode == VerifySuiteShadowMode::Off {
+        if shadow_verdict != VerifySuiteShadowVerdict::NotRun {
+            return Err(
+                "shadow_mode=off requires shadow_verdict=not_run so quick conservative runs stay explicit"
+                    .to_owned(),
+            );
+        }
+        if kill_switch_state != VerifySuiteKillSwitchState::Disarmed {
+            return Err(
+                "shadow_mode=off requires kill_switch_state=disarmed because no shadow comparator ran"
+                    .to_owned(),
+            );
+        }
+        if counterexample_bundle.is_some() {
+            return Err(
+                "counterexample bundles are only valid when shadow verdicts diverge".to_owned(),
+            );
+        }
+        return Ok(());
+    }
+
+    if shadow_verdict == VerifySuiteShadowVerdict::NotRun {
+        return Err(
+            "shadow_mode requires shadow_verdict=pending_execution|clean|diverged".to_owned(),
+        );
+    }
+
+    if shadow_verdict == VerifySuiteShadowVerdict::Diverged {
+        if kill_switch_state != VerifySuiteKillSwitchState::Tripped {
+            return Err("shadow_verdict=diverged requires kill_switch_state=tripped".to_owned());
+        }
+        return Ok(());
+    }
+
+    if counterexample_bundle.is_some() {
+        return Err("counterexample_bundle is only valid when shadow_verdict=diverged".to_owned());
+    }
+
+    if kill_switch_state == VerifySuiteKillSwitchState::Tripped {
+        return Err("kill_switch_state=tripped requires shadow_verdict=diverged".to_owned());
+    }
+
+    Ok(())
+}
+
+fn sanitize_verify_suite_component(raw: &str) -> String {
+    sanitize_db_id(raw).unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn verify_suite_concurrency_csv(concurrency: &[u16]) -> String {
+    concurrency
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn verify_suite_selector_summary(
+    db_selector: &str,
+    workload_selector: &str,
+    concurrency_selector: &str,
+) -> String {
+    format!("db={db_selector}; workload={workload_selector}; concurrency={concurrency_selector}")
+}
+
+fn verify_suite_trace_id(
+    suite_id: &str,
+    mode: VerifySuiteMode,
+    placement_profile_id: &str,
+    verification_depth: VerifySuiteDepth,
+    activation_regime: &str,
+    shadow_mode: VerifySuiteShadowMode,
+) -> String {
+    format!(
+        "verify_suite_{}_{}_{}_{}_{}_{}",
+        sanitize_verify_suite_component(suite_id),
+        mode.as_str(),
+        placement_profile_id,
+        verification_depth.as_str(),
+        sanitize_verify_suite_component(activation_regime),
+        shadow_mode.as_str()
+    )
+}
+
+fn verify_suite_scenario_id(
+    suite_id: &str,
+    mode: VerifySuiteMode,
+    placement_profile_id: &str,
+    activation_regime: &str,
+    db_selector: &str,
+    workload_selector: &str,
+    concurrency_selector: &str,
+) -> String {
+    format!(
+        "{suite_id}:{mode}:{placement_profile_id}:{activation_regime}:{db_selector}:{workload_selector}:{concurrency_selector}",
+        mode = mode.as_str()
+    )
+}
+
+fn verify_suite_retention_class(
+    verification_depth: VerifySuiteDepth,
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+) -> &'static str {
+    if shadow_verdict == VerifySuiteShadowVerdict::Diverged
+        || kill_switch_state == VerifySuiteKillSwitchState::Tripped
+    {
+        "failure_bundle"
+    } else if verification_depth == VerifySuiteDepth::Full
+        || shadow_mode != VerifySuiteShadowMode::Off
+    {
+        "full_proof"
+    } else {
+        "quick_run"
+    }
+}
+
+fn verify_suite_pass_fail_signature(
+    verification_depth: VerifySuiteDepth,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+) -> &'static str {
+    if shadow_verdict == VerifySuiteShadowVerdict::Diverged
+        || kill_switch_state == VerifySuiteKillSwitchState::Tripped
+    {
+        "fail.shadow_divergence"
+    } else {
+        match (verification_depth, shadow_verdict) {
+            (_, VerifySuiteShadowVerdict::PendingExecution) => "pending.shadow_execution",
+            (_, VerifySuiteShadowVerdict::Clean) => "pass.shadow_clean",
+            (VerifySuiteDepth::Full, _) => "pass.full_contract",
+            (VerifySuiteDepth::Quick, _) => "pass.quick_contract",
+        }
+    }
+}
+
+fn default_verify_suite_output_dir(
+    suite_id: &str,
+    mode: VerifySuiteMode,
+    placement_profile_id: &str,
+    verification_depth: VerifySuiteDepth,
+    activation_regime: &str,
+    shadow_mode: VerifySuiteShadowMode,
+) -> PathBuf {
+    PathBuf::from("artifacts")
+        .join("bd-db300.7.7")
+        .join(sanitize_verify_suite_component(suite_id))
+        .join(mode.as_str())
+        .join(placement_profile_id)
+        .join(verification_depth.as_str())
+        .join(sanitize_verify_suite_component(activation_regime))
+        .join(shadow_mode.as_str())
+}
+
+fn verify_suite_command_prefix(context: VerifySuiteExecutionContext) -> &'static str {
+    match context {
+        VerifySuiteExecutionContext::Local => "",
+        VerifySuiteExecutionContext::Ci => "rch exec -- ",
+    }
+}
+
+fn push_verify_suite_flag(parts: &mut Vec<String>, flag: &str, value: &str) {
+    parts.push(flag.to_owned());
+    parts.push(shell_escape(value));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_verify_suite_contract_command(
+    context: VerifySuiteExecutionContext,
+    suite_id: &str,
+    mode: VerifySuiteMode,
+    placement_profile_id: &str,
+    verification_depth: VerifySuiteDepth,
+    activation_regime: &str,
+    shadow_mode: VerifySuiteShadowMode,
+    shadow_verdict: VerifySuiteShadowVerdict,
+    kill_switch_state: VerifySuiteKillSwitchState,
+    db_selector: &str,
+    workload_selector: &str,
+    concurrency_selector: &str,
+    output_dir: &Path,
+    counterexample_bundle: Option<&Path>,
+    first_failure_diagnostics: Option<&str>,
+) -> String {
+    let mut parts = vec![format!(
+        "{}cargo run -p fsqlite-e2e --bin realdb-e2e -- verify-suite",
+        verify_suite_command_prefix(context)
+    )];
+    push_verify_suite_flag(&mut parts, "--suite-id", suite_id);
+    push_verify_suite_flag(&mut parts, "--execution-context", context.as_str());
+    push_verify_suite_flag(&mut parts, "--mode", mode.as_str());
+    push_verify_suite_flag(&mut parts, "--placement-profile", placement_profile_id);
+    push_verify_suite_flag(
+        &mut parts,
+        "--verification-depth",
+        verification_depth.as_str(),
+    );
+    push_verify_suite_flag(&mut parts, "--activation-regime", activation_regime);
+    push_verify_suite_flag(&mut parts, "--shadow-mode", shadow_mode.as_str());
+    push_verify_suite_flag(&mut parts, "--shadow-verdict", shadow_verdict.as_str());
+    push_verify_suite_flag(
+        &mut parts,
+        "--kill-switch-state",
+        kill_switch_state.as_str(),
+    );
+    push_verify_suite_flag(&mut parts, "--db", db_selector);
+    push_verify_suite_flag(&mut parts, "--workload", workload_selector);
+    push_verify_suite_flag(&mut parts, "--concurrency", concurrency_selector);
+    push_verify_suite_flag(
+        &mut parts,
+        "--output-dir",
+        &output_dir.as_os_str().to_string_lossy(),
+    );
+    if let Some(bundle) = counterexample_bundle {
+        push_verify_suite_flag(
+            &mut parts,
+            "--counterexample-bundle",
+            &bundle.as_os_str().to_string_lossy(),
+        );
+    }
+    if let Some(diagnostics) = first_failure_diagnostics {
+        push_verify_suite_flag(&mut parts, "--first-failure-diagnostics", diagnostics);
+    }
+    parts.join(" ")
+}
+
+fn build_verify_suite_bench_command(
+    context: VerifySuiteExecutionContext,
+    mode: VerifySuiteMode,
+    db_selector: &str,
+    workload_selector: &str,
+    concurrency_selector: &str,
+    verification_depth: VerifySuiteDepth,
+    output_dir: &Path,
+    focused: bool,
+) -> String {
+    let mut command = format!(
+        "{}cargo run -p fsqlite-e2e --bin realdb-e2e -- bench",
+        verify_suite_command_prefix(context)
+    );
+    let engine = if mode == VerifySuiteMode::SqliteReference {
+        "sqlite3"
+    } else {
+        "fsqlite"
+    };
+    command.push_str(" --engine ");
+    command.push_str(engine);
+    if mode == VerifySuiteMode::FsqliteMvcc {
+        command.push_str(" --mvcc");
+    } else if mode == VerifySuiteMode::FsqliteSingleWriter {
+        command.push_str(" --no-mvcc");
+    }
+    if db_selector != "all" {
+        command.push_str(" --db ");
+        command.push_str(&shell_escape(db_selector));
+    }
+    if workload_selector != "all" {
+        command.push_str(" --preset ");
+        command.push_str(&shell_escape(workload_selector));
+    }
+    command.push_str(" --concurrency ");
+    command.push_str(&shell_escape(concurrency_selector));
+    match (verification_depth, focused) {
+        (_, true) | (VerifySuiteDepth::Quick, false) => command.push_str(" --repeat 1"),
+        (VerifySuiteDepth::Full, false) => command.push_str(" --min-iters 5 --time-secs 30"),
+    }
+    let bench_dir = output_dir.join(if focused {
+        "reruns/first_failure"
+    } else {
+        "bench"
+    });
+    command.push_str(" --output-jsonl ");
+    command.push_str(&shell_escape(
+        &bench_dir.join("results.jsonl").display().to_string(),
+    ));
+    command.push_str(" --output-md ");
+    command.push_str(&shell_escape(
+        &bench_dir.join("summary.md").display().to_string(),
+    ));
+    command
+}
+
+fn render_verify_suite_summary(package: &VerifySuitePackage) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# Verification Suite Package");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- suite_id: {}", package.suite_id);
+    let _ = writeln!(
+        out,
+        "- execution_context: {}",
+        package.execution_context.as_str()
+    );
+    let _ = writeln!(out, "- mode: {}", package.mode.as_str());
+    let _ = writeln!(
+        out,
+        "- placement_profile_id: {}",
+        package.placement_profile_id
+    );
+    let _ = writeln!(
+        out,
+        "- verification_depth: {} (quick => --repeat 1, full => --min-iters 5 --time-secs 30)",
+        package.verification_depth.as_str()
+    );
+    let _ = writeln!(out, "- activation_regime: {}", package.activation_regime);
+    let _ = writeln!(out, "- shadow_mode: {}", package.shadow_mode.as_str());
+    let _ = writeln!(out, "- shadow_verdict: {}", package.shadow_verdict.as_str());
+    let _ = writeln!(
+        out,
+        "- kill_switch_state: {}",
+        package.kill_switch_state.as_str()
+    );
+    let _ = writeln!(
+        out,
+        "- selectors: {}",
+        verify_suite_selector_summary(
+            &package.db_selector,
+            &package.workload_selector,
+            &package.concurrency_selector
+        )
+    );
+    let _ = writeln!(out, "- artifact_root: {}", package.artifact_root);
+    let _ = writeln!(out, "- retention_class: {}", package.retention_class);
+    let _ = writeln!(
+        out,
+        "- pass_fail_signature: {}",
+        package.pass_fail_signature
+    );
+    let _ = writeln!(out, "- rerun_entrypoint: `{}`", package.rerun_entrypoint);
+    let _ = writeln!(out, "- local_entrypoint: `{}`", package.local_entrypoint);
+    let _ = writeln!(out, "- ci_entrypoint: `{}`", package.ci_entrypoint);
+    let _ = writeln!(
+        out,
+        "- focused_rerun_entrypoint: `{}`",
+        package.focused_rerun_entrypoint
+    );
+    let _ = writeln!(
+        out,
+        "- counterexample_bundle: {}",
+        package.counterexample_bundle.as_deref().unwrap_or("none")
+    );
+    let _ = writeln!(
+        out,
+        "- first_failure_diagnostics: {}",
+        package
+            .first_failure_diagnostics
+            .as_deref()
+            .unwrap_or("none")
+    );
+    out
+}
+
+fn write_verify_suite_shell_script(path: &Path, command: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = format!("#!/usr/bin/env bash\nset -euo pipefail\n{command}\n");
+    fs::write(path, body)?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn write_verify_suite_artifacts(output_dir: &Path, package: &VerifySuitePackage) -> io::Result<()> {
+    fs::create_dir_all(output_dir)?;
+    let package_json = serde_json::to_string_pretty(package)
+        .map_err(|error| io::Error::other(format!("verify suite package JSON: {error}")))?;
+    fs::write(
+        output_dir.join(VERIFY_SUITE_PACKAGE_NAME),
+        package_json.as_bytes(),
+    )?;
+    let summary = render_verify_suite_summary(package);
+    fs::write(
+        output_dir.join(VERIFY_SUITE_SUMMARY_NAME),
+        summary.as_bytes(),
+    )?;
+    append_jsonl_line(
+        &output_dir.join(VERIFY_SUITE_LOG_NAME),
+        &serde_json::to_string(package)
+            .map_err(|error| io::Error::other(format!("verify suite log JSON: {error}")))?,
+    )?;
+    write_verify_suite_shell_script(
+        &output_dir.join(VERIFY_SUITE_RERUN_NAME),
+        &package.rerun_entrypoint,
+    )?;
+    write_verify_suite_shell_script(
+        &output_dir.join(VERIFY_SUITE_FOCUSED_RERUN_NAME),
+        &package.focused_rerun_entrypoint,
+    )?;
+
+    if let Some(counterexample_bundle) = &package.counterexample_bundle {
+        let diagnostics = package
+            .first_failure_diagnostics
+            .clone()
+            .unwrap_or_else(|| {
+                "shadow divergence captured without a detailed diagnostic".to_owned()
+            });
+        let bundle = VerifySuiteCounterexampleBundle {
+            schema_version: "fsqlite-e2e.verify_suite_counterexample.v1".to_owned(),
+            trace_id: package.trace_id.clone(),
+            scenario_id: package.scenario_id.clone(),
+            suite_id: package.suite_id.clone(),
+            mode: package.mode,
+            activation_regime: package.activation_regime.clone(),
+            shadow_mode: package.shadow_mode,
+            shadow_verdict: package.shadow_verdict,
+            kill_switch_state: package.kill_switch_state,
+            rerun_entrypoint: package.rerun_entrypoint.clone(),
+            focused_rerun_entrypoint: package.focused_rerun_entrypoint.clone(),
+            first_failure_diagnostics: diagnostics,
+        };
+        let bundle_path = PathBuf::from(counterexample_bundle);
+        if let Some(parent) = bundle_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bundle_json = serde_json::to_string_pretty(&bundle).map_err(|error| {
+            io::Error::other(format!("verify suite counterexample JSON: {error}"))
+        })?;
+        fs::write(bundle_path, bundle_json.as_bytes())?;
+    }
+
+    Ok(())
+}
+
 fn main() {
     let exit_code = run_cli(std::env::args_os());
     if exit_code != 0 {
@@ -1421,6 +2136,7 @@ where
         "corpus" => cmd_corpus(&tail[1..]),
         "run" => cmd_run(&tail[1..]),
         "bench" => cmd_bench(&tail[1..]),
+        "verify-suite" => cmd_verify_suite(&tail[1..]),
         "hot-profile" => cmd_hot_profile(&tail[1..]),
         "corrupt" => cmd_corrupt(&tail[1..]),
         "compare" => cmd_compare(&tail[1..]),
@@ -1448,6 +2164,7 @@ SUBCOMMANDS:
     corpus verify           Verify golden copies against checksums.sha256
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
+    verify-suite            Resolve and package one-command verification suite entrypoints
     hot-profile             Capture hot-path evidence for a benchmark preset
     corrupt                 Inject corruption into a working copy
     compare                 Tiered comparison of two database files
@@ -1463,6 +2180,7 @@ EXAMPLES:
     realdb-e2e run --engine sqlite3 --db beads-proj-a --workload commutative_inserts --concurrency 4
     realdb-e2e run --engine fsqlite --db beads-proj-a --workload hot_page_contention --concurrency 8
     realdb-e2e bench --db beads-proj-a --preset all
+    realdb-e2e verify-suite --mode fsqlite_mvcc --placement-profile recommended_pinned --verification-depth full
     realdb-e2e hot-profile --db beads-proj-a --workload mixed_read_write --concurrency 4
     realdb-e2e corrupt --db beads-proj-a --strategy page --page 1 --seed 42
 ";
@@ -3725,6 +4443,458 @@ OPTIONS:
     --output-md <PATH>      Write a Markdown report to PATH (rendered from summaries)
     --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
+";
+    let _ = io::stdout().write_all(text.as_bytes());
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_verify_suite(argv: &[String]) -> i32 {
+    if argv.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_verify_suite_help();
+        return 0;
+    }
+
+    let mut suite_id = DEFAULT_VERIFY_SUITE_ID.to_owned();
+    let mut execution_context = VerifySuiteExecutionContext::Local;
+    let mut mode = VerifySuiteMode::FsqliteMvcc;
+    let mut placement_profile_id = PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned();
+    let mut verification_depth = VerifySuiteDepth::Quick;
+    let mut activation_regime = VERIFY_SUITE_REGIME_HOSTILE_OR_UNCLASSIFIED.to_owned();
+    let mut shadow_mode = VerifySuiteShadowMode::Off;
+    let mut shadow_verdict: Option<VerifySuiteShadowVerdict> = None;
+    let mut kill_switch_state: Option<VerifySuiteKillSwitchState> = None;
+    let mut db_selector = "all".to_owned();
+    let mut workload_selector = "all".to_owned();
+    let mut concurrency: Vec<u16> = vec![1, 4, 8];
+    let mut output_dir: Option<PathBuf> = None;
+    let mut counterexample_bundle: Option<PathBuf> = None;
+    let mut first_failure_diagnostics: Option<String> = None;
+    let mut pretty = false;
+    let mut emit_inline_bundle = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--suite-id" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --suite-id requires a value");
+                    return 2;
+                }
+                suite_id.clone_from(&argv[i]);
+            }
+            "--execution-context" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --execution-context requires local|ci");
+                    return 2;
+                }
+                let Some(value) = VerifySuiteExecutionContext::parse(&argv[i]) else {
+                    eprintln!("error: invalid --execution-context `{}`", argv[i]);
+                    return 2;
+                };
+                execution_context = value;
+            }
+            "--mode" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!(
+                        "error: --mode requires sqlite_reference|fsqlite_mvcc|fsqlite_single_writer"
+                    );
+                    return 2;
+                }
+                let Some(value) = VerifySuiteMode::parse(&argv[i]) else {
+                    eprintln!("error: invalid --mode `{}`", argv[i]);
+                    return 2;
+                };
+                mode = value;
+            }
+            "--placement-profile" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --placement-profile requires a value");
+                    return 2;
+                }
+                match validate_verify_suite_placement_profile(&argv[i]) {
+                    Ok(value) => placement_profile_id = value,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 2;
+                    }
+                }
+            }
+            "--verification-depth" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --verification-depth requires quick|full");
+                    return 2;
+                }
+                let Some(value) = VerifySuiteDepth::parse(&argv[i]) else {
+                    eprintln!("error: invalid --verification-depth `{}`", argv[i]);
+                    return 2;
+                };
+                verification_depth = value;
+            }
+            "--activation-regime" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --activation-regime requires a value");
+                    return 2;
+                }
+                match validate_verify_suite_activation_regime(&argv[i]) {
+                    Ok(value) => activation_regime = value,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 2;
+                    }
+                }
+            }
+            "--shadow-mode" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --shadow-mode requires off|forced|sampled|shadow_canary");
+                    return 2;
+                }
+                let Some(value) = VerifySuiteShadowMode::parse(&argv[i]) else {
+                    eprintln!("error: invalid --shadow-mode `{}`", argv[i]);
+                    return 2;
+                };
+                shadow_mode = value;
+            }
+            "--shadow-verdict" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!(
+                        "error: --shadow-verdict requires not_run|pending_execution|clean|diverged"
+                    );
+                    return 2;
+                }
+                let Some(value) = VerifySuiteShadowVerdict::parse(&argv[i]) else {
+                    eprintln!("error: invalid --shadow-verdict `{}`", argv[i]);
+                    return 2;
+                };
+                shadow_verdict = Some(value);
+            }
+            "--kill-switch-state" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --kill-switch-state requires disarmed|armed|tripped");
+                    return 2;
+                }
+                let Some(value) = VerifySuiteKillSwitchState::parse(&argv[i]) else {
+                    eprintln!("error: invalid --kill-switch-state `{}`", argv[i]);
+                    return 2;
+                };
+                kill_switch_state = Some(value);
+            }
+            "--db" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db requires a selector or comma-separated list");
+                    return 2;
+                }
+                db_selector.clone_from(&argv[i]);
+            }
+            "--workload" | "--preset" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --workload requires a selector or comma-separated list");
+                    return 2;
+                }
+                workload_selector.clone_from(&argv[i]);
+            }
+            "--concurrency" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --concurrency requires an integer or comma-separated list");
+                    return 2;
+                }
+                match parse_u16_list(&argv[i]) {
+                    Ok(value) => concurrency = value,
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 2;
+                    }
+                }
+            }
+            "--output-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-dir requires a directory path");
+                    return 2;
+                }
+                output_dir = Some(PathBuf::from(&argv[i]));
+            }
+            "--counterexample-bundle" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --counterexample-bundle requires a path");
+                    return 2;
+                }
+                counterexample_bundle = Some(PathBuf::from(&argv[i]));
+            }
+            "--first-failure-diagnostics" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --first-failure-diagnostics requires a message");
+                    return 2;
+                }
+                first_failure_diagnostics = Some(argv[i].clone());
+            }
+            "--pretty" => pretty = true,
+            "--emit-inline-bundle" => emit_inline_bundle = true,
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let shadow_verdict =
+        shadow_verdict.unwrap_or_else(|| default_verify_suite_shadow_verdict(shadow_mode));
+    let kill_switch_state = kill_switch_state
+        .unwrap_or_else(|| default_verify_suite_kill_switch_state(shadow_mode, shadow_verdict));
+    let output_dir = resolve_path_from_current_dir(output_dir.unwrap_or_else(|| {
+        default_verify_suite_output_dir(
+            &suite_id,
+            mode,
+            &placement_profile_id,
+            verification_depth,
+            &activation_regime,
+            shadow_mode,
+        )
+    }));
+    let counterexample_bundle = match counterexample_bundle {
+        Some(path) => Some(resolve_path_from_current_dir(path)),
+        None if shadow_verdict == VerifySuiteShadowVerdict::Diverged => {
+            Some(output_dir.join(VERIFY_SUITE_COUNTEREXAMPLE_NAME))
+        }
+        None => None,
+    };
+    if let Err(error) = validate_verify_suite_shadow_contract(
+        shadow_mode,
+        shadow_verdict,
+        kill_switch_state,
+        counterexample_bundle.as_deref(),
+    ) {
+        eprintln!("error: {error}");
+        return 2;
+    }
+    if suite_id.trim().is_empty() {
+        eprintln!("error: --suite-id must not be empty");
+        return 2;
+    }
+
+    let concurrency_selector = verify_suite_concurrency_csv(&concurrency);
+    let trace_id = verify_suite_trace_id(
+        &suite_id,
+        mode,
+        &placement_profile_id,
+        verification_depth,
+        &activation_regime,
+        shadow_mode,
+    );
+    let scenario_id = verify_suite_scenario_id(
+        &suite_id,
+        mode,
+        &placement_profile_id,
+        &activation_regime,
+        &db_selector,
+        &workload_selector,
+        &concurrency_selector,
+    );
+    let default_failure_diagnostics = (shadow_verdict == VerifySuiteShadowVerdict::Diverged)
+        .then(|| {
+            format!(
+                "shadow divergence captured for regime `{}` with placement `{}`; inspect the counterexample bundle before enabling defaults",
+                activation_regime, placement_profile_id
+            )
+        });
+    let first_failure_diagnostics = first_failure_diagnostics.or(default_failure_diagnostics);
+
+    let contract_entrypoint = build_verify_suite_contract_command(
+        VerifySuiteExecutionContext::Local,
+        &suite_id,
+        mode,
+        &placement_profile_id,
+        verification_depth,
+        &activation_regime,
+        shadow_mode,
+        shadow_verdict,
+        kill_switch_state,
+        &db_selector,
+        &workload_selector,
+        &concurrency_selector,
+        &output_dir,
+        counterexample_bundle.as_deref(),
+        first_failure_diagnostics.as_deref(),
+    );
+    let local_entrypoint = build_verify_suite_bench_command(
+        VerifySuiteExecutionContext::Local,
+        mode,
+        &db_selector,
+        &workload_selector,
+        &concurrency_selector,
+        verification_depth,
+        &output_dir,
+        false,
+    );
+    let ci_entrypoint = build_verify_suite_bench_command(
+        VerifySuiteExecutionContext::Ci,
+        mode,
+        &db_selector,
+        &workload_selector,
+        &concurrency_selector,
+        verification_depth,
+        &output_dir,
+        false,
+    );
+    let focused_rerun_entrypoint = build_verify_suite_bench_command(
+        execution_context,
+        mode,
+        &db_selector,
+        &workload_selector,
+        &concurrency_selector,
+        VerifySuiteDepth::Quick,
+        &output_dir,
+        true,
+    );
+    let rerun_entrypoint = match execution_context {
+        VerifySuiteExecutionContext::Local => local_entrypoint.clone(),
+        VerifySuiteExecutionContext::Ci => ci_entrypoint.clone(),
+    };
+
+    let package = VerifySuitePackage {
+        schema_version: VERIFY_SUITE_PACKAGE_SCHEMA_V1.to_owned(),
+        trace_id,
+        scenario_id,
+        suite_id,
+        execution_context,
+        mode,
+        placement_profile_id,
+        verification_depth,
+        activation_regime,
+        shadow_mode,
+        shadow_verdict,
+        kill_switch_state,
+        db_selector,
+        workload_selector,
+        concurrency_selector,
+        artifact_root: output_dir.display().to_string(),
+        retention_class: verify_suite_retention_class(
+            verification_depth,
+            shadow_mode,
+            shadow_verdict,
+            kill_switch_state,
+        )
+        .to_owned(),
+        rerun_entrypoint,
+        contract_entrypoint,
+        local_entrypoint,
+        ci_entrypoint,
+        focused_rerun_entrypoint,
+        counterexample_bundle: counterexample_bundle
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        pass_fail_signature: verify_suite_pass_fail_signature(
+            verification_depth,
+            shadow_verdict,
+            kill_switch_state,
+        )
+        .to_owned(),
+        first_failure_diagnostics,
+    };
+
+    if let Err(error) = write_verify_suite_artifacts(&output_dir, &package) {
+        eprintln!("error: failed to write verify-suite artifacts: {error}");
+        return 1;
+    }
+
+    if emit_inline_bundle {
+        match serde_json::to_string(&package) {
+            Ok(json) => eprintln!("{VERIFY_SUITE_INLINE_BUNDLE_PREFIX}{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize verify-suite inline bundle: {error}");
+                return 1;
+            }
+        }
+    }
+
+    if pretty {
+        match serde_json::to_string_pretty(&package) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize verify-suite package: {error}");
+                return 1;
+            }
+        }
+    } else {
+        match serde_json::to_string(&package) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize verify-suite package: {error}");
+                return 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "Verification suite package: suite={} mode={} placement={} depth={} regime={} shadow={} verdict={} kill_switch={} artifact_root={}",
+        package.suite_id,
+        package.mode.as_str(),
+        package.placement_profile_id,
+        package.verification_depth.as_str(),
+        package.activation_regime,
+        package.shadow_mode.as_str(),
+        package.shadow_verdict.as_str(),
+        package.kill_switch_state.as_str(),
+        package.artifact_root
+    );
+    eprintln!("  rerun_entrypoint: {}", package.rerun_entrypoint);
+    eprintln!(
+        "  focused_rerun_entrypoint: {}",
+        package.focused_rerun_entrypoint
+    );
+    if let Some(counterexample_bundle) = &package.counterexample_bundle {
+        eprintln!("  counterexample_bundle: {counterexample_bundle}");
+    }
+    0
+}
+
+fn print_verify_suite_help() {
+    let text = "\
+realdb-e2e verify-suite — Package one-command verification suite entrypoints
+
+USAGE:
+    realdb-e2e verify-suite [OPTIONS]
+
+OPTIONS:
+    --suite-id <ID>             Stable suite identifier (default: db300_verification)
+    --execution-context <CTX>   local | ci (default: local)
+    --mode <MODE>               sqlite_reference | fsqlite_mvcc | fsqlite_single_writer
+                                (default: fsqlite_mvcc)
+    --placement-profile <ID>    baseline_unpinned | recommended_pinned | adversarial_cross_node
+                                (default: baseline_unpinned)
+    --verification-depth <D>    quick | full (default: quick)
+    --activation-regime <ID>    red_path_correctness | low_concurrency_fixed_cost |
+                                mid_concurrency_scaling | many_core_parallel |
+                                hostile_or_unclassified (default: hostile_or_unclassified)
+    --shadow-mode <MODE>        off | forced | sampled | shadow_canary (default: off)
+    --shadow-verdict <V>        not_run | pending_execution | clean | diverged
+                                (default: derived from shadow-mode)
+    --kill-switch-state <S>     disarmed | armed | tripped
+                                (default: derived from shadow verdict)
+    --db <SELECTOR>             Fixture selector or comma-separated list (default: all)
+    --workload <SELECTOR>       Workload selector or comma-separated list (default: all)
+    --preset <SELECTOR>         Alias for --workload
+    --concurrency <N|LIST>      Concurrency list (default: 1,4,8)
+    --output-dir <DIR>          Artifact output directory
+    --counterexample-bundle <P> Override counterexample bundle path when shadow diverges
+    --first-failure-diagnostics Text shown in failure packaging and summaries
+    --emit-inline-bundle        Print a tagged single-line bundle for wrappers
+    --pretty                    Pretty-print JSON instead of compact JSON
+    -h, --help                  Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
 }
@@ -6701,6 +7871,119 @@ mod tests {
     #[test]
     fn test_bench_help() {
         assert_eq!(run_with(&["realdb-e2e", "bench", "--help"]), 0);
+    }
+
+    #[test]
+    fn test_verify_suite_help() {
+        assert_eq!(run_with(&["realdb-e2e", "verify-suite", "--help"]), 0);
+    }
+
+    #[test]
+    fn verify_suite_rejects_unknown_activation_regime() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let output_dir = tempdir.path().join("verify-suite");
+        let args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("verify-suite"),
+            OsString::from("--activation-regime"),
+            OsString::from("unknown_regime"),
+            OsString::from("--output-dir"),
+            output_dir.into_os_string(),
+        ];
+        assert_eq!(run_cli(args), 2);
+    }
+
+    #[test]
+    fn verify_suite_writes_operator_friendly_package_artifacts() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let output_dir = tempdir.path().join("verify-suite");
+        let exit_code = run_cli(vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("verify-suite"),
+            OsString::from("--suite-id"),
+            OsString::from("bd-db300.7.7.operator_surface"),
+            OsString::from("--execution-context"),
+            OsString::from("ci"),
+            OsString::from("--mode"),
+            OsString::from("fsqlite_mvcc"),
+            OsString::from("--placement-profile"),
+            OsString::from("recommended_pinned"),
+            OsString::from("--verification-depth"),
+            OsString::from("full"),
+            OsString::from("--activation-regime"),
+            OsString::from("mid_concurrency_scaling"),
+            OsString::from("--shadow-mode"),
+            OsString::from("forced"),
+            OsString::from("--shadow-verdict"),
+            OsString::from("diverged"),
+            OsString::from("--kill-switch-state"),
+            OsString::from("tripped"),
+            OsString::from("--db"),
+            OsString::from("frankensqlite"),
+            OsString::from("--workload"),
+            OsString::from("mixed_read_write"),
+            OsString::from("--concurrency"),
+            OsString::from("4,8"),
+            OsString::from("--first-failure-diagnostics"),
+            OsString::from("shadow mismatch on state_hash"),
+            OsString::from("--output-dir"),
+            output_dir.clone().into_os_string(),
+        ]);
+        assert_eq!(exit_code, 0);
+
+        let package_json = fs::read_to_string(output_dir.join(VERIFY_SUITE_PACKAGE_NAME))
+            .expect("suite package should be written");
+        let package: Value =
+            serde_json::from_str(&package_json).expect("suite package should parse");
+        assert_eq!(package["schema_version"], VERIFY_SUITE_PACKAGE_SCHEMA_V1);
+        assert_eq!(package["execution_context"], "ci");
+        assert_eq!(package["mode"], "fsqlite_mvcc");
+        assert_eq!(package["placement_profile_id"], "recommended_pinned");
+        assert_eq!(package["verification_depth"], "full");
+        assert_eq!(package["activation_regime"], "mid_concurrency_scaling");
+        assert_eq!(package["shadow_mode"], "forced");
+        assert_eq!(package["shadow_verdict"], "diverged");
+        assert_eq!(package["kill_switch_state"], "tripped");
+        assert_eq!(package["pass_fail_signature"], "fail.shadow_divergence");
+        assert_eq!(package["retention_class"], "failure_bundle");
+        assert!(
+            package["counterexample_bundle"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(VERIFY_SUITE_COUNTEREXAMPLE_NAME))
+        );
+        assert!(package["rerun_entrypoint"].as_str().is_some_and(|command| {
+            command.contains("rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- bench")
+        }));
+        assert!(
+            package["focused_rerun_entrypoint"]
+                .as_str()
+                .is_some_and(|command| command.contains("--repeat 1"))
+        );
+
+        let summary = fs::read_to_string(output_dir.join(VERIFY_SUITE_SUMMARY_NAME))
+            .expect("suite summary should be written");
+        assert!(summary.contains("shadow_verdict: diverged"));
+        assert!(summary.contains("kill_switch_state: tripped"));
+        assert!(summary.contains("counterexample_bundle:"));
+        assert!(summary.contains("rerun_entrypoint:"));
+
+        let log_jsonl = fs::read_to_string(output_dir.join(VERIFY_SUITE_LOG_NAME))
+            .expect("verify-suite log should be written");
+        assert!(log_jsonl.contains("\"shadow_mode\":\"forced\""));
+        assert!(log_jsonl.contains("\"kill_switch_state\":\"tripped\""));
+
+        let counterexample_bundle =
+            fs::read_to_string(output_dir.join(VERIFY_SUITE_COUNTEREXAMPLE_NAME))
+                .expect("counterexample bundle should be written");
+        assert!(counterexample_bundle.contains("\"shadow_verdict\": \"diverged\""));
+
+        let rerun_script = fs::read_to_string(output_dir.join(VERIFY_SUITE_RERUN_NAME))
+            .expect("rerun script should be written");
+        assert!(rerun_script.contains("realdb-e2e -- bench"));
+        let focused_rerun_script =
+            fs::read_to_string(output_dir.join(VERIFY_SUITE_FOCUSED_RERUN_NAME))
+                .expect("focused rerun script should be written");
+        assert!(focused_rerun_script.contains("--repeat 1"));
     }
 
     #[test]

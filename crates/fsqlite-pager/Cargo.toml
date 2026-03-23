@@ -12,6 +12,7 @@ default = ["native"]
 native = ["fsqlite-types/native", "fsqlite-vfs/native", "fsqlite-wal/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm", "fsqlite-wal/wasm"]
 linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
+fault-injection = ["fsqlite-wal/fault-injection"]
 
 [dependencies]
 foldhash = "0.1"

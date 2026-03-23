@@ -3776,6 +3776,30 @@ where
 
                 match flush_result {
                     Ok(()) => {
+                        #[cfg(any(test, feature = "fault-injection"))]
+                        if let Err(error) =
+                            crate::fault_hooks::maybe_inject_after_flush_before_publish(
+                                flush_epoch,
+                                batch_count,
+                                frame_count,
+                            )
+                        {
+                            let abort_result = {
+                                let mut consolidator = queue
+                                    .consolidator
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                consolidator.abort_flush()
+                            };
+                            queue.publish_failed_epoch(flush_epoch, &error);
+                            if let Err(abort_error) = abort_result {
+                                return Err(FrankenError::internal(format!(
+                                    "group commit flush hook failed for epoch {flush_epoch} and abort_flush also failed: hook={error}; abort={abort_error}"
+                                )));
+                            }
+                            return Err(error);
+                        }
+
                         GLOBAL_CONSOLIDATION_METRICS
                             .groups_flushed
                             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -9898,6 +9922,126 @@ mod tests {
             *observed_lock_level.lock().unwrap(),
             LockLevel::None,
             "bead_id={BEAD_ID} case=group_commit_failure_drop_releases_retained_writer_lock"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_fault_hook_after_flush_before_publish_wakes_waiters_with_error_and_records_context()
+     {
+        for attempt in 0..32 {
+            crate::fault_hooks::clear();
+
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from(format!("/wal_group_commit_publish_hook_{attempt}.db"));
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+            let cx = Cx::new();
+            let (backend, _frames, _begin_calls, batch_calls, sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+            pager
+                .set_wal_commit_sync_policy(WalCommitSyncPolicy::PerCommit)
+                .unwrap();
+
+            crate::fault_hooks::arm_after_flush_before_publish(
+                crate::fault_hooks::FaultHookArm::new(
+                    "bd-db300.7.2.2-after-flush-before-publish",
+                    "GROUP-COMMIT-PUBLISH",
+                    "group_commit_publish_recovery",
+                ),
+            );
+
+            let inner = Arc::clone(&pager.inner);
+            let wal_backend = Arc::clone(&pager.wal_backend);
+            let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+            let pool = pager.pool.clone();
+            let start = StdArc::new(std::sync::Barrier::new(3));
+
+            let spawn_commit = |page_number: u32, fill: u8| {
+                let inner = Arc::clone(&inner);
+                let wal_backend = Arc::clone(&wal_backend);
+                let queue = Arc::clone(&queue);
+                let pool = pool.clone();
+                let start = StdArc::clone(&start);
+                std::thread::spawn(move || {
+                    let cx = Cx::new();
+                    let page_no = PageNumber::new(page_number).unwrap();
+                    let page =
+                        StagedPage::from_bytes(&pool, &vec![fill; pool.page_size()]).unwrap();
+                    let mut write_set = HashMap::new();
+                    write_set.insert(page_no, page);
+                    let write_pages_sorted = vec![page_no];
+                    start.wait();
+                    SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                        &cx,
+                        &wal_backend,
+                        &inner,
+                        &write_set,
+                        &write_pages_sorted,
+                        &queue,
+                    )
+                })
+            };
+
+            let writer_a = spawn_commit(2, 0x11);
+            let writer_b = spawn_commit(3, 0x22);
+            start.wait();
+
+            let result_a = writer_a.join().unwrap();
+            let result_b = writer_b.join().unwrap();
+            if *batch_calls.lock().unwrap() != 1 {
+                continue;
+            }
+
+            assert_eq!(
+                *sync_calls.lock().unwrap(),
+                1,
+                "bead_id={BEAD_ID} case=group_commit_publish_hook_runs_after_real_sync"
+            );
+
+            let error_a = result_a
+                .expect_err("flusher should surface publish-hook failure")
+                .to_string();
+            let error_b = result_b
+                .expect_err("waiter should observe propagated publish-hook failure")
+                .to_string();
+            assert!(
+                error_a.contains("fault_inject:after_flush_before_publish")
+                    || error_b.contains("fault_inject:after_flush_before_publish"),
+                "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_primary_failure error_a={error_a} error_b={error_b}"
+            );
+            assert!(
+                error_a.contains("group commit flush failed")
+                    || error_b.contains("group commit flush failed"),
+                "bead_id={BEAD_ID} case=group_commit_publish_hook_reports_epoch_failure error_a={error_a} error_b={error_b}"
+            );
+
+            let records = crate::fault_hooks::take_records();
+            assert_eq!(records.len(), 1, "publish hook should record exactly once");
+            assert_eq!(records[0].point, "after_flush_before_publish");
+            assert_eq!(
+                records[0].run_id,
+                "bd-db300.7.2.2-after-flush-before-publish"
+            );
+            assert_eq!(records[0].scenario_id, "GROUP-COMMIT-PUBLISH");
+            assert_eq!(records[0].invariant_family, "group_commit_publish_recovery");
+            assert!(
+                records[0].detail.contains("batch_count=2"),
+                "record should capture coalesced batch context: {}",
+                records[0].detail
+            );
+            assert!(
+                records[0].detail.contains("frame_count=2"),
+                "record should capture coalesced frame context: {}",
+                records[0].detail
+            );
+
+            crate::fault_hooks::clear();
+            return;
+        }
+
+        panic!(
+            "bead_id={BEAD_ID} case=group_commit_publish_hook_wakes_waiters could not coalesce flusher+waiter in allotted attempts"
         );
     }
 

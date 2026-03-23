@@ -1,5 +1,7 @@
 pub mod arc_cache;
 pub mod encrypt;
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod fault_hooks;
 pub mod journal;
 pub mod page_buf;
 pub mod page_cache;

@@ -11,14 +11,14 @@
 | ID   | Path Name                     | Entry Point (file:line)                                      | Hot? |
 |------|-------------------------------|--------------------------------------------------------------|------|
 | P1   | Group-commit flusher          | `pager.rs:3560` `SubmitOutcome::Flusher`                     | Yes  |
-| P2   | Group-commit waiter           | `pager.rs:3803` `SubmitOutcome::Waiter`                      | Yes  |
+| P2   | Group-commit waiter           | `pager.rs:3861` `SubmitOutcome::Waiter` (shifted from 3803)  | Yes  |
 | P3   | WAL append_frames             | `wal.rs:1001` `WalFile::append_frames`                       | Yes  |
 | P4   | WAL sync                      | `wal.rs:1132` `WalFile::sync`                                | Yes  |
 | P5   | Checkpoint backfill           | `checkpoint_executor.rs:104`                                 | No   |
 | P6   | Checkpoint WAL reset/truncate | `wal.rs:1141` `WalFile::reset`                               | No   |
 | P7   | Epoch pipelining              | `pager.rs:3547-3556` next_epoch_batches submit during FLUSHING | Yes  |
 | P8   | WalBackendAdapter publish     | `wal_adapter.rs:830-868` `record_appended_frames` + FEC      | Yes  |
-| P9   | Phase C publish               | `pager.rs:4446-4509` commit_seq update + snapshot publish     | Yes  |
+| P9   | Phase C publish (distributed) | `pager.rs:4470+` commit_seq in Phase A; snapshot via `publish_completed_epoch` at 3823 | Yes  |
 | P10  | VFS file open (IoUring+Unix)  | `uring.rs:632-672` double-fd open                            | Startup |
 | P11  | VFS inode table close         | `unix.rs:1555-1581` refcount decrement + maybe_remove        | Close |
 
@@ -185,44 +185,46 @@ next commit's lock acquisition.
   - `UnixFile` via `self.unix.open()` → shared through global inode table `Arc<File>`
   - `AsupersyncIoUringFile` via `open_asupersync_backend()` → independent fd
 
-**Root cause hypotheses (ranked by likelihood):**
+**Root cause: CONFIRMED and FIXED (2026-03-22).**
 
-**H1 (HIGH): Inode table premature removal under concurrent close/re-open.**
-When a connection closes its WAL file handle (e.g., during checkpoint or
-connection drop), `UnixFile::close()` (unix.rs:1555) decrements `n_ref` and
-calls `maybe_remove()` (unix.rs:1574→406). If `n_ref` reaches 0, the
-`InodeInfo` is removed from the global table. A subsequent `open()` for the
-same path creates a NEW `InodeInfo` with a NEW `Arc<File>` — but any surviving
-`Arc<File>` clones from the OLD `InodeInfo` still reference the old fd. If the
-old fd gets closed (Arc refcount → 0 when the last old-generation handle drops),
-the NEW generation's fd is unaffected... UNLESS:
-- The `NamedTempFile` (`_tmp`) in the benchmark's setup closure gets dropped
-  between Criterion iterations, deleting the underlying file
-- A new iteration creates a new temp file at a DIFFERENT path
-- But the global inode table or group commit queue retains stale references
+The WAL file was opened `READONLY` in two connection.rs functions:
+- `install_existing_wal_backend_with_vfs()` (line 1174): tried READONLY before READWRITE
+- `wal_file_present_with_vfs()` (line 1205): probe opened READONLY
 
-**H2 (MEDIUM): NamedTempFile deletion race.**
-Criterion's `iter_batched` calls the setup closure to get `(tmp, path, ...)`,
-then the measurement closure takes ownership. After measurement, `tmp` drops →
-OS deletes the file. If the benchmark spawns threads that haven't fully closed
-their connections before `tmp` drops, those threads' WAL sync operations hit
-a deleted file. The `for h in handles { h.join() }` should prevent this, but
-if a thread panics (e.g., from a prior error) and `join()` returns `Err`, the
-remaining threads may still be running when `tmp` drops.
+On the first open for an inode, the global `InodeInfo` table installs this
+READONLY fd as the canonical fd shared across all connections. When subsequent
+connections clone this fd via the fast path, they inherit the read-only handle.
+The WAL group commit flusher calls `pwrite()` on this read-only fd, which
+returns EBADF on Linux (pwrite on O_RDONLY fd = EBADF).
 
-**H3 (MEDIUM): AsupersyncIoUringFile fd lifetime vs IoUringFile.inner close.**
-`IoUringFile::close()` delegates to `self.inner.close(cx)` (UnixFile close).
-But the `asupersync_backend` field is only dropped when the `IoUringFile` is
-dropped (Rust destructor order). If the asupersync backend holds an fd that
-references the same file, and the UnixFile close triggers POSIX lock release
-that invalidates the asupersync fd's position, subsequent operations on the
-asupersync fd could fail.
+**Diagnostic evidence:**
+```
+fd=6 closed=false path=/tmp/.tmpSBeP7K-wal
+fcntl(F_GETFD)=1 /proc/self/fd exists=true
+Arc<File> strong=3 Arc<InodeInfo> strong=3
+```
+The fd was VALID but READONLY → pwrite returned EBADF.
 
-**H4 (LOW): Global GroupCommitQueue outlives file handles.**
-`GROUP_COMMIT_QUEUES` is a `static OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>>>`.
-The queue for a temp file path persists after the file is deleted. If a new
-benchmark iteration reuses a path that maps to a stale queue, the flusher
-may try to write to a WAL backend whose underlying file has been closed.
+**Fix:** Changed both functions to open READWRITE first, with READONLY as
+fallback only for read-only filesystems. Verified with full Criterion
+benchmark (14+ iterations, 0 errors) and with `--no-default-features`
+(no io_uring) confirming H3 was NOT the cause.
+
+**Hypothesis disposition:**
+- H1 (inode table removal): NOT the primary cause (maybe_remove_exact_when_idle guard was correct)
+- H2 (NamedTempFile race): NOT the primary cause (bug occurs within single iteration)
+- H3 (asupersync fd): RULED OUT (reproduces without io_uring)
+- H4 (stale queue): NOT the primary cause (different temp paths per iteration)
+
+**Original hypotheses preserved below for historical reference:**
+
+H1 (DEBUNKED): Inode table premature removal under concurrent close/re-open.
+
+H2 (DEBUNKED): NamedTempFile deletion race.
+
+H3 (RULED OUT): AsupersyncIoUringFile fd lifetime vs IoUringFile.inner close.
+
+H4 (NOT PRIMARY): Global GroupCommitQueue outlives file handles.
 
 **H5 (LOW-MEDIUM): Auto-checkpoint WAL reset invalidating concurrent WAL state.**
 `maybe_run_adaptive_autocheckpoint()` (connection.rs:11080) runs after each commit.
@@ -329,7 +331,7 @@ or notification). No permanent hangs.
 
 ## Cross-References
 
-- **bd-zna34** (P0 bug): Covered by F8. Root cause investigation ongoing.
+- **bd-zna34** (P0 bug): Covered by F8. **FIXED** (READONLY canonical fd poisoning).
 - **bd-db300.3.1** (C1: batched WAL append): Covered by F1, F2, F3, F5.
 - **bd-db300.3.2** (C2: checksum outside publish): Covered by F3, F4, F8.
 - **bd-db300.5.3.1** (metadata publication): F3, F4 are the publish-path faults.
@@ -345,7 +347,7 @@ or notification). No permanent hangs.
    stable storage. If the hardware lies (write cache without battery backup),
    all bets are off — this is outside our fault model.
 
-3. **POSIX fd semantics:** Closing an fd does not affect other fds for the same
+3. **POSIX fd semantics (hardened by bd-zna34 fix):** Closing an fd does not affect other fds for the same
    file opened via `open()`. The `Arc<File>` model in unix.rs depends on this.
 
 4. **Single-process model:** The current fault matrix assumes all writers are

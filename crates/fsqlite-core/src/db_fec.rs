@@ -665,10 +665,14 @@ pub fn attempt_page_repair(
     all_page_data: &dyn Fn(u32) -> Vec<u8>,
     repair_symbols: &[(u32, Vec<u8>)],
 ) -> Result<(Vec<u8>, RepairResult)> {
-    let local_idx = target_pgno.checked_sub(group_meta.start_pgno)
-        .ok_or_else(|| FrankenError::internal(format!(
-            "target_pgno ({target_pgno}) < start_pgno ({})", group_meta.start_pgno
-        )))?;
+    let local_idx = target_pgno
+        .checked_sub(group_meta.start_pgno)
+        .ok_or_else(|| {
+            FrankenError::internal(format!(
+                "target_pgno ({target_pgno}) < start_pgno ({})",
+                group_meta.start_pgno
+            ))
+        })?;
     let k = group_meta.group_size;
 
     debug!(

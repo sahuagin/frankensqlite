@@ -2750,9 +2750,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         });
                     }
 
-                    let top_after_seek = cursor.stack.last().ok_or_else(|| {
-                        FrankenError::internal("cursor stack empty after reseek in delete")
-                    })?.clone();
+                    let top_after_seek = cursor
+                        .stack
+                        .last()
+                        .ok_or_else(|| {
+                            FrankenError::internal("cursor stack empty after reseek in delete")
+                        })?
+                        .clone();
                     if !top_after_seek.header.page_type.is_leaf() {
                         // The seek found the interior node separator we just inserted.
                         // We must advance to the next logical entry to reach the duplicate in the leaf.

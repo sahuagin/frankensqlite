@@ -1003,6 +1003,9 @@ impl<F: VfsFile> WalFile<F> {
             return Ok(());
         }
 
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_append_busy(self.frame_count, frames.len())?;
+
         let frame_size = self.frame_size();
         let total_bytes = frames
             .len()
@@ -1011,6 +1014,8 @@ impl<F: VfsFile> WalFile<F> {
         let page_size = self.page_size;
         let salts = self.header.salts;
         let big_endian_checksum = self.big_endian_checksum;
+        #[cfg(any(test, feature = "fault-injection"))]
+        let frame_count_before = self.frame_count;
 
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
         frame_scratch.resize(total_bytes, 0);
@@ -1045,6 +1050,12 @@ impl<F: VfsFile> WalFile<F> {
             self.append_prepared_frame_bytes(cx, &mut frame_scratch, &frame_transforms)
         })();
         self.frame_scratch = frame_scratch;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        if append_result.is_ok() {
+            crate::fault_hooks::maybe_inject_after_append(frame_count_before, frames.len())?;
+        }
+
         append_result
     }
 
@@ -1130,6 +1141,9 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Sync the WAL file to stable storage.
     pub fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
+
         self.file.sync(cx, flags)
     }
 
@@ -1568,6 +1582,68 @@ mod tests {
     }
 
     #[test]
+    fn test_fault_hook_after_wal_append_returns_error_and_records_context() {
+        crate::fault_hooks::clear();
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 1, test_salts()).expect("create WAL");
+        let page = sample_page(0x33);
+        let frames = [WalAppendFrameRef {
+            page_number: 1,
+            page_data: &page,
+            db_size_if_commit: 1,
+        }];
+
+        crate::fault_hooks::arm_after_append(crate::fault_hooks::FaultHookArm::new(
+            "bd-db300.7.2.2-after-append",
+            "WAL-AFTER-APPEND",
+            "wal_append_recovery",
+        ));
+
+        let error = wal
+            .append_frames(&cx, &frames)
+            .expect_err("fault hook should force an error after append");
+        assert!(
+            error.to_string().contains("fault_inject:wal_after_append"),
+            "fault error should identify the append hook: {error}"
+        );
+        assert_eq!(
+            wal.frame_count(),
+            1,
+            "append should still have reached the WAL"
+        );
+
+        wal.close(&cx).expect("close WAL");
+        let reopened_file = open_wal_file(&vfs, &cx);
+        let reopened = WalFile::open(&cx, reopened_file).expect("reopen WAL");
+        assert_eq!(
+            reopened.frame_count(),
+            1,
+            "reopened WAL should preserve the appended frame for later recovery checks"
+        );
+
+        let records = crate::fault_hooks::take_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one append fault should be recorded"
+        );
+        assert_eq!(records[0].point, "wal_after_append");
+        assert_eq!(records[0].run_id, "bd-db300.7.2.2-after-append");
+        assert_eq!(records[0].scenario_id, "WAL-AFTER-APPEND");
+        assert_eq!(records[0].invariant_family, "wal_append_recovery");
+        assert!(
+            records[0].detail.contains("appended_frames=1"),
+            "record should preserve append context: {}",
+            records[0].detail
+        );
+
+        crate::fault_hooks::clear();
+    }
+
+    #[test]
     fn test_append_commit_frame() {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
@@ -1796,6 +1872,112 @@ mod tests {
         wal.sync(&cx, SyncFlags::FULL).expect("full sync");
 
         wal.close(&cx).expect("close WAL");
+    }
+
+    #[test]
+    fn test_fault_hook_sync_failure_returns_error_and_records_context() {
+        crate::fault_hooks::clear();
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 1, test_salts()).expect("create WAL");
+        wal.append_frame(&cx, 1, &sample_page(0x44), 1)
+            .expect("append frame");
+
+        crate::fault_hooks::arm_sync_failure(crate::fault_hooks::FaultHookArm::new(
+            "bd-db300.7.2.2-sync-failure",
+            "WAL-SYNC-FAILURE",
+            "wal_sync_recovery",
+        ));
+
+        let error = wal
+            .sync(&cx, SyncFlags::NORMAL)
+            .expect_err("fault hook should force sync failure");
+        assert!(
+            error.to_string().contains("fault_inject:wal_sync_failure"),
+            "fault error should identify the sync hook: {error}"
+        );
+
+        let records = crate::fault_hooks::take_records();
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one sync fault should be recorded"
+        );
+        assert_eq!(records[0].point, "wal_sync_failure");
+        assert_eq!(records[0].run_id, "bd-db300.7.2.2-sync-failure");
+        assert!(
+            records[0].detail.contains("frame_count_before=1"),
+            "record should capture sync context: {}",
+            records[0].detail
+        );
+
+        crate::fault_hooks::clear();
+    }
+
+    #[test]
+    fn test_fault_hook_append_busy_countdown_fires_once_and_preserves_retry_surface() {
+        crate::fault_hooks::clear();
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 1, test_salts()).expect("create WAL");
+
+        crate::fault_hooks::arm_append_busy_countdown(
+            crate::fault_hooks::FaultHookArm::new(
+                "bd-db300.7.2.2-busy-countdown",
+                "WAL-APPEND-BUSY",
+                "wal_append_retry",
+            ),
+            2,
+        );
+
+        let first_page = sample_page(0x55);
+        let first_frames = [WalAppendFrameRef {
+            page_number: 1,
+            page_data: &first_page,
+            db_size_if_commit: 1,
+        }];
+        wal.append_frames(&cx, &first_frames)
+            .expect("countdown should not fire on first append");
+
+        let second_page = sample_page(0x66);
+        let second_frames = [WalAppendFrameRef {
+            page_number: 2,
+            page_data: &second_page,
+            db_size_if_commit: 2,
+        }];
+        let busy = wal
+            .append_frames(&cx, &second_frames)
+            .expect_err("countdown should fire on second append");
+        assert!(matches!(busy, FrankenError::Busy));
+        assert_eq!(
+            wal.frame_count(),
+            1,
+            "busy fault should fire before the second append mutates WAL state"
+        );
+
+        wal.append_frames(&cx, &second_frames)
+            .expect("hook should disarm after firing once");
+        assert_eq!(
+            wal.frame_count(),
+            2,
+            "retry should succeed once the hook is spent"
+        );
+
+        let records = crate::fault_hooks::take_records();
+        assert_eq!(records.len(), 1, "busy countdown should record one trigger");
+        assert_eq!(records[0].point, "wal_append_busy_countdown");
+        assert_eq!(records[0].run_id, "bd-db300.7.2.2-busy-countdown");
+        assert!(
+            records[0].detail.contains("submitted_frames=1"),
+            "record should preserve append batch context: {}",
+            records[0].detail
+        );
+
+        crate::fault_hooks::clear();
     }
 
     #[test]

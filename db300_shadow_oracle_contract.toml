@@ -1,0 +1,416 @@
+# DB300 Shadow-Oracle Contract v1.0.0
+#
+# Bead: bd-db300.7.5.6
+# Purpose: define the shared shadow-oracle differential verification and
+# counterexample-capture contract for aggressive fast paths and controller-
+# bearing modes before they become user-visible defaults.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.5.6"
+track_id = "bd-db300.7.5"
+generated_at = "2026-03-23"
+contract_owner = "db300-track-g-shadow-oracle"
+
+[global_defaults]
+oracle_result_authority = "conservative_oracle_wins"
+default_shadow_mode = "off"
+default_rollout_stage = "shadow_only"
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; no shadow-oracle lane may serialize writers or flip MVCC defaults."
+default_eligibility_rule = "A candidate path may advance from shadow_only only after the named forced and sampled suites stay free of blocker divergences, the relevant kill switch remains disarmed, and replayable counterexample bundles exist for every induced negative-path scenario."
+fallback_policy = "Any blocker divergence forces conservative result selection, emits a counterexample bundle, and arms the per-surface kill switch according to the referenced threshold profile."
+safe_mode_policy = "If a surface is unclassified, hostile, or lacks complete evidence, remain on the conservative oracle path and record the gap as tracked work."
+
+[logging]
+common_fields = [
+  "trace_id",
+  "scenario_id",
+  "shadow_run_id",
+  "surface_id",
+  "oracle_path",
+  "candidate_path",
+  "equivalence_scope",
+  "allowed_difference_policy",
+  "shadow_mode",
+  "shadow_sample_rate",
+  "rollout_stage",
+  "fallback_state",
+  "kill_switch_state",
+  "counterexample_bundle",
+]
+first_failure_fields = [
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_json_pointer",
+  "replay_command",
+  "diagnostic_json_pointer",
+  "minimal_reproduction_json_pointer",
+]
+
+[counterexample_bundle]
+bundle_schema = "fsqlite-harness.shadow_oracle_counterexample.v1"
+required_files = [
+  "bundle_summary.json",
+  "oracle_observation.json",
+  "candidate_observation.json",
+  "artifact_manifest.json",
+  "structured_logs.ndjson",
+  "replay.sh",
+]
+optional_files = [
+  "decision_record.json",
+  "minimal_reproduction.json",
+  "state_hash_inputs.json",
+]
+required_fields = [
+  "bundle_id",
+  "trace_id",
+  "scenario_id",
+  "shadow_run_id",
+  "surface_id",
+  "oracle_path",
+  "candidate_path",
+  "equivalence_scope",
+  "allowed_difference_policy",
+  "shadow_mode",
+  "rollout_stage",
+  "divergence_class",
+  "kill_switch_state",
+  "fallback_state",
+  "replay_command",
+  "diagnostic_json_pointer",
+  "artifact_entries",
+  "oracle_observation_hash",
+  "candidate_observation_hash",
+]
+optional_fields = [
+  "decision_id",
+  "policy_id",
+  "budget_id",
+  "slo_id",
+  "counterfactual_action",
+  "regret_delta",
+  "minimal_reproduction_json_pointer",
+]
+minimization_expectation = "Capture the first failing scenario plus a minimized reproduction when feasible; if minimization is not feasible, emit an explicit reason in the bundle summary."
+replay_contract = "Every bundle must include a single-command rerun entrypoint and JSON pointers to the first failing diagnostic payload."
+
+[[equivalence_scope]]
+scope_id = "user_visible_result"
+comparison_kind = "exact_after_normalization"
+normalization_rules = [
+  "Canonicalize SQLite-compatible error code and message pairs.",
+  "Canonicalize result encodings without changing row order or cardinality.",
+  "Strip trace identifiers, timestamps, and duration counters from the compared payload.",
+]
+blocker = true
+
+[[equivalence_scope]]
+scope_id = "state_hash"
+comparison_kind = "semantic_hash_after_scrub"
+normalization_rules = [
+  "Hash only semantics-bearing state: page bytes, publication sequence, commit certificate bytes, and recovery-visible WAL state.",
+  "Exclude ephemeral telemetry, trace metadata, and sampling counters.",
+]
+blocker = true
+
+[[equivalence_scope]]
+scope_id = "invariant_hash"
+comparison_kind = "exact"
+normalization_rules = [
+  "Hash invariant ledger outputs after deterministic field ordering.",
+  "Reject any missing invariant proof field as a divergence rather than a scrub candidate.",
+]
+blocker = true
+
+[[equivalence_scope]]
+scope_id = "decision_equivalence"
+comparison_kind = "budgeted"
+normalization_rules = [
+  "Compare chosen action, fallback decision, and budget state after deterministic field ordering.",
+  "Permit action drift only through an allowed-difference policy that records counterfactual action and regret delta.",
+]
+blocker = false
+
+[[allowed_difference_policy]]
+policy_id = "exact_identity"
+applies_to_scopes = ["user_visible_result", "invariant_hash"]
+allowed_differences = []
+forbidden_differences = [
+  "row count drift",
+  "row order drift",
+  "error surface drift",
+  "fallback decision drift",
+  "commit certificate drift",
+]
+
+[[allowed_difference_policy]]
+policy_id = "ephemeral_field_scrub"
+applies_to_scopes = ["user_visible_result", "state_hash"]
+allowed_differences = [
+  "trace ids",
+  "timing counters",
+  "sampling counters",
+  "allocation counters",
+  "placement probe counters",
+]
+forbidden_differences = [
+  "page bytes",
+  "publication sequence",
+  "visibility generation",
+  "durability-visible WAL bytes",
+]
+
+[[allowed_difference_policy]]
+policy_id = "state_hash_semantic_scrub"
+applies_to_scopes = ["state_hash"]
+allowed_differences = [
+  "debug-only instrumentation bytes",
+  "non-semantic artifact ordering",
+]
+forbidden_differences = [
+  "page-image hash drift",
+  "metadata publication fingerprint drift",
+  "checkpoint or recovery visible state drift",
+]
+
+[[allowed_difference_policy]]
+policy_id = "bounded_regret_decision_delta"
+applies_to_scopes = ["decision_equivalence"]
+allowed_differences = [
+  "action choice",
+  "helper-lane budget",
+  "flush timing hint",
+  "placement hint",
+]
+forbidden_differences = [
+  "fallback suppression when budget is exhausted",
+  "user-visible result drift",
+  "invariant-hash drift",
+]
+decision_budget_rule = "The chosen action may differ from the oracle only when the emitted decision record shows regret_delta within the active budget_id or slo_id contract."
+
+[[shadow_mode]]
+mode_id = "off"
+oracle_executes = true
+candidate_executes = false
+authoritative_result = "oracle"
+sample_rate_rule = "none"
+escalation_rule = "Remain here until forced-shadow suites are available."
+
+[[shadow_mode]]
+mode_id = "forced"
+oracle_executes = true
+candidate_executes = true
+authoritative_result = "oracle"
+sample_rate_rule = "100%"
+escalation_rule = "Required entry gate for any new candidate path before sampled or canary rollout."
+
+[[shadow_mode]]
+mode_id = "sampled"
+oracle_executes = true
+candidate_executes = true
+authoritative_result = "oracle"
+sample_rate_rule = "Deterministic sample keyed by trace_id or scenario_id."
+escalation_rule = "May follow forced mode only after blocker divergences remain zero over the named suite pack."
+
+[[shadow_mode]]
+mode_id = "shadow_canary"
+oracle_executes = true
+candidate_executes = true
+authoritative_result = "candidate_with_oracle_override_on_divergence"
+sample_rate_rule = "Canary slice only; every canary request emits oracle lineage."
+escalation_rule = "A blocker divergence forces immediate local fallback and surfaces the kill-switch state in logs and artifacts."
+
+[[divergence_class]]
+divergence_class_id = "semantic_result_mismatch"
+severity = "blocker"
+description = "User-visible rows, status, ordering, or error surface differ after normalization."
+default_kill_switch_profile = "immediate_surface_latch"
+
+[[divergence_class]]
+divergence_class_id = "state_hash_mismatch"
+severity = "blocker"
+description = "State hash differs on semantics-bearing bytes after the allowed scrub policy."
+default_kill_switch_profile = "immediate_surface_latch"
+
+[[divergence_class]]
+divergence_class_id = "invariant_violation"
+severity = "blocker"
+description = "The candidate or oracle violates a named invariant or emits an incomplete invariant record."
+default_kill_switch_profile = "immediate_surface_latch"
+
+[[divergence_class]]
+divergence_class_id = "fallback_contract_breach"
+severity = "blocker"
+description = "The candidate suppresses or bypasses the conservative fallback when the contract requires oracle authority."
+default_kill_switch_profile = "immediate_surface_latch"
+
+[[divergence_class]]
+divergence_class_id = "decision_budget_exceeded"
+severity = "warning"
+description = "A controller-bearing surface chooses a different action and exceeds the allowed regret or budget envelope without changing user-visible results."
+default_kill_switch_profile = "rate_based_decision_latch"
+
+[[divergence_class]]
+divergence_class_id = "observability_gap"
+severity = "blocker"
+description = "Required logging fields, replay hooks, or counterexample-bundle contents are missing or malformed."
+default_kill_switch_profile = "observability_fail_closed"
+
+[[kill_switch_profile]]
+profile_id = "immediate_surface_latch"
+threshold_count = 1
+threshold_window = "single_observation"
+action = "Force oracle-only operation for the affected surface and forbid rollout advancement."
+reset_rule = "Manual reset only after a fixed build plus replayable green verification."
+
+[[kill_switch_profile]]
+profile_id = "rate_based_decision_latch"
+threshold_count = 3
+threshold_window = "1000_shadow_decisions_or_one_ci_suite"
+action = "Downgrade the affected controller from shadow_canary or sampled back to forced oracle authority."
+reset_rule = "Automatic reset requires two consecutive green windows and no active blocker divergence."
+
+[[kill_switch_profile]]
+profile_id = "observability_fail_closed"
+threshold_count = 1
+threshold_window = "single_observation"
+action = "Fail verification immediately because missing evidence makes the shadow result unauditable."
+reset_rule = "Regenerate complete evidence and rerun the failed suite."
+
+[[named_script]]
+script_id = "g5_6_shadow_oracle_suite"
+path = "scripts/verify_g5_6_shadow_oracle.sh"
+surfaces = ["e2_fused_entry", "e3_metadata_publication", "d1_parallel_wal", "e4_controller_decisions"]
+artifact_outputs = ["shadow_oracle_manifest.json", "counterexample_bundle/", "structured_logs.ndjson"]
+
+[[named_script]]
+script_id = "e2_fused_entry_suite"
+path = "scripts/verify_e2_2_fused_entry.sh"
+surfaces = ["e2_fused_entry"]
+artifact_outputs = ["fused_entry_shadow_report.json", "counterexample_bundle/", "structured_logs.ndjson"]
+
+[[named_script]]
+script_id = "e3_metadata_publication_suite"
+path = "scripts/verify_e3_3_metadata_publication.sh"
+surfaces = ["e3_metadata_publication"]
+artifact_outputs = ["metadata_publication_shadow_report.json", "counterexample_bundle/", "structured_logs.ndjson"]
+
+[[named_script]]
+script_id = "d1_parallel_wal_suite"
+path = "scripts/verify_d1_parallel_wal_matrix.sh"
+surfaces = ["d1_parallel_wal"]
+artifact_outputs = ["parallel_wal_shadow_report.json", "counterexample_bundle/", "structured_logs.ndjson"]
+
+[[named_script]]
+script_id = "e4_controller_guardrails_suite"
+path = "scripts/verify_e4_3_tail_guardrails.sh"
+surfaces = ["e4_controller_decisions"]
+artifact_outputs = ["tail_guardrail_shadow_report.json", "counterexample_bundle/", "structured_logs.ndjson"]
+
+[[surface_contract]]
+surface_id = "e2_fused_entry"
+pillar_id = "E2"
+title = "Fused prepared-DML entry and fallback routing"
+oracle_identity = "Prepared-DML conservative entry path with explicit ticket revalidation, fallback-only control mode, and the existing slow-path visibility checks."
+candidate_identity = "Fused prepared-DML common path with one reusable entry ticket and explicit fallback boundary."
+equivalence_scopes = ["user_visible_result", "state_hash", "invariant_hash"]
+allowed_difference_policies = ["exact_identity", "ephemeral_field_scrub", "state_hash_semantic_scrub"]
+supported_shadow_modes = ["forced", "sampled", "shadow_canary"]
+divergence_classes = ["semantic_result_mismatch", "state_hash_mismatch", "invariant_violation", "fallback_contract_breach", "observability_gap"]
+kill_switch_profiles = ["immediate_surface_latch", "observability_fail_closed"]
+named_scripts = ["g5_6_shadow_oracle_suite", "e2_fused_entry_suite"]
+required_log_fields = ["entry_ticket_state", "compatibility_selector", "fallback_reason", "schema_epoch", "publication_seq", "wal_generation", "shadow_verdict"]
+unit_test_obligations = [
+  "crates/fsqlite-core/src/connection.rs::tests::shadow_oracle_normalizes_fused_entry_observation",
+  "crates/fsqlite-core/src/connection.rs::tests::shadow_oracle_forced_mode_returns_oracle_result_for_fused_entry",
+  "crates/fsqlite-core/src/connection.rs::tests::shadow_oracle_counterexample_bundle_captures_schema_and_wal_invalidations",
+]
+integration_test_obligations = [
+  "crates/fsqlite-e2e/tests/e2_shadow_fused_entry_invalidations.rs::ddl_and_wal_generation_invalidations_emit_oracle_wins",
+  "crates/fsqlite-e2e/tests/e2_shadow_fused_entry_invalidations.rs::prepared_dml_shadow_canary_downgrades_after_blocker_divergence",
+]
+e2e_obligations = [
+  "scripts/verify_e2_2_fused_entry.sh --shadow-mode forced --compatibility-selector prepared_dml",
+  "scripts/verify_e2_2_fused_entry.sh --shadow-mode shadow_canary --matrix weak_cells",
+]
+
+[[surface_contract]]
+surface_id = "e3_metadata_publication"
+pillar_id = "E3"
+title = "Immutable metadata publication and read-side binding"
+oracle_identity = "Current conservative metadata publication path with stable publication sequencing and explicit retry/fallback behavior."
+candidate_identity = "Immutable metadata publication bundles with bounded retry, reclamation tracking, and read-side binding to the published snapshot."
+equivalence_scopes = ["user_visible_result", "state_hash", "invariant_hash"]
+allowed_difference_policies = ["exact_identity", "ephemeral_field_scrub", "state_hash_semantic_scrub"]
+supported_shadow_modes = ["forced", "sampled", "shadow_canary"]
+divergence_classes = ["semantic_result_mismatch", "state_hash_mismatch", "invariant_violation", "fallback_contract_breach", "observability_gap"]
+kill_switch_profiles = ["immediate_surface_latch", "observability_fail_closed"]
+named_scripts = ["g5_6_shadow_oracle_suite", "e3_metadata_publication_suite"]
+required_log_fields = ["publication_generation", "snapshot_age", "retry_count", "compatibility_selector", "fallback_reason", "shadow_verdict"]
+unit_test_obligations = [
+  "crates/fsqlite-core/src/connection.rs::tests::shadow_oracle_normalizes_metadata_publication_observation",
+  "crates/fsqlite-core/src/connection.rs::tests::shadow_oracle_metadata_publication_bundle_captures_retry_and_reclamation_context",
+]
+integration_test_obligations = [
+  "crates/fsqlite-e2e/tests/e3_shadow_metadata_publication.rs::forced_legacy_and_candidate_paths_preserve_user_visible_semantics",
+  "crates/fsqlite-e2e/tests/e3_shadow_metadata_publication.rs::reclamation_and_retry_divergence_arms_kill_switch",
+]
+e2e_obligations = [
+  "scripts/verify_e3_3_metadata_publication.sh --shadow-mode forced --placement-profile pinned",
+  "scripts/verify_e3_3_metadata_publication.sh --shadow-mode sampled --topology-profile adversarial",
+]
+
+[[surface_contract]]
+surface_id = "d1_parallel_wal"
+pillar_id = "D1"
+title = "Per-core parallel WAL append and publication"
+oracle_identity = "Conservative WAL append and publish path with deterministic commit ordering, auditable visibility handoff, and the current ordered residue."
+candidate_identity = "Per-core parallel WAL lanes with commit certificates, ordered durability residue, and explicit safe-mode fallback."
+equivalence_scopes = ["user_visible_result", "state_hash", "invariant_hash"]
+allowed_difference_policies = ["exact_identity", "ephemeral_field_scrub", "state_hash_semantic_scrub"]
+supported_shadow_modes = ["forced", "sampled", "shadow_canary"]
+divergence_classes = ["semantic_result_mismatch", "state_hash_mismatch", "invariant_violation", "fallback_contract_breach", "observability_gap"]
+kill_switch_profiles = ["immediate_surface_latch", "observability_fail_closed"]
+named_scripts = ["g5_6_shadow_oracle_suite", "d1_parallel_wal_suite"]
+required_log_fields = ["commit_certificate_id", "commit_order", "wal_generation", "ordered_region_ns", "compatibility_selector", "fallback_reason", "shadow_verdict"]
+unit_test_obligations = [
+  "crates/fsqlite-wal/src/lib.rs::tests::shadow_oracle_normalizes_parallel_wal_commit_observation",
+  "crates/fsqlite-wal/src/lib.rs::tests::shadow_oracle_parallel_wal_bundle_captures_commit_certificate_and_visibility_state",
+]
+integration_test_obligations = [
+  "crates/fsqlite-e2e/tests/d1_shadow_parallel_wal.rs::forced_shadow_preserves_commit_order_and_recovery_visibility",
+  "crates/fsqlite-e2e/tests/d1_shadow_parallel_wal.rs::checkpoint_overlap_divergence_forces_oracle_and_bundle_capture",
+]
+e2e_obligations = [
+  "scripts/verify_d1_parallel_wal_matrix.sh --shadow-mode forced --concurrency c1,c4,c8",
+  "scripts/verify_d1_parallel_wal_matrix.sh --shadow-mode sampled --control-mode auto,conservative",
+]
+
+[[surface_contract]]
+surface_id = "e4_controller_decisions"
+pillar_id = "E4"
+title = "Admission control and tail-latency guardrail decisions"
+oracle_identity = "Deterministic conservative admission and tail guardrail policy with fixed fallback precedence and no adaptive action drift."
+candidate_identity = "Loss-aware or policy-as-data controller for admission, helper budget, and safe-mode forcing with explicit decision records."
+equivalence_scopes = ["user_visible_result", "invariant_hash", "decision_equivalence"]
+allowed_difference_policies = ["exact_identity", "ephemeral_field_scrub", "bounded_regret_decision_delta"]
+supported_shadow_modes = ["forced", "sampled", "shadow_canary"]
+divergence_classes = ["semantic_result_mismatch", "invariant_violation", "decision_budget_exceeded", "fallback_contract_breach", "observability_gap"]
+kill_switch_profiles = ["immediate_surface_latch", "rate_based_decision_latch", "observability_fail_closed"]
+named_scripts = ["g5_6_shadow_oracle_suite", "e4_controller_guardrails_suite"]
+required_log_fields = ["policy_id", "decision_id", "budget_id", "slo_id", "top_evidence_terms", "expected_loss", "counterfactual_action", "regret_delta", "chosen_action"]
+unit_test_obligations = [
+  "crates/fsqlite-e2e/src/fairness.rs::tests::shadow_oracle_normalizes_guardrail_decision_records",
+  "crates/fsqlite-e2e/src/fairness.rs::tests::shadow_oracle_budgeted_decision_delta_stays_within_regret_cap",
+  "crates/fsqlite-e2e/src/fairness.rs::tests::shadow_oracle_decision_budget_exceeded_arms_rate_latch",
+]
+integration_test_obligations = [
+  "crates/fsqlite-e2e/tests/e4_shadow_guardrails.rs::bursty_arrivals_preserve_user_visible_semantics_under_forced_shadow",
+  "crates/fsqlite-e2e/tests/e4_shadow_guardrails.rs::decision_budget_exhaustion_forces_conservative_fallback",
+]
+e2e_obligations = [
+  "scripts/verify_e4_3_tail_guardrails.sh --shadow-mode forced --workload bursty",
+  "scripts/verify_e4_3_tail_guardrails.sh --shadow-mode shadow_canary --topology-profile adversarial",
+]
