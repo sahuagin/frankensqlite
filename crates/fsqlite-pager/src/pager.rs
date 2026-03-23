@@ -857,7 +857,11 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     let mut predicted_freelist = inner.freelist.clone();
     return_pages_to_freelist(&mut predicted_freelist, pending_freed_pages.iter().copied());
     let predicted_normalized = normalize_freelist(&predicted_freelist, upper_bound);
-    inner.freelist = normalize_freelist(&inner.freelist, upper_bound);
+    // NOTE: Do NOT normalize inner.freelist here — this runs during Phase A
+    // where inner.lock() may be released before Phase B. Mutating the shared
+    // freelist would leak a side-effect visible to concurrent transactions
+    // even if this commit fails. Normalization of inner.freelist (if needed)
+    // should be deferred to Phase C after successful commit.
     let durable_freelist: Vec<PageNumber> = predicted_normalized
         .iter()
         .copied()
@@ -4587,7 +4591,7 @@ where
             // Phase C (after WAL success).
             pending_freed = self.freed_pages.drain(..).collect();
             if freelist_dirty {
-                serialize_freelist_to_write_set(
+                if let Err(e) = serialize_freelist_to_write_set(
                     cx,
                     &mut inner,
                     &self.cache,
@@ -4597,7 +4601,10 @@ where
                     &mut self.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
-                )?;
+                ) {
+                    self.freed_pages.extend(pending_freed);
+                    return Err(e);
+                }
             }
 
             // In rollback-journal mode page 1 is still the durable commit beacon.
@@ -4616,14 +4623,20 @@ where
                 true
             };
             if must_write_page1 {
-                let mut page1 = ensure_page_one_in_write_set(
+                let mut page1 = match ensure_page_one_in_write_set(
                     cx,
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
                     &self.pool,
                     &mut self.write_set,
-                )?;
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.freed_pages.extend(pending_freed);
+                        return Err(e);
+                    }
+                };
                 if page1.len() >= DATABASE_HEADER_SIZE {
                     let mut page_count_bytes = [0_u8; 4];
                     page_count_bytes.copy_from_slice(&page1[28..32]);
@@ -4675,10 +4688,17 @@ where
             );
 
             // Re-acquire inner lock for Phase C (finalize).
-            inner = self
+            inner = match self
                 .inner
                 .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    self.freed_pages.extend(pending_freed);
+                    return Err(e);
+                }
+            };
 
             result
         } else {
@@ -4838,7 +4858,7 @@ where
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
             if freelist_dirty {
-                serialize_freelist_to_write_set(
+                if let Err(e) = serialize_freelist_to_write_set(
                     cx,
                     &mut inner,
                     &self.cache,
@@ -4848,7 +4868,10 @@ where
                     &mut self.write_pages_sorted,
                     committed_db_size,
                     &pending_freed,
-                )?;
+                ) {
+                    self.freed_pages.extend(pending_freed);
+                    return Err(e);
+                }
             }
 
             let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
@@ -4864,14 +4887,20 @@ where
                 true
             };
             if must_write_page1 {
-                let mut page1 = ensure_page_one_in_write_set(
+                let mut page1 = match ensure_page_one_in_write_set(
                     cx,
                     &mut inner,
                     &self.cache,
                     &self.wal_backend,
                     &self.pool,
                     &mut self.write_set,
-                )?;
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.freed_pages.extend(pending_freed);
+                        return Err(e);
+                    }
+                };
                 if page1.len() >= DATABASE_HEADER_SIZE {
                     let mut page_count_bytes = [0_u8; 4];
                     page_count_bytes.copy_from_slice(&page1[28..32]);
@@ -4904,10 +4933,17 @@ where
                     &self.write_pages_sorted,
                     &self.group_commit_queue,
                 );
-                inner = self
+                inner = match self
                     .inner
                     .lock()
-                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))
+                {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        self.freed_pages.extend(pending_freed);
+                        return Err(e);
+                    }
+                };
                 result
             } else {
                 Self::commit_journal(
@@ -12599,7 +12635,7 @@ mod tests {
             let reused2 = txn3.allocate_page(&cx).unwrap();
             // Should get p2 and p3 back (from freelist).
             assert!(
-                [p2, p3].contains(&reused1) || [p2, p3].contains(&reused2),
+                [p2, p3].contains(&reused1) && [p2, p3].contains(&reused2),
                 "bead_id={BEAD_ID} case=freed_pages_reusable reused1={} reused2={}",
                 reused1.get(),
                 reused2.get()
