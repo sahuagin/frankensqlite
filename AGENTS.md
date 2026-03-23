@@ -50,7 +50,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
-- **Workspace:** 24 crates under `crates/` (see members list in root `Cargo.toml`)
+- **Workspace:** 27 crates under `crates/` (see members list in root `Cargo.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via workspace lints)
@@ -74,7 +74,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | Crate | Purpose |
 |-------|---------|
 | `asupersync` | Structured async runtime (channels, sync, regions, testing) |
-| `ftui` | TUI framework (local at `/dp/frankentui`) |
+| `ftui` | TUI framework (crates.io: `ftui = "0.2.1"`) |
 | `thiserror` | Derive macro for `Error` trait implementations |
 | `serde` + `serde_json` | Serialization/deserialization |
 | `bitflags` | Type-safe bitflag types for page flags, lock modes, etc. |
@@ -300,7 +300,7 @@ Storage: VFS --> Pager --> WAL --> MVCC --> B-Tree --> Page I/O
 
 ```
 frankensqlite/
-├── Cargo.toml                         # Workspace root — all 24 members, shared deps, profiles
+├── Cargo.toml                         # Workspace root — all 27 members, shared deps, profiles
 ├── rust-toolchain.toml                # Nightly toolchain requirement
 ├── crates/
 │   ├── fsqlite-types/                 # Foundation types (Value, PageNumber, RowId, etc.)
@@ -371,7 +371,7 @@ frankensqlite/
 - **Conformance testing against C SQLite** — `rusqlite` is a dev dependency for reference comparison
 - **Property-based testing** — proptest for invariant verification on B-Trees, MVCC chains, parser
 - **Snapshot testing** — insta for parser output, query plans, bytecode dumps
-- **`#![forbid(unsafe_code)]`** — zero unsafe blocks across all crates
+- **`#![forbid(unsafe_code)]`** at workspace level — `unsafe` is only in `fsqlite-vfs` (mmap/shm) and `fsqlite-c-api` (FFI); those crates override the workspace lint locally
 - **Structured tracing** throughout — every layer emits spans for diagnostics
 
 ---

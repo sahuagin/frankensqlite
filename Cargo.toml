@@ -26,7 +26,6 @@ members = [
     "crates/fsqlite",
     "crates/fsqlite-cli",
     "crates/fsqlite-harness",
-    "crates/fsqlite-e2e",
     "crates/fsqlite-observability",
     "crates/fsqlite-c-api",
     "crates/fsqlite-wasm",
@@ -139,7 +138,7 @@ fsqlite-c-api = { version = "0.1.2", path = "crates/fsqlite-c-api" }
 fsqlite-wasm = { version = "0.1.0", path = "crates/fsqlite-wasm" }
 
 # External dependencies
-ftui = { path = "/data/projects/frankentui/crates/ftui" }
+ftui = { version = "0.2.1", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
