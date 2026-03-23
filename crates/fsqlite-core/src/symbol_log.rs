@@ -288,18 +288,28 @@ pub fn ensure_symbol_segment(segment_path: &Path, header: SymbolSegmentHeader) -
         }
     }
 
-    if !segment_path.exists() {
-        let encoded = header.encode();
-        fs::write(segment_path, encoded)?;
-        info!(
-            bead_id = BEAD_ID,
-            logging_standard = LOGGING_STANDARD_BEAD,
-            path = %segment_path.display(),
-            segment_id = header.segment_id,
-            epoch_id = header.epoch_id,
-            "created symbol segment"
-        );
-        return Ok(());
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(segment_path)
+    {
+        Ok(mut file) => {
+            file.write_all(&header.encode())?;
+            file.sync_all()?;
+            info!(
+                bead_id = BEAD_ID,
+                logging_standard = LOGGING_STANDARD_BEAD,
+                path = %segment_path.display(),
+                segment_id = header.segment_id,
+                epoch_id = header.epoch_id,
+                "created symbol segment"
+            );
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Segment already exists — another process created it first. That's fine.
+        }
+        Err(e) => return Err(e.into()),
     }
 
     let bytes = fs::read(segment_path)?;
@@ -1098,7 +1108,9 @@ fn build_systematic_run_locator(
     for relative in 0..source_symbols {
         let row = &rows[start_idx + relative];
         let rec = &row.record;
-        let expected_esi = u32::try_from(relative).expect("relative index fits u32");
+        let expected_esi = u32::try_from(relative).map_err(|_| {
+            format!("relative index {relative} exceeds u32::MAX in systematic run locator")
+        })?;
 
         if rec.object_id != start.object_id {
             return Err(format!(
