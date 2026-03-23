@@ -258,6 +258,10 @@ static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_READ_SNAPSHOT_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
+// bd-db300.5.2.2.1: Boundary-duplication census counters.
+static FSQLITE_BEGIN_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMMIT_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MEMDB_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_REUSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_CACHED_WRITE_TXN_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
@@ -311,6 +315,12 @@ pub struct HotPathProfileSnapshot {
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
     pub cached_read_snapshot_parks: u64,
+    /// bd-db300.5.2.2.1: Times autocommit-begin did refresh work.
+    pub begin_refresh_count: u64,
+    /// bd-db300.5.2.2.1: Times autocommit-commit did publication refresh.
+    pub commit_refresh_count: u64,
+    /// bd-db300.5.2.2.1: Times memdb-from-pager refresh was executed (not skipped).
+    pub memdb_refresh_count: u64,
     pub cached_write_txn_reuses: u64,
     pub cached_write_txn_parks: u64,
     pub column_default_evaluation_passes: u64,
@@ -374,6 +384,9 @@ pub fn reset_hot_path_profile() {
     FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_READ_SNAPSHOT_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_READ_SNAPSHOT_PARKS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_BEGIN_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMMIT_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_MEMDB_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_REUSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_CACHED_WRITE_TXN_PARKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
@@ -434,6 +447,9 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         cached_read_snapshot_parks: FSQLITE_CACHED_READ_SNAPSHOT_PARKS
             .load(AtomicOrdering::Relaxed),
+        begin_refresh_count: FSQLITE_BEGIN_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
+        commit_refresh_count: FSQLITE_COMMIT_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
+        memdb_refresh_count: FSQLITE_MEMDB_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         cached_write_txn_reuses: FSQLITE_CACHED_WRITE_TXN_REUSES.load(AtomicOrdering::Relaxed),
         cached_write_txn_parks: FSQLITE_CACHED_WRITE_TXN_PARKS.load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
@@ -5191,6 +5207,10 @@ impl Connection {
     ) -> Result<BoundPagerPublication> {
         let publication = self.bind_pager_publication(cx, scenario_id)?;
         if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+            // bd-db300.5.2.2.1: Count actual memdb refreshes (not skips).
+            if hot_path_profile_enabled() {
+                FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             self.reload_memdb_from_pager(cx)?;
         }
         Ok(publication)
@@ -11538,6 +11558,10 @@ impl Connection {
             return Ok(true);
         }
 
+        // bd-db300.5.2.2.1: Count begin-side refresh work.
+        if hot_path_profile_enabled() {
+            FSQLITE_BEGIN_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let publication = if let Some(publication) = prebound_publication {
             publication
         } else if is_concurrent {
@@ -11642,6 +11666,10 @@ impl Connection {
     ) -> Result<()> {
         if !was_auto {
             return Ok(());
+        }
+        // bd-db300.5.2.2.1: Count commit-side refresh work.
+        if hot_path_profile_enabled() {
+            FSQLITE_COMMIT_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let mut txn = {
             let mut guard = self.active_txn.borrow_mut();

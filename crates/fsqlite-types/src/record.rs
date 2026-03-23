@@ -566,6 +566,53 @@ pub fn decode_column_from_offset(
     decode_value(col.serial_type, &data[start..end], profile_enabled)
 }
 
+/// Decode a single column, reusing the previous row's cached `Arc` when the
+/// raw bytes are identical (bd-db300.4.4.2 — K1 copy elimination).
+///
+/// For Text/Blob columns that repeat across consecutive rows (common in
+/// JOINs, GROUP BY, denormalized tables), this avoids the malloc+memcpy+free
+/// cycle by returning `Arc::clone` of the existing cached value instead of
+/// allocating a fresh `Arc::from(bytes)`.
+///
+/// Cost when values match: one `memcmp(len)` + `Arc::clone` (~5ns).
+/// Cost when values differ: one `memcmp(len)` + normal `decode_value`.
+/// Scalars (Integer, Float, Null): no overhead — hint check is skipped.
+#[inline]
+pub fn decode_column_from_offset_reuse(
+    data: &[u8],
+    col: &ColumnOffset,
+    hint: Option<&SqliteValue>,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
+    let start = col.body_offset as usize;
+    let end = start.checked_add(col.value_len as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    let bytes = &data[start..end];
+
+    // Fast path: if the hint's raw bytes match, reuse its Arc allocation.
+    if let Some(hint) = hint {
+        match (classify_serial_type(col.serial_type), hint) {
+            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes() == bytes => {
+                if profile_enabled {
+                    note_decoded_value(hint);
+                }
+                return Some(SqliteValue::Text(Arc::clone(arc)));
+            }
+            (SerialTypeClass::Blob, SqliteValue::Blob(arc)) if arc.as_ref() == bytes => {
+                if profile_enabled {
+                    note_decoded_value(hint);
+                }
+                return Some(SqliteValue::Blob(Arc::clone(arc)));
+            }
+            _ => {}
+        }
+    }
+
+    decode_value(col.serial_type, bytes, profile_enabled)
+}
+
 /// Caller-owned scratch for lazy record decode and row materialization.
 ///
 /// This scratch is intended to be owned by a single cursor-like object and
@@ -946,11 +993,29 @@ fn decode_value_into(
         }
         SerialTypeClass::Text => {
             let text = std::str::from_utf8(bytes).ok()?;
-            // Arc<str> is immutable — replace rather than mutate in place.
-            // The O(1) clone benefit of Arc outweighs the lack of buffer reuse.
+            // bd-db300.4.4.2 K1: reuse existing Arc if the raw bytes match,
+            // avoiding malloc+memcpy for duplicate text across consecutive rows.
+            if let SqliteValue::Text(existing) = slot {
+                if existing.as_bytes() == bytes {
+                    // Existing Arc already holds identical content — keep it.
+                    if profile_enabled {
+                        note_decoded_value(slot);
+                    }
+                    return Some(());
+                }
+            }
             *slot = SqliteValue::Text(Arc::from(text));
         }
         SerialTypeClass::Blob => {
+            // bd-db300.4.4.2 K1: same reuse optimization for blobs.
+            if let SqliteValue::Blob(existing) = slot {
+                if existing.as_ref() == bytes {
+                    if profile_enabled {
+                        note_decoded_value(slot);
+                    }
+                    return Some(());
+                }
+            }
             *slot = SqliteValue::Blob(Arc::from(bytes));
         }
         SerialTypeClass::Reserved => return None,

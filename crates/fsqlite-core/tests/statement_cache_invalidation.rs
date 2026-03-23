@@ -11,8 +11,9 @@
 //! 6. File-backed databases share the same cache/invalidation behavior.
 //! 7. Warm-loop churn measurement scorecard with structured output.
 //!
-//! NOTE: Tests T1–T3 and T5–T7 use global atomic counters, so they must
-//! run with `--test-threads=1` for reliable absolute counts.
+//! NOTE: Tests T1–T3 and T5–T9 use global hot-path counters. This file
+//! serializes those tests with a mutex so they do not leak profiling state or
+//! race each other under the default Rust test runner.
 //!
 //! Run:
 //!   cargo test -p fsqlite-core --test statement_cache_invalidation \
@@ -24,8 +25,44 @@
 //!     2>&1 | grep "fsqlite.statement_reuse"
 
 use fsqlite_core::connection::{
-    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
 };
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+static HOT_PATH_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_profile_test_mutex() -> MutexGuard<'static, ()> {
+    match HOT_PATH_PROFILE_TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+struct HotPathProfileTestGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous_enabled: bool,
+}
+
+impl HotPathProfileTestGuard {
+    fn new() -> Self {
+        let lock = lock_profile_test_mutex();
+        let previous_enabled = hot_path_profile_enabled();
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(true);
+        Self {
+            _lock: lock,
+            previous_enabled,
+        }
+    }
+}
+
+impl Drop for HotPathProfileTestGuard {
+    fn drop(&mut self) {
+        reset_hot_path_profile();
+        set_hot_path_profile_enabled(self.previous_enabled);
+    }
+}
 
 /// Helper: snapshot the parser cache counters.
 fn cache_snapshot() -> (u64, u64, u64, u64, u64, u64) {
@@ -43,7 +80,7 @@ fn cache_snapshot() -> (u64, u64, u64, u64, u64, u64) {
 /// T1: Repeated identical SELECT produces parse cache hit delta.
 #[test]
 fn test_parse_cache_hits_on_repeated_select() {
-    set_hot_path_profile_enabled(true);
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -73,7 +110,7 @@ fn test_parse_cache_hits_on_repeated_select() {
 /// T2: DDL invalidates caches; subsequent query still correct.
 #[test]
 fn test_ddl_invalidates_all_caches() {
-    set_hot_path_profile_enabled(true);
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -116,7 +153,7 @@ fn test_ddl_invalidates_all_caches() {
 /// T3: Rollback to savepoint does NOT invalidate caches when schema unchanged.
 #[test]
 fn test_rollback_savepoint_preserves_cache() {
-    set_hot_path_profile_enabled(true);
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -193,7 +230,7 @@ fn test_schema_generation_invalidates_prepared() {
 /// T5: Repeated identical INSERT uses compiled cache.
 #[test]
 fn test_compiled_cache_hits_on_repeated_insert() {
-    set_hot_path_profile_enabled(true);
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -217,7 +254,7 @@ fn test_compiled_cache_hits_on_repeated_insert() {
 /// T6: File-backed database has same invalidation behavior.
 #[test]
 fn test_file_backed_cache_invalidation() {
-    set_hot_path_profile_enabled(true);
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let path = tmp.path().to_str().unwrap();
@@ -259,8 +296,7 @@ fn test_file_backed_cache_invalidation() {
 /// T7: Churn measurement scorecard — the authoritative artifact for bd-db300.4.2.3.
 #[test]
 fn test_churn_measurement_scorecard() {
-    set_hot_path_profile_enabled(true);
-    reset_hot_path_profile();
+    let _profile_guard = HotPathProfileTestGuard::new();
 
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
@@ -327,6 +363,12 @@ fn test_churn_measurement_scorecard() {
     );
     eprintln!("=== END SCORECARD ===");
 
+    // bd-6eyrg.1 fast-path counters.
+    eprintln!(
+        "  fast_path={}, slow_path={}",
+        snap_warm.parser.fast_path_executions, snap_warm.parser.slow_path_executions
+    );
+
     // Assertion: warm loop cache hits should dominate misses.
     assert!(
         snap_warm.parser.parse_cache_hits > snap_warm.parser.parse_cache_misses,
@@ -334,4 +376,156 @@ fn test_churn_measurement_scorecard() {
         snap_warm.parser.parse_cache_hits,
         snap_warm.parser.parse_cache_misses
     );
+}
+
+/// T8: Full transaction rollback with DDL preserves cache correctness.
+///
+/// `BEGIN; CREATE TABLE ...; ROLLBACK` should leave the schema_cookie
+/// unchanged (the DDL was rolled back). Same-connection schema_generation
+/// may still conservatively invalidate local prepared state, so this test
+/// proves post-rollback correctness rather than a mandatory cache hit.
+#[test]
+fn test_rollback_transaction_with_ddl_preserves_cache() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'stable')").unwrap();
+
+    // Warm the cache.
+    let _ = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
+    let _ = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
+
+    // DDL inside a rolled-back transaction.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE t_temp(x INTEGER)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // Query after rollback — schema_cookie is restored, but same-connection
+    // schema_generation may have bumped conservatively. Accept either a hit
+    // or a miss here; the contract is correctness after rollback.
+    let rows = conn.query("SELECT val FROM t WHERE id = 1").unwrap();
+    assert_eq!(rows.len(), 1, "rolled-back DDL should not affect data");
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("stable".into())),
+        "result must be correct after rolled-back DDL"
+    );
+
+    // t_temp should not exist.
+    let result = conn.query("SELECT * FROM t_temp");
+    assert!(result.is_err(), "t_temp should not exist after ROLLBACK");
+}
+
+/// T9: Rapid multi-DDL schema churn — cache invalidation and recovery.
+///
+/// Exercises: CREATE TABLE, ALTER TABLE, DROP TABLE in rapid sequence,
+/// verifying that queries against surviving tables return correct results
+/// and that the cache recovers to hit state after the churn settles.
+#[test]
+fn test_rapid_schema_churn_invalidation_and_recovery() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE stable(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO stable VALUES(1, 'anchor')")
+        .unwrap();
+
+    // Warm cache on the stable table.
+    let _ = conn.query("SELECT val FROM stable WHERE id = 1").unwrap();
+    let _ = conn.query("SELECT val FROM stable WHERE id = 1").unwrap();
+
+    // Schema churn storm.
+    for i in 0..5 {
+        conn.execute(&format!("CREATE TABLE churn_{i}(x INTEGER)"))
+            .unwrap();
+    }
+    for i in 0..5 {
+        conn.execute(&format!("DROP TABLE churn_{i}")).unwrap();
+    }
+    conn.execute("ALTER TABLE stable ADD COLUMN extra INTEGER DEFAULT 0")
+        .unwrap();
+
+    // After churn, verify the stable table is still correct.
+    let rows = conn.query("SELECT val FROM stable WHERE id = 1").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("anchor".into())),
+        "stable table data must survive schema churn"
+    );
+
+    // Verify cache recovers: two identical queries should produce a hit.
+    let (ph_pre, _, _, _, _, _) = cache_snapshot();
+    let _ = conn.query("SELECT val FROM stable WHERE id = 1").unwrap();
+    let (ph_post, _, _, _, _, _) = cache_snapshot();
+    assert!(
+        ph_post > ph_pre,
+        "cache should recover after schema churn: {ph_pre} -> {ph_post}"
+    );
+}
+
+/// T10: Re-prepare after SchemaChanged returns correct results.
+///
+/// After a prepared statement gets SchemaChanged, the caller must be able
+/// to re-prepare the same SQL and get correct results for the new schema.
+#[test]
+fn test_reprepare_after_schema_changed_returns_correct_results() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'original')").unwrap();
+
+    // Prepare against old schema.
+    let stmt = conn.prepare("SELECT val FROM t WHERE id = ?1").unwrap();
+    let rows = stmt
+        .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("original".into())),
+        "prepared query should read the original value before schema churn"
+    );
+
+    // DDL changes the schema.
+    conn.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 42")
+        .unwrap();
+
+    // Old prepared stmt should fail or transparently re-prepare.
+    let result = stmt.query_with_params(&[fsqlite_types::SqliteValue::Integer(1)]);
+    let schema_changed = matches!(result, Err(fsqlite_error::FrankenError::SchemaChanged));
+
+    if schema_changed {
+        // Re-prepare with the NEW schema.
+        let stmt2 = conn
+            .prepare("SELECT val, extra FROM t WHERE id = ?1")
+            .unwrap();
+        let rows2 = stmt2
+            .query_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(rows2.len(), 1, "re-prepared query should return 1 row");
+        assert_eq!(
+            rows2[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("original".into())),
+            "re-prepared query should preserve the original column value"
+        );
+        // The new column should have the default value.
+        assert_eq!(
+            rows2[0].get(1),
+            Some(&fsqlite_types::SqliteValue::Integer(42)),
+            "new column should have DEFAULT 42"
+        );
+    } else {
+        // Transparent re-prepare — verify it returned the correct row.
+        let rows = result.unwrap();
+        assert_eq!(rows.len(), 1, "transparent re-prepare should return 1 row");
+        assert_eq!(
+            rows[0].get(0),
+            Some(&fsqlite_types::SqliteValue::Text("original".into())),
+            "transparent re-prepare should preserve the original value"
+        );
+    }
 }

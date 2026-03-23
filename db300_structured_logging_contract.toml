@@ -1,0 +1,796 @@
+# DB300 Structured Logging / Run-Identity Contract v1.0.0
+#
+# Bead: bd-db300.7.6.1
+# Purpose: define the canonical structured logging schema and run-identity
+# contract for verification, benchmark, and controller proof surfaces so later
+# beads can add emitters and packages without inventing new field names.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.6.1"
+track_id = "bd-db300.7.6"
+generated_at = "2026-03-23"
+contract_owner = "db300-track-g-structured-logging"
+artifact_manifest_contract_ref = "crates/fsqlite-e2e/src/fixture_select.rs"
+regime_atlas_contract_ref = "db300_regime_atlas_contract.toml"
+shadow_oracle_contract_ref = "db300_shadow_oracle_contract.toml"
+policy_snapshot_contract_ref = "db300_policy_snapshot_contract.toml"
+
+[global_defaults]
+event_schema_id = "fsqlite.db300.structured_log_event.v1"
+run_identity_schema_id = "fsqlite.db300.run_identity.v1"
+mechanical_comparison_schema_id = "fsqlite.db300.mechanical_comparison.v1"
+id_pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; no log contract, replay path, or controller package may disable MVCC defaults or serialize writers for convenience."
+missing_field_policy = "Any missing required field, topology disclosure, or provenance identifier is an observability_gap blocker rather than an optional omission."
+serialization_policy = "Emit UTF-8 JSON with stable snake_case field names, finite numeric values, integer counters for counts or durations, and sorted keys whenever a standalone artifact is rendered."
+topology_policy = "Placement-sensitive runs must disclose placement_profile_id, hardware_class_id, hardware_signature, cpu_affinity_mask, smt_policy_state, memory_policy, helper_lane_cpu_set, and numa_balancing_state."
+comparison_policy = "Mechanical comparison joins on canonical run identity and event family, ignores only declared ephemeral fields, and yields not_comparable when placement or topology disclosures differ."
+
+[common_fields]
+required_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+]
+
+[run_identity]
+required_fields = [
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "seed",
+  "seed_policy_id",
+  "retry_policy_id",
+  "primitive_version",
+  "concurrent_writer_mode",
+]
+
+[topology_fields]
+required_fields = [
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "cpu_affinity_mask",
+  "smt_policy_state",
+  "memory_policy",
+  "helper_lane_cpu_set",
+  "numa_balancing_state",
+]
+
+[artifact_lineage]
+always_required = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "baseline_comparator",
+]
+decision_plane_required = ["policy_id", "decision_id", "budget_id", "slo_id"]
+shadow_required = ["shadow_run_id"]
+artifact_required = ["artifact_graph_id", "provenance_root"]
+
+[decision_plane]
+required_fields = [
+  "policy_id",
+  "decision_id",
+  "action",
+  "expected_loss",
+  "top_evidence_terms",
+  "counterfactual_action",
+  "regret_delta",
+  "fallback_active",
+  "fallback_reason",
+  "controller_calibration",
+  "policy_version",
+]
+one_of_fields = ["confidence", "posterior"]
+
+[failure_context]
+required_fields = [
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "replay_command",
+  "fallback_active",
+  "fallback_reason",
+]
+
+[mechanical_comparison]
+join_key_fields = [
+  "surface_id",
+  "event_family",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "primitive_version",
+  "seed",
+]
+required_match_fields = [
+  "surface_id",
+  "event_family",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "primitive_version",
+]
+ignored_ephemeral_fields = [
+  "timestamp",
+  "elapsed_ms",
+  "log_path",
+  "artifact_path",
+  "first_failure_json_pointer",
+  "diagnostic_json_pointer",
+  "minimal_reproduction_json_pointer",
+]
+numeric_counter_fields = [
+  "elapsed_ms",
+  "iterations",
+  "legacy_parse_record_calls",
+  "scratch_parse_record_calls",
+  "legacy_owned_payload_materialization_calls",
+  "scratch_owned_payload_materialization_calls",
+  "scratch_local_payload_copy_calls",
+  "payload_capacity",
+  "target_capacity",
+  "current_capacity",
+  "expected_loss",
+  "regret_delta",
+]
+id_fields = [
+  "run_id",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "claim_id",
+  "evidence_id",
+  "policy_id",
+  "decision_id",
+  "budget_id",
+  "slo_id",
+  "shadow_run_id",
+]
+not_comparable_on_mismatch = [
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "cpu_affinity_mask",
+  "smt_policy_state",
+  "memory_policy",
+  "helper_lane_cpu_set",
+  "numa_balancing_state",
+  "source_revision",
+  "beads_data_hash",
+  "primitive_version",
+]
+require_sorted_keys = true
+comparison_status_on_missing_field = "observability_gap"
+comparison_status_on_topology_mismatch = "not_comparable"
+
+[[event_family]]
+family_id = "verification_bundle_summary"
+purpose = "Canonical run-level summary for a verification or proof bundle."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "artifact_graph_id",
+  "provenance_root",
+  "baseline_comparator",
+  "replay_command",
+  "source_revision",
+  "beads_data_hash",
+]
+compare_fields = [
+  "surface_id",
+  "claim_id",
+  "evidence_id",
+  "baseline_comparator",
+  "source_revision",
+  "beads_data_hash",
+]
+live_consumers = [
+  "scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh",
+  "scripts/verify_g5_5_regime_atlas.sh",
+  "scripts/verify_g5_6_shadow_oracle.sh",
+  "scripts/verify_g6_4_policy_snapshot_contract.sh",
+]
+future_consumers = ["bd-db300.7.6.2", "bd-db300.7.6.3", "bd-db300.7.7.1"]
+
+[[event_family]]
+family_id = "failure_bundle_summary"
+purpose = "Canonical first-failure and fallback bundle record for replayable negative paths."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "surface_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "replay_command",
+  "fallback_active",
+  "fallback_reason",
+]
+compare_fields = [
+  "surface_id",
+  "claim_id",
+  "evidence_id",
+  "first_failure_stage",
+  "fallback_reason",
+]
+live_consumers = ["scripts/verify_g5_6_shadow_oracle.sh", "scripts/verify_g6_4_policy_snapshot_contract.sh"]
+future_consumers = ["bd-db300.7.6.2", "bd-db300.7.6.3"]
+
+[[event_family]]
+family_id = "copy_alloc_churn"
+purpose = "Allocator-pressure and scratch-reuse evidence for row decode or materialization hot loops."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "surface_id",
+  "event_family",
+  "hot_path",
+  "iterations",
+  "primitive_version",
+  "legacy_parse_record_calls",
+  "scratch_parse_record_calls",
+  "legacy_owned_payload_materialization_calls",
+  "scratch_owned_payload_materialization_calls",
+  "scratch_local_payload_copy_calls",
+  "payload_capacity",
+  "target_capacity",
+  "current_capacity",
+]
+compare_fields = [
+  "hot_path",
+  "iterations",
+  "legacy_parse_record_calls",
+  "scratch_parse_record_calls",
+  "legacy_owned_payload_materialization_calls",
+  "scratch_owned_payload_materialization_calls",
+  "scratch_local_payload_copy_calls",
+]
+live_consumers = ["scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh"]
+future_consumers = ["bd-db300.4.3.4", "bd-db300.9.12", "bd-db300.10.10"]
+
+[[event_family]]
+family_id = "cache_hit_ledger"
+purpose = "Cache hit, miss, and invalidation accounting for reusable decode, metadata, or WAL caches."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "cache_name",
+  "hit_count",
+  "miss_count",
+  "invalidation_count",
+  "primitive_version",
+]
+compare_fields = ["cache_name", "hit_count", "miss_count", "invalidation_count"]
+live_consumers = []
+future_consumers = ["bd-db300.4.2.3", "bd-db300.4.4.1"]
+
+[[event_family]]
+family_id = "retry_cause_histogram"
+purpose = "Retry and backoff cause accounting for contention, admission, or publish retries."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "retry_class",
+  "retry_count",
+  "total_wait_ms",
+  "max_wait_ms",
+  "primitive_version",
+]
+compare_fields = ["retry_class", "retry_count", "total_wait_ms", "max_wait_ms"]
+live_consumers = []
+future_consumers = ["bd-db300.7.6.2", "bd-db300.10.10"]
+
+[[event_family]]
+family_id = "page_touch_class"
+purpose = "Page-touch mix across data, metadata, root, leaf, and WAL-visible classes."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "page_class",
+  "read_count",
+  "write_count",
+  "hot_page_pressure",
+  "conflict_topology",
+]
+compare_fields = ["page_class", "read_count", "write_count", "hot_page_pressure", "conflict_topology"]
+live_consumers = []
+future_consumers = ["bd-db300.7.6.2", "bd-db300.9.12"]
+
+[[event_family]]
+family_id = "split_path_summary"
+purpose = "Split or rebalance summary for structure-sensitive write paths."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "split_kind",
+  "split_count",
+  "parent_level",
+  "hot_page_pressure",
+  "conflict_topology",
+]
+compare_fields = ["split_kind", "split_count", "parent_level", "hot_page_pressure", "conflict_topology"]
+live_consumers = []
+future_consumers = ["bd-db300.7.6.2", "bd-db300.9.12"]
+
+[[event_family]]
+family_id = "hold_wait_distribution"
+purpose = "Distribution summary for hold times and wait times on publication or group-commit lanes."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "lane_id",
+  "wait_count",
+  "wait_p50_ms",
+  "wait_p95_ms",
+  "wait_p99_ms",
+  "timeout_count",
+]
+compare_fields = ["lane_id", "wait_count", "wait_p50_ms", "wait_p95_ms", "wait_p99_ms", "timeout_count"]
+live_consumers = []
+future_consumers = ["bd-db300.7.6.2", "bd-db300.10.10"]
+
+[[event_family]]
+family_id = "write_tier_selection"
+purpose = "Decision record for selected write or publish tier under a named policy."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "policy_id",
+  "decision_id",
+  "action",
+  "expected_loss",
+  "counterfactual_action",
+  "regret_delta",
+  "fallback_active",
+  "fallback_reason",
+]
+compare_fields = [
+  "policy_id",
+  "decision_id",
+  "action",
+  "expected_loss",
+  "counterfactual_action",
+  "regret_delta",
+  "fallback_active",
+]
+live_consumers = ["crates/fsqlite-core/src/policy_controller.rs"]
+future_consumers = ["bd-db300.7.6.2", "bd-db300.7.6.4", "bd-db300.10.10"]
+
+[[event_family]]
+family_id = "allocator_lease_delta"
+purpose = "Lease or scratch arena outstanding-bytes delta across reset or replay boundaries."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "allocator_name",
+  "outstanding_before",
+  "outstanding_after",
+  "bytes_reserved",
+  "bytes_released",
+]
+compare_fields = ["allocator_name", "outstanding_before", "outstanding_after", "bytes_reserved", "bytes_released"]
+live_consumers = []
+future_consumers = ["bd-db300.4.3.3", "bd-db300.7.6.2"]
+
+[[event_family]]
+family_id = "parent_micro_publish"
+purpose = "Micro-publication summary for metadata or WAL publish paths."
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "surface_id",
+  "event_family",
+  "publish_lane",
+  "publish_count",
+  "publish_bytes",
+  "publication_seq",
+  "wal_generation",
+]
+compare_fields = ["publish_lane", "publish_count", "publish_bytes", "publication_seq", "wal_generation"]
+live_consumers = []
+future_consumers = ["bd-db300.7.6.2", "bd-db300.9.12"]
+
+[[surface_contract]]
+surface_id = "d3_storage_cursor_scratch_decode"
+pillar_id = "D3"
+source_path = "scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh"
+source_symbol = "emit_event + verification_summary"
+artifact_outputs = ["structured_logs.ndjson", "verification_summary.json", "reset_churn.json", "manifest.json"]
+observed_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "elapsed_ms",
+  "timestamp",
+  "message",
+  "replay_command",
+  "log_standard_ref",
+  "log_path",
+  "artifact_path",
+]
+observed_artifact_fields = [
+  "schema_version",
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "hot_path",
+  "iterations",
+  "boundary_sequence",
+  "proofs",
+  "heap_churn",
+  "scratch_capacities",
+  "acceptance",
+  "replay_command",
+]
+canonical_event_families = ["verification_bundle_summary", "copy_alloc_churn"]
+required_upgrade_fields = [
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "seed",
+  "primitive_version",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "baseline_comparator",
+]
+
+[[surface_contract]]
+surface_id = "g5_regime_atlas"
+pillar_id = "G5"
+source_path = "scripts/verify_g5_5_regime_atlas.sh"
+source_symbol = "emit_event + regime_atlas_manifest"
+artifact_outputs = ["events.jsonl", "regime_atlas_manifest.json", "activation_frontiers.json", "summary.md"]
+observed_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "elapsed_ms",
+  "timestamp",
+  "message",
+  "surface_id",
+  "pillar_id",
+  "regime_id",
+  "activation_state",
+  "frontier_reason",
+  "breakpoint_metric",
+  "placement_profile",
+  "topology_class",
+  "fallback_state",
+  "baseline_comparator",
+]
+observed_artifact_fields = [
+  "trace_id",
+  "scenario_id",
+  "run_id",
+  "bead_id",
+  "meta",
+  "global_defaults",
+  "logging",
+  "regime_axes",
+  "activation_states",
+  "frontier_rules",
+  "gap_conversion_rules",
+  "surfaces",
+]
+canonical_event_families = ["verification_bundle_summary", "failure_bundle_summary"]
+required_upgrade_fields = [
+  "schema_version",
+  "run_id",
+  "event_family",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "seed",
+  "seed_policy_id",
+  "retry_policy_id",
+  "primitive_version",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "artifact_graph_id",
+  "provenance_root",
+  "cpu_affinity_mask",
+  "smt_policy_state",
+  "memory_policy",
+  "helper_lane_cpu_set",
+  "numa_balancing_state",
+]
+
+[[surface_contract]]
+surface_id = "g5_shadow_oracle"
+pillar_id = "G5"
+source_path = "scripts/verify_g5_6_shadow_oracle.sh"
+source_symbol = "emit_event + shadow_oracle_manifest"
+artifact_outputs = ["structured_logs.ndjson", "shadow_oracle_manifest.json", "counterexample_bundle/bundle_summary.json", "summary.md"]
+observed_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "shadow_run_id",
+  "bead_id",
+  "phase",
+  "event_type",
+  "outcome",
+  "elapsed_ms",
+  "timestamp",
+  "message",
+  "surface_id",
+  "oracle_path",
+  "candidate_path",
+  "equivalence_scope",
+  "allowed_difference_policy",
+  "shadow_mode",
+  "shadow_sample_rate",
+  "rollout_stage",
+  "fallback_state",
+  "kill_switch_state",
+  "counterexample_bundle",
+  "divergence_class",
+  "first_failure_summary",
+  "first_failure_json_pointer",
+  "replay_command",
+  "diagnostic_json_pointer",
+  "minimal_reproduction_json_pointer",
+]
+observed_artifact_fields = [
+  "trace_id",
+  "scenario_id",
+  "run_id",
+  "shadow_run_id",
+  "bead_id",
+  "meta",
+  "logging",
+  "counterexample_bundle",
+]
+canonical_event_families = ["verification_bundle_summary", "failure_bundle_summary"]
+required_upgrade_fields = [
+  "schema_version",
+  "run_id",
+  "event_family",
+  "pillar_id",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "seed",
+  "primitive_version",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "baseline_comparator",
+  "artifact_graph_id",
+  "provenance_root",
+  "policy_id",
+  "decision_id",
+  "budget_id",
+  "slo_id",
+]
+
+[[surface_contract]]
+surface_id = "g6_policy_runtime_snapshot"
+pillar_id = "G6"
+source_path = "crates/fsqlite-core/src/policy_controller.rs"
+source_symbol = "PolicyRuntimeSnapshot + PolicyArtifactContract + PolicyEvidenceEntry"
+artifact_outputs = ["policy_runtime_snapshot.json", "policy_artifact.json", "decision_record.json", "operator_scorecard.json"]
+observed_log_fields = [
+  "trace_id",
+  "scenario_id",
+  "policy_id",
+  "decision_id",
+  "controller_family",
+  "policy_version",
+  "rollout_stage",
+  "control_mode",
+  "activation_regime_id",
+  "activation_state",
+  "budget_id",
+  "slo_id",
+  "shadow_mode",
+  "shadow_sample_rate",
+  "kill_switch_state",
+  "fallback_active",
+  "divergence_class",
+  "decision_count",
+  "last_action",
+  "expected_loss",
+  "counterfactual_action",
+  "regret_delta",
+  "evidence_root",
+  "comparator_lineage",
+  "counterexample_bundle",
+  "first_failure_diagnostics",
+]
+observed_artifact_fields = [
+  "schema_version",
+  "policy_id",
+  "controller_family",
+  "policy_version",
+  "rollout_stage",
+  "control_mode",
+  "budget_id",
+  "slo_id",
+  "conservative_baseline_id",
+  "fallback_policy",
+  "shadow_contract_ref",
+  "controller_calibration",
+  "evidence_root",
+  "provenance_root",
+  "artifact_graph_id",
+]
+canonical_event_families = ["verification_bundle_summary", "failure_bundle_summary", "write_tier_selection"]
+required_upgrade_fields = [
+  "bead_id",
+  "run_id",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "claim_id",
+  "evidence_id",
+  "baseline_comparator",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode_id",
+  "build_profile_id",
+  "placement_profile_id",
+  "hardware_class_id",
+  "hardware_signature",
+  "source_revision",
+  "beads_data_hash",
+  "seed",
+  "primitive_version",
+  "action",
+  "top_evidence_terms",
+]
+
+[[surface_contract]]
+surface_id = "a3_benchmark_artifact_manifest"
+pillar_id = "A3"
+source_path = "crates/fsqlite-e2e/src/fixture_select.rs"
+source_symbol = "BenchmarkArtifactManifest + BenchmarkArtifactProvenanceEnvelope"
+artifact_outputs = ["manifest.json", "hardware_discovery_bundle.json", "summary.md", "results.jsonl"]
+observed_log_fields = []
+observed_artifact_fields = [
+  "schema_version",
+  "campaign_id",
+  "campaign_manifest_path",
+  "row_id",
+  "fixture_id",
+  "workload",
+  "concurrency",
+  "mode",
+  "placement_profile_id",
+  "hardware_class_id",
+  "retry_policy_id",
+  "build_profile_id",
+  "seed_policy_id",
+  "run_id",
+  "artifact_bundle_key",
+  "artifact_bundle_name",
+  "artifact_bundle_dir",
+  "artifact_bundle_relpath",
+  "retention_policy",
+  "provenance",
+  "command_entrypoint",
+  "source_revision",
+  "beads_data_hash",
+  "kernel_release",
+  "placement_policy",
+]
+canonical_event_families = ["verification_bundle_summary"]
+required_upgrade_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "surface_id",
+  "pillar_id",
+  "event_family",
+  "hardware_signature",
+  "cpu_affinity_mask",
+  "smt_policy_state",
+  "memory_policy",
+  "helper_lane_cpu_set",
+  "numa_balancing_state",
+  "primitive_version",
+  "claim_id",
+  "evidence_id",
+  "evidence_root",
+  "baseline_comparator",
+  "artifact_graph_id",
+  "provenance_root",
+]

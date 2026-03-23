@@ -9540,13 +9540,17 @@ impl VdbeEngine {
             }
 
             // Not yet decoded: decode from raw payload.
+            // bd-db300.4.4.2 K1: pass the previous row's cached value as a hint.
+            // If raw bytes match, reuse the existing Arc (skip malloc+memcpy).
             note_decode_cache_miss(collect_vdbe_metrics);
-            let val = fsqlite_types::record::decode_column_from_offset(
+            let hint = cursor.row_decode.cached_value(payload_idx);
+            let val = fsqlite_types::record::decode_column_from_offset_reuse(
                 &cursor.payload_buf,
                 cursor
                     .row_decode
                     .column_offset(payload_idx)
                     .expect("payload_idx checked against column_count"),
+                hint,
                 collect_vdbe_metrics,
             )
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -9656,13 +9660,16 @@ impl VdbeEngine {
                     }
                 }
                 // Decode just this column from the offset table + raw payload.
+                // bd-db300.4.4.2 K1: reuse hint from previous row's cached value.
                 note_decode_cache_miss(collect_vdbe_metrics);
-                let val = fsqlite_types::record::decode_column_from_offset(
+                let hint = cursor.row_decode.cached_value(payload_idx);
+                let val = fsqlite_types::record::decode_column_from_offset_reuse(
                     &cursor.payload_buf,
                     cursor
                         .row_decode
                         .column_offset(payload_idx)
                         .expect("payload_idx checked against column_count"),
+                    hint,
                     collect_vdbe_metrics,
                 )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
