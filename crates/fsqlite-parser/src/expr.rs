@@ -151,7 +151,8 @@ impl Parser {
             // ── Literals ────────────────────────────────────────────────
             TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(*i), tok.span)),
             TokenKind::OversizedInt(s) => match s.parse::<f64>() {
-                Ok(v) => Ok(Expr::Literal(Literal::Float(v), tok.span)),
+                Ok(v) if v.is_finite() => Ok(Expr::Literal(Literal::Float(v), tok.span)),
+                Ok(_) => Ok(Expr::Literal(Literal::Float(f64::MAX), tok.span)),
                 Err(_) => Err(ParseError::at("integer out of range", Some(&tok))),
             },
             TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(*f), tok.span)),

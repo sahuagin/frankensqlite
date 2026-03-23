@@ -801,6 +801,10 @@ impl Parser {
     }
 
     fn parse_table_or_subquery(&mut self) -> Result<TableOrSubquery, ParseError> {
+        self.with_recursion_guard(|parser| parser.parse_table_or_subquery_inner())
+    }
+
+    fn parse_table_or_subquery_inner(&mut self) -> Result<TableOrSubquery, ParseError> {
         if self.check(&TokenKind::LeftParen) {
             self.advance();
             if matches!(

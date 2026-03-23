@@ -727,8 +727,11 @@ impl<'a> Lexer<'a> {
 
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
         if is_float {
+            let clamp = |v: f64| -> f64 {
+                if v.is_finite() { v } else { f64::MAX }
+            };
             match text.parse::<f64>() {
-                Ok(v) => TokenKind::Float(v),
+                Ok(v) => TokenKind::Float(clamp(v)),
                 Err(_) => {
                     // Rust's f64 parser rejects `.e4` but SQLite accepts it as 0.0.
                     let mut text_fixed = text.clone().into_owned();
@@ -736,7 +739,7 @@ impl<'a> Lexer<'a> {
                         text_fixed.insert(0, '0');
                     }
                     match text_fixed.parse::<f64>() {
-                        Ok(v) => TokenKind::Float(v),
+                        Ok(v) => TokenKind::Float(clamp(v)),
                         Err(_) => TokenKind::Error(format!("invalid float: {text}")),
                     }
                 }
