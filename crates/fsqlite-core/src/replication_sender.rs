@@ -867,8 +867,7 @@ impl ReplicationPacket {
         }
         match (self.auth_tag, auth_key) {
             (Some(tag), Some(key)) => tag == self.compute_auth_tag(key),
-            (Some(_), None) => false,
-            (None, Some(_)) => false,
+            (Some(_), None) | (None, Some(_)) => false,
             (None, None) => true,
         }
     }

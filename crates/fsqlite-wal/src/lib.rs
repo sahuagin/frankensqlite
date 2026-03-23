@@ -7,6 +7,7 @@ pub mod cell_delta_wal;
 pub mod checkpoint;
 pub mod checkpoint_executor;
 pub mod checksum;
+pub mod commit_path_histograms;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod fault_hooks;
 pub mod group_commit;
@@ -54,8 +55,9 @@ pub use checksum::{
 };
 pub use group_commit::{
     ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase, FrameSubmission,
-    GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, SubmitOutcome,
-    TransactionFrameBatch, write_consolidated_frames,
+    GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator, PhaseHistogram,
+    PhasePercentiles, SubmitOutcome, TransactionFrameBatch, WakeReasonCounters, WakeReasonSnapshot,
+    write_consolidated_frames,
 };
 pub use metrics::{
     GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS,

@@ -6692,7 +6692,7 @@ impl Connection {
         entry
     }
 
-    fn planner_directive_cache_key(&self, sql: &str, feature_flags: PlannerFeatureFlags) -> u64 {
+    fn planner_directive_cache_key(sql: &str, feature_flags: PlannerFeatureFlags) -> u64 {
         Self::sql_hash(&format!(
             "{sql}|planner_flags:{}:{}",
             u8::from(feature_flags.leapfrog_join),
@@ -20534,7 +20534,7 @@ impl Connection {
         // This cache intentionally lives only on the connection seam where
         // there are no cracking or runtime hints to poison reused directives.
         self.refresh_parse_cache_if_needed(canonical_sql);
-        let key = self.planner_directive_cache_key(canonical_sql, feature_flags);
+        let key = Self::planner_directive_cache_key(canonical_sql, feature_flags);
         let profile_enabled = hot_path_profile_enabled();
         if let Some(entry) = self.lookup_planner_directive_cache(key, canonical_sql, feature_flags)
         {

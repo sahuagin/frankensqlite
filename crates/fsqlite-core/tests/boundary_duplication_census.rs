@@ -18,8 +18,7 @@
 //!     -- --test-threads=1 --nocapture
 
 use fsqlite_core::connection::{
-    Connection, HotPathProfileSnapshot, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled,
+    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 
 /// Snapshot the census-relevant counters.

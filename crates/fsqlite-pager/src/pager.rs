@@ -3978,6 +3978,30 @@ where
                             0,
                         );
 
+                        // bd-db300.3.8.2: per-flush structured event splitting
+                        // lock-wait time from WAL service time.
+                        let lock_wait_total_us =
+                            inner_lock_wait_us + exclusive_lock_us + flushing_wait_us;
+                        let wal_service_total_us = wal_append_us + wal_sync_us;
+                        tracing::debug!(
+                            target: "fsqlite::wal::lock_scope",
+                            role = "flusher",
+                            epoch = flush_epoch,
+                            frames = frame_count,
+                            lock_wait_us = lock_wait_total_us,
+                            inner_lock_wait_us,
+                            exclusive_lock_us,
+                            flushing_wait_us,
+                            wal_service_us = wal_service_total_us,
+                            wal_append_us,
+                            wal_sync_us,
+                            arrival_wait_us,
+                            "WAL backend commit: lock_wait={lock_wait_total_us}us \
+                             service={wal_service_total_us}us \
+                             (append={wal_append_us}us sync={wal_sync_us}us) \
+                             frames={frame_count}"
+                        );
+
                         let (completed_epoch, has_promoted) = {
                             let mut consolidator = queue
                                 .consolidator
@@ -4059,6 +4083,25 @@ where
                             0,     // wal_append_us (N/A for waiter)
                             0,     // wal_sync_us (N/A for waiter)
                             waiter_epoch_wait_us,
+                        );
+
+                        // bd-db300.3.8.2: per-waiter structured event showing
+                        // time spent waiting for the flusher (all lock-wait,
+                        // zero WAL service time on this thread).
+                        let lock_wait_total_us =
+                            consolidator_lock_wait_us + flushing_wait_us + waiter_epoch_wait_us;
+                        tracing::debug!(
+                            target: "fsqlite::wal::lock_scope",
+                            role = "waiter",
+                            lock_wait_us = lock_wait_total_us,
+                            consolidator_lock_wait_us,
+                            flushing_wait_us,
+                            waiter_epoch_wait_us,
+                            wal_service_us = 0_u64,
+                            wal_append_us = 0_u64,
+                            wal_sync_us = 0_u64,
+                            "WAL backend commit: lock_wait={lock_wait_total_us}us \
+                             service=0us (waiter — flusher did I/O)"
                         );
 
                         // The flusher already updated inner.db_size.

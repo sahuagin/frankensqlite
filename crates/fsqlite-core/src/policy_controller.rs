@@ -907,7 +907,6 @@ impl PolicyController {
 
     #[must_use]
     fn activation_state(
-        &self,
         auto_tune_enabled: bool,
         telemetry_available: bool,
     ) -> PolicyActivationState {
@@ -934,7 +933,7 @@ impl PolicyController {
     }
 
     #[must_use]
-    fn divergence_class(&self, decision_reason: &DecisionReason) -> PolicyDivergenceClass {
+    fn divergence_class(decision_reason: &DecisionReason) -> PolicyDivergenceClass {
         match decision_reason {
             DecisionReason::NoAllowedCandidates => PolicyDivergenceClass::DecisionBudgetExceeded,
             DecisionReason::FallbackTelemetryUnavailable => PolicyDivergenceClass::ObservabilityGap,
@@ -943,8 +942,8 @@ impl PolicyController {
     }
 
     #[must_use]
-    fn kill_switch_state(&self, decision_reason: &DecisionReason) -> PolicyKillSwitchState {
-        match self.divergence_class(decision_reason) {
+    fn kill_switch_state(decision_reason: &DecisionReason) -> PolicyKillSwitchState {
+        match Self::divergence_class(decision_reason) {
             PolicyDivergenceClass::None => PolicyKillSwitchState::Disarmed,
             PolicyDivergenceClass::ObservabilityGap
             | PolicyDivergenceClass::DecisionBudgetExceeded
@@ -956,7 +955,7 @@ impl PolicyController {
     }
 
     #[must_use]
-    fn fallback_active(&self, decision_reason: &DecisionReason) -> bool {
+    fn fallback_active(decision_reason: &DecisionReason) -> bool {
         matches!(
             decision_reason,
             DecisionReason::NoAllowedCandidates
@@ -1037,7 +1036,7 @@ impl PolicyController {
         expected_losses: &BTreeMap<u64, f64>,
     ) -> PolicyRuntimeSnapshot {
         let activation_regime_id = Self::activation_regime_id(signals);
-        let divergence_class = self.divergence_class(decision_reason);
+        let divergence_class = Self::divergence_class(decision_reason);
         let counterexample_bundle = Self::counterexample_bundle_path(decision_id, divergence_class);
         let first_failure_diagnostics =
             Self::first_failure_diagnostics(decision_reason, &activation_regime_id);
@@ -1073,20 +1072,20 @@ impl PolicyController {
             policy_id: self.policy_contract.policy_id.clone(),
             controller_family: self.policy_contract.controller_family.clone(),
             policy_version: self.policy_contract.policy_version.clone(),
-            rollout_stage: if self.fallback_active(decision_reason) {
+            rollout_stage: if Self::fallback_active(decision_reason) {
                 PolicyRolloutStage::FallbackOnly
             } else {
                 self.policy_contract.rollout_stage
             },
             control_mode: self.control_mode(auto_tune_enabled, telemetry_available),
             activation_regime_id,
-            activation_state: self.activation_state(auto_tune_enabled, telemetry_available),
+            activation_state: Self::activation_state(auto_tune_enabled, telemetry_available),
             budget_id: self.policy_contract.budget_id.clone(),
             slo_id: self.policy_contract.slo_id.clone(),
             shadow_mode: PolicyShadowMode::Off,
             shadow_sample_rate: self.policy_contract.shadow_sample_rate.clone(),
-            kill_switch_state: self.kill_switch_state(decision_reason),
-            fallback_active: self.fallback_active(decision_reason),
+            kill_switch_state: Self::kill_switch_state(decision_reason),
+            fallback_active: Self::fallback_active(decision_reason),
             divergence_class,
             decision_count,
             last_action,

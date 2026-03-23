@@ -161,6 +161,205 @@ pub enum SubmitOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Lock-free phase histogram (bd-db300.3.8.1)
+// ---------------------------------------------------------------------------
+
+/// Fixed-capacity ring buffer for lock-free percentile estimation.
+///
+/// Writers atomically advance `write_idx` and store samples. Readers
+/// snapshot the ring and sort to extract percentiles. The ring overwrites
+/// old samples when full, giving a rolling window of the last N observations.
+/// This is intentionally simple — no locks, no allocations on the hot path.
+const PHASE_HISTOGRAM_CAPACITY: usize = 4096;
+
+pub struct PhaseHistogram {
+    /// Circular sample buffer.
+    samples: [AtomicU64; PHASE_HISTOGRAM_CAPACITY],
+    /// Monotonic write index (wraps via modulo).
+    write_idx: AtomicU64,
+    /// Running max (updated atomically on each record).
+    max_us: AtomicU64,
+    /// Total samples recorded (not capped by ring size).
+    count: AtomicU64,
+    /// Running sum for mean computation.
+    sum_us: AtomicU64,
+}
+
+impl PhaseHistogram {
+    const fn new() -> Self {
+        // SAFETY: AtomicU64 has the same layout as u64, and 0 is valid.
+        // We need const init for static. Using array::from_fn is not const.
+        // Workaround: macro-generate or use a helper. For now, use a const
+        // block with transmute-free initialization.
+        const ZERO: AtomicU64 = AtomicU64::new(0);
+        Self {
+            samples: [ZERO; PHASE_HISTOGRAM_CAPACITY],
+            write_idx: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a single sample (microseconds). Lock-free.
+    pub fn record(&self, value_us: u64) {
+        let idx =
+            self.write_idx.fetch_add(1, Ordering::Relaxed) as usize % PHASE_HISTOGRAM_CAPACITY;
+        self.samples[idx].store(value_us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(value_us, Ordering::Relaxed);
+        // Update max.
+        let mut prev = self.max_us.load(Ordering::Relaxed);
+        while value_us > prev {
+            match self.max_us.compare_exchange_weak(
+                prev,
+                value_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// Snapshot percentiles: returns (p50, p95, p99, max, count, mean_us).
+    #[must_use]
+    pub fn percentiles(&self) -> PhasePercentiles {
+        let total_count = self.count.load(Ordering::Relaxed);
+        let max = self.max_us.load(Ordering::Relaxed);
+        let sum = self.sum_us.load(Ordering::Relaxed);
+
+        if total_count == 0 {
+            return PhasePercentiles {
+                p50: 0,
+                p95: 0,
+                p99: 0,
+                max: 0,
+                count: 0,
+                mean_us: 0,
+            };
+        }
+
+        // Copy samples into a local vec and sort.
+        let n = total_count.min(PHASE_HISTOGRAM_CAPACITY as u64) as usize;
+        let mut buf = Vec::with_capacity(n);
+        for i in 0..n {
+            buf.push(self.samples[i].load(Ordering::Relaxed));
+        }
+        buf.sort_unstable();
+
+        let p = |pct: usize| -> u64 {
+            if buf.is_empty() {
+                return 0;
+            }
+            let idx = (pct * buf.len()) / 100;
+            buf[idx.min(buf.len() - 1)]
+        };
+
+        PhasePercentiles {
+            p50: p(50),
+            p95: p(95),
+            p99: p(99),
+            max,
+            count: total_count,
+            mean_us: sum / total_count,
+        }
+    }
+
+    /// Reset all samples and counters.
+    pub fn reset(&self) {
+        for s in &self.samples {
+            s.store(0, Ordering::Relaxed);
+        }
+        self.write_idx.store(0, Ordering::Relaxed);
+        self.max_us.store(0, Ordering::Relaxed);
+        self.count.store(0, Ordering::Relaxed);
+        self.sum_us.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Percentile snapshot from a `PhaseHistogram`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhasePercentiles {
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    pub max: u64,
+    pub count: u64,
+    pub mean_us: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Wake-reason accounting (bd-db300.3.8.1)
+// ---------------------------------------------------------------------------
+
+/// Tracks why a waiter woke up during epoch wait.
+pub struct WakeReasonCounters {
+    /// Woken by condvar notify (normal completion).
+    pub notify: AtomicU64,
+    /// Woken by condvar timeout.
+    pub timeout: AtomicU64,
+    /// Waiter took over as flusher (flusher died or slow).
+    pub flusher_takeover: AtomicU64,
+    /// Woken to observe a failed epoch.
+    pub failed_epoch: AtomicU64,
+    /// Woken but must busy-retry (spurious or race).
+    pub busy_retry: AtomicU64,
+}
+
+impl WakeReasonCounters {
+    const fn new() -> Self {
+        Self {
+            notify: AtomicU64::new(0),
+            timeout: AtomicU64::new(0),
+            flusher_takeover: AtomicU64::new(0),
+            failed_epoch: AtomicU64::new(0),
+            busy_retry: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot all counters.
+    #[must_use]
+    pub fn snapshot(&self) -> WakeReasonSnapshot {
+        WakeReasonSnapshot {
+            notify: self.notify.load(Ordering::Relaxed),
+            timeout: self.timeout.load(Ordering::Relaxed),
+            flusher_takeover: self.flusher_takeover.load(Ordering::Relaxed),
+            failed_epoch: self.failed_epoch.load(Ordering::Relaxed),
+            busy_retry: self.busy_retry.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters.
+    pub fn reset(&self) {
+        self.notify.store(0, Ordering::Relaxed);
+        self.timeout.store(0, Ordering::Relaxed);
+        self.flusher_takeover.store(0, Ordering::Relaxed);
+        self.failed_epoch.store(0, Ordering::Relaxed);
+        self.busy_retry.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Point-in-time snapshot of wake reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WakeReasonSnapshot {
+    pub notify: u64,
+    pub timeout: u64,
+    pub flusher_takeover: u64,
+    pub failed_epoch: u64,
+    pub busy_retry: u64,
+}
+
+impl WakeReasonSnapshot {
+    /// Total wake events.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.notify + self.timeout + self.flusher_takeover + self.failed_epoch + self.busy_retry
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Consolidation metrics
 // ---------------------------------------------------------------------------
 
@@ -217,6 +416,30 @@ pub struct ConsolidationMetrics {
     pub commit_phase_c2_us_total: AtomicU64,
     /// Total commits with phase timing recorded.
     pub commit_phase_count: AtomicU64,
+
+    // ── Per-phase distribution histograms (bd-db300.3.8.1) ──
+    /// Distribution: consolidator lock wait.
+    pub hist_consolidator_lock_wait: PhaseHistogram,
+    /// Distribution: arrival wait (flusher only).
+    pub hist_arrival_wait: PhaseHistogram,
+    /// Distribution: WAL backend (inner) lock wait.
+    pub hist_wal_backend_lock_wait: PhaseHistogram,
+    /// Distribution: WAL append_frames.
+    pub hist_wal_append: PhaseHistogram,
+    /// Distribution: exclusive file lock acquisition.
+    pub hist_exclusive_lock: PhaseHistogram,
+    /// Distribution: waiter epoch wait.
+    pub hist_waiter_epoch_wait: PhaseHistogram,
+    /// Distribution: full Phase B (group commit path, flusher + waiter).
+    pub hist_phase_b: PhaseHistogram,
+    /// Distribution: WAL sync/fsync.
+    pub hist_wal_sync: PhaseHistogram,
+    /// Distribution: full commit (phase A + B + C).
+    pub hist_full_commit: PhaseHistogram,
+
+    // ── Wake-reason accounting (bd-db300.3.8.1) ──
+    /// Why waiters woke up during epoch wait.
+    pub wake_reasons: WakeReasonCounters,
 }
 
 impl ConsolidationMetrics {
@@ -249,6 +472,17 @@ impl ConsolidationMetrics {
             commit_phase_c1_us_total: AtomicU64::new(0),
             commit_phase_c2_us_total: AtomicU64::new(0),
             commit_phase_count: AtomicU64::new(0),
+            // Phase histograms (bd-db300.3.8.1)
+            hist_consolidator_lock_wait: PhaseHistogram::new(),
+            hist_arrival_wait: PhaseHistogram::new(),
+            hist_wal_backend_lock_wait: PhaseHistogram::new(),
+            hist_wal_append: PhaseHistogram::new(),
+            hist_exclusive_lock: PhaseHistogram::new(),
+            hist_waiter_epoch_wait: PhaseHistogram::new(),
+            hist_phase_b: PhaseHistogram::new(),
+            hist_wal_sync: PhaseHistogram::new(),
+            hist_full_commit: PhaseHistogram::new(),
+            wake_reasons: WakeReasonCounters::new(),
         }
     }
 
@@ -299,6 +533,11 @@ impl ConsolidationMetrics {
             .fetch_add(consolidator_lock_wait_us, Ordering::Relaxed);
         self.consolidator_flushing_wait_us_total
             .fetch_add(consolidator_flushing_wait_us, Ordering::Relaxed);
+
+        // bd-db300.3.8.1: record to per-phase histograms.
+        self.hist_consolidator_lock_wait
+            .record(consolidator_lock_wait_us);
+
         if is_flusher {
             self.flusher_arrival_wait_us_total
                 .fetch_add(flusher_arrival_wait_us, Ordering::Relaxed);
@@ -311,11 +550,35 @@ impl ConsolidationMetrics {
             self.wal_sync_us_total
                 .fetch_add(wal_sync_us, Ordering::Relaxed);
             self.flusher_commits.fetch_add(1, Ordering::Relaxed);
+
+            // bd-db300.3.8.1: flusher-specific histograms.
+            self.hist_arrival_wait.record(flusher_arrival_wait_us);
+            self.hist_wal_backend_lock_wait.record(inner_lock_wait_us);
+            self.hist_wal_append.record(wal_append_us);
+            self.hist_exclusive_lock.record(exclusive_lock_us);
+            self.hist_wal_sync.record(wal_sync_us);
         } else {
             self.waiter_epoch_wait_us_total
                 .fetch_add(waiter_epoch_wait_us, Ordering::Relaxed);
             self.waiter_commits.fetch_add(1, Ordering::Relaxed);
+
+            // bd-db300.3.8.1: waiter-specific histogram.
+            self.hist_waiter_epoch_wait.record(waiter_epoch_wait_us);
         }
+
+        // bd-db300.3.8.1: Phase B total = consolidator_lock + flushing_wait + flusher/waiter work.
+        let phase_b_total = consolidator_lock_wait_us
+            + consolidator_flushing_wait_us
+            + if is_flusher {
+                flusher_arrival_wait_us
+                    + inner_lock_wait_us
+                    + exclusive_lock_us
+                    + wal_append_us
+                    + wal_sync_us
+            } else {
+                waiter_epoch_wait_us
+            };
+        self.hist_phase_b.record(phase_b_total);
     }
 
     /// Record full commit path phase timing.
@@ -335,6 +598,10 @@ impl ConsolidationMetrics {
         self.commit_phase_c2_us_total
             .fetch_add(phase_c2_us, Ordering::Relaxed);
         self.commit_phase_count.fetch_add(1, Ordering::Relaxed);
+
+        // bd-db300.3.8.1: full commit distribution.
+        self.hist_full_commit
+            .record(phase_a_us + phase_b_us + phase_c1_us + phase_c2_us);
     }
 
     /// Take a point-in-time snapshot.
@@ -372,6 +639,17 @@ impl ConsolidationMetrics {
             commit_phase_c1_us_total: self.commit_phase_c1_us_total.load(Ordering::Relaxed),
             commit_phase_c2_us_total: self.commit_phase_c2_us_total.load(Ordering::Relaxed),
             commit_phase_count: self.commit_phase_count.load(Ordering::Relaxed),
+            // Per-phase distributions (bd-db300.3.8.1)
+            dist_consolidator_lock_wait: self.hist_consolidator_lock_wait.percentiles(),
+            dist_arrival_wait: self.hist_arrival_wait.percentiles(),
+            dist_wal_backend_lock_wait: self.hist_wal_backend_lock_wait.percentiles(),
+            dist_wal_append: self.hist_wal_append.percentiles(),
+            dist_exclusive_lock: self.hist_exclusive_lock.percentiles(),
+            dist_waiter_epoch_wait: self.hist_waiter_epoch_wait.percentiles(),
+            dist_phase_b: self.hist_phase_b.percentiles(),
+            dist_wal_sync: self.hist_wal_sync.percentiles(),
+            dist_full_commit: self.hist_full_commit.percentiles(),
+            wake_reasons: self.wake_reasons.snapshot(),
         }
     }
 
@@ -405,6 +683,17 @@ impl ConsolidationMetrics {
         self.commit_phase_c1_us_total.store(0, Ordering::Relaxed);
         self.commit_phase_c2_us_total.store(0, Ordering::Relaxed);
         self.commit_phase_count.store(0, Ordering::Relaxed);
+        // Histograms and wake reasons (bd-db300.3.8.1)
+        self.hist_consolidator_lock_wait.reset();
+        self.hist_arrival_wait.reset();
+        self.hist_wal_backend_lock_wait.reset();
+        self.hist_wal_append.reset();
+        self.hist_exclusive_lock.reset();
+        self.hist_waiter_epoch_wait.reset();
+        self.hist_phase_b.reset();
+        self.hist_wal_sync.reset();
+        self.hist_full_commit.reset();
+        self.wake_reasons.reset();
     }
 }
 
@@ -443,6 +732,18 @@ pub struct ConsolidationMetricsSnapshot {
     pub commit_phase_c1_us_total: u64,
     pub commit_phase_c2_us_total: u64,
     pub commit_phase_count: u64,
+    // ── Per-phase distributions (bd-db300.3.8.1) ──
+    pub dist_consolidator_lock_wait: PhasePercentiles,
+    pub dist_arrival_wait: PhasePercentiles,
+    pub dist_wal_backend_lock_wait: PhasePercentiles,
+    pub dist_wal_append: PhasePercentiles,
+    pub dist_exclusive_lock: PhasePercentiles,
+    pub dist_waiter_epoch_wait: PhasePercentiles,
+    pub dist_phase_b: PhasePercentiles,
+    pub dist_wal_sync: PhasePercentiles,
+    pub dist_full_commit: PhasePercentiles,
+    // ── Wake reasons (bd-db300.3.8.1) ──
+    pub wake_reasons: WakeReasonSnapshot,
 }
 
 impl ConsolidationMetricsSnapshot {
@@ -518,6 +819,47 @@ impl ConsolidationMetricsSnapshot {
         self.waiter_epoch_wait_us_total
             .checked_div(self.waiter_commits)
             .unwrap_or(0)
+    }
+
+    // ── bd-db300.3.8.2: lock-wait vs WAL-service split ──
+
+    /// Total flusher lock-wait time (inner_lock + exclusive_lock +
+    /// flushing_wait), microseconds. This is time spent WAITING to acquire
+    /// the WAL backend write path, NOT doing WAL I/O.
+    #[must_use]
+    pub fn flusher_lock_wait_us_total(&self) -> u64 {
+        self.inner_lock_wait_us_total
+            .saturating_add(self.exclusive_lock_us_total)
+            .saturating_add(self.consolidator_flushing_wait_us_total)
+    }
+
+    /// Total WAL service time (append + sync), microseconds. This is time
+    /// spent doing actual WAL I/O AFTER acquiring the write lock.
+    #[must_use]
+    pub fn wal_service_us_total(&self) -> u64 {
+        self.wal_append_us_total
+            .saturating_add(self.wal_sync_us_total)
+    }
+
+    /// Lock-wait fraction of total flusher phase-B time (0.0–1.0).
+    /// Values > 0.5 indicate the regime is lock-topology-limited, not
+    /// I/O-limited.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn flusher_lock_wait_fraction(&self) -> f64 {
+        let lock = self.flusher_lock_wait_us_total();
+        let service = self.wal_service_us_total();
+        let total = lock.saturating_add(service);
+        if total == 0 {
+            return 0.0;
+        }
+        lock as f64 / total as f64
+    }
+
+    /// Whether the flusher is lock-topology-limited (lock wait > service).
+    #[must_use]
+    pub fn is_lock_topology_limited(&self) -> bool {
+        self.flusher_lock_wait_us_total() > self.wal_service_us_total()
     }
 
     /// Generate detailed phase timing report.
@@ -1728,5 +2070,151 @@ mod tests {
         let wal2 = WalFile::open(&cx, file2).expect("reopen WAL");
         assert_eq!(wal2.frame_count(), 5, "all frames valid on reopen");
         wal2.close(&cx).expect("close WAL");
+    }
+
+    // ── PhaseHistogram tests (bd-db300.3.8.1) ──────────────────────
+
+    #[test]
+    fn phase_histogram_empty_returns_zeros() {
+        let h = PhaseHistogram::new();
+        let p = h.percentiles();
+        assert_eq!(p.count, 0);
+        assert_eq!(p.p50, 0);
+        assert_eq!(p.p99, 0);
+        assert_eq!(p.max, 0);
+        assert_eq!(p.mean_us, 0);
+    }
+
+    #[test]
+    fn phase_histogram_single_sample() {
+        let h = PhaseHistogram::new();
+        h.record(42);
+        let p = h.percentiles();
+        assert_eq!(p.count, 1);
+        assert_eq!(p.p50, 42);
+        assert_eq!(p.p95, 42);
+        assert_eq!(p.p99, 42);
+        assert_eq!(p.max, 42);
+        assert_eq!(p.mean_us, 42);
+    }
+
+    #[test]
+    fn phase_histogram_percentiles_ordered() {
+        let h = PhaseHistogram::new();
+        for i in 1..=100 {
+            h.record(i);
+        }
+        let p = h.percentiles();
+        assert_eq!(p.count, 100);
+        assert!(p.p50 <= p.p95, "p50={} should be <= p95={}", p.p50, p.p95);
+        assert!(p.p95 <= p.p99, "p95={} should be <= p99={}", p.p95, p.p99);
+        assert!(p.p99 <= p.max, "p99={} should be <= max={}", p.p99, p.max);
+        assert_eq!(p.max, 100);
+        assert_eq!(p.mean_us, 50);
+    }
+
+    #[test]
+    fn phase_histogram_max_tracks_outlier() {
+        let h = PhaseHistogram::new();
+        for _ in 0..100 {
+            h.record(10);
+        }
+        h.record(99999);
+        let p = h.percentiles();
+        assert_eq!(p.max, 99999);
+        assert_eq!(p.p50, 10);
+    }
+
+    #[test]
+    fn phase_histogram_reset_clears_state() {
+        let h = PhaseHistogram::new();
+        for i in 0..50 {
+            h.record(i * 10);
+        }
+        h.reset();
+        let p = h.percentiles();
+        assert_eq!(p.count, 0);
+        assert_eq!(p.max, 0);
+    }
+
+    #[test]
+    fn phase_histogram_concurrent_writers_no_panic() {
+        use std::sync::Arc;
+        let h = Arc::new(PhaseHistogram::new());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let h = Arc::clone(&h);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for i in 0..500 {
+                    h.record(t * 1000 + i);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let p = h.percentiles();
+        assert_eq!(p.count, 2000);
+        assert!(p.max >= 3499);
+    }
+
+    // ── WakeReasonCounters tests (bd-db300.3.8.1) ──────────────────
+
+    #[test]
+    fn wake_reason_counters_track_all_reasons() {
+        let w = WakeReasonCounters::new();
+        w.notify.fetch_add(10, Ordering::Relaxed);
+        w.timeout.fetch_add(3, Ordering::Relaxed);
+        w.flusher_takeover.fetch_add(1, Ordering::Relaxed);
+        w.failed_epoch.fetch_add(2, Ordering::Relaxed);
+        w.busy_retry.fetch_add(5, Ordering::Relaxed);
+        let s = w.snapshot();
+        assert_eq!(s.notify, 10);
+        assert_eq!(s.timeout, 3);
+        assert_eq!(s.flusher_takeover, 1);
+        assert_eq!(s.failed_epoch, 2);
+        assert_eq!(s.busy_retry, 5);
+        assert_eq!(s.total(), 21);
+    }
+
+    #[test]
+    fn wake_reason_reset_clears() {
+        let w = WakeReasonCounters::new();
+        w.notify.fetch_add(99, Ordering::Relaxed);
+        w.reset();
+        let s = w.snapshot();
+        assert_eq!(s.total(), 0);
+    }
+
+    // ── Integration: histograms in ConsolidationMetrics ──────────────
+
+    #[test]
+    fn consolidation_metrics_snapshot_includes_distributions() {
+        GLOBAL_CONSOLIDATION_METRICS.reset();
+
+        for i in 0..10u64 {
+            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                10 + i, 5 + i, 2, true, 20 + i, 3 + i, 8 + i, 50 + i, 30 + i, 0,
+            );
+        }
+        for i in 0..5u64 {
+            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                10 + i, 5 + i, 2, false, 0, 0, 0, 0, 0, 100 + i,
+            );
+        }
+
+        let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert_eq!(snap.dist_consolidator_lock_wait.count, 15);
+        assert_eq!(snap.dist_arrival_wait.count, 10);
+        assert_eq!(snap.dist_wal_append.count, 10);
+        assert_eq!(snap.dist_waiter_epoch_wait.count, 5);
+        assert_eq!(snap.dist_phase_b.count, 15);
+        assert!(snap.dist_wal_append.p50 > 0);
+        assert!(snap.dist_wal_append.max >= 59);
+
+        GLOBAL_CONSOLIDATION_METRICS.reset();
     }
 }

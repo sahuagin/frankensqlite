@@ -2127,7 +2127,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let param = params.get(param_idx);
                 param_idx += 1;
                 let val = match param {
-                    Some(SqliteValue::Null) | None => String::new(),
+                    Some(SqliteValue::Null) | None => "(null)".to_string(),
                     Some(v) => v.to_text(),
                 };
                 let truncated = if let Some(prec) = precision {
@@ -2138,11 +2138,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&pad_string(&truncated, width, left_align));
             }
             'q' => {
-                // Single-quote escaping; NULL → literal "(NULL)" (C SQLite convention)
+                // Single-quote escaping; C SQLite emits nothing for %q with NULL
                 let param = params.get(param_idx);
                 param_idx += 1;
                 match param {
-                    Some(SqliteValue::Null) | None => result.push_str("(NULL)"),
+                    Some(SqliteValue::Null) | None => { /* C SQLite emits nothing for %q with NULL */ }
                     Some(v) => {
                         let val = v.to_text();
                         let escaped = val.replace('\'', "''");
