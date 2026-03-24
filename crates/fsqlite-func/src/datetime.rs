@@ -36,61 +36,33 @@ use fsqlite_types::SqliteValue;
 
 use crate::{FunctionRegistry, ScalarFunction};
 
-// ── System Timezone Offset ────────────────────────────────────────────────
+// ── Per-datetime UTC Offset ───────────────────────────────────────────────
 //
-// Used by the 'localtime' and 'utc' modifiers.  Since we cannot use unsafe
-// code (libc::localtime_r) and no chrono/time crate is available, we shell
-// out to `date +%z` once and cache the result.
+// Used by the 'localtime' and 'utc' modifiers.  We compute the UTC offset
+// for the *specific* datetime being converted so that DST transitions are
+// handled correctly (matching C SQLite's per-call localtime_r behaviour).
 
-/// Parse a `+HHMM` / `-HHMM` string into seconds.
-fn parse_tz_offset(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.len() < 5 {
-        return None;
-    }
-    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
-    let digits = if s.starts_with('+') || s.starts_with('-') {
-        &s[1..]
-    } else {
-        s
-    };
-    if digits.len() < 4 {
-        return None;
-    }
-    let hours: i64 = digits[..2].parse().ok()?;
-    let minutes: i64 = digits[2..4].parse().ok()?;
-    Some(sign * (hours * 3600 + minutes * 60))
-}
-
-/// Compute the local UTC offset in seconds by running `date +%z`.
-fn compute_utc_offset() -> i64 {
-    // Check TZ env var for explicit UTC.
-    if let Ok(tz) = std::env::var("TZ") {
-        let tz_upper = tz.trim().to_uppercase();
-        if tz_upper == "UTC"
-            || tz_upper == "GMT"
-            || tz_upper == "UTC0"
-            || tz_upper.starts_with("UTC-0")
-            || tz_upper.starts_with("UTC+0")
-        {
-            return 0;
-        }
-    }
-    let output = std::process::Command::new("date").arg("+%z").output();
-    match output {
-        Ok(out) if out.status.success() => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            parse_tz_offset(s.trim()).unwrap_or(0)
-        }
-        _ => 0,
+/// Return the local UTC offset in seconds for the given date/time components.
+///
+/// Uses `chrono::Local` to determine the correct offset (including DST) for
+/// the specific instant rather than caching a single system-wide offset.
+fn utc_offset_for_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+    use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+    let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
+    let time = NaiveTime::from_hms_opt(h, mi, s).unwrap_or_default();
+    let naive = NaiveDateTime::new(date, time);
+    match Local.from_local_datetime(&naive).earliest() {
+        Some(dt) => dt.offset().local_minus_utc() as i64,
+        None => 0, // ambiguous or nonexistent time (DST gap)
     }
 }
 
-/// Return the cached system UTC offset in seconds.
-fn utc_offset_seconds() -> i64 {
-    use std::sync::OnceLock;
-    static OFFSET: OnceLock<i64> = OnceLock::new();
-    *OFFSET.get_or_init(compute_utc_offset)
+/// Compute the UTC offset in seconds for a given JDN, decomposing it into
+/// calendar components first.
+fn utc_offset_for_jdn(jdn: f64) -> i64 {
+    let (y, mo, d) = jdn_to_ymd(jdn);
+    let (h, mi, s, _frac) = jdn_to_hms(jdn);
+    utc_offset_for_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
 }
 
 // ── Julian Day Number Conversions ─────────────────────────────────────────
@@ -360,14 +332,16 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         return None;
     }
 
-    // 'localtime' — convert UTC to local time by adding the system UTC offset.
+    // 'localtime' — convert UTC to local time by adding the UTC offset for
+    // this specific datetime (DST-aware).
     if m == "localtime" {
-        let offset = utc_offset_seconds();
+        let offset = utc_offset_for_jdn(jdn);
         return Some(jdn + offset as f64 / 86400.0);
     }
-    // 'utc' — convert local time to UTC by subtracting the system UTC offset.
+    // 'utc' — convert local time to UTC by subtracting the UTC offset for
+    // this specific datetime (DST-aware).
     if m == "utc" {
-        let offset = utc_offset_seconds();
+        let offset = utc_offset_for_jdn(jdn);
         return Some(jdn - offset as f64 / 86400.0);
     }
 
@@ -1152,7 +1126,7 @@ mod tests {
     #[test]
     fn test_modifier_localtime_shifts_value() {
         // When system offset != 0, 'localtime' should actually shift the value.
-        let offset = utc_offset_seconds();
+        let offset = utc_offset_for_jdn(ymdhms_to_jdn(2024, 3, 15, 12, 0, 0, 0.0));
         if offset != 0 {
             let r = DateTimeFunc
                 .invoke(&[text("2024-03-15 12:00:00"), text("localtime")])
