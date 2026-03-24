@@ -451,30 +451,30 @@ The authoritative replay surface is
 exposes the `persistent_concurrent_write_8t` and
 `persistent_concurrent_write_16t` groups directly.
 
-When local load is noisy and `rch` is healthy, split the workflow into remote
-compile plus local execution:
+Use those exact group ids when filtering. Do not substitute shorthand suffix
+filters such as `/8t` or `/16t`; the bench source names the groups with the full
+`persistent_concurrent_write_<N>t` prefix.
+
+Keep the authoritative pack capture local-only by default. Do not assume
+`rch exec -- cargo bench ... --no-run` or `rch exec -- cargo build --bench ...`
+will materialize a usable local `target/.../concurrent_write_persistent_bench-*`
+binary; that artifact-sync behavior is not part of the current replay contract.
+
+Use the exact group id with a local `cargo bench` invocation for the measured
+pack run:
 
 ```bash
-# 1. Offload only the compile step.
-rch exec -- cargo build --profile release-perf -p fsqlite-e2e --bench concurrent_write_persistent_bench
-
-# 2. Resolve the locally synced bench executable.
-BENCH_BIN="$(find target/release-perf/deps -maxdepth 1 -type f -perm -111 -name 'concurrent_write_persistent_bench-*' | head -n 1)"
-test -n "$BENCH_BIN"
-
-# 3. Execute the measured runs locally on the operator host.
-RUN_ID="bd-db300.1.7.2-$(date -u +%Y%m%dT%H%M%SZ)"
-PACK_ROOT="artifacts/perf/bd-db300.1.7.2/$RUN_ID"
-mkdir -p "$PACK_ROOT"/{8t,16t}
-
 FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$PACK_ROOT/8t" \
-  "$BENCH_BIN" persistent_concurrent_write_8t \
-  2>&1 | tee "$PACK_ROOT/8t/bench.log"
-
-FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$PACK_ROOT/16t" \
-  "$BENCH_BIN" persistent_concurrent_write_16t \
-  2>&1 | tee "$PACK_ROOT/16t/bench.log"
+  cargo bench --profile release-perf -p fsqlite-e2e \
+    --bench concurrent_write_persistent_bench \
+    -- persistent_concurrent_write_8t
 ```
+
+Keep any `rch` usage advisory-only in operator notes. It is still appropriate
+for non-measured compile, check, or test offload elsewhere in the workflow, but
+the measured A7.2 replay path and any wrapper script should stay local unless a
+separate, explicit local-artifact handoff mechanism is introduced and
+documented.
 
 Do not route this pack through `realdb-e2e bench --threads ...`; that CLI does
 not own the persistent Criterion harness and its contract is comparative matrix
