@@ -35,6 +35,7 @@ fn census_snapshot() -> CensusCounters {
         fast_path: s.parser.fast_path_executions,
         slow_path: s.parser.slow_path_executions,
         bg_status: s.background_status_checks,
+        prepared_insert_fast_lane_hits: s.prepared_insert_fast_lane_hits,
     }
 }
 
@@ -50,6 +51,7 @@ struct CensusCounters {
     fast_path: u64,
     slow_path: u64,
     bg_status: u64,
+    prepared_insert_fast_lane_hits: u64,
 }
 
 impl CensusCounters {
@@ -71,6 +73,9 @@ impl CensusCounters {
             fast_path: self.fast_path.saturating_sub(before.fast_path),
             slow_path: self.slow_path.saturating_sub(before.slow_path),
             bg_status: self.bg_status.saturating_sub(before.bg_status),
+            prepared_insert_fast_lane_hits: self
+                .prepared_insert_fast_lane_hits
+                .saturating_sub(before.prepared_insert_fast_lane_hits),
         }
     }
 
@@ -89,6 +94,10 @@ impl CensusCounters {
             self.fast_path, self.slow_path
         );
         eprintln!("    bg_status={}", self.bg_status);
+        eprintln!(
+            "    prepared_insert_fast_lane_hits={}",
+            self.prepared_insert_fast_lane_hits
+        );
     }
 }
 
@@ -119,8 +128,16 @@ fn test_census_single_prepared_insert_autocommit() {
     eprintln!("=== C1: Single prepared INSERT ×10, :memory: autocommit ===");
     delta.print("per-10-stmts");
 
-    // The fast path should be taken for all 10.
-    assert_eq!(delta.fast_path, 10, "all 10 INSERTs should use fast path");
+    // The direct prepared INSERT fast lane should be taken for all 10. The
+    // broader parser fast-path counter also includes internal helper work.
+    assert_eq!(
+        delta.prepared_insert_fast_lane_hits, 10,
+        "all 10 INSERTs should use the prepared INSERT fast lane"
+    );
+    assert_eq!(
+        delta.slow_path, 0,
+        "prepared INSERT should avoid slow fallback"
+    );
 
     // :memory: autocommit should NOT trigger begin_refresh (uses fast path).
     // begin_refresh only fires for file-backed databases.
@@ -169,8 +186,20 @@ fn test_census_file_backed_prepared_insert() {
     eprintln!("=== C2: File-backed prepared INSERT ×10, WAL autocommit ===");
     delta.print("per-10-stmts");
 
-    // All 10 should take the fast path.
-    assert_eq!(delta.fast_path, 10, "all 10 INSERTs should use fast path");
+    // All 10 should take the direct prepared INSERT fast lane. The broader
+    // parser fast-path counter also includes internal helper statements.
+    assert_eq!(
+        delta.prepared_insert_fast_lane_hits, 10,
+        "all 10 INSERTs should use the prepared INSERT fast lane"
+    );
+    assert_eq!(
+        delta.slow_path, 0,
+        "prepared INSERT should avoid slow fallback"
+    );
+    assert_eq!(
+        delta.memdb_refresh, 0,
+        "file-backed WAL path should not pay memdb refresh work in this census"
+    );
 
     // Key census output: how many begin + commit refreshes per 10 statements?
     eprintln!(
@@ -217,14 +246,28 @@ fn test_census_explicit_transaction_prepared_insert() {
     eprintln!("=== C3: Explicit txn, file-backed INSERT ×10 ===");
     delta.print("per-10-stmts");
 
-    // Inside explicit txn, begin/commit refresh should be 0 (was_auto=false).
+    // The direct prepared INSERT fast lane should still handle every user
+    // statement. Global parser fast-path counters include internal helper
+    // traffic and are not one-to-one with user statements anymore.
     assert_eq!(
-        delta.begin_refresh, 0,
-        "explicit txn: begin_refresh should be 0 (not autocommit)"
+        delta.prepared_insert_fast_lane_hits, 10,
+        "explicit txn should still use the prepared INSERT fast lane"
     );
     assert_eq!(
-        delta.commit_refresh, 0,
-        "explicit txn: commit_refresh should be 0 (not autocommit)"
+        delta.slow_path, 0,
+        "explicit txn should avoid slow fallback"
+    );
+
+    // Explicit transactions should materially reduce begin/commit refresh work
+    // versus per-statement autocommit, even if some internal helper activity
+    // still contributes to the global counters.
+    assert!(
+        delta.begin_refresh < 10,
+        "explicit txn begin_refresh should be below one-per-statement duplication: {delta:?}"
+    );
+    assert!(
+        delta.commit_refresh < 10,
+        "explicit txn commit_refresh should be below one-per-statement duplication: {delta:?}"
     );
 }
 

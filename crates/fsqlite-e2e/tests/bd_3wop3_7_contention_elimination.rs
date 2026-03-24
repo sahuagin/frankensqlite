@@ -9,6 +9,9 @@
 //!
 //! The ignored throughput gates in this file therefore remain historical
 //! scaffolding only; they must not be read as current pass/fail policy.
+//! Operators should use `scripts/capture_c1_evidence_pack.sh` for the c1 truth
+//! surface and `scripts/capture_persistent_phase_pack.sh` for the persistent
+//! 8t/16t truth surface and same-pack comparator provenance.
 //!
 //! ## Contention Tests
 //! 1. test_no_global_locks_in_commit_fast_path
@@ -387,7 +390,7 @@ fn test_ebr_no_gc_pauses() {
 #[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_scaling_curve() {
     panic!(
-        "test_scaling_curve: stale placeholder gate; use the canonical matrix and persistent benchmark surfaces instead"
+        "test_scaling_curve: stale placeholder gate; use scripts/capture_c1_evidence_pack.sh and scripts/capture_persistent_phase_pack.sh instead"
     );
 }
 
@@ -403,7 +406,7 @@ fn test_scaling_curve() {
 #[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_8t_throughput_regression_gate() {
     panic!(
-        "test_8t_throughput_regression_gate: historical {GATE_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to the overlay benchmark contract"
+        "test_8t_throughput_regression_gate: historical {GATE_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to scripts/capture_persistent_phase_pack.sh with same-pack sqlite3 comparison"
     );
 }
 
@@ -415,7 +418,7 @@ fn test_8t_throughput_regression_gate() {
 #[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_16t_throughput_regression_gate() {
     panic!(
-        "test_16t_throughput_regression_gate: historical {GATE_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to the overlay benchmark contract"
+        "test_16t_throughput_regression_gate: historical {GATE_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to scripts/capture_persistent_phase_pack.sh with phase-attribution evidence"
     );
 }
 
@@ -893,6 +896,6 @@ fn scaling_report() {
     }
 
     println!(
-        "\nNote: FrankenSQLite numbers here come from a historical sequential placeholder control, not the authoritative 2026-03-23 persistent benchmark surface."
+        "\nNote: FrankenSQLite numbers here come from a historical sequential placeholder control, not the authoritative c1 or persistent 8t/16t scorecard surfaces. Use scripts/capture_c1_evidence_pack.sh and scripts/capture_persistent_phase_pack.sh for current truth."
     );
 }
