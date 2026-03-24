@@ -109,7 +109,11 @@ impl CommitSeq {
     #[inline]
     #[must_use]
     pub const fn next(self) -> Self {
-        Self(self.0.checked_add(1).expect("CommitSeq overflow after 2^64 commits"))
+        Self(
+            self.0
+                .checked_add(1)
+                .expect("CommitSeq overflow after 2^64 commits"),
+        )
     }
 }
 

@@ -231,10 +231,7 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
         .unwrap();
 
     let err = stale_stmt
-        .execute_with_params(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("stale".into()),
-        ])
+        .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("stale".into())])
         .expect_err("cross-connection DDL must invalidate the stale prepared INSERT");
     assert!(matches!(err, FrankenError::SchemaChanged));
 

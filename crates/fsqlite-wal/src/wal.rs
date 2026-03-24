@@ -3036,8 +3036,7 @@ mod tests {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
-        let mut wal =
-            WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
         let good_page = sample_page(0x11);
         wal.append_frame(&cx, 1, &good_page, 0)

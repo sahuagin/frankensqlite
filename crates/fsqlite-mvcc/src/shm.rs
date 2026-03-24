@@ -436,7 +436,10 @@ impl SharedMemoryLayout {
     /// Uses `fetch_add(1, Release)` so readers observe the new even value
     /// and all preceding stores.
     pub fn end_snapshot_publish(&self) {
-        let new_seq = self.snapshot_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let new_seq = self
+            .snapshot_seq
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
         debug_assert!(new_seq != 0, "seqlock counter wrapped to zero");
     }
 

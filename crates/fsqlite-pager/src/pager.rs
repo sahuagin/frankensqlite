@@ -3896,8 +3896,7 @@ where
                 // eliminating the intermediate `all_frames` Vec allocation.
                 let batch_count = batches.len();
                 let total_frames: usize = batches.iter().map(|b| b.frames.len()).sum();
-                let mut frame_refs: Vec<traits::WalFrameRef<'_>> =
-                    Vec::with_capacity(total_frames);
+                let mut frame_refs: Vec<traits::WalFrameRef<'_>> = Vec::with_capacity(total_frames);
                 let mut final_db_size = current_db_size;
                 for batch in &batches {
                     for frame in &batch.frames {
@@ -15006,15 +15005,33 @@ mod tests {
 
         let batches = vec![
             TransactionFrameBatch::new(vec![
-                FrameSubmission { page_number: 2, page_data: vec![0xAA; 4096], db_size_if_commit: 0 },
-                FrameSubmission { page_number: 3, page_data: vec![0xBB; 4096], db_size_if_commit: 10 },
+                FrameSubmission {
+                    page_number: 2,
+                    page_data: vec![0xAA; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 3,
+                    page_data: vec![0xBB; 4096],
+                    db_size_if_commit: 10,
+                },
             ]),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 5,
+                page_data: vec![0xCC; 4096],
+                db_size_if_commit: 12,
+            }]),
             TransactionFrameBatch::new(vec![
-                FrameSubmission { page_number: 5, page_data: vec![0xCC; 4096], db_size_if_commit: 12 },
-            ]),
-            TransactionFrameBatch::new(vec![
-                FrameSubmission { page_number: 7, page_data: vec![0xDD; 4096], db_size_if_commit: 0 },
-                FrameSubmission { page_number: 8, page_data: vec![0xEE; 4096], db_size_if_commit: 8 },
+                FrameSubmission {
+                    page_number: 7,
+                    page_data: vec![0xDD; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 8,
+                    page_data: vec![0xEE; 4096],
+                    db_size_if_commit: 8,
+                },
             ]),
         ];
         let current_db_size: u32 = 5;
@@ -15034,7 +15051,11 @@ mod tests {
             }
         }
         let page_numbers: Vec<u32> = frame_refs.iter().map(|f| f.page_number).collect();
-        assert_eq!(page_numbers, vec![2, 3, 5, 7, 8], "bd-db300.3.8.6: frame order");
+        assert_eq!(
+            page_numbers,
+            vec![2, 3, 5, 7, 8],
+            "bd-db300.3.8.6: frame order"
+        );
         assert_eq!(frame_refs.len(), 5);
         assert_eq!(final_db_size, 12, "bd-db300.3.8.6: max commit size");
     }
@@ -15045,8 +15066,16 @@ mod tests {
         use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
 
         let batches = vec![TransactionFrameBatch::new(vec![
-            FrameSubmission { page_number: 2, page_data: vec![0; 4096], db_size_if_commit: 0 },
-            FrameSubmission { page_number: 3, page_data: vec![0; 4096], db_size_if_commit: 0 },
+            FrameSubmission {
+                page_number: 2,
+                page_data: vec![0; 4096],
+                db_size_if_commit: 0,
+            },
+            FrameSubmission {
+                page_number: 3,
+                page_data: vec![0; 4096],
+                db_size_if_commit: 0,
+            },
         ])];
         let current_db_size: u32 = 7;
         let mut final_db_size = current_db_size;
@@ -15057,6 +15086,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(final_db_size, 7, "bd-db300.3.8.6: all-zero preserves current");
+        assert_eq!(
+            final_db_size, 7,
+            "bd-db300.3.8.6: all-zero preserves current"
+        );
     }
 }
