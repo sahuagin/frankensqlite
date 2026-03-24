@@ -16148,43 +16148,47 @@ mod tests {
     }
 
     /// bd-db300.3.8.6: Prove fused batch assembly preserves cross-batch frame
-    /// order and final_db_size semantics.
+    /// order and final_db_size semantics, including the all-zero boundary.
     #[test]
     fn test_fused_batch_assembly_preserves_order_and_db_size() {
         use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
 
+        // Three batches simulating three concurrent transactions.
         let batches = vec![
             TransactionFrameBatch::new(vec![
                 FrameSubmission {
                     page_number: 2,
                     page_data: vec![0xAA; 4096],
-                    db_size_if_commit: 0,
+                    db_size_if_commit: 0, // non-commit frame
                 },
                 FrameSubmission {
                     page_number: 3,
                     page_data: vec![0xBB; 4096],
-                    db_size_if_commit: 10,
+                    db_size_if_commit: 10, // commit: db has 10 pages
                 },
             ]),
             TransactionFrameBatch::new(vec![FrameSubmission {
                 page_number: 5,
                 page_data: vec![0xCC; 4096],
-                db_size_if_commit: 12,
+                db_size_if_commit: 12, // commit: db has 12 pages
             }]),
             TransactionFrameBatch::new(vec![
                 FrameSubmission {
                     page_number: 7,
                     page_data: vec![0xDD; 4096],
-                    db_size_if_commit: 0,
+                    db_size_if_commit: 0, // non-commit
                 },
                 FrameSubmission {
                     page_number: 8,
                     page_data: vec![0xEE; 4096],
-                    db_size_if_commit: 8,
+                    db_size_if_commit: 8, // commit: db has 8 pages (smaller)
                 },
             ]),
         ];
+
         let current_db_size: u32 = 5;
+
+        // Fused single-pass assembly (mirrors the production code exactly).
         let total_frames: usize = batches.iter().map(|b| b.frames.len()).sum();
         let mut frame_refs: Vec<traits::WalFrameRef<'_>> = Vec::with_capacity(total_frames);
         let mut final_db_size = current_db_size;
@@ -16200,17 +16204,35 @@ mod tests {
                 }
             }
         }
+
+        // 1. Frame order: batch-by-batch, frame-by-frame.
         let page_numbers: Vec<u32> = frame_refs.iter().map(|f| f.page_number).collect();
         assert_eq!(
             page_numbers,
             vec![2, 3, 5, 7, 8],
-            "bd-db300.3.8.6: frame order"
+            "bd-db300.3.8.6: fused assembly must preserve cross-batch frame order"
         );
-        assert_eq!(frame_refs.len(), 5);
-        assert_eq!(final_db_size, 12, "bd-db300.3.8.6: max commit size");
+
+        // 2. Total frame count.
+        assert_eq!(frame_refs.len(), 5, "should flatten all 5 frames");
+
+        // 3. final_db_size = max(current_db_size, max positive db_size_if_commit).
+        // max(5, 0, 10, 12, 0, 8) = 12
+        assert_eq!(
+            final_db_size, 12,
+            "bd-db300.3.8.6: final_db_size must be max commit size across group"
+        );
+
+        // 4. Pre-sized capacity: no reallocation should have occurred.
+        assert!(
+            frame_refs.capacity() >= 5,
+            "Vec should have been pre-sized to avoid realloc"
+        );
     }
 
-    /// bd-db300.3.8.6: All-zero db_size_if_commit preserves current_db_size.
+    /// bd-db300.3.8.6: Edge case — all db_size_if_commit are zero (no commits
+    /// in the batch, only non-commit frames). final_db_size must fall back to
+    /// current_db_size.
     #[test]
     fn test_fused_batch_assembly_all_zero_db_size() {
         use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
@@ -16227,6 +16249,7 @@ mod tests {
                 db_size_if_commit: 0,
             },
         ])];
+
         let current_db_size: u32 = 7;
         let mut final_db_size = current_db_size;
         for batch in &batches {
@@ -16236,9 +16259,10 @@ mod tests {
                 }
             }
         }
+
         assert_eq!(
             final_db_size, 7,
-            "bd-db300.3.8.6: all-zero preserves current"
+            "bd-db300.3.8.6: all-zero db_size_if_commit must preserve current_db_size"
         );
     }
 }

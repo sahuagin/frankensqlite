@@ -2974,8 +2974,9 @@ mod tests {
         }
     }
 
-    /// bd-db300.3.8.6: Verify the fused append_frames path produces
-    /// byte-identical raw frame bytes compared to the single-frame path.
+    /// bd-db300.3.8.6: Verify the fused append_frames path produces a
+    /// byte-identical WAL file compared to the single-frame append path,
+    /// including WAL header bytes and all frame header/payload bytes.
     #[test]
     fn test_fused_append_frames_produces_byte_identical_wal_file() {
         let cx = test_cx();
@@ -3009,6 +3010,7 @@ mod tests {
             .collect();
         wal_f.append_frames(&cx, &frames).expect("append fused");
 
+        // Compare checksums, frame count, and raw frame bytes.
         assert_eq!(wal_s.frame_count(), wal_f.frame_count());
         assert_eq!(wal_s.running_checksum(), wal_f.running_checksum());
 
@@ -3029,8 +3031,9 @@ mod tests {
         }
     }
 
-    /// bd-db300.3.8.6: Verify frame_scratch is restored after an error in
-    /// append_frames, so subsequent valid appends still work correctly.
+    /// bd-db300.3.8.6: Verify that frame_scratch is restored after an error
+    /// in append_frames (e.g. page size mismatch), so subsequent valid
+    /// appends still work correctly.
     #[test]
     fn test_append_frames_restores_scratch_on_error() {
         let cx = test_cx();
@@ -3038,6 +3041,7 @@ mod tests {
         let file = open_wal_file(&vfs, &cx);
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
 
+        // First, a valid append to establish scratch state.
         let good_page = sample_page(0x11);
         wal.append_frame(&cx, 1, &good_page, 0)
             .expect("first append");
@@ -3047,8 +3051,8 @@ mod tests {
         wal.read_frame_into(&cx, 0, &mut first_frame_before)
             .expect("read baseline frame");
 
-        // Batch with a bad page size — should fail.
-        let bad_page = vec![0xBBu8; PAGE_SIZE as usize + 1];
+        // Attempt a batch with a bad page size — should fail.
+        let bad_page = vec![0xBBu8; PAGE_SIZE as usize + 1]; // wrong size
         let good_page2 = sample_page(0x22);
         let bad_frames = vec![
             WalAppendFrameRef {
@@ -3058,13 +3062,14 @@ mod tests {
             },
             WalAppendFrameRef {
                 page_number: 3,
-                page_data: &bad_page,
+                page_data: &bad_page, // size mismatch
                 db_size_if_commit: 3,
             },
         ];
         let err = wal.append_frames(&cx, &bad_frames);
         assert!(err.is_err(), "bad page size should cause error");
 
+        // Scratch must still be usable — frame_count unchanged.
         assert_eq!(
             wal.frame_count(),
             1,
@@ -3087,7 +3092,7 @@ mod tests {
             "failed append must not rewrite previously committed raw frame bytes"
         );
 
-        // Recovery: subsequent valid append must succeed.
+        // Recovery: subsequent valid append must succeed and produce correct checksums.
         let recovery_page = sample_page(0x33);
         wal.append_frame(&cx, 2, &recovery_page, 2)
             .expect("recovery append after error");

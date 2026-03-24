@@ -5120,6 +5120,12 @@ impl VdbeEngine {
         self.index_desc_flags_by_root_page = map;
     }
 
+    /// Provide per-index collation sequences keyed by index root page.
+    pub fn set_index_collations_by_root_page(&mut self, map: HashMap<i32, Vec<Option<String>>>) {
+        self.index_collations_by_root_page = Arc::new(map);
+    }
+
+
     /// Reuse shared per-index collation sequences keyed by index root page.
     pub fn set_shared_index_collations_by_root_page(
         &mut self,
@@ -8228,14 +8234,14 @@ impl VdbeEngine {
                                 probe_fields.len()
                             };
                             let desc_flags = self.index_desc_flags_for_root(cursor.root_page);
-                            let idx_collations = self.index_collations_for_root(cursor.root_page);
+                            let collations = self.index_collations_for_root(cursor.root_page);
                             let coll_guard = self.lock_collation();
                             let cmp = compare_index_prefix_keys(
                                 &row.values,
                                 &probe_fields,
                                 n_compare,
                                 &desc_flags,
-                                &idx_collations,
+                                &collations,
                                 &coll_guard,
                             );
                             drop(coll_guard);

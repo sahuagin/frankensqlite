@@ -751,6 +751,7 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 columns: vec![column.name.clone()],
                 key_expressions: Vec::new(),
                 key_sort_directions: vec![SortDirection::Asc],
+                key_collations: Vec::new(),
                 where_clause: None,
                 is_unique: true,
                 key_collations: vec![column.constraints.iter().find_map(|constraint| {
@@ -810,6 +811,7 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 .iter()
                 .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
                 .collect(),
+            key_collations: Vec::new(),
             where_clause: None,
             is_unique: true,
             key_collations: normalized_terms
@@ -2781,6 +2783,7 @@ mod tests {
                 columns: vec!["parent_id".to_owned(), "slug".to_owned()],
                 key_expressions: Vec::new(),
                 key_sort_directions: vec![SortDirection::Asc, SortDirection::Asc],
+                key_collations: Vec::new(),
                 where_clause: None,
                 is_unique: true,
                 key_collations: vec![],
