@@ -2974,6 +2974,111 @@ mod tests {
         }
     }
 
+    /// bd-db300.3.8.6: Verify the fused append_frames path produces
+    /// byte-identical raw frame bytes compared to the single-frame path.
+    #[test]
+    fn test_fused_append_frames_produces_byte_identical_wal_file() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_fused = MemoryVfs::new();
+
+        let pages: Vec<Vec<u8>> = (0..4u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = vec![3, 1, 4, 2];
+        let commit_sizes: Vec<u32> = vec![0, 0, 0, 4];
+
+        // Single-frame path (reference).
+        let file_s = open_wal_file(&vfs_single, &cx);
+        let mut wal_s =
+            WalFile::create(&cx, file_s, PAGE_SIZE, 0, test_salts()).expect("create single");
+        for i in 0..4 {
+            wal_s
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append single");
+        }
+
+        // Fused batch path (under test).
+        let file_f = open_wal_file(&vfs_fused, &cx);
+        let mut wal_f =
+            WalFile::create(&cx, file_f, PAGE_SIZE, 0, test_salts()).expect("create fused");
+        let frames: Vec<_> = (0..4)
+            .map(|i| WalAppendFrameRef {
+                page_number: page_nums[i],
+                page_data: &pages[i],
+                db_size_if_commit: commit_sizes[i],
+            })
+            .collect();
+        wal_f.append_frames(&cx, &frames).expect("append fused");
+
+        assert_eq!(wal_s.frame_count(), wal_f.frame_count());
+        assert_eq!(wal_s.running_checksum(), wal_f.running_checksum());
+
+        let frame_size = wal_s.frame_size();
+        for i in 0..4 {
+            let mut buf_s = vec![0u8; frame_size];
+            let mut buf_f = vec![0u8; frame_size];
+            wal_s
+                .read_frame_into(&cx, i, &mut buf_s)
+                .expect("read single");
+            wal_f
+                .read_frame_into(&cx, i, &mut buf_f)
+                .expect("read fused");
+            assert_eq!(
+                buf_s, buf_f,
+                "raw frame bytes at index {i} must be identical"
+            );
+        }
+    }
+
+    /// bd-db300.3.8.6: Verify frame_scratch is restored after an error in
+    /// append_frames, so subsequent valid appends still work correctly.
+    #[test]
+    fn test_append_frames_restores_scratch_on_error() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal =
+            WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let good_page = sample_page(0x11);
+        wal.append_frame(&cx, 1, &good_page, 0)
+            .expect("first append");
+        let scratch_cap_before = wal.frame_scratch_capacity();
+
+        // Batch with a bad page size — should fail.
+        let bad_page = vec![0xBBu8; PAGE_SIZE as usize + 1];
+        let good_page2 = sample_page(0x22);
+        let bad_frames = vec![
+            WalAppendFrameRef {
+                page_number: 2,
+                page_data: &good_page2,
+                db_size_if_commit: 0,
+            },
+            WalAppendFrameRef {
+                page_number: 3,
+                page_data: &bad_page,
+                db_size_if_commit: 3,
+            },
+        ];
+        let err = wal.append_frames(&cx, &bad_frames);
+        assert!(err.is_err(), "bad page size should cause error");
+
+        assert_eq!(
+            wal.frame_count(),
+            1,
+            "failed append must not advance frame count"
+        );
+        assert!(
+            wal.frame_scratch_capacity() >= scratch_cap_before,
+            "scratch capacity must not shrink after error"
+        );
+
+        // Recovery: subsequent valid append must succeed.
+        let recovery_page = sample_page(0x33);
+        wal.append_frame(&cx, 2, &recovery_page, 2)
+            .expect("recovery append after error");
+        assert_eq!(wal.frame_count(), 2, "recovery append should succeed");
+    }
+
     #[test]
     fn test_append_frame_reuses_frame_scratch_between_calls() {
         let cx = test_cx();
