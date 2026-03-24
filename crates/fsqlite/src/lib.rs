@@ -266,15 +266,20 @@ mod tests {
 
         {
             let conn = Connection::open(&db).unwrap();
-            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER NOT NULL);")
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER NOT NULL, name TEXT NOT NULL);",
+            )
+            .unwrap();
             conn.execute("CREATE INDEX idx_t_b ON t(b);").unwrap();
-            conn.execute("INSERT INTO t (id, b) VALUES (1, 42), (2, 42), (5, 42), (9, 99);")
-                .unwrap();
+            conn.execute(
+                "INSERT INTO t (id, b, name) VALUES \
+                 (1, 42, 'alice'), (2, 42, 'bruce'), (5, 42, 'claire'), (9, 99, 'dora');",
+            )
+            .unwrap();
         }
 
         let conn = Connection::open(&db).unwrap();
-        let stmt = conn.prepare("SELECT id FROM t WHERE b = ?1;").unwrap();
+        let stmt = conn.prepare("SELECT name FROM t WHERE b = ?1;").unwrap();
 
         let explain = stmt.explain();
         assert!(explain.contains("idx_t_b"));
@@ -292,9 +297,9 @@ mod tests {
                 .map(|row| row.get(0).cloned().unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(2),
-                SqliteValue::Integer(5),
+                SqliteValue::Text("alice".to_owned().into()),
+                SqliteValue::Text("bruce".to_owned().into()),
+                SqliteValue::Text("claire".to_owned().into()),
             ]
         );
     }
