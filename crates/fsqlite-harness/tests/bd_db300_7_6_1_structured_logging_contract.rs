@@ -4,6 +4,8 @@
 //! proof and artifact surfaces already present in the tree so later emission
 //! beads can wire fields mechanically instead of inventing names ad hoc.
 
+#![allow(clippy::needless_lifetimes, clippy::struct_field_names)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,10 +87,14 @@ struct RequiredFieldSet {
 
 #[derive(Debug, Deserialize)]
 struct ArtifactLineage {
-    always_required: Vec<String>,
-    decision_plane_required: Vec<String>,
-    shadow_required: Vec<String>,
-    artifact_required: Vec<String>,
+    #[serde(rename = "always_required")]
+    always: Vec<String>,
+    #[serde(rename = "decision_plane_required")]
+    decision_plane: Vec<String>,
+    #[serde(rename = "shadow_required")]
+    shadow: Vec<String>,
+    #[serde(rename = "artifact_required")]
+    artifact: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,7 +177,7 @@ fn as_set(values: &[String]) -> BTreeSet<&str> {
     values.iter().map(String::as_str).collect()
 }
 
-fn by_family<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a EventFamily> {
+fn by_family(document: &ContractDocument) -> BTreeMap<&str, &EventFamily> {
     document
         .event_families
         .iter()
@@ -179,7 +185,7 @@ fn by_family<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a EventF
         .collect()
 }
 
-fn by_surface<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a SurfaceContract> {
+fn by_surface(document: &ContractDocument) -> BTreeMap<&str, &SurfaceContract> {
     document
         .surface_contracts
         .iter()
@@ -343,7 +349,7 @@ fn field_ledgers_cover_run_identity_topology_lineage_and_decision_plane() {
         );
     }
 
-    let always = as_set(&document.artifact_lineage.always_required);
+    let always = as_set(&document.artifact_lineage.always);
     for required in [
         "trace_id",
         "scenario_id",
@@ -360,15 +366,15 @@ fn field_ledgers_cover_run_identity_topology_lineage_and_decision_plane() {
         );
     }
     assert_eq!(
-        as_set(&document.artifact_lineage.decision_plane_required),
+        as_set(&document.artifact_lineage.decision_plane),
         expected(&["budget_id", "decision_id", "policy_id", "slo_id"])
     );
     assert_eq!(
-        as_set(&document.artifact_lineage.shadow_required),
+        as_set(&document.artifact_lineage.shadow),
         expected(&["shadow_run_id"])
     );
     assert_eq!(
-        as_set(&document.artifact_lineage.artifact_required),
+        as_set(&document.artifact_lineage.artifact),
         expected(&["artifact_graph_id", "provenance_root"])
     );
 

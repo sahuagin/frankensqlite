@@ -1092,10 +1092,8 @@ mod tests {
             // used.  With max_block_size = TEST_MAX_BLOCK_SIZE, the encoder
             // partitions into ceil(k * symbol_size / max_block_size) blocks.
             let max_block_symbols = (TEST_MAX_BLOCK_SIZE as u32 / symbol_size.max(1)).max(1);
-            let source_blocks =
-                ((k_source + max_block_symbols - 1) / max_block_symbols).max(1) as u16;
-            let symbols_per_block =
-                ((k_source + u32::from(source_blocks) - 1) / u32::from(source_blocks)).max(1);
+            let source_blocks = k_source.div_ceil(max_block_symbols).max(1) as u16;
+            let symbols_per_block = k_source.div_ceil(u32::from(source_blocks)).max(1);
             let object_size = u64::from(k_source)
                 .checked_mul(u64::from(symbol_size))
                 .ok_or_else(|| FrankenError::OutOfRange {

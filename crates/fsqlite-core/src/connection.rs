@@ -34,9 +34,10 @@ use fsqlite_ast::{
     TableConstraintKind, TableOrSubquery, TimeTravelTarget, UnaryOp, WindowSpec,
 };
 use fsqlite_btree::cursor::TransactionPageIo;
+#[cfg(not(test))]
+use fsqlite_btree::set_btree_copy_profile_enabled;
 use fsqlite_btree::{
-    BtreeCopyProfileSnapshot, BtreeCursorOps, btree_copy_profile_snapshot,
-    reset_btree_copy_profile, set_btree_copy_profile_enabled,
+    BtreeCopyProfileSnapshot, BtreeCursorOps, btree_copy_profile_snapshot, reset_btree_copy_profile,
 };
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_ext_fts5::{
@@ -75,9 +76,11 @@ use fsqlite_types::cx::{CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
+#[cfg(not(test))]
+use fsqlite_types::record::set_record_profile_enabled;
 use fsqlite_types::record::{
     RecordHotPathProfileSnapshot, RecordProfileScope, enter_record_profile_scope, parse_record,
-    record_profile_snapshot, reset_record_profile, serialize_record, set_record_profile_enabled,
+    record_profile_snapshot, reset_record_profile, serialize_record,
 };
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{
@@ -89,11 +92,13 @@ use fsqlite_vdbe::codegen::{
     PlannerSelectAccessKind, SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_scan_filter,
 };
+#[cfg(not(test))]
+use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
 use fsqlite_vdbe::engine::{
     ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, VdbeMetricsSnapshot,
     reset_vdbe_jit_metrics, reset_vdbe_metrics, set_vdbe_jit_cache_capacity, set_vdbe_jit_enabled,
-    set_vdbe_jit_hot_threshold, set_vdbe_metrics_enabled, vdbe_jit_cache_capacity,
-    vdbe_jit_enabled, vdbe_jit_hot_threshold, vdbe_jit_metrics_snapshot, vdbe_metrics_snapshot,
+    set_vdbe_jit_hot_threshold, vdbe_jit_cache_capacity, vdbe_jit_enabled, vdbe_jit_hot_threshold,
+    vdbe_jit_metrics_snapshot, vdbe_metrics_snapshot,
 };
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
 #[cfg(target_os = "linux")]
@@ -231,13 +236,13 @@ const MAX_TRIGGER_DEPTH: usize = 32;
 const MAX_FK_CASCADE_DEPTH: usize = 50;
 
 static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Thread-local override for hot-path profiling.  When `Some(true)`, profiling
-/// is enabled only on the current thread; when `Some(false)`, disabled only on
-/// the current thread; when `None`, the global flag is used.  This prevents
-/// a test-only profile guard from accidentally enabling profiling for
-/// concurrent threads in the same process.
 #[cfg(test)]
 thread_local! {
+    // Thread-local override for hot-path profiling. When `Some(true)`, profiling
+    // is enabled only on the current thread; when `Some(false)`, disabled only on
+    // the current thread; when `None`, the global flag is used. This prevents a
+    // test-only profile guard from accidentally enabling profiling for concurrent
+    // threads in the same process.
     static FSQLITE_HOT_PATH_PROFILE_THREAD_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
@@ -374,7 +379,6 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
         // Do NOT set the global flag or the cross-crate profiling flags —
         // that would enable profiling on all concurrent test threads.
         FSQLITE_HOT_PATH_PROFILE_THREAD_OVERRIDE.with(|c| c.set(Some(enabled)));
-        return;
     }
     #[cfg(not(test))]
     {
@@ -52726,7 +52730,7 @@ mod tests {
             .collect();
 
         assert!(
-            blob_ops.len() >= 1,
+            !blob_ops.is_empty(),
             "expected at least one OP_Blob, found {}",
             blob_ops.len()
         );

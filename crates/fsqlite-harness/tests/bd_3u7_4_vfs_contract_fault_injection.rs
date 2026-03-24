@@ -1,3 +1,5 @@
+#![allow(clippy::struct_field_names)]
+
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]

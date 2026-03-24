@@ -1980,6 +1980,7 @@ fn build_verify_suite_contract_command(
     parts.join(" ")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_verify_suite_bench_command(
     context: VerifySuiteExecutionContext,
     mode: VerifySuiteMode,

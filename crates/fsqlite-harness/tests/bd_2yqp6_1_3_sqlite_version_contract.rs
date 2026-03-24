@@ -3,6 +3,8 @@
 //! Enforces a single canonical SQLite target version across runtime, harness,
 //! and docs, and verifies parity reports carry an explicit contract reference.
 
+#![allow(clippy::struct_field_names)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

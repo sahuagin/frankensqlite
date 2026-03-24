@@ -4,6 +4,8 @@
 //! frontier, fallback, and gap-conversion semantics stay explicit across the
 //! benchmark matrix and the three structural pillars.
 
+#![allow(clippy::struct_field_names)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;

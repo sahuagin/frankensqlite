@@ -5125,7 +5125,6 @@ impl VdbeEngine {
         self.index_collations_by_root_page = Arc::new(map);
     }
 
-
     /// Reuse shared per-index collation sequences keyed by index root page.
     pub fn set_shared_index_collations_by_root_page(
         &mut self,

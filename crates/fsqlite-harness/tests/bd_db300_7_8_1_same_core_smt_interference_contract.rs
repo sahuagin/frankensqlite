@@ -5,6 +5,8 @@
 //! measurement beads inherit one stable case matrix, log vocabulary, and
 //! artifact layout instead of inventing new selectors or file names.
 
+#![allow(clippy::needless_lifetimes, clippy::struct_field_names)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -214,7 +216,7 @@ fn expected<'a>(values: &'a [&'a str]) -> BTreeSet<&'a str> {
     values.iter().copied().collect()
 }
 
-fn by_family<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a EventFamily> {
+fn by_family(document: &ContractDocument) -> BTreeMap<&str, &EventFamily> {
     document
         .event_families
         .iter()
@@ -222,7 +224,7 @@ fn by_family<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a EventF
         .collect()
 }
 
-fn by_case<'a>(document: &'a ContractDocument) -> BTreeMap<&'a str, &'a CaseContract> {
+fn by_case(document: &ContractDocument) -> BTreeMap<&str, &CaseContract> {
     document
         .cases
         .iter()

@@ -3,6 +3,8 @@
 //! Enforces deterministic parity score semantics and strict, unambiguous
 //! definition of a "100%" parity claim.
 
+#![allow(clippy::struct_field_names)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

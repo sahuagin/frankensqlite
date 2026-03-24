@@ -1534,7 +1534,7 @@ fn execute_batch_with_executor(
         executor.conn.rollback_transaction()
     };
     match finalize_result {
-        Ok(_) => {
+        Ok(()) => {
             let finalize_time_ns = duration_to_u64_ns(finalize_started.elapsed());
             if batch.commit {
                 timing.commit_finalize = finalize_time_ns;
@@ -1676,7 +1676,7 @@ fn run_records_with_retry(
 
 fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
     match conn.rollback_transaction() {
-        Ok(_) | Err(FrankenError::NoActiveTransaction) => Ok(()),
+        Ok(()) | Err(FrankenError::NoActiveTransaction) => Ok(()),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -1714,17 +1714,14 @@ impl<'conn> PreparedOpExecutor<'conn> {
             OpKind::Begin => self
                 .conn
                 .begin_transaction()
-                .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Commit => self
                 .conn
                 .commit_transaction()
-                .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
             OpKind::Rollback => self
                 .conn
                 .rollback_transaction()
-                .map(|_| ())
                 .map_err(classify_fsqlite_error_as_op),
         }
     }

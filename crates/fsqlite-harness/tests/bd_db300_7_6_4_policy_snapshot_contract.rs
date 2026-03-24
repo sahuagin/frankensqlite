@@ -4,6 +4,8 @@
 //! schema so downstream beads can consume decision records, operator packages,
 //! and fallback semantics without inventing ad hoc metadata.
 
+#![allow(clippy::struct_field_names)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;

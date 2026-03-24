@@ -2462,7 +2462,7 @@ mod tests {
 
         // After 4 windows, tracker has min_samples=4 → first swap on window 4.
         assert!(
-            ctrl.generation() >= initial_gen + 1,
+            ctrl.generation() > initial_gen,
             "bead_id=bd-3t52f matrix should have been swapped at least once after 4 windows (gen={})",
             ctrl.generation()
         );

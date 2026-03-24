@@ -4,6 +4,8 @@
 //! perf, failure, and decision-plane entrypoints so future operator suites do
 //! not have to reconstruct observability coverage by hand.
 
+#![allow(clippy::struct_field_names)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -94,7 +96,8 @@ struct SurfaceClassPolicy {
 
 #[derive(Debug, Deserialize)]
 struct EmitterFamily {
-    emitter_family_id: String,
+    #[serde(rename = "emitter_family_id")]
+    id: String,
     surface_class: String,
     entrypoint_name: String,
     source_path: String,
@@ -268,7 +271,7 @@ fn emitter_family_set_and_surface_coverage_are_exact() {
     let emitter_ids = document
         .emitter_families
         .iter()
-        .map(|family| family.emitter_family_id.as_str())
+        .map(|family| family.id.as_str())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         emitter_ids,
@@ -323,86 +326,86 @@ fn every_emitter_has_real_sources_and_complete_required_shape() {
         assert!(
             source_path.exists(),
             "source path for {} should exist: {}",
-            family.emitter_family_id,
+            family.id,
             source_path.display()
         );
         assert!(
             !family.entrypoint_name.trim().is_empty(),
             "entrypoint_name must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             family.entrypoint_name.contains(&family.source_path)
                 || family.entrypoint_name.contains(&family.source_symbol),
             "entrypoint_name for {} must point back to its source path or symbol",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.source_symbol.trim().is_empty(),
             "source_symbol must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.artifact_manifest_key.trim().is_empty(),
             "artifact_manifest_key must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.bundle_kind.trim().is_empty(),
             "bundle_kind must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.replay_command.trim().is_empty(),
             "replay_command must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.mode_scope.is_empty(),
             "mode_scope must not be empty for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.mandatory_when.is_empty(),
             "mandatory_when must not be empty for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.required_event_families.is_empty(),
             "required_event_families must not be empty for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.expected_artifacts.is_empty(),
             "expected_artifacts must not be empty for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.negative_path_expectation.trim().is_empty(),
             "negative_path_expectation must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.gap_conversion_rule.trim().is_empty(),
             "gap_conversion_rule must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             !family.notes.trim().is_empty(),
             "notes must not be blank for {}",
-            family.emitter_family_id
+            family.id
         );
 
         let minimum_fields = as_set(&family.minimum_required_fields);
         assert!(
             coverage_fields.is_subset(&minimum_fields),
             "{} must include every coverage log field",
-            family.emitter_family_id
+            family.id
         );
         assert!(
             linkage_fields.is_subset(&minimum_fields),
             "{} must include every artifact linkage field",
-            family.emitter_family_id
+            family.id
         );
     }
 }

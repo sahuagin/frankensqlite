@@ -4,6 +4,8 @@
 //! and E4 so rollout, fallback, divergence capture, and replay semantics stay
 //! consistent across the performance program.
 
+#![allow(clippy::struct_field_names)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -289,7 +291,7 @@ fn scope_policy_mode_divergence_and_script_vocabularies_are_exact() {
                 "decision equivalence should escalate through a policy budget, not a direct blocker bit"
             ),
             "user_visible_result" | "state_hash" | "invariant_hash" => {
-                assert!(scope.blocker, "{} must be a blocker scope", scope.scope_id)
+                assert!(scope.blocker, "{} must be a blocker scope", scope.scope_id);
             }
             _ => {}
         }
