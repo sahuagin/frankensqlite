@@ -317,6 +317,18 @@ mod tests {
         ChecksumFailureKind, RecoveryAction, WalChainInvalidReason, WalFecRepairOutcome,
     };
 
+    struct ResetTelemetryGlobals;
+
+    impl Drop for ResetTelemetryGlobals {
+        fn drop(&mut self) {
+            crate::metrics::GLOBAL_WAL_METRICS.reset();
+            crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();
+            crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.reset();
+            crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.reset();
+            crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.reset();
+        }
+    }
+
     // ── Helper: build one event per variant ──
 
     fn all_event_variants() -> Vec<WalTelemetryEvent> {
@@ -656,6 +668,10 @@ mod tests {
 
     #[test]
     fn composite_snapshot_captures_all_globals() {
+        let _guard = crate::group_commit::GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
+            .lock()
+            .expect("global consolidation metrics test lock poisoned");
+        let _reset = ResetTelemetryGlobals;
         // Reset globals to known state.
         crate::metrics::GLOBAL_WAL_METRICS.reset();
         crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();

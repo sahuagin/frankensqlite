@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber, PageSize};
 
@@ -188,6 +188,33 @@ pub trait WalBackend: Send + Sync {
     /// explicit and reserved for exceptional cases such as a deliberately
     /// partial index or recovery-oriented handling.
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
+
+    /// Read a page from the WAL using a previously pinned read snapshot.
+    ///
+    /// This method takes `&self` instead of `&mut self`, enabling callers to
+    /// hold only a shared (read) lock on the WAL backend when the transaction
+    /// has already pinned its snapshot via `begin_transaction`.
+    ///
+    /// The default implementation falls back to `read_page(&mut self)` which
+    /// requires exclusive access. Implementors that can serve reads from an
+    /// immutable pinned snapshot should override this to avoid contention with
+    /// the append path.
+    ///
+    /// # bd-db300.3.8.7: write-lock-scope narrowing
+    fn read_page_pinned(&self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+        // Default: signal that the implementation doesn't support pinned reads.
+        // Callers must fall back to read_page(&mut self) via write lock.
+        Err(FrankenError::internal(
+            "read_page_pinned not supported by this WalBackend; use read_page",
+        ))
+    }
+
+    /// Whether this backend supports `read_page_pinned` (shared-lock reads).
+    ///
+    /// Callers check this before choosing the read vs write lock path.
+    fn supports_pinned_reads(&self) -> bool {
+        false
+    }
 
     /// Count committed transactions that occur after the latest committed
     /// frame for `page_number` in the current visible WAL snapshot.

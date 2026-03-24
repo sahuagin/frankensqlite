@@ -1086,6 +1086,44 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Ok(Some(data))
     }
 
+    // bd-db300.3.8.7: shared-lock read path for pinned snapshots.
+    fn read_page_pinned(&self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
+        let snapshot = self.read_snapshot.as_ref().ok_or_else(|| {
+            FrankenError::internal(
+                "read_page_pinned called without a pinned read snapshot; \
+                 use read_page(&mut self) or call begin_transaction first",
+            )
+        })?;
+        if snapshot.last_commit_frame.is_none() {
+            return Ok(None);
+        }
+
+        let resolution = self.resolve_visible_frame(cx, snapshot, page_number)?;
+        let Some(frame_index) = resolution.frame_index() else {
+            return Ok(None);
+        };
+
+        let mut frame_buf = vec![0u8; self.wal.frame_size()];
+        let header = self.wal.read_frame_into(cx, frame_index, &mut frame_buf)?;
+
+        if header.page_number != page_number {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL page index integrity failure: expected page {page_number} \
+                     at frame {frame_index}, found page {}",
+                    header.page_number
+                ),
+            });
+        }
+
+        let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
+        Ok(Some(data))
+    }
+
+    fn supports_pinned_reads(&self) -> bool {
+        self.read_snapshot.is_some()
+    }
+
     fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
         let snapshot = if let Some(snapshot) = self.read_snapshot.clone() {
             snapshot

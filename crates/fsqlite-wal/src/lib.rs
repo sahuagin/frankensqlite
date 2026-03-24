@@ -7,6 +7,7 @@ pub mod cell_delta_wal;
 pub mod checkpoint;
 pub mod checkpoint_executor;
 pub mod checksum;
+#[cfg(test)]
 pub mod commit_path_histograms;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod fault_hooks;

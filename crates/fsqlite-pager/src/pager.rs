@@ -144,12 +144,22 @@ impl GroupCommitQueue {
                 .get(&target_epoch)
                 .cloned();
             if let Some(detail) = failed_detail {
+                // bd-db300.3.8.1: wake reason = failed_epoch
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .failed_epoch
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 return Err(FrankenError::internal(format!(
                     "group commit flush failed for epoch {target_epoch}: {detail}"
                 )));
             }
 
             if self.is_epoch_complete(target_epoch) {
+                // bd-db300.3.8.1: wake reason = notify (epoch completed)
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .notify
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 return Ok(WaitForEpochOutcome::Completed);
             }
 
@@ -157,6 +167,11 @@ impl GroupCommitQueue {
                 && guard.epoch().checked_add(1) == Some(target_epoch)
                 && guard.claim_flusher_vacancy()
             {
+                // bd-db300.3.8.1: wake reason = flusher_takeover
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .flusher_takeover
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 let batches = guard.begin_flush()?;
                 return Ok(WaitForEpochOutcome::TakeOverFlusher {
                     flush_epoch: guard.epoch(),
@@ -169,11 +184,22 @@ impl GroupCommitQueue {
             // writing but before notifying). The 200ms timeout is long enough
             // to avoid spurious wakeup overhead but short enough to recover
             // from genuine notification loss within a reasonable window.
-            let (new_guard, _timeout_result) = self
+            let (new_guard, timeout_result) = self
                 .flush_complete
                 .wait_timeout(guard, std::time::Duration::from_millis(200))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = new_guard;
+
+            // bd-db300.3.8.1: wake reason = timeout (condvar timed out without notify)
+            if timeout_result.timed_out() {
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .timeout
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            // If not timed out but no condition met → spurious wakeup or busy-retry.
+            // We don't count spurious wakeups as a separate reason — the loop retries
+            // and the next iteration will record the actual outcome.
         }
     }
 }
@@ -196,14 +222,40 @@ type GroupCommitQueueRef = Arc<GroupCommitQueue>;
 
 /// Thread-safe shared WAL backend for split-lock commit protocol.
 ///
-/// We retain an `RwLock` here because WAL publication is still split from
-/// `inner.lock()`, but page lookup paths currently take write access as well:
-/// the `WalBackend` lookup methods mutate backend snapshot state.
+/// The `RwLock` enables split-lock access: page-lookup paths that support
+/// pinned reads take a shared (read) lock, while mutation paths (append,
+/// sync, begin_transaction) take an exclusive (write) lock.
+///
+/// # bd-db300.3.8.7: write-lock-scope narrowing
+///
+/// Before this change, all WAL access went through `with_wal_backend` which
+/// always took the write lock. Now, `with_wal_backend_read` takes only the
+/// read lock for `read_page_pinned` when the backend supports pinned reads.
 pub type SharedWalBackend = Arc<std::sync::RwLock<Option<Box<dyn WalBackend>>>>;
 
 /// Create a new empty shared WAL backend.
 fn new_shared_wal_backend() -> SharedWalBackend {
     Arc::new(std::sync::RwLock::new(None))
+}
+
+/// Read access to WAL backend (read_page_pinned, frame_count).
+///
+/// Takes only a shared (read) lock on the WAL backend RwLock. This allows
+/// multiple concurrent readers without blocking the append path, and the
+/// append path without blocking readers.
+///
+/// # bd-db300.3.8.7
+fn with_wal_backend_read<T>(
+    wal_backend: &SharedWalBackend,
+    f: impl FnOnce(&dyn WalBackend) -> Result<T>,
+) -> Result<T> {
+    let guard = wal_backend
+        .read()
+        .map_err(|_| FrankenError::internal("SharedWalBackend lock poisoned"))?;
+    let wal = guard
+        .as_deref()
+        .ok_or_else(|| FrankenError::internal("WAL mode active but no WAL backend installed"))?;
+    f(wal)
 }
 
 /// Write access to WAL backend (append_frames, sync, set_wal_backend).
@@ -384,11 +436,25 @@ impl<F: VfsFile> PagerInner<F> {
         page_no: PageNumber,
     ) -> Result<Vec<u8>> {
         // In WAL mode, check the WAL for the latest version of the page first.
+        // bd-db300.3.8.7: try shared-lock path when the backend supports pinned reads.
         if self.journal_mode == JournalMode::Wal {
-            if let Some(wal_data) =
-                with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?
-            {
-                return Ok(wal_data);
+            let wal_result = with_wal_backend_read(wal_backend, |wal| {
+                if wal.supports_pinned_reads() {
+                    wal.read_page_pinned(cx, page_no.get())
+                } else {
+                    // Pinned reads not available — signal fallback.
+                    Err(FrankenError::internal("pinned_reads_unavailable"))
+                }
+            });
+            let wal_data = match wal_result {
+                Ok(data) => data,
+                Err(_) => {
+                    // Fallback: take write lock for unpinned read.
+                    with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?
+                }
+            };
+            if let Some(data) = wal_data {
+                return Ok(data);
             }
         }
 
@@ -440,11 +506,22 @@ impl<F: VfsFile> PagerInner<F> {
         wal_backend: &SharedWalBackend,
         page_no: PageNumber,
     ) -> Result<Vec<u8>> {
-        if self.journal_mode == JournalMode::Wal
-            && let Some(wal_data) =
-                with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?
-        {
-            return Ok(wal_data);
+        // bd-db300.3.8.7: try shared-lock path first for WAL reads.
+        if self.journal_mode == JournalMode::Wal {
+            let wal_result = with_wal_backend_read(wal_backend, |wal| {
+                if wal.supports_pinned_reads() {
+                    wal.read_page_pinned(cx, page_no.get())
+                } else {
+                    Err(FrankenError::internal("pinned_reads_unavailable"))
+                }
+            });
+            let wal_data = match wal_result {
+                Ok(data) => data,
+                Err(_) => with_wal_backend(wal_backend, |wal| wal.read_page(cx, page_no.get()))?,
+            };
+            if let Some(data) = wal_data {
+                return Ok(data);
+            }
         }
 
         let page_size = self.page_size.as_usize();
@@ -3912,6 +3989,11 @@ where
                             let delay_ms = base_delay_ms.saturating_add(jitter_ms);
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                             GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
+                            // bd-db300.3.8.1: wake reason = busy_retry
+                            GLOBAL_CONSOLIDATION_METRICS
+                                .wake_reasons
+                                .busy_retry
+                                .fetch_add(1, AtomicOrdering::Relaxed);
                         }
                         _ => break,
                     }
@@ -4354,12 +4436,24 @@ where
             return Ok(cached.clone());
         }
 
-        // WAL mode fast path: read from WAL via write lock (needs &mut self for snapshot updates).
+        // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
         if self.journal_mode == JournalMode::Wal {
-            if let Ok(Some(wal_data)) =
-                with_wal_backend(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
-            {
-                let page = PageData::from_vec(wal_data);
+            let wal_data = match with_wal_backend_read(&self.wal_backend, |wal| {
+                if wal.supports_pinned_reads() {
+                    wal.read_page_pinned(cx, page_no.get())
+                } else {
+                    Err(FrankenError::internal("pinned_reads_unavailable"))
+                }
+            }) {
+                Ok(data) => data,
+                Err(_) => {
+                    // Fallback to write lock for unpinned reads.
+                    with_wal_backend(&self.wal_backend, |wal| wal.read_page(cx, page_no.get()))
+                        .unwrap_or(None)
+                }
+            };
+            if let Some(data) = wal_data {
+                let page = PageData::from_vec(data);
                 self.txn_read_cache
                     .borrow_mut()
                     .insert(page_no, page.clone());

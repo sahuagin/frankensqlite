@@ -37,7 +37,10 @@
 use fsqlite_types::sync_primitives::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -175,7 +178,7 @@ const PHASE_HISTOGRAM_CAPACITY: usize = 4096;
 
 pub struct PhaseHistogram {
     /// Circular sample buffer.
-    samples: [AtomicU64; PHASE_HISTOGRAM_CAPACITY],
+    samples: Box<[AtomicU64]>,
     /// Monotonic write index (wraps via modulo).
     write_idx: AtomicU64,
     /// Running max (updated atomically on each record).
@@ -187,10 +190,13 @@ pub struct PhaseHistogram {
 }
 
 impl PhaseHistogram {
-    pub const fn new() -> Self {
-        const ZERO: AtomicU64 = AtomicU64::new(0);
+    #[must_use]
+    pub fn new() -> Self {
+        let samples: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(PHASE_HISTOGRAM_CAPACITY)
+            .collect();
         Self {
-            samples: [ZERO; PHASE_HISTOGRAM_CAPACITY],
+            samples: samples.into_boxed_slice(),
             write_idx: AtomicU64::new(0),
             max_us: AtomicU64::new(0),
             count: AtomicU64::new(0),
@@ -273,6 +279,12 @@ impl PhaseHistogram {
         self.max_us.store(0, Ordering::Relaxed);
         self.count.store(0, Ordering::Relaxed);
         self.sum_us.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for PhaseHistogram {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -442,7 +454,7 @@ pub struct ConsolidationMetrics {
 impl ConsolidationMetrics {
     /// Create zeroed metrics.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             groups_flushed: AtomicU64::new(0),
             frames_consolidated: AtomicU64::new(0),
@@ -971,7 +983,12 @@ impl std::fmt::Display for ConsolidationMetricsSnapshot {
 }
 
 /// Global consolidation metrics singleton.
-pub static GLOBAL_CONSOLIDATION_METRICS: ConsolidationMetrics = ConsolidationMetrics::new();
+pub static GLOBAL_CONSOLIDATION_METRICS: LazyLock<ConsolidationMetrics> =
+    LazyLock::new(ConsolidationMetrics::new);
+
+#[cfg(test)]
+pub(crate) static GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
+    LazyLock::new(|| std::sync::Mutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Group commit consolidator (single-threaded core)
@@ -1399,8 +1416,8 @@ pub fn write_consolidated_frames<F: VfsFile>(
 #[cfg(test)]
 mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
-    use fsqlite_vfs::traits::Vfs;
     use fsqlite_vfs::MemoryVfs;
+    use fsqlite_vfs::traits::Vfs;
 
     use super::*;
     use crate::checksum::WalSalts;
@@ -1434,6 +1451,23 @@ mod tests {
             .open(cx, Some(std::path::Path::new("test.db-wal")), flags)
             .expect("open WAL file");
         file
+    }
+
+    struct ResetGlobalConsolidationMetrics;
+
+    impl Drop for ResetGlobalConsolidationMetrics {
+        fn drop(&mut self) {
+            GLOBAL_CONSOLIDATION_METRICS.reset();
+        }
+    }
+
+    fn with_global_consolidation_metrics<T>(body: impl FnOnce() -> T) -> T {
+        let _guard = GLOBAL_CONSOLIDATION_METRICS_TEST_LOCK
+            .lock()
+            .expect("global consolidation metrics test lock poisoned");
+        let _reset = ResetGlobalConsolidationMetrics;
+        GLOBAL_CONSOLIDATION_METRICS.reset();
+        body()
     }
 
     // ── Consolidator state machine tests ──
@@ -1962,19 +1996,19 @@ mod tests {
     /// Reduction: N/1 = N (for N=10, reduction = 10x).
     #[test]
     fn test_fsync_reduction_deterministic_proof() {
-        GLOBAL_CONSOLIDATION_METRICS.reset();
+        with_global_consolidation_metrics(|| {
+            let n = 10_u64;
+            GLOBAL_CONSOLIDATION_METRICS.record_flush(n * 2, n, 1000);
 
-        let n = 10_u64;
-        GLOBAL_CONSOLIDATION_METRICS.record_flush(n * 2, n, 1000);
-
-        let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
-        assert_eq!(snap.fsyncs_total, 1);
-        assert_eq!(snap.transactions_batched, n);
-        assert_eq!(
-            snap.fsync_reduction_ratio(),
-            n,
-            "10 transactions in 1 fsync = 10x reduction"
-        );
+            let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            assert_eq!(snap.fsyncs_total, 1);
+            assert_eq!(snap.transactions_batched, n);
+            assert_eq!(
+                snap.fsync_reduction_ratio(),
+                n,
+                "10 transactions in 1 fsync = 10x reduction"
+            );
+        });
     }
 
     // ── Config validation tests ──
@@ -2223,46 +2257,44 @@ mod tests {
 
     #[test]
     fn consolidation_metrics_snapshot_includes_distributions() {
-        GLOBAL_CONSOLIDATION_METRICS.reset();
+        with_global_consolidation_metrics(|| {
+            for i in 0..10u64 {
+                GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                    10 + i,
+                    5 + i,
+                    2,
+                    true,
+                    20 + i,
+                    3 + i,
+                    8 + i,
+                    50 + i,
+                    30 + i,
+                    0,
+                );
+            }
+            for i in 0..5u64 {
+                GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
+                    10 + i,
+                    5 + i,
+                    2,
+                    false,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    100 + i,
+                );
+            }
 
-        for i in 0..10u64 {
-            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                10 + i,
-                5 + i,
-                2,
-                true,
-                20 + i,
-                3 + i,
-                8 + i,
-                50 + i,
-                30 + i,
-                0,
-            );
-        }
-        for i in 0..5u64 {
-            GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                10 + i,
-                5 + i,
-                2,
-                false,
-                0,
-                0,
-                0,
-                0,
-                0,
-                100 + i,
-            );
-        }
-
-        let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
-        assert_eq!(snap.hist_consolidator_lock_wait.count, 15);
-        assert_eq!(snap.hist_arrival_wait.count, 10);
-        assert_eq!(snap.hist_wal_append.count, 10);
-        assert_eq!(snap.hist_waiter_epoch_wait.count, 5);
-        assert_eq!(snap.hist_phase_b.count, 15);
-        assert!(snap.hist_wal_append.p50 > 0);
-        assert!(snap.hist_wal_append.max >= 59);
-
-        GLOBAL_CONSOLIDATION_METRICS.reset();
+            let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+            assert_eq!(snap.hist_consolidator_lock_wait.count, 15);
+            assert_eq!(snap.hist_arrival_wait.count, 10);
+            assert_eq!(snap.hist_wal_append.count, 10);
+            assert_eq!(snap.hist_waiter_epoch_wait.count, 5);
+            assert_eq!(snap.hist_phase_b.count, 15);
+            assert!(snap.hist_wal_append.p50 > 0);
+            assert!(snap.hist_wal_append.max >= 59);
+        });
     }
 }
