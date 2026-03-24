@@ -5242,10 +5242,7 @@ impl Connection {
             }
             // bd-db300.4.5.2: Reuse the already-bound publication instead of
             // calling bind_pager_publication again inside reload_memdb_from_pager.
-            self.reload_memdb_from_pager_with_prebound_publication(
-                cx,
-                &publication,
-            )?;
+            self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)?;
         }
         Ok(publication)
     }
@@ -5319,10 +5316,7 @@ impl Connection {
                     // bd-db300.4.5.2: Reuse the publication that
                     // try_refresh_prepared_metadata_if_stale already bound,
                     // avoiding a redundant bind_pager_publication call.
-                    self.reload_memdb_from_pager_with_prebound_publication(
-                        cx,
-                        &publication,
-                    )?;
+                    self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)?;
                     if hot_path_profile_enabled() {
                         FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
                     }
@@ -7533,7 +7527,9 @@ impl Connection {
                 } else if (has_group_by(select)
                     || has_implicit_aggregation(select)
                     || ordered_aggregate)
-                    && (has_joins(select) || has_fallback_from_source(select) || self.has_primary_live_vtab_source(select))
+                    && (has_joins(select)
+                        || has_fallback_from_source(select)
+                        || self.has_primary_live_vtab_source(select))
                 {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
@@ -11853,11 +11849,13 @@ impl Connection {
                         // must not re-enter the connection through vtab callbacks.
                         self.dropped_vtab_instances.borrow_mut().clear();
                         self.live_vtab_registry_undo.borrow_mut().clear();
-                        // Capture time-travel snapshot for :memory: DDL commits
-                        // before returning from the fast path.
-                        if capture_time_travel_snapshot {
-                            if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
-                                self.emit_differential_commit_invalidations(committed_seq);
+                        // Emit differential subscriber invalidations for ALL
+                        // committed writes (not just DDL) so that subscribers
+                        // tracking DML changes also receive their events.
+                        if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
+                            self.emit_differential_commit_invalidations(committed_seq);
+                            // Capture time-travel snapshot only for DDL commits.
+                            if capture_time_travel_snapshot {
                                 self.capture_time_travel_snapshot(committed_seq.get());
                             }
                         }
@@ -13645,11 +13643,8 @@ impl Connection {
             //   args[1] = database name ("main")
             //   args[2] = table name
             //   args[3..] = module arguments from the CREATE statement
-            let mut full_args: Vec<String> = vec![
-                create.module.clone(),
-                "main".to_owned(),
-                table_name.clone(),
-            ];
+            let mut full_args: Vec<String> =
+                vec![create.module.clone(), "main".to_owned(), table_name.clone()];
             full_args.extend(create.args.iter().cloned());
             let arg_strs: Vec<&str> = full_args.iter().map(String::as_str).collect();
             let cx = self.op_cx()?;
@@ -16516,9 +16511,17 @@ impl Connection {
                             drop(handle);
                             snapshot
                         }
-                        Some(_) | None => {
+                        Some(handle) => {
+                            // Handle was already marked aborted by
+                            // prepare_concurrent_commit_with_ssi — capture
+                            // whatever evidence we can before giving up.
+                            let snapshot = Self::capture_ssi_snapshot(&handle);
+                            drop(handle);
+                            snapshot
+                        }
+                        None => {
                             return Err(FrankenError::Internal(
-                                "MVCC session invalid or inactive".to_owned(),
+                                "MVCC session missing during commit planning".to_owned(),
                             ));
                         }
                     };
@@ -70984,7 +70987,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_file_backed_insert_reuses_schema_bound_publication_for_autocommit_begin() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("prepared_insert_publication_reuse.db");
@@ -71047,7 +71049,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_file_backed_single_writer_insert_reuses_schema_bound_publication() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir
@@ -71267,7 +71268,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_insert_reuses_table_engine_after_first_execution() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71321,7 +71321,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_update_reuses_table_engine_after_first_execution() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_update_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71374,7 +71373,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_delete_reuses_table_engine_after_first_execution() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE prep_delete_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
@@ -71539,7 +71537,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_prepared_delete_fast_path_rechecks_foreign_key_pragma_dynamically() {
-        let _serial = super::fsqlite_core_test_serializer();
         let _profile_guard = StatementReuseHotPathProfileGuard::new();
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("PRAGMA foreign_keys = OFF;").unwrap();

@@ -25,18 +25,18 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use fsqlite_btree::BtreeCopyProfileSnapshot;
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
+    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 
-use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use crate::HarnessSettings;
+use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use crate::fixture_select::{BenchmarkArtifactCommand, BenchmarkArtifactToolVersion};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::{EngineRunReport, HotPathRetryBreakdown, WalHotPathProfile};
-use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
-use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -4893,12 +4893,16 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Sqlite3
+                && c.fixture_id == "fix1"
+                && c.concurrency == 1)
+        );
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Fsqlite
+                && c.fixture_id == "fix2"
+                && c.concurrency == 4)
+        );
     }
 
     fn focused_perf_workspace_root() -> PathBuf {
@@ -5301,39 +5305,55 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## B-Tree Copy Kernel Targets"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## Baseline Reuse Ledger"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## MVCC Write Path"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## PageData Motion"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## Baseline Waste Ledger"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## Wall-Time Decomposition"));
-        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
-            .unwrap()
-            .contains("## Causal Classification"));
-        assert!(actionable_ranking
-            .named_hotspots
-            .iter()
-            .flat_map(|entry| entry.mapped_beads.iter())
-            .any(|bead| bead == "bd-db300.10.2"
-                || bead == "bd-db300.5.2.1"
-                || bead == "bd-db300.5.5.1"
-                || bead == "bd-db300.10.3"
-                || bead == "bd-db300.10.4"
-                || bead == "bd-db300.10.5"
-                || bead == "bd-db300.10.6"
-                || bead == "bd-db300.10.7"));
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## B-Tree Copy Kernel Targets")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Baseline Reuse Ledger")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## MVCC Write Path")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## PageData Motion")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Baseline Waste Ledger")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Wall-Time Decomposition")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Causal Classification")
+        );
+        assert!(
+            actionable_ranking
+                .named_hotspots
+                .iter()
+                .flat_map(|entry| entry.mapped_beads.iter())
+                .any(|bead| bead == "bd-db300.10.2"
+                    || bead == "bd-db300.5.2.1"
+                    || bead == "bd-db300.5.5.1"
+                    || bead == "bd-db300.10.3"
+                    || bead == "bd-db300.10.4"
+                    || bead == "bd-db300.10.5"
+                    || bead == "bd-db300.10.6"
+                    || bead == "bd-db300.10.7")
+        );
         assert_eq!(actionable_ranking.cost_components.len(), 4);
         let wall_component_names = actionable_ranking
             .wall_time_components
@@ -5400,30 +5420,37 @@ mod tests {
             Some(5_288)
         );
         assert!(!actionable_ranking.causal_classification.mixed_or_ambiguous);
-        assert!(actionable_ranking
-            .microarchitectural_signatures
-            .iter()
-            .all(|entry| entry.fixture_id == report.fixture_id));
-        assert!(actionable_ranking
-            .microarchitectural_signatures
-            .iter()
-            .all(
-                |entry| entry.row_id.as_deref() == Some(microarchitectural_context.row_id.as_str())
-            ));
-        assert!(actionable_ranking
-            .microarchitectural_signatures
-            .iter()
-            .all(|entry| entry.mode_id.as_deref()
-                == Some(microarchitectural_context.mode_id.as_str())));
-        assert!(actionable_ranking
-            .microarchitectural_signatures
-            .iter()
-            .all(
-                |entry| entry.placement_profile_id.as_deref() == Some("baseline_unpinned")
-                    && entry.hardware_class_id.as_deref() == Some("linux_x86_64_any")
-                    && entry.hardware_signature.as_deref() == Some("linux:x86_64:any")
-                    && !entry.evidence_sources.is_empty()
-            ));
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.fixture_id == report.fixture_id)
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.row_id.as_deref()
+                    == Some(microarchitectural_context.row_id.as_str()))
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.mode_id.as_deref()
+                    == Some(microarchitectural_context.mode_id.as_str()))
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(
+                    |entry| entry.placement_profile_id.as_deref() == Some("baseline_unpinned")
+                        && entry.hardware_class_id.as_deref() == Some("linux_x86_64_any")
+                        && entry.hardware_signature.as_deref() == Some("linux:x86_64:any")
+                        && !entry.evidence_sources.is_empty()
+                )
+        );
         let component_names = actionable_ranking
             .cost_components
             .iter()
@@ -5433,10 +5460,12 @@ mod tests {
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
         assert!(component_names.contains(&"page_data_motion"));
-        assert!(actionable_ranking
-            .allocator_pressure
-            .iter()
-            .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty()));
+        assert!(
+            actionable_ranking
+                .allocator_pressure
+                .iter()
+                .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty())
+        );
 
         let parser_component = actionable_ranking
             .cost_components

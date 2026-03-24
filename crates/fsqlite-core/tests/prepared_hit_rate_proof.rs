@@ -37,12 +37,8 @@ fn test_prepared_fast_lane_hit_rate_on_c1_workload() {
         .unwrap();
 
     // Prepare statements (one per table, as the real executor does).
-    let stmt0 = conn
-        .prepare("INSERT INTO t0 VALUES(?1, ?2)")
-        .unwrap();
-    let stmt1 = conn
-        .prepare("INSERT INTO t1 VALUES(?1, ?2)")
-        .unwrap();
+    let stmt0 = conn.prepare("INSERT INTO t0 VALUES(?1, ?2)").unwrap();
+    let stmt1 = conn.prepare("INSERT INTO t1 VALUES(?1, ?2)").unwrap();
 
     // Warm: one execution per table to establish baseline.
     stmt0
