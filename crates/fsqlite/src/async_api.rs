@@ -35,9 +35,9 @@
 
 use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
 use fsqlite_types::cx::Cx;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
 // ---------------------------------------------------------------------------
@@ -101,16 +101,26 @@ enum Command {
 /// A `Future` that polls an `mpsc::Receiver` for a single value.
 ///
 /// Uses `try_recv` to avoid blocking the async runtime. When the value is not
-/// yet available, registers a waker that will be triggered by a background
-/// thread polling the receiver. This is a minimal oneshot implementation to
-/// avoid pulling in additional async channel crates.
+/// yet available, a single background waker thread is spawned that blocks on
+/// the receiver and wakes the task when the value arrives. Subsequent polls
+/// before the value is ready simply update the stored waker (in case the
+/// executor migrated the task to a new waker) without spawning additional
+/// threads.
 struct OneshotFuture<T> {
     rx: Option<mpsc::Receiver<T>>,
+    /// Shared waker slot: the waker thread reads from this so it always wakes
+    /// the most-recently-registered waker (handles executor waker rotation).
+    /// `None` before the first `Empty` poll; `Some` once the waker thread has
+    /// been spawned.
+    shared_waker: Option<Arc<std::sync::Mutex<Option<std::task::Waker>>>>,
 }
 
 impl<T> OneshotFuture<T> {
     fn new(rx: mpsc::Receiver<T>) -> Self {
-        Self { rx: Some(rx) }
+        Self {
+            rx: Some(rx),
+            shared_waker: None,
+        }
     }
 }
 
@@ -139,34 +149,47 @@ where
                 )))
             }
             Err(mpsc::TryRecvError::Empty) => {
-                // Spawn a helper thread to wait for the result and wake the task.
-                // This is a pragmatic approach that avoids depending on a full
-                // async channel implementation. Each pending poll spawns at most
-                // one waker thread; the thread exits as soon as the value arrives
-                // or the sender disconnects.
-                let waker = task_cx.waker().clone();
-                let rx_clone = this.rx.take().unwrap();
-                let (ready_tx, ready_rx) = mpsc::sync_channel::<T>(1);
+                if let Some(ref shared) = this.shared_waker {
+                    // Waker thread already running — just update the waker in
+                    // case the executor rotated it (common with work-stealing
+                    // schedulers).
+                    let mut guard = shared.lock().expect("waker mutex poisoned");
+                    *guard = Some(task_cx.waker().clone());
+                } else {
+                    // First time we see Empty — spawn one helper thread that
+                    // blocks on the receiver and wakes the task when the value
+                    // arrives or the sender disconnects.
+                    let shared = Arc::new(std::sync::Mutex::new(Some(task_cx.waker().clone())));
+                    this.shared_waker = Some(Arc::clone(&shared));
 
-                thread::Builder::new()
-                    .name("fsqlite-async-waker".into())
-                    .spawn(move || {
-                        // Block until the worker sends the result.
-                        match rx_clone.recv() {
-                            Ok(val) => {
-                                let _ = ready_tx.send(val);
-                            }
-                            Err(_) => {
-                                // Sender dropped — will surface as Disconnected on next poll.
-                            }
-                        }
-                        waker.wake();
-                    })
-                    .expect("failed to spawn async waker thread");
+                    let rx_taken = this.rx.take().unwrap();
+                    let (ready_tx, ready_rx) = mpsc::sync_channel::<T>(1);
 
-                // Replace our receiver with the forwarding channel so the next
-                // poll reads from it.
-                this.rx = Some(ready_rx);
+                    thread::Builder::new()
+                        .name("fsqlite-async-waker".into())
+                        .spawn(move || {
+                            // Block until the worker sends the result.
+                            match rx_taken.recv() {
+                                Ok(val) => {
+                                    let _ = ready_tx.send(val);
+                                }
+                                Err(_) => {
+                                    // Sender dropped — will surface as
+                                    // Disconnected on next poll.
+                                }
+                            }
+                            // Wake the latest waker (may differ from the one
+                            // captured at spawn time if the executor rotated).
+                            if let Some(w) = shared.lock().expect("waker mutex poisoned").take() {
+                                w.wake();
+                            }
+                        })
+                        .expect("failed to spawn async waker thread");
+
+                    // Replace our receiver with the forwarding channel so the
+                    // next poll reads from it.
+                    this.rx = Some(ready_rx);
+                }
                 std::task::Poll::Pending
             }
         }
@@ -320,9 +343,7 @@ impl AsyncConnection {
         // Block on the open result (sync path, no async executor needed).
         open_rx
             .recv()
-            .map_err(|_| {
-                FrankenError::Internal("worker thread terminated during open".to_owned())
-            })?
+            .map_err(|_| FrankenError::Internal("worker thread terminated during open".to_owned()))?
             .map(|()| Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
@@ -375,17 +396,13 @@ impl AsyncConnection {
 
     /// Return a reference to the command sender, or an error if the worker is gone.
     fn sender(&self) -> Result<&mpsc::SyncSender<Command>, FrankenError> {
-        self.cmd_tx.as_ref().ok_or_else(|| {
-            FrankenError::Internal("AsyncConnection has been closed".to_owned())
-        })
+        self.cmd_tx
+            .as_ref()
+            .ok_or_else(|| FrankenError::Internal("AsyncConnection has been closed".to_owned()))
     }
 
     /// Execute a SQL query and return all result rows.
-    pub async fn query<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-        sql: &str,
-    ) -> Result<Vec<Row>, FrankenError>
+    pub async fn query<Caps>(&self, cx: &Cx<Caps>, sql: &str) -> Result<Vec<Row>, FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -423,11 +440,7 @@ impl AsyncConnection {
     }
 
     /// Execute a query and return exactly one row.
-    pub async fn query_row<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-        sql: &str,
-    ) -> Result<Row, FrankenError>
+    pub async fn query_row<Caps>(&self, cx: &Cx<Caps>, sql: &str) -> Result<Row, FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -465,11 +478,7 @@ impl AsyncConnection {
     }
 
     /// Execute SQL and return the number of affected/output rows.
-    pub async fn execute<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-        sql: &str,
-    ) -> Result<usize, FrankenError>
+    pub async fn execute<Caps>(&self, cx: &Cx<Caps>, sql: &str) -> Result<usize, FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -507,11 +516,7 @@ impl AsyncConnection {
     }
 
     /// Execute zero or more SQL statements separated by semicolons.
-    pub async fn execute_batch<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-        sql: &str,
-    ) -> Result<(), FrankenError>
+    pub async fn execute_batch<Caps>(&self, cx: &Cx<Caps>, sql: &str) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -527,10 +532,7 @@ impl AsyncConnection {
     }
 
     /// Begin a transaction.
-    pub async fn begin_transaction<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-    ) -> Result<(), FrankenError>
+    pub async fn begin_transaction<Caps>(&self, cx: &Cx<Caps>) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -547,10 +549,7 @@ impl AsyncConnection {
     }
 
     /// Commit the active transaction.
-    pub async fn commit_transaction<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-    ) -> Result<(), FrankenError>
+    pub async fn commit_transaction<Caps>(&self, cx: &Cx<Caps>) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -567,10 +566,7 @@ impl AsyncConnection {
     }
 
     /// Roll back the active transaction.
-    pub async fn rollback_transaction<Caps>(
-        &self,
-        cx: &Cx<Caps>,
-    ) -> Result<(), FrankenError>
+    pub async fn rollback_transaction<Caps>(&self, cx: &Cx<Caps>) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -598,10 +594,7 @@ impl AsyncConnection {
     ///
     /// After this call, all subsequent operations will return an error.
     /// The worker thread is joined before returning.
-    pub async fn close<Caps>(
-        &mut self,
-        cx: &Cx<Caps>,
-    ) -> Result<(), FrankenError>
+    pub async fn close<Caps>(&mut self, cx: &Cx<Caps>) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     {
@@ -674,12 +667,9 @@ mod tests {
                 .await
                 .expect("open should succeed");
 
-            conn.execute(
-                &cx,
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
-            )
-            .await
-            .expect("create table should succeed");
+            conn.execute(&cx, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+                .await
+                .expect("create table should succeed");
 
             conn.execute_with_params(
                 &cx,
@@ -695,10 +685,7 @@ mod tests {
                 .expect("query should succeed");
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(0), Some(&SqliteValue::Integer(1)));
-            assert_eq!(
-                rows[0].get(1),
-                Some(&SqliteValue::Text("hello".into()))
-            );
+            assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("hello".into())));
 
             let row = conn
                 .query_row(&cx, "SELECT name FROM t WHERE id = 1")
@@ -802,10 +789,7 @@ mod tests {
             cx.cancel();
 
             let result = conn.execute(&cx, "SELECT 1").await;
-            assert!(
-                result.is_err(),
-                "operation should fail after cancellation"
-            );
+            assert!(result.is_err(), "operation should fail after cancellation");
             match result.unwrap_err() {
                 FrankenError::Interrupt => {}
                 other => panic!("expected Interrupt, got: {other}"),
@@ -842,12 +826,9 @@ mod tests {
                 .await
                 .expect("open should succeed");
 
-            conn.execute_batch(
-                &cx,
-                "CREATE TABLE a (x INTEGER); CREATE TABLE b (y TEXT);",
-            )
-            .await
-            .expect("batch should succeed");
+            conn.execute_batch(&cx, "CREATE TABLE a (x INTEGER); CREATE TABLE b (y TEXT);")
+                .await
+                .expect("batch should succeed");
 
             // Verify both tables exist.
             let _ = conn.query(&cx, "SELECT * FROM a").await.expect("table a");
