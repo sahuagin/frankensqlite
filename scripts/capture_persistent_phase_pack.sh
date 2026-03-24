@@ -228,6 +228,38 @@ def format_us_triplet(row):
     return f"{row['p50']}/{row['p95']}/{row['p99']}"
 
 
+def median_nested(rows, *keys):
+    return median_value([nested_get(row, *keys) for row in rows])
+
+
+def format_optional_us(value):
+    if value is None:
+        return "n/a"
+    return f"{int(value)}us"
+
+
+def format_signed_us(value):
+    if value is None:
+        return "n/a"
+    value = int(value)
+    return f"+{value}us" if value > 0 else f"{value}us"
+
+
+def format_retry_stage_counts(stage_counts):
+    if not stage_counts:
+        return "n/a"
+    values = [
+        stage_counts.get("retry_stage_begin_retries_median"),
+        stage_counts.get("retry_stage_body_retries_median"),
+        stage_counts.get("retry_stage_commit_retries_median"),
+        stage_counts.get("retry_stage_duplicate_after_retry_exits_median"),
+        stage_counts.get("retry_stage_total_retries_median"),
+    ]
+    if any(value is None for value in values):
+        return "n/a"
+    return "/".join(str(int(value)) for value in values)
+
+
 def parse_interval(body):
     matches = re.findall(r"([0-9]+(?:\.[0-9]+)?)\s*([KMG]?elem/s)", body)
     if len(matches) != 3:
@@ -347,16 +379,84 @@ for label in thread_labels:
         for metric in ("p50", "p95", "p99")
     }
     phase_metric_rows = [row for row in fsqlite_rows if isinstance(row.get("phase_metrics"), dict)]
+    wall_audit_rows = [
+        row for row in fsqlite_rows
+        if isinstance(row.get("operation_wall_time_audit"), dict)
+    ]
     phase_metrics_medians = {
-        "arrival_wait_p95_us": median_value([nested_get(row, "phase_metrics", "hist_arrival_wait", "p95") for row in phase_metric_rows]),
-        "wal_backend_lock_wait_p99_us": median_value([nested_get(row, "phase_metrics", "hist_wal_backend_lock_wait", "p99") for row in phase_metric_rows]),
-        "wal_append_p99_us": median_value([nested_get(row, "phase_metrics", "hist_wal_append", "p99") for row in phase_metric_rows]),
-        "phase_b_p99_us": median_value([nested_get(row, "phase_metrics", "hist_phase_b", "p99") for row in phase_metric_rows]),
-        "waiter_epoch_wait_p99_us": median_value([nested_get(row, "phase_metrics", "hist_waiter_epoch_wait", "p99") for row in phase_metric_rows]),
-        "wake_timeout_median": median_value([nested_get(row, "phase_metrics", "wake_reasons", "timeout") for row in phase_metric_rows]),
-        "wake_flusher_takeover_median": median_value([nested_get(row, "phase_metrics", "wake_reasons", "flusher_takeover") for row in phase_metric_rows]),
-        "wake_notify_median": median_value([nested_get(row, "phase_metrics", "wake_reasons", "notify") for row in phase_metric_rows]),
+        "arrival_wait_p95_us": median_nested(phase_metric_rows, "phase_metrics", "hist_arrival_wait", "p95"),
+        "wal_backend_lock_wait_p99_us": median_nested(phase_metric_rows, "phase_metrics", "hist_wal_backend_lock_wait", "p99"),
+        "wal_append_p99_us": median_nested(phase_metric_rows, "phase_metrics", "hist_wal_append", "p99"),
+        "phase_b_p99_us": median_nested(phase_metric_rows, "phase_metrics", "hist_phase_b", "p99"),
+        "waiter_epoch_wait_p99_us": median_nested(phase_metric_rows, "phase_metrics", "hist_waiter_epoch_wait", "p99"),
+        "wake_timeout_median": median_nested(phase_metric_rows, "phase_metrics", "wake_reasons", "timeout"),
+        "wake_flusher_takeover_median": median_nested(phase_metric_rows, "phase_metrics", "wake_reasons", "flusher_takeover"),
+        "wake_notify_median": median_nested(phase_metric_rows, "phase_metrics", "wake_reasons", "notify"),
         "lock_topology_limited_sample_count": sum(1 for row in fsqlite_rows if row.get("lock_topology_limited") is True),
+    }
+    operation_wall_time_audit_medians = {
+        "wall_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "wall_time", "avg_us_per_operation"),
+        "begin_retry_handoff_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "begin_retry_handoff", "avg_us_per_operation"),
+        "statement_execute_body_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "statement_execute_body", "avg_us_per_operation"),
+        "commit_roundtrip_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "commit_roundtrip", "avg_us_per_operation"),
+        "rollback_cleanup_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "rollback_cleanup", "avg_us_per_operation"),
+        "retry_backoff_sleep_avg_us_per_operation": median_nested(wall_audit_rows, "operation_wall_time_audit", "retry_backoff_sleep", "avg_us_per_operation"),
+        "commit_center_avg_us_per_recorded_commit": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "measured_commit_sub_buckets",
+            "commit_center",
+            "avg_us_per_recorded_commit",
+        ),
+        "post_commit_cleanup_publish_avg_us_per_recorded_commit": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "measured_commit_sub_buckets",
+            "post_commit_cleanup_publish",
+            "avg_us_per_recorded_commit",
+        ),
+        "measured_commit_roundtrip_gap_avg_us_per_recorded_commit": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "measured_commit_roundtrip_gap",
+            "avg_us_per_recorded_commit",
+        ),
+        "measured_commit_roundtrip_gap_abs_fraction_basis_points": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "measured_commit_roundtrip_gap",
+            "abs_fraction_basis_points",
+        ),
+        "residual_avg_us_per_operation": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "residual",
+            "avg_us_per_operation",
+        ),
+        "residual_abs_fraction_basis_points": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "residual",
+            "abs_fraction_basis_points",
+        ),
+        "retry_stage_begin_retries_median": median_nested(
+            wall_audit_rows, "operation_wall_time_audit", "retry_stage_counts", "begin_retries"
+        ),
+        "retry_stage_body_retries_median": median_nested(
+            wall_audit_rows, "operation_wall_time_audit", "retry_stage_counts", "body_retries"
+        ),
+        "retry_stage_commit_retries_median": median_nested(
+            wall_audit_rows, "operation_wall_time_audit", "retry_stage_counts", "commit_retries"
+        ),
+        "retry_stage_duplicate_after_retry_exits_median": median_nested(
+            wall_audit_rows,
+            "operation_wall_time_audit",
+            "retry_stage_counts",
+            "duplicate_after_retry_exits",
+        ),
+        "retry_stage_total_retries_median": median_nested(
+            wall_audit_rows, "operation_wall_time_audit", "retry_stage_counts", "total_retries"
+        ),
     }
 
     regime["latency_medians_us"] = {
@@ -365,6 +465,8 @@ for label in thread_labels:
     }
     regime["latency_ratio_vs_sqlite"] = latency_ratios
     regime["phase_metrics_medians"] = phase_metrics_medians
+    regime["operation_wall_time_audit_sample_count"] = len(wall_audit_rows)
+    regime["operation_wall_time_audit_medians"] = operation_wall_time_audit_medians
 
     throughput_ratio = None
     comparator_state = "missing_criterion_comparator"
@@ -425,6 +527,44 @@ for label in thread_labels:
             else f"lock_topology_limited was true in {phase_metrics_medians['lock_topology_limited_sample_count']} captured MVCC samples"
         ),
     ]
+    if wall_audit_rows:
+        measured_reasons.append(
+            "end-to-end wall avg/op median {} with begin/retry-handoff {}, statement body {}, commit roundtrip {}, rollback cleanup {}, retry backoff {}, residual {} ({} bp of wall)".format(
+                format_optional_us(operation_wall_time_audit_medians["wall_avg_us_per_operation"]),
+                format_optional_us(operation_wall_time_audit_medians["begin_retry_handoff_avg_us_per_operation"]),
+                format_optional_us(operation_wall_time_audit_medians["statement_execute_body_avg_us_per_operation"]),
+                format_optional_us(operation_wall_time_audit_medians["commit_roundtrip_avg_us_per_operation"]),
+                format_optional_us(operation_wall_time_audit_medians["rollback_cleanup_avg_us_per_operation"]),
+                format_optional_us(operation_wall_time_audit_medians["retry_backoff_sleep_avg_us_per_operation"]),
+                format_signed_us(operation_wall_time_audit_medians["residual_avg_us_per_operation"]),
+                "n/a"
+                if operation_wall_time_audit_medians["residual_abs_fraction_basis_points"] is None
+                else int(operation_wall_time_audit_medians["residual_abs_fraction_basis_points"]),
+            )
+        )
+        measured_reasons.append(
+            "measured commit center/post-commit medians are {commit_center}/{post_commit} per recorded commit; commit roundtrip gap is {commit_gap} ({commit_gap_bp} bp of roundtrip), which captures commit-side wall time the old commit-center-only view hid".format(
+                commit_center=format_optional_us(
+                    operation_wall_time_audit_medians["commit_center_avg_us_per_recorded_commit"]
+                ),
+                post_commit=format_optional_us(
+                    operation_wall_time_audit_medians["post_commit_cleanup_publish_avg_us_per_recorded_commit"]
+                ),
+                commit_gap=format_signed_us(
+                    operation_wall_time_audit_medians["measured_commit_roundtrip_gap_avg_us_per_recorded_commit"]
+                ),
+                commit_gap_bp="n/a"
+                if operation_wall_time_audit_medians["measured_commit_roundtrip_gap_abs_fraction_basis_points"] is None
+                else int(operation_wall_time_audit_medians["measured_commit_roundtrip_gap_abs_fraction_basis_points"]),
+            )
+        )
+        measured_reasons.append(
+            "retry stage count medians begin/body/commit/duplicate-after-retry/total = {}".format(
+                format_retry_stage_counts(operation_wall_time_audit_medians)
+            )
+        )
+    else:
+        measured_reasons.append("operation wall-time audit is unavailable in captured MVCC samples")
     if missing_artifacts:
         regime["coverage_state"] = "incomplete"
         regime["verdict"] = "incomplete"
@@ -471,7 +611,7 @@ honest_gate_summary = {
 }
 
 scorecard = {
-    "schema_version": "bd-db300.persistent_phase_pack_scorecard.v2",
+    "schema_version": "bd-db300.persistent_phase_pack_scorecard.v3",
     "bead_id": bead_id,
     "run_id": output_dir.name,
     "entrypoint": "scripts/capture_persistent_phase_pack.sh",
@@ -486,6 +626,12 @@ scorecard = {
         "comparator_engine": "sqlite3",
         "comparator_scope": "same thread regime, same pack",
         "aggregate_rows_are_secondary": True,
+    },
+    "operation_wall_time_audit_disclosure": {
+        "avg_us_per_operation": "median_of_per_sample_averages",
+        "avg_us_per_recorded_commit": "median_of_per_sample_averages",
+        "retry_stage_counts": "median_of_per_sample_counts",
+        "not_a_per_operation_quantile": True,
     },
     "honest_gate_summary": honest_gate_summary,
     "critical_regimes": critical_regimes,
@@ -531,7 +677,7 @@ summary_lines = [
     f"- run_id: `{output_dir.name}`",
     "- baseline_comparator: same-pack `sqlite3` Criterion + `samples.jsonl` rows when present",
     f"- critical_regimes: `{', '.join(regime['regime_id'] for regime in critical_regimes)}`",
-    "- disclosure: `samples.jsonl` mixes warmup and measurement; use it for phase and wake-reason truth, not headline throughput without the Criterion comparator`",
+    "- disclosure: `samples.jsonl` mixes warmup and measurement; use it for phase and wake-reason truth, not headline throughput without the Criterion comparator",
     "",
     "## Honest Gate Summary",
     "",
@@ -565,6 +711,35 @@ for regime in critical_regimes:
             wal_append_p99="n/a" if phase_metrics.get("wal_append_p99_us") is None else int(phase_metrics["wal_append_p99_us"]),
             phase_b_p99="n/a" if phase_metrics.get("phase_b_p99_us") is None else int(phase_metrics["phase_b_p99_us"]),
             lock_topology_count=phase_metrics.get("lock_topology_limited_sample_count", "n/a"),
+        )
+    )
+
+summary_lines.extend([
+    "",
+    "## End-to-End Wall-Time Audit (FrankenSQLite Median-of-Per-Sample Averages)",
+    "",
+    "- disclosure: `avg/op` and `avg/recorded` columns below are medians of per-sample averages from captured MVCC samples; they are not per-operation p50/p95 quantiles.",
+    "",
+    "| Regime | Wall avg/op | Begin/retry-handoff avg/op | Commit roundtrip avg/op | Commit center avg/recorded | Post-commit avg/recorded | Commit roundtrip gap avg/recorded | Rollback avg/op | Backoff avg/op | Residual avg/op | Retry medians begin/body/commit/dup/total |",
+    "|--------|-------------|----------------------------|-------------------------|----------------------------|--------------------------|-----------------------------------|-----------------|----------------|-----------------|-------------------------------------------|",
+])
+for regime in critical_regimes:
+    wall_audit = regime.get("operation_wall_time_audit_medians", {})
+    summary_lines.append(
+        "| {regime_id} | {wall_avg} | {begin_retry_handoff} | {commit_roundtrip} | {commit_center} | {post_commit} | {commit_gap} | {rollback} | {backoff} | {residual} | {retry_counts} |".format(
+            regime_id=regime["regime_id"],
+            wall_avg=format_optional_us(wall_audit.get("wall_avg_us_per_operation")),
+            begin_retry_handoff=format_optional_us(
+                wall_audit.get("begin_retry_handoff_avg_us_per_operation")
+            ),
+            commit_roundtrip=format_optional_us(wall_audit.get("commit_roundtrip_avg_us_per_operation")),
+            commit_center=format_optional_us(wall_audit.get("commit_center_avg_us_per_recorded_commit")),
+            post_commit=format_optional_us(wall_audit.get("post_commit_cleanup_publish_avg_us_per_recorded_commit")),
+            commit_gap=format_signed_us(wall_audit.get("measured_commit_roundtrip_gap_avg_us_per_recorded_commit")),
+            rollback=format_optional_us(wall_audit.get("rollback_cleanup_avg_us_per_operation")),
+            backoff=format_optional_us(wall_audit.get("retry_backoff_sleep_avg_us_per_operation")),
+            residual=format_signed_us(wall_audit.get("residual_avg_us_per_operation")),
+            retry_counts=format_retry_stage_counts(wall_audit),
         )
     )
 

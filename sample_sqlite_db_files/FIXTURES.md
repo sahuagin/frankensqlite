@@ -327,6 +327,10 @@ Discovery tags are best-effort hints. Current heuristics include:
   `wal` as a derived tag for selection convenience.
 - Tag-based selection for `run/bench/corrupt` can be built on top of metadata/manifest
   (future work); today the CLI prints tags during scan/import.
+- Fixtures that fail stock `sqlite3` open or `PRAGMA integrity_check` are still useful, but they
+  are **not** clean compatibility baselines. Keep them tagged as `invalid` or `corrupt`, keep
+  `safety.allowed_for_ci=false`, and use them for recovery/corruption testing rather than normal
+  golden-parity runs.
 
 ## Sensitivity and PII Policy
 

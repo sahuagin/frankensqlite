@@ -27,6 +27,7 @@
   },
   "tags": [
     "agent-mail",
+    "corrupt",
     "fts",
     "large",
     "many-indexes",

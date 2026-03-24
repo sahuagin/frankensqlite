@@ -724,6 +724,41 @@ fn full_compat_round_trip() {
     assert_eq!(count, 3, "Charlie should be committed");
 }
 
+#[test]
+fn multi_row_upsert_with_foreign_keys_uses_fallback_without_failing() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE parent (
+             id INTEGER PRIMARY KEY
+         );
+         CREATE TABLE child (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER NOT NULL REFERENCES parent(id),
+             value INTEGER NOT NULL
+         );
+         INSERT INTO parent (id) VALUES (1), (2);
+         INSERT INTO child (id, parent_id, value) VALUES (1, 1, 10);",
+    )
+    .unwrap();
+
+    conn.execute_compat(
+        "INSERT INTO child (id, parent_id, value) VALUES (?1, ?2, ?3), (?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET value = child.value + excluded.value",
+        params![1_i64, 1_i64, 5_i64, 2_i64, 2_i64, 7_i64],
+    )
+    .unwrap();
+
+    let rows: Vec<(i64, i64)> = conn
+        .query_map_collect(
+            "SELECT id, value FROM child ORDER BY id",
+            params![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, vec![(1, 15), (2, 7)]);
+}
+
 // ===========================================================================
 // 11. RUSQLITE PARITY (golden tests)
 // ===========================================================================
