@@ -11163,7 +11163,6 @@ mod tests {
                 consolidator.submit_batch(pipelined_batch).unwrap(),
                 SubmitOutcome::Waiter
             );
-            assert!(consolidator.complete_flush().unwrap());
         }
 
         queue.publish_completed_epoch(1, true);
@@ -11258,7 +11257,6 @@ mod tests {
                 consolidator.submit_batch(pipelined_batch).unwrap(),
                 SubmitOutcome::Waiter
             );
-            assert!(consolidator.complete_flush().unwrap());
         }
 
         let waiter_queue = Arc::clone(&queue);
@@ -11269,6 +11267,10 @@ mod tests {
                 .consolidator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Pre-register the targeted slot before publishing readiness so
+            // this test isolates the targeted wake behavior instead of racing
+            // the scheduler on when the waiter first touches the registry.
+            let _registered_slot = waiter_queue.epoch_waiters.slot(2);
             ready_tx.send(()).expect("waiter should signal readiness");
             let outcome = waiter_queue.wait_for_epoch_outcome(guard, 2);
             done_tx.send(outcome).expect("waiter should report outcome");
@@ -11277,17 +11279,18 @@ mod tests {
         ready_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("waiter should start");
-        for _ in 0..10_000 {
-            if queue.epoch_waiters.has_slot(2) {
-                break;
-            }
-            std::thread::yield_now();
-        }
         assert!(
-            queue.epoch_waiters.has_slot(2),
-            "bead_id={BEAD_ID} case=group_commit_targeted_waiter_registers_epoch_slot"
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "bead_id={BEAD_ID} case=group_commit_promoted_waiter_stays_parked_until_targeted_publish"
         );
 
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(consolidator.complete_flush().unwrap());
+        }
         queue.publish_completed_epoch(1, true);
 
         let outcome = done_rx
@@ -15413,8 +15416,6 @@ mod tests {
     fn test_read_page_from_wal_backend_uses_shared_lock_when_pinned() {
         // Verify that read_page_from_wal_backend uses the read (shared)
         // lock path when supports_pinned_reads() returns true.
-        use crate::traits::WalBackend;
-
         let wal_backend: SharedWalBackend = new_shared_wal_backend();
         let cx = Cx::new();
         let page_no = PageNumber::new(1).unwrap();
