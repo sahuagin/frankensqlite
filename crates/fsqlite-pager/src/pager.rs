@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
@@ -51,6 +51,130 @@ use fsqlite_wal::{
 // - fsync overhead: N commits × fsync → 1 group × fsync
 // - Cache-line ping-pong: N lock acquisitions → 1 flusher + N-1 condvar waits
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // LegacyCondvarTimeout is a compile-time alternative to KeyedEventcount
+enum WaitPathMode {
+    KeyedEventcount,
+    LegacyCondvarTimeout,
+}
+
+impl WaitPathMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyedEventcount => "keyed_eventcount",
+            Self::LegacyCondvarTimeout => "legacy_condvar_timeout",
+        }
+    }
+}
+
+const GROUP_COMMIT_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
+const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
+const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedWaitResult {
+    Signaled,
+    TimedOut,
+}
+
+#[derive(Debug, Default)]
+struct KeyedWaitSlot {
+    state: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl KeyedWaitSlot {
+    fn generation(&self) -> u64 {
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn wait_for_change(&self, observed_generation: u64, timeout: Duration) -> KeyedWaitResult {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *guard != observed_generation {
+            return KeyedWaitResult::Signaled;
+        }
+        let (_guard, timeout_result) = self
+            .cv
+            .wait_timeout_while(guard, timeout, |generation| {
+                *generation == observed_generation
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if timeout_result.timed_out() {
+            KeyedWaitResult::TimedOut
+        } else {
+            KeyedWaitResult::Signaled
+        }
+    }
+
+    fn signal(&self) {
+        let mut generation = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.saturating_add(1);
+        self.cv.notify_all();
+    }
+}
+
+#[derive(Debug, Default)]
+struct KeyedWaitRegistry {
+    slots: Mutex<HashMap<u64, Weak<KeyedWaitSlot>>>,
+}
+
+impl KeyedWaitRegistry {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn slot(&self, key: u64) -> Arc<KeyedWaitSlot> {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.retain(|_, slot| slot.strong_count() > 0);
+        if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
+            return slot;
+        }
+        let slot = Arc::new(KeyedWaitSlot::default());
+        slots.insert(key, Arc::downgrade(&slot));
+        slot
+    }
+
+    fn signal(&self, key: u64) -> bool {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            slots.get(&key).and_then(Weak::upgrade)
+        };
+        if let Some(slot) = slot {
+            slot.signal();
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn has_slot(&self, key: u64) -> bool {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .is_some_and(|slot| slot.strong_count() > 0)
+    }
+}
+
 /// Per-database group commit queue for WAL write consolidation.
 struct GroupCommitQueue {
     /// The consolidator managing FILLING→FLUSHING→COMPLETE phases.
@@ -63,6 +187,8 @@ struct GroupCommitQueue {
     /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
     /// a failed flush after a newer epoch completes successfully.
     failed_epochs: Mutex<HashMap<u64, String>>,
+    /// Narrow per-target-epoch wake slots for waiter coordination.
+    epoch_waiters: KeyedWaitRegistry,
 }
 
 #[derive(Debug)]
@@ -81,6 +207,7 @@ impl GroupCommitQueue {
             flush_complete: Condvar::new(),
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
+            epoch_waiters: KeyedWaitRegistry::new(),
         }
     }
 
@@ -89,7 +216,7 @@ impl GroupCommitQueue {
     /// We take the consolidator mutex before publishing so a waiter cannot
     /// observe an incomplete epoch, race with notify, and then go to sleep
     /// forever on a lost wakeup.
-    fn publish_completed_epoch(&self, epoch: u64) {
+    fn publish_completed_epoch(&self, epoch: u64, wake_next_epoch: bool) {
         let _guard = self
             .consolidator
             .lock()
@@ -100,17 +227,25 @@ impl GroupCommitQueue {
         // storing the completed epoch. Waiters must recover via wait_timeout.
         #[cfg(any(test, feature = "fault-injection"))]
         if crate::fault_hooks::maybe_inject_drop_condvar_notify(epoch) {
+            tracing::trace!(
+                target: "fsqlite::wal::epoch_wait",
+                wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                published_epoch = epoch,
+                wake_next_epoch,
+                fallback = "timeout_recheck",
+                "suppressed direct waiter wake after completion publish"
+            );
             return;
         }
 
-        self.flush_complete.notify_all();
+        self.signal_completed_epoch_waiters(epoch, wake_next_epoch);
     }
 
     /// Publish a failed epoch and wake all waiters.
     ///
     /// This uses the same mutex discipline as `publish_completed_epoch` so
     /// waiter condition checks and condvar parking stay synchronized.
-    fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError) {
+    fn publish_failed_epoch(&self, epoch: u64, error: &FrankenError, wake_next_epoch: bool) {
         let _guard = self
             .consolidator
             .lock()
@@ -121,7 +256,7 @@ impl GroupCommitQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         failed_epochs.insert(epoch, error.to_string());
         drop(failed_epochs);
-        self.flush_complete.notify_all();
+        self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -129,77 +264,205 @@ impl GroupCommitQueue {
         self.completed_epoch.load(AtomicOrdering::Acquire) >= epoch
     }
 
-    /// Wait for the target epoch to either complete successfully, fail, or be
-    /// taken over by this waiter if the promoted epoch lost its original flusher.
-    fn wait_for_epoch_outcome(
+    fn signal_completed_epoch_waiters(&self, epoch: u64, wake_next_epoch: bool) {
+        match GROUP_COMMIT_WAIT_PATH_MODE {
+            WaitPathMode::KeyedEventcount => {
+                let woke_target_epoch = self.epoch_waiters.signal(epoch);
+                let woke_next_epoch = wake_next_epoch
+                    && epoch
+                        .checked_add(1)
+                        .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
+                tracing::trace!(
+                    target: "fsqlite::wal::epoch_wait",
+                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                    published_epoch = epoch,
+                    wake_next_epoch,
+                    woke_target_epoch,
+                    woke_next_epoch,
+                    "published completed epoch to targeted waiters"
+                );
+            }
+            WaitPathMode::LegacyCondvarTimeout => self.flush_complete.notify_all(),
+        }
+    }
+
+    fn signal_failed_epoch_waiters(&self, epoch: u64, wake_next_epoch: bool) {
+        match GROUP_COMMIT_WAIT_PATH_MODE {
+            WaitPathMode::KeyedEventcount => {
+                let woke_failed_epoch = self.epoch_waiters.signal(epoch);
+                let woke_next_epoch = wake_next_epoch
+                    && epoch
+                        .checked_add(1)
+                        .is_some_and(|next_epoch| self.epoch_waiters.signal(next_epoch));
+                tracing::trace!(
+                    target: "fsqlite::wal::epoch_wait",
+                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                    failed_epoch = epoch,
+                    wake_next_epoch,
+                    woke_failed_epoch,
+                    woke_next_epoch,
+                    "published failed epoch to targeted waiters"
+                );
+            }
+            WaitPathMode::LegacyCondvarTimeout => self.flush_complete.notify_all(),
+        }
+    }
+
+    fn observe_epoch_outcome(
+        &self,
+        guard: &mut std::sync::MutexGuard<'_, GroupCommitConsolidator>,
+        target_epoch: u64,
+    ) -> Result<Option<WaitForEpochOutcome>> {
+        let failed_detail = self
+            .failed_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&target_epoch)
+            .cloned();
+        if let Some(detail) = failed_detail {
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .failed_epoch
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::trace!(
+                target: "fsqlite::wal::epoch_wait",
+                wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                wake_reason = "failed_epoch",
+                target_epoch,
+                "waiter observed failed epoch"
+            );
+            return Err(FrankenError::internal(format!(
+                "group commit flush failed for epoch {target_epoch}: {detail}"
+            )));
+        }
+
+        if self.is_epoch_complete(target_epoch) {
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .notify
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::trace!(
+                target: "fsqlite::wal::epoch_wait",
+                wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                wake_reason = "notify",
+                target_epoch,
+                completed_epoch = self.completed_epoch.load(AtomicOrdering::Acquire),
+                "waiter observed completed epoch"
+            );
+            return Ok(Some(WaitForEpochOutcome::Completed));
+        }
+
+        if guard.has_flusher_vacancy()
+            && guard.epoch().checked_add(1) == Some(target_epoch)
+            && guard.claim_flusher_vacancy()
+        {
+            GLOBAL_CONSOLIDATION_METRICS
+                .wake_reasons
+                .flusher_takeover
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::trace!(
+                target: "fsqlite::wal::epoch_wait",
+                wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                wake_reason = "flusher_takeover",
+                target_epoch,
+                current_epoch = guard.epoch(),
+                "waiter claimed promoted flusher vacancy"
+            );
+            let batches = guard.begin_flush()?;
+            return Ok(Some(WaitForEpochOutcome::TakeOverFlusher {
+                flush_epoch: guard.epoch(),
+                batches,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    fn wait_for_epoch_outcome_legacy(
         &self,
         mut guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
         target_epoch: u64,
     ) -> Result<WaitForEpochOutcome> {
         loop {
-            let failed_detail = self
-                .failed_epochs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&target_epoch)
-                .cloned();
-            if let Some(detail) = failed_detail {
-                // bd-db300.3.8.1: wake reason = failed_epoch
-                GLOBAL_CONSOLIDATION_METRICS
-                    .wake_reasons
-                    .failed_epoch
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                return Err(FrankenError::internal(format!(
-                    "group commit flush failed for epoch {target_epoch}: {detail}"
-                )));
+            if let Some(outcome) = self.observe_epoch_outcome(&mut guard, target_epoch)? {
+                return Ok(outcome);
             }
 
-            if self.is_epoch_complete(target_epoch) {
-                // bd-db300.3.8.1: wake reason = notify (epoch completed)
-                GLOBAL_CONSOLIDATION_METRICS
-                    .wake_reasons
-                    .notify
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                return Ok(WaitForEpochOutcome::Completed);
-            }
-
-            if guard.has_flusher_vacancy()
-                && guard.epoch().checked_add(1) == Some(target_epoch)
-                && guard.claim_flusher_vacancy()
-            {
-                // bd-db300.3.8.1: wake reason = flusher_takeover
-                GLOBAL_CONSOLIDATION_METRICS
-                    .wake_reasons
-                    .flusher_takeover
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                let batches = guard.begin_flush()?;
-                return Ok(WaitForEpochOutcome::TakeOverFlusher {
-                    flush_epoch: guard.epoch(),
-                    batches,
-                });
-            }
-
-            // Bounded wait: use wait_timeout to prevent permanent hangs if
-            // the Condvar notification is lost (e.g., flusher panics after
-            // writing but before notifying). The 200ms timeout is long enough
-            // to avoid spurious wakeup overhead but short enough to recover
-            // from genuine notification loss within a reasonable window.
             let (new_guard, timeout_result) = self
                 .flush_complete
-                .wait_timeout(guard, std::time::Duration::from_millis(200))
+                .wait_timeout(guard, GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = new_guard;
 
-            // bd-db300.3.8.1: wake reason = timeout (condvar timed out without notify)
             if timeout_result.timed_out() {
                 GLOBAL_CONSOLIDATION_METRICS
                     .wake_reasons
                     .timeout
                     .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::trace!(
+                    target: "fsqlite::wal::epoch_wait",
+                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                    wake_reason = "timeout",
+                    target_epoch,
+                    "legacy waiter timeout fallback fired"
+                );
             }
-            // If not timed out but no condition met → spurious wakeup or busy-retry.
-            // We don't count spurious wakeups as a separate reason — the loop retries
-            // and the next iteration will record the actual outcome.
+        }
+    }
+
+    fn wait_for_epoch_outcome_keyed<'a>(
+        &'a self,
+        mut guard: std::sync::MutexGuard<'a, GroupCommitConsolidator>,
+        target_epoch: u64,
+    ) -> Result<WaitForEpochOutcome> {
+        loop {
+            if let Some(outcome) = self.observe_epoch_outcome(&mut guard, target_epoch)? {
+                return Ok(outcome);
+            }
+
+            let slot = self.epoch_waiters.slot(target_epoch);
+            let observed_generation = slot.generation();
+            if let Some(outcome) = self.observe_epoch_outcome(&mut guard, target_epoch)? {
+                return Ok(outcome);
+            }
+
+            drop(guard);
+            let wait_result =
+                slot.wait_for_change(observed_generation, GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK);
+            guard = self
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            if wait_result == KeyedWaitResult::TimedOut {
+                GLOBAL_CONSOLIDATION_METRICS
+                    .wake_reasons
+                    .timeout
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                tracing::trace!(
+                    target: "fsqlite::wal::epoch_wait",
+                    wait_strategy = GROUP_COMMIT_WAIT_PATH_MODE.as_str(),
+                    wake_reason = "timeout",
+                    target_epoch,
+                    fallback = "timeout_recheck",
+                    "keyed epoch waiter timeout fallback fired"
+                );
+            }
+        }
+    }
+
+    /// Wait for the target epoch to either complete successfully, fail, or be
+    /// taken over by this waiter if the promoted epoch lost its original flusher.
+    fn wait_for_epoch_outcome(
+        &self,
+        guard: std::sync::MutexGuard<'_, GroupCommitConsolidator>,
+        target_epoch: u64,
+    ) -> Result<WaitForEpochOutcome> {
+        match GROUP_COMMIT_WAIT_PATH_MODE {
+            WaitPathMode::KeyedEventcount => self.wait_for_epoch_outcome_keyed(guard, target_epoch),
+            WaitPathMode::LegacyCondvarTimeout => {
+                self.wait_for_epoch_outcome_legacy(guard, target_epoch)
+            }
         }
     }
 }
@@ -1369,6 +1632,7 @@ struct PublishedPagerState {
     publish_lock: Mutex<()>,
     sequence_gate: Mutex<()>,
     sequence_cv: Condvar,
+    sequence_waiters: KeyedWaitRegistry,
     sequence: AtomicU64,
     visible_commit_seq: AtomicU64,
     db_size: AtomicU32,
@@ -1394,6 +1658,7 @@ impl PublishedPagerState {
             publish_lock: Mutex::new(()),
             sequence_gate: Mutex::new(()),
             sequence_cv: Condvar::new(),
+            sequence_waiters: KeyedWaitRegistry::new(),
             sequence: AtomicU64::new(2),
             visible_commit_seq: AtomicU64::new(visible_commit_seq.get()),
             db_size: AtomicU32::new(db_size),
@@ -1405,6 +1670,29 @@ impl PublishedPagerState {
             read_retry_count: StripedCounter64::new(),
             published_page_hits: StripedCounter64::new(),
             pages: ShardedPublishedPages::new(),
+        }
+    }
+
+    fn signal_sequence_waiters(&self, observed_sequence: u64, stage: &'static str) {
+        match PUBLISHED_SEQUENCE_WAIT_PATH_MODE {
+            WaitPathMode::KeyedEventcount => {
+                let woke_waiters = self.sequence_waiters.signal(observed_sequence);
+                tracing::trace!(
+                    target: "fsqlite.snapshot_publication",
+                    run_id = "pager-publication",
+                    scenario_id = "sequence_wait_signal",
+                    observed_sequence,
+                    stage,
+                    wait_strategy = PUBLISHED_SEQUENCE_WAIT_PATH_MODE.as_str(),
+                    publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                    woke_waiters,
+                    "signaled targeted publication waiters"
+                );
+            }
+            WaitPathMode::LegacyCondvarTimeout if stage == "publish_complete" => {
+                self.sequence_cv.notify_all();
+            }
+            WaitPathMode::LegacyCondvarTimeout => {}
         }
     }
 
@@ -1491,7 +1779,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         if should_clear {
             self.pages.clear();
@@ -1509,7 +1798,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         self.pages.remove(page_no);
         let page_set_size = self.pages.len();
@@ -1525,7 +1815,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         let page_set_size = self.pages.len();
 
@@ -1540,7 +1831,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         self.pages.retain(|page_no| page_no.get() <= max_page);
         self.pages.remove(PageNumber::ONE);
@@ -1562,7 +1854,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         // Retain pages within db_size
         self.pages.retain(|page_no| page_no.get() <= update.db_size);
@@ -1593,7 +1886,8 @@ impl PublishedPagerState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         self.pages.insert(page_no, page);
         let page_set_size = self.pages.len();
@@ -1610,7 +1904,8 @@ impl PublishedPagerState {
         page: PageData,
     ) {
         let start = Instant::now();
-        self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
         self.pages.insert(page_no, page);
         let page_set_size = self.pages.len();
@@ -1647,11 +1942,9 @@ impl PublishedPagerState {
             .store(update.checkpoint_active, AtomicOrdering::Release);
         self.page_set_size
             .store(page_set_size, AtomicOrdering::Release);
-        let snapshot_gen = self
-            .sequence
-            .fetch_add(1, AtomicOrdering::AcqRel)
-            .saturating_add(1);
-        self.sequence_cv.notify_all();
+        let previous_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        let snapshot_gen = previous_sequence.saturating_add(1);
+        self.signal_sequence_waiters(previous_sequence, "publish_complete");
         tracing::trace!(
             target: "fsqlite.snapshot_publication",
             trace_id = cx.trace_id(),
@@ -1678,16 +1971,43 @@ impl PublishedPagerState {
     }
 
     fn wait_for_sequence_change(&self, observed_sequence: u64, timeout: Duration) {
-        let guard = self
-            .sequence_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (_guard, _timeout) = self
-            .sequence_cv
-            .wait_timeout_while(guard, timeout, |()| {
-                self.sequence.load(AtomicOrdering::Acquire) == observed_sequence
-            })
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match PUBLISHED_SEQUENCE_WAIT_PATH_MODE {
+            WaitPathMode::KeyedEventcount => {
+                if self.sequence.load(AtomicOrdering::Acquire) != observed_sequence {
+                    return;
+                }
+                let slot = self.sequence_waiters.slot(observed_sequence);
+                let observed_generation = slot.generation();
+                if self.sequence.load(AtomicOrdering::Acquire) != observed_sequence {
+                    return;
+                }
+                let wait_result = slot.wait_for_change(observed_generation, timeout);
+                tracing::trace!(
+                    target: "fsqlite.snapshot_publication",
+                    run_id = "pager-publication",
+                    scenario_id = match wait_result {
+                        KeyedWaitResult::Signaled => "sequence_wait_woke",
+                        KeyedWaitResult::TimedOut => "sequence_wait_timeout_fallback",
+                    },
+                    observed_sequence,
+                    wait_strategy = PUBLISHED_SEQUENCE_WAIT_PATH_MODE.as_str(),
+                    publication_mode = SNAPSHOT_PUBLICATION_MODE,
+                    "publication wait finished"
+                );
+            }
+            WaitPathMode::LegacyCondvarTimeout => {
+                let guard = self
+                    .sequence_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (_guard, _timeout) = self
+                    .sequence_cv
+                    .wait_timeout_while(guard, timeout, |()| {
+                        self.sequence.load(AtomicOrdering::Acquire) == observed_sequence
+                    })
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
     }
 
     fn read_retry_count(&self) -> u64 {
@@ -4008,14 +4328,17 @@ where
                                 frame_count,
                             )
                         {
-                            let abort_result = {
+                            let (abort_result, wake_next_epoch) = {
                                 let mut consolidator = queue
                                     .consolidator
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                consolidator.abort_flush()
+                                let abort_result = consolidator.abort_flush();
+                                let wake_next_epoch =
+                                    abort_result.is_ok() && consolidator.has_flusher_vacancy();
+                                (abort_result, wake_next_epoch)
                             };
-                            queue.publish_failed_epoch(flush_epoch, &error);
+                            queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                             if let Err(abort_error) = abort_result {
                                 return Err(FrankenError::internal(format!(
                                     "group commit flush hook failed for epoch {flush_epoch} and abort_flush also failed: hook={error}; abort={abort_error}"
@@ -4091,8 +4414,7 @@ where
                             let promoted = consolidator.complete_flush()?;
                             (consolidator.epoch(), promoted)
                         };
-
-                        queue.publish_completed_epoch(completed_epoch);
+                        queue.publish_completed_epoch(completed_epoch, has_promoted);
 
                         if has_promoted {
                             record_initial_metrics = false;
@@ -4102,14 +4424,17 @@ where
                         }
                     }
                     Err(error) => {
-                        let abort_result = {
+                        let (abort_result, wake_next_epoch) = {
                             let mut consolidator = queue
                                 .consolidator
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            consolidator.abort_flush()
+                            let abort_result = consolidator.abort_flush();
+                            let wake_next_epoch =
+                                abort_result.is_ok() && consolidator.has_flusher_vacancy();
+                            (abort_result, wake_next_epoch)
                         };
-                        queue.publish_failed_epoch(flush_epoch, &error);
+                        queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
                         if let Err(abort_error) = abort_result {
                             return Err(FrankenError::internal(format!(
                                 "group commit flush failed for epoch {flush_epoch} and abort_flush also failed: flush={error}; abort={abort_error}"
@@ -10721,8 +11046,9 @@ mod tests {
         queue.publish_failed_epoch(
             1,
             &FrankenError::internal("forced group commit flush failure"),
+            false,
         );
-        queue.publish_completed_epoch(2);
+        queue.publish_completed_epoch(2, false);
 
         let guard = queue
             .consolidator
@@ -10747,8 +11073,9 @@ mod tests {
         queue.publish_failed_epoch(
             1,
             &FrankenError::internal("forced group commit flush failure"),
+            false,
         );
-        queue.publish_completed_epoch(2);
+        queue.publish_completed_epoch(2, false);
 
         let guard = queue
             .consolidator
@@ -10775,7 +11102,7 @@ mod tests {
             started_tx
                 .send(())
                 .expect("publisher thread should signal start");
-            publish_queue.publish_completed_epoch(1);
+            publish_queue.publish_completed_epoch(1, false);
             done_tx
                 .send(())
                 .expect("publisher thread should signal completion");
@@ -10839,7 +11166,7 @@ mod tests {
             assert!(consolidator.complete_flush().unwrap());
         }
 
-        queue.publish_completed_epoch(1);
+        queue.publish_completed_epoch(1, true);
 
         let guard = queue
             .consolidator
@@ -10855,6 +11182,128 @@ mod tests {
         };
         assert_eq!(flush_epoch, 2);
         assert_eq!(batches.len(), 1);
+    }
+
+    #[test]
+    fn test_keyed_wait_registry_signals_only_target_key() {
+        let registry = Arc::new(KeyedWaitRegistry::new());
+        let slot_a = registry.slot(11);
+        let slot_b = registry.slot(17);
+        let generation_a = slot_a.generation();
+        let generation_b = slot_b.generation();
+        let (done_a_tx, done_a_rx) = std::sync::mpsc::channel();
+        let (done_b_tx, done_b_rx) = std::sync::mpsc::channel();
+
+        let waiter_a = std::thread::spawn(move || {
+            done_a_tx
+                .send(slot_a.wait_for_change(generation_a, Duration::from_secs(1)))
+                .expect("waiter A should report");
+        });
+        let waiter_b = std::thread::spawn(move || {
+            done_b_tx
+                .send(slot_b.wait_for_change(generation_b, Duration::from_secs(1)))
+                .expect("waiter B should report");
+        });
+
+        assert!(registry.signal(11));
+        assert_eq!(
+            done_a_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("targeted waiter should wake"),
+            KeyedWaitResult::Signaled,
+            "bead_id={BEAD_ID} case=keyed_wait_registry_wakes_target_key"
+        );
+        assert!(
+            done_b_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "bead_id={BEAD_ID} case=keyed_wait_registry_does_not_herd_wake_other_keys"
+        );
+        assert!(registry.signal(17));
+        assert_eq!(
+            done_b_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("second waiter should wake once signaled"),
+            KeyedWaitResult::Signaled,
+            "bead_id={BEAD_ID} case=keyed_wait_registry_wakes_second_key"
+        );
+
+        waiter_a.join().unwrap();
+        waiter_b.join().unwrap();
+    }
+
+    #[test]
+    fn test_group_commit_queue_promoted_waiter_wakes_on_targeted_publish() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x10),
+                db_size_if_commit: 1,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(batch1).unwrap(),
+                SubmitOutcome::Flusher
+            );
+            let _ = consolidator.begin_flush().unwrap();
+            let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x20),
+                db_size_if_commit: 2,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(pipelined_batch).unwrap(),
+                SubmitOutcome::Waiter
+            );
+            assert!(consolidator.complete_flush().unwrap());
+        }
+
+        let waiter_queue = Arc::clone(&queue);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let guard = waiter_queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ready_tx.send(()).expect("waiter should signal readiness");
+            let outcome = waiter_queue.wait_for_epoch_outcome(guard, 2);
+            done_tx.send(outcome).expect("waiter should report outcome");
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should start");
+        for _ in 0..10_000 {
+            if queue.epoch_waiters.has_slot(2) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            queue.epoch_waiters.has_slot(2),
+            "bead_id={BEAD_ID} case=group_commit_targeted_waiter_registers_epoch_slot"
+        );
+
+        queue.publish_completed_epoch(1, true);
+
+        let outcome = done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("targeted publish should wake the promoted waiter")
+            .expect("waiter should succeed");
+        let WaitForEpochOutcome::TakeOverFlusher {
+            flush_epoch,
+            batches,
+        } = outcome
+        else {
+            panic!("promoted epoch waiter should take over after targeted wake");
+        };
+        assert_eq!(flush_epoch, 2);
+        assert_eq!(batches.len(), 1);
+        waiter.join().unwrap();
     }
 
     #[test]
@@ -14746,6 +15195,100 @@ mod tests {
             snapshot.checkpoint_active,
             "bead_id={BEAD_ID} case=publication_retry_checkpoint_flag"
         );
+    }
+
+    #[test]
+    fn test_published_sequence_waiters_wake_on_targeted_transitions() {
+        init_publication_test_tracing();
+        let published = Arc::new(PublishedPagerState::new(
+            1,
+            CommitSeq::new(1),
+            JournalMode::Delete,
+            0,
+        ));
+        published.sequence.store(4, AtomicOrdering::Release);
+
+        let begin_plane = Arc::clone(&published);
+        let (begin_ready_tx, begin_ready_rx) = std::sync::mpsc::channel();
+        let (begin_done_tx, begin_done_rx) = std::sync::mpsc::channel();
+        let begin_waiter = std::thread::spawn(move || {
+            begin_ready_tx
+                .send(())
+                .expect("begin waiter should signal readiness");
+            begin_plane.wait_for_sequence_change(4, Duration::from_secs(1));
+            begin_done_tx
+                .send(())
+                .expect("begin waiter should signal completion");
+        });
+
+        begin_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("begin waiter should start");
+        for _ in 0..10_000 {
+            if published.sequence_waiters.has_slot(4) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            published.sequence_waiters.has_slot(4),
+            "bead_id={BEAD_ID} case=publication_begin_waiter_registers_targeted_slot"
+        );
+        assert!(
+            begin_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=publication_begin_waiter_stays_parked_until_targeted_signal"
+        );
+
+        let begin_sequence = published.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        assert_eq!(begin_sequence, 4);
+        published.signal_sequence_waiters(begin_sequence, "test_begin");
+        begin_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("publish-begin signal should wake matching waiter");
+        begin_waiter.join().unwrap();
+
+        let complete_plane = Arc::clone(&published);
+        let (complete_ready_tx, complete_ready_rx) = std::sync::mpsc::channel();
+        let (complete_done_tx, complete_done_rx) = std::sync::mpsc::channel();
+        let complete_waiter = std::thread::spawn(move || {
+            complete_ready_tx
+                .send(())
+                .expect("complete waiter should signal readiness");
+            complete_plane.wait_for_sequence_change(5, Duration::from_secs(1));
+            complete_done_tx
+                .send(())
+                .expect("complete waiter should signal completion");
+        });
+
+        complete_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("complete waiter should start");
+        for _ in 0..10_000 {
+            if published.sequence_waiters.has_slot(5) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            published.sequence_waiters.has_slot(5),
+            "bead_id={BEAD_ID} case=publication_complete_waiter_registers_targeted_slot"
+        );
+        assert!(
+            complete_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=publication_complete_waiter_stays_parked_until_targeted_signal"
+        );
+
+        let complete_sequence = published.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        assert_eq!(complete_sequence, 5);
+        published.signal_sequence_waiters(complete_sequence, "test_complete");
+        complete_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("publish-complete signal should wake matching waiter");
+        complete_waiter.join().unwrap();
     }
 
     fn run_parallel_counter_benchmark<F>(
