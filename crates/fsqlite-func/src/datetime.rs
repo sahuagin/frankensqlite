@@ -42,11 +42,11 @@ use crate::{FunctionRegistry, ScalarFunction};
 // for the *specific* datetime being converted so that DST transitions are
 // handled correctly (matching C SQLite's per-call localtime_r behaviour).
 
-/// Return the local UTC offset in seconds for the given date/time components.
+/// Return the UTC offset in seconds, interpreting the components as **local** time.
 ///
-/// Uses `chrono::Local` to determine the correct offset (including DST) for
-/// the specific instant rather than caching a single system-wide offset.
-fn utc_offset_for_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+/// Used by the `utc` modifier (local → UTC): the input JDN is local time,
+/// so we ask chrono "what UTC offset applies at this local time?"
+fn utc_offset_for_local_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
     use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
     let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
     let time = NaiveTime::from_hms_opt(h, mi, s).unwrap_or_default();
@@ -57,12 +57,34 @@ fn utc_offset_for_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> 
     }
 }
 
-/// Compute the UTC offset in seconds for a given JDN, decomposing it into
-/// calendar components first.
-fn utc_offset_for_jdn(jdn: f64) -> i64 {
+/// Return the UTC offset in seconds, interpreting the components as **UTC** time.
+///
+/// Used by the `localtime` modifier (UTC → local): the input JDN is UTC,
+/// so we convert to a UTC instant and ask chrono what the local offset is
+/// at that moment. This correctly handles DST transitions where the UTC
+/// time and the resulting local time fall in different DST phases.
+fn utc_offset_for_utc_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+    use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+    let date = NaiveDate::from_ymd_opt(y, mo, d).unwrap_or_default();
+    let time = NaiveTime::from_hms_opt(h, mi, s).unwrap_or_default();
+    let naive = NaiveDateTime::new(date, time);
+    let utc_dt = Utc.from_utc_datetime(&naive);
+    let local_dt = utc_dt.with_timezone(&Local);
+    local_dt.offset().local_minus_utc() as i64
+}
+
+/// Compute the UTC offset for the `localtime` modifier (UTC → local).
+fn utc_offset_for_utc_jdn(jdn: f64) -> i64 {
     let (y, mo, d) = jdn_to_ymd(jdn);
     let (h, mi, s, _frac) = jdn_to_hms(jdn);
-    utc_offset_for_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
+    utc_offset_for_utc_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
+}
+
+/// Compute the UTC offset for the `utc` modifier (local → UTC).
+fn utc_offset_for_local_jdn(jdn: f64) -> i64 {
+    let (y, mo, d) = jdn_to_ymd(jdn);
+    let (h, mi, s, _frac) = jdn_to_hms(jdn);
+    utc_offset_for_local_datetime(y as i32, mo as u32, d as u32, h as u32, mi as u32, s as u32)
 }
 
 // ── Julian Day Number Conversions ─────────────────────────────────────────
@@ -332,16 +354,16 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         return None;
     }
 
-    // 'localtime' — convert UTC to local time by adding the UTC offset for
-    // this specific datetime (DST-aware).
+    // 'localtime' — convert UTC to local time.  The input JDN is UTC, so we
+    // must compute the offset by interpreting the datetime as UTC (not local).
     if m == "localtime" {
-        let offset = utc_offset_for_jdn(jdn);
+        let offset = utc_offset_for_utc_jdn(jdn);
         return Some(jdn + offset as f64 / 86400.0);
     }
-    // 'utc' — convert local time to UTC by subtracting the UTC offset for
-    // this specific datetime (DST-aware).
+    // 'utc' — convert local time to UTC.  The input JDN is local time, so
+    // we compute the offset by interpreting the datetime as local.
     if m == "utc" {
-        let offset = utc_offset_for_jdn(jdn);
+        let offset = utc_offset_for_local_jdn(jdn);
         return Some(jdn - offset as f64 / 86400.0);
     }
 
@@ -1126,7 +1148,7 @@ mod tests {
     #[test]
     fn test_modifier_localtime_shifts_value() {
         // When system offset != 0, 'localtime' should actually shift the value.
-        let offset = utc_offset_for_jdn(ymdhms_to_jdn(2024, 3, 15, 12, 0, 0, 0.0));
+        let offset = utc_offset_for_utc_jdn(ymdhms_to_jdn(2024, 3, 15, 12, 0, 0, 0.0));
         if offset != 0 {
             let r = DateTimeFunc
                 .invoke(&[text("2024-03-15 12:00:00"), text("localtime")])
