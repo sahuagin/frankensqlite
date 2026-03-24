@@ -290,6 +290,7 @@ pub struct WalTelemetrySnapshot {
     pub fec_repair: crate::metrics::WalFecRepairCountersSnapshot,
     pub recovery: crate::metrics::WalRecoveryCountersSnapshot,
     pub group_commit: crate::metrics::GroupCommitMetricsSnapshot,
+    pub consolidation: crate::group_commit::ConsolidationMetricsSnapshot,
 }
 
 /// Collect a point-in-time snapshot of all global WAL telemetry counters.
@@ -300,6 +301,7 @@ pub fn wal_telemetry_snapshot() -> WalTelemetrySnapshot {
         fec_repair: crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.snapshot(),
         recovery: crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.snapshot(),
         group_commit: crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.snapshot(),
+        consolidation: crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.snapshot(),
     }
 }
 
@@ -466,11 +468,12 @@ mod tests {
     fn conformance_composite_snapshot_serializes() {
         let snap = wal_telemetry_snapshot();
         let json = serde_json::to_string(&snap).expect("WalTelemetrySnapshot must serialize");
-        // Must contain all four sub-sections.
+        // Must contain all five sub-sections.
         assert!(json.contains("wal"));
         assert!(json.contains("fec_repair"));
         assert!(json.contains("recovery"));
         assert!(json.contains("group_commit"));
+        assert!(json.contains("consolidation"));
     }
 
     // ── Conformance rule 3: kind_str covers every variant ──
@@ -658,17 +661,22 @@ mod tests {
         crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.reset();
         crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.reset();
         crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.reset();
+        crate::group_commit::GLOBAL_CONSOLIDATION_METRICS.reset();
 
         // Record some activity.
         crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(4096);
         crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_repair(true, 100);
         crate::metrics::GLOBAL_WAL_RECOVERY_METRICS.record_recovery(5, 1, 1);
         crate::metrics::GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(2, 500);
+        crate::group_commit::GLOBAL_CONSOLIDATION_METRICS
+            .record_phase_timing(10, 20, 30, true, 40, 50, 60, 70, 80, 0);
 
         let snap = wal_telemetry_snapshot();
         assert_eq!(snap.wal.frames_written_total, 1);
         assert_eq!(snap.fec_repair.repairs_succeeded, 1);
         assert_eq!(snap.recovery.recovery_frames_total, 5);
         assert_eq!(snap.group_commit.group_commits_total, 1);
+        assert_eq!(snap.consolidation.total_commits(), 1);
+        assert_eq!(snap.consolidation.inner_lock_wait_us_total, 50);
     }
 }

@@ -2142,7 +2142,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let param = params.get(param_idx);
                 param_idx += 1;
                 match param {
-                    Some(SqliteValue::Null) | None => { /* C SQLite emits nothing for %q with NULL */ }
+                    Some(SqliteValue::Null) | None => { /* C SQLite emits nothing for %q with NULL */
+                    }
                     Some(v) => {
                         let val = v.to_text();
                         let escaped = val.replace('\'', "''");

@@ -1088,11 +1088,16 @@ mod tests {
             config.encoding.symbol_size = symbol_size as u16;
             config.encoding.max_block_size = TEST_MAX_BLOCK_SIZE;
 
-            // The test codec exposes the same metadata surface as the
-            // production `SymbolCodec`, so it must rebuild decode parameters
-            // using the same single-block geometry.
-            let source_blocks = 1_u16;
-            let symbols_per_block = k_source.max(1);
+            // The test codec must match the same block geometry the encoder
+            // used.  With max_block_size = TEST_MAX_BLOCK_SIZE, the encoder
+            // partitions into ceil(k * symbol_size / max_block_size) blocks.
+            let max_block_symbols =
+                (TEST_MAX_BLOCK_SIZE as u32 / symbol_size.max(1)).max(1);
+            let source_blocks = ((k_source + max_block_symbols - 1) / max_block_symbols)
+                .max(1) as u16;
+            let symbols_per_block = ((k_source + u32::from(source_blocks) - 1)
+                / u32::from(source_blocks))
+                .max(1);
             let object_size = u64::from(k_source)
                 .checked_mul(u64::from(symbol_size))
                 .ok_or_else(|| FrankenError::OutOfRange {
@@ -1717,6 +1722,7 @@ mod tests {
 
     #[test]
     fn test_e2e_roundtrip_64_pages() {
+        let _serial = crate::connection::fsqlite_core_test_serializer();
         let config = PipelineConfig::for_page_size(4096);
         let encoder =
             RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");
@@ -1765,6 +1771,7 @@ mod tests {
 
     #[test]
     fn test_e2e_bd_1hi_5() {
+        let _serial = crate::connection::fsqlite_core_test_serializer();
         let config = PipelineConfig::for_page_size(4096);
         let encoder =
             RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");

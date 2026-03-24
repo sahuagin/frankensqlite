@@ -1,3 +1,4 @@
+use fsqlite_wal::{PhasePercentiles, WakeReasonSnapshot};
 use serde::{Deserialize, Serialize};
 
 use crate::methodology::{EnvironmentCaptureMode, EnvironmentMeta, MethodologyMeta};
@@ -415,6 +416,41 @@ pub struct VfsHotPathProfile {
     pub write_bytes_total: u64,
 }
 
+/// Commit-path split, tails, and wake evidence captured from WAL telemetry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WalCommitPathProfile {
+    pub prepare_us_total: u64,
+    pub consolidator_lock_wait_us_total: u64,
+    pub consolidator_flushing_wait_us_total: u64,
+    pub flusher_arrival_wait_us_total: u64,
+    pub wal_backend_lock_wait_us_total: u64,
+    pub exclusive_lock_us_total: u64,
+    pub wal_append_us_total: u64,
+    pub wal_sync_us_total: u64,
+    pub waiter_epoch_wait_us_total: u64,
+    pub flusher_commits: u64,
+    pub waiter_commits: u64,
+    pub commit_phase_a_us_total: u64,
+    pub commit_phase_b_us_total: u64,
+    pub commit_phase_c1_us_total: u64,
+    pub commit_phase_c2_us_total: u64,
+    pub commit_phase_count: u64,
+    pub flusher_lock_wait_us_total: u64,
+    pub wal_service_us_total: u64,
+    pub flusher_lock_wait_basis_points: u32,
+    pub lock_topology_limited: bool,
+    pub hist_consolidator_lock_wait: PhasePercentiles,
+    pub hist_arrival_wait: PhasePercentiles,
+    pub hist_wal_backend_lock_wait: PhasePercentiles,
+    pub hist_wal_append: PhasePercentiles,
+    pub hist_exclusive_lock: PhasePercentiles,
+    pub hist_waiter_epoch_wait: PhasePercentiles,
+    pub hist_phase_b: PhasePercentiles,
+    pub hist_wal_sync: PhasePercentiles,
+    pub hist_full_commit: PhasePercentiles,
+    pub wake_reasons: WakeReasonSnapshot,
+}
+
 /// WAL-side delta observed during the profiled run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct WalHotPathProfile {
@@ -427,6 +463,8 @@ pub struct WalHotPathProfile {
     pub group_commits_total: u64,
     pub group_commit_size_sum: u64,
     pub group_commit_latency_us_total: u64,
+    #[serde(default)]
+    pub commit_path: WalCommitPathProfile,
 }
 
 /// Runtime phase timings captured directly by the FrankenSQLite executor.
@@ -940,6 +978,107 @@ mod tests {
                 group_commits_total: 1,
                 group_commit_size_sum: 2,
                 group_commit_latency_us_total: 50,
+                commit_path: WalCommitPathProfile {
+                    prepare_us_total: 12,
+                    consolidator_lock_wait_us_total: 8,
+                    consolidator_flushing_wait_us_total: 6,
+                    flusher_arrival_wait_us_total: 4,
+                    wal_backend_lock_wait_us_total: 10,
+                    exclusive_lock_us_total: 7,
+                    wal_append_us_total: 19,
+                    wal_sync_us_total: 11,
+                    waiter_epoch_wait_us_total: 5,
+                    flusher_commits: 1,
+                    waiter_commits: 0,
+                    commit_phase_a_us_total: 14,
+                    commit_phase_b_us_total: 47,
+                    commit_phase_c1_us_total: 9,
+                    commit_phase_c2_us_total: 3,
+                    commit_phase_count: 1,
+                    flusher_lock_wait_us_total: 23,
+                    wal_service_us_total: 30,
+                    flusher_lock_wait_basis_points: 4340,
+                    lock_topology_limited: false,
+                    hist_consolidator_lock_wait: PhasePercentiles {
+                        p50: 8,
+                        p95: 8,
+                        p99: 8,
+                        max: 8,
+                        count: 1,
+                        mean_us: 8,
+                    },
+                    hist_arrival_wait: PhasePercentiles {
+                        p50: 4,
+                        p95: 4,
+                        p99: 4,
+                        max: 4,
+                        count: 1,
+                        mean_us: 4,
+                    },
+                    hist_wal_backend_lock_wait: PhasePercentiles {
+                        p50: 10,
+                        p95: 10,
+                        p99: 10,
+                        max: 10,
+                        count: 1,
+                        mean_us: 10,
+                    },
+                    hist_wal_append: PhasePercentiles {
+                        p50: 19,
+                        p95: 19,
+                        p99: 19,
+                        max: 19,
+                        count: 1,
+                        mean_us: 19,
+                    },
+                    hist_exclusive_lock: PhasePercentiles {
+                        p50: 7,
+                        p95: 7,
+                        p99: 7,
+                        max: 7,
+                        count: 1,
+                        mean_us: 7,
+                    },
+                    hist_waiter_epoch_wait: PhasePercentiles {
+                        p50: 5,
+                        p95: 5,
+                        p99: 5,
+                        max: 5,
+                        count: 1,
+                        mean_us: 5,
+                    },
+                    hist_phase_b: PhasePercentiles {
+                        p50: 47,
+                        p95: 47,
+                        p99: 47,
+                        max: 47,
+                        count: 1,
+                        mean_us: 47,
+                    },
+                    hist_wal_sync: PhasePercentiles {
+                        p50: 11,
+                        p95: 11,
+                        p99: 11,
+                        max: 11,
+                        count: 1,
+                        mean_us: 11,
+                    },
+                    hist_full_commit: PhasePercentiles {
+                        p50: 73,
+                        p95: 73,
+                        p99: 73,
+                        max: 73,
+                        count: 1,
+                        mean_us: 73,
+                    },
+                    wake_reasons: WakeReasonSnapshot {
+                        notify: 1,
+                        timeout: 0,
+                        flusher_takeover: 0,
+                        failed_epoch: 0,
+                        busy_retry: 0,
+                    },
+                },
             },
             decoded_values: HotPathValueHistogram {
                 integers: 9,
@@ -1037,6 +1176,9 @@ mod tests {
         assert_eq!(parsed.profile.runtime_retry.total_retries, 2);
         assert_eq!(parsed.profile.runtime_retry.kind.busy_snapshot, 1);
         assert_eq!(parsed.profile.runtime_retry.phase.commit, 1);
+        assert_eq!(parsed.profile.wal.commit_path.wal_service_us_total, 30);
+        assert_eq!(parsed.profile.wal.commit_path.hist_phase_b.p99, 47);
+        assert_eq!(parsed.profile.wal.commit_path.wake_reasons.notify, 1);
         assert_eq!(
             parsed.profile.runtime_retry.top_snapshot_conflict_pages,
             vec![HotPathConflictPageCount {

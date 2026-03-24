@@ -35,18 +35,33 @@
 //! Remaining issues:
 //! - Performance degrades at 8+ threads (internal lock contention suspected)
 //! - p50 latency increases dramatically at higher thread counts
+//!
+//! Optional machine-readable capture:
+//! - Set `FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR=/path/to/dir`
+//! - The benchmark writes `provenance.json` once and appends per-iteration
+//!   records to `samples.jsonl` without changing default stderr output
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::{FrankenError, SqliteValue};
+use fsqlite_wal::ConsolidationMetricsSnapshot;
+use serde::Serialize;
 
 const ROWS_PER_THREAD: i64 = 1000;
 /// Maximum retries before giving up on a transaction (applies to both engines).
 const MAX_TXN_RETRIES: u32 = 100;
+const PERSISTENT_PHASE_CAPTURE_DIR_ENV: &str = "FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR";
+const PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1: &str =
+    "fsqlite-e2e.persistent_phase_capture_provenance.v1";
+const PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1: &str =
+    "fsqlite-e2e.persistent_phase_capture_sample.v1";
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -124,6 +139,161 @@ fn insert_sql(table_id: usize) -> String {
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PersistentPhaseCaptureProvenance {
+    schema_version: &'static str,
+    benchmark: &'static str,
+    output_dir_env: &'static str,
+    rows_per_thread: i64,
+    max_txn_retries: u32,
+    current_dir: String,
+    current_exe: Option<String>,
+    argv: Vec<String>,
+    hostname: Option<String>,
+    kernel_release: Option<String>,
+    criterion_emission_scope: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct PersistentLatencySummary {
+    sample_count: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PersistentPhaseCaptureSample {
+    schema_version: &'static str,
+    timestamp_unix_ms: u64,
+    benchmark_group: String,
+    engine: &'static str,
+    counter_name: &'static str,
+    counter_value: u64,
+    concurrency: usize,
+    rows_per_thread: i64,
+    total_rows: u64,
+    latency_us: PersistentLatencySummary,
+    phase_metrics: Option<ConsolidationMetricsSnapshot>,
+    phase_timing_report: Option<String>,
+    flusher_lock_wait_fraction_basis_points: Option<u64>,
+    lock_topology_limited: Option<bool>,
+}
+
+fn persistent_phase_capture_dir() -> Option<PathBuf> {
+    std::env::var_os(PERSISTENT_PHASE_CAPTURE_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read_trimmed_file(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|contents| contents.trim().to_owned())
+        .filter(|contents| !contents.is_empty())
+}
+
+fn persistent_phase_capture_provenance() -> PersistentPhaseCaptureProvenance {
+    PersistentPhaseCaptureProvenance {
+        schema_version: PERSISTENT_PHASE_CAPTURE_PROVENANCE_SCHEMA_V1,
+        benchmark: "concurrent_write_persistent_bench",
+        output_dir_env: PERSISTENT_PHASE_CAPTURE_DIR_ENV,
+        rows_per_thread: ROWS_PER_THREAD,
+        max_txn_retries: MAX_TXN_RETRIES,
+        current_dir: std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| ".".to_owned()),
+        current_exe: std::env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string()),
+        argv: std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect(),
+        hostname: std::env::var("HOSTNAME")
+            .ok()
+            .filter(|hostname| !hostname.is_empty())
+            .or_else(|| read_trimmed_file("/etc/hostname")),
+        kernel_release: read_trimmed_file("/proc/sys/kernel/osrelease"),
+        criterion_emission_scope: "every completed Criterion batched iteration appends one record; warmup and measurement phases are not distinguished by this harness",
+    }
+}
+
+fn ensure_persistent_phase_capture_provenance(output_dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(output_dir)?;
+    let provenance_path = output_dir.join("provenance.json");
+    if provenance_path.exists() {
+        return Ok(());
+    }
+    let payload = serde_json::to_string_pretty(&persistent_phase_capture_provenance())
+        .map_err(std::io::Error::other)?;
+    fs::write(provenance_path, payload.as_bytes())
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn persistent_latency_summary(sorted: &[Duration]) -> PersistentLatencySummary {
+    PersistentLatencySummary {
+        sample_count: u64::try_from(sorted.len()).unwrap_or(u64::MAX),
+        p50_us: duration_micros_u64(percentile(sorted, 50.0)),
+        p95_us: duration_micros_u64(percentile(sorted, 95.0)),
+        p99_us: duration_micros_u64(percentile(sorted, 99.0)),
+        max_us: duration_micros_u64(sorted.last().copied().unwrap_or(Duration::ZERO)),
+    }
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn flusher_lock_wait_fraction_basis_points(metrics: &ConsolidationMetricsSnapshot) -> Option<u64> {
+    let lock_wait_total = metrics.flusher_lock_wait_us_total();
+    let wal_service_total = metrics.wal_service_us_total();
+    let total = lock_wait_total.saturating_add(wal_service_total);
+    (total > 0).then_some(lock_wait_total.saturating_mul(10_000) / total)
+}
+
+fn maybe_write_persistent_phase_capture(sample: &PersistentPhaseCaptureSample) {
+    let Some(output_dir) = persistent_phase_capture_dir() else {
+        return;
+    };
+    if let Err(error) = ensure_persistent_phase_capture_provenance(&output_dir) {
+        eprintln!(
+            "[persistent phase capture] failed to write provenance in {}: {error}",
+            output_dir.display()
+        );
+        return;
+    }
+    let sample_path = output_dir.join("samples.jsonl");
+    let encoded = match serde_json::to_string(sample) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            eprintln!("[persistent phase capture] failed to serialize sample: {error}");
+            return;
+        }
+    };
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sample_path)?;
+        writeln!(file, "{encoded}")?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        eprintln!(
+            "[persistent phase capture] failed to append {}: {error}",
+            sample_path.display()
+        );
+    }
 }
 
 /// Compute percentiles from a sorted slice of latencies.
@@ -263,6 +433,22 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
                     "[C SQLite {n_threads}t] retries={total_retries}, p50={:?}, p95={:?}, p99={:?}, max={:?}",
                     p50, p95, p99, max
                 );
+                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1,
+                    timestamp_unix_ms: unix_timestamp_ms(),
+                    benchmark_group: format!("{label}/csqlite_concurrent_persistent"),
+                    engine: "sqlite3",
+                    counter_name: "retries",
+                    counter_value: total_retries,
+                    concurrency: n_threads,
+                    rows_per_thread: ROWS_PER_THREAD,
+                    total_rows,
+                    latency_us: persistent_latency_summary(&all_latencies),
+                    phase_metrics: None,
+                    phase_timing_report: None,
+                    flusher_lock_wait_fraction_basis_points: None,
+                    lock_topology_limited: None,
+                });
             },
             criterion::BatchSize::LargeInput,
         );
@@ -417,9 +603,50 @@ fn bench_concurrent_csqlite_persistent(c: &mut Criterion, n_threads: usize, labe
 
                 // Print phase timing report from group commit metrics
                 let metrics = fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.snapshot();
-                if metrics.total_commits() > 0 {
-                    eprintln!("[FrankenSQLite {n_threads}t phase timing]\n{}", metrics.phase_timing_report());
+                let has_phase_metrics = metrics.total_commits() > 0;
+                let phase_timing_report =
+                    has_phase_metrics.then(|| metrics.phase_timing_report());
+                if has_phase_metrics {
+                    eprintln!(
+                        "[FrankenSQLite {n_threads}t wal split] flusher_lock_wait_total={}us, wal_service_total={}us, wal_backend_lock_wait_p99={}us, wal_append_p99={}us, wal_sync_p99={}us, phase_b_p99={}us, lock_topology_limited={}, wakes={{notify:{}, timeout:{}, takeover:{}, failed_epoch:{}, busy_retry:{}}}",
+                        metrics.flusher_lock_wait_us_total(),
+                        metrics.wal_service_us_total(),
+                        metrics.hist_wal_backend_lock_wait.p99,
+                        metrics.hist_wal_append.p99,
+                        metrics.hist_wal_sync.p99,
+                        metrics.hist_phase_b.p99,
+                        metrics.is_lock_topology_limited(),
+                        metrics.wake_reasons.notify,
+                        metrics.wake_reasons.timeout,
+                        metrics.wake_reasons.flusher_takeover,
+                        metrics.wake_reasons.failed_epoch,
+                        metrics.wake_reasons.busy_retry,
+                    );
+                    eprintln!(
+                        "[FrankenSQLite {n_threads}t phase timing]\n{}",
+                        phase_timing_report
+                            .as_deref()
+                            .unwrap_or("phase timing unavailable")
+                    );
                 }
+                maybe_write_persistent_phase_capture(&PersistentPhaseCaptureSample {
+                    schema_version: PERSISTENT_PHASE_CAPTURE_SAMPLE_SCHEMA_V1,
+                    timestamp_unix_ms: unix_timestamp_ms(),
+                    benchmark_group: format!("{label}/frankensqlite_concurrent_persistent"),
+                    engine: "fsqlite_mvcc",
+                    counter_name: "conflicts",
+                    counter_value: total_conflicts,
+                    concurrency: n_threads,
+                    rows_per_thread: ROWS_PER_THREAD,
+                    total_rows,
+                    latency_us: persistent_latency_summary(&all_latencies),
+                    phase_metrics: has_phase_metrics.then_some(metrics.clone()),
+                    phase_timing_report,
+                    flusher_lock_wait_fraction_basis_points:
+                        flusher_lock_wait_fraction_basis_points(&metrics),
+                    lock_topology_limited: has_phase_metrics
+                        .then_some(metrics.is_lock_topology_limited()),
+                });
                 // Reset metrics for next iteration
                 fsqlite_wal::GLOBAL_CONSOLIDATION_METRICS.reset();
             },

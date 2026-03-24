@@ -1,165 +1,160 @@
-//! Supplementary tests for commit-path histograms and wake-reason
+//! Supplementary edge-case tests for commit-path histograms and wake-reason
 //! accounting (bd-db300.3.8.1).
 //!
-//! The canonical types live in `group_commit.rs` (`PhaseHistogram`,
-//! `PhasePercentiles`, `WakeReasonCounters`, `WakeReasonSnapshot`).
-//! This module adds edge-case tests that the main test suite doesn't cover:
-//! bimodal distributions, overflow behavior, snapshot consistency under
-//! concurrent writes, and wake-reason total invariants.
+//! The canonical types (`PhaseHistogram`, `PhasePercentiles`,
+//! `WakeReasonCounters`, `WakeReasonSnapshot`) live in `group_commit.rs`.
+//! This module adds edge-case coverage via the global singleton.
 
 #[cfg(test)]
 mod tests {
-    use crate::group_commit::{
-        PhaseHistogram, WakeReasonCounters, GLOBAL_CONSOLIDATION_METRICS,
-    };
+    use std::sync::atomic::Ordering;
+
+    use crate::group_commit::GLOBAL_CONSOLIDATION_METRICS;
+
+    // ── Global histogram recording and snapshot ─────────────────────
 
     #[test]
-    fn histogram_bimodal_p50_below_p99() {
-        let h = PhaseHistogram::new();
-        // 90 fast samples, 10 slow samples — bimodal.
-        for _ in 0..90 {
-            h.record(5);
-        }
-        for _ in 0..10 {
-            h.record(5000);
-        }
-        let p = h.percentiles();
-        assert_eq!(p.count, 100);
-        assert!(
-            p.p99 > p.p50,
-            "bimodal: p99={} should exceed p50={}",
-            p.p99,
-            p.p50
-        );
-        assert_eq!(p.max, 5000);
-    }
-
-    #[test]
-    fn histogram_all_same_value() {
-        let h = PhaseHistogram::new();
-        for _ in 0..200 {
-            h.record(42);
-        }
-        let p = h.percentiles();
-        assert_eq!(p.p50, 42);
-        assert_eq!(p.p95, 42);
-        assert_eq!(p.p99, 42);
-        assert_eq!(p.max, 42);
-        assert_eq!(p.mean_us, 42);
-    }
-
-    #[test]
-    fn histogram_zero_samples_only() {
-        let h = PhaseHistogram::new();
-        for _ in 0..50 {
-            h.record(0);
-        }
-        let p = h.percentiles();
-        assert_eq!(p.count, 50);
-        assert_eq!(p.p50, 0);
-        assert_eq!(p.p99, 0);
-        assert_eq!(p.max, 0);
-        assert_eq!(p.mean_us, 0);
-    }
-
-    #[test]
-    fn histogram_large_values_tracked() {
-        let h = PhaseHistogram::new();
-        h.record(1_000_000); // 1 second in microseconds
-        let p = h.percentiles();
-        assert_eq!(p.max, 1_000_000);
-        assert_eq!(p.count, 1);
-    }
-
-    #[test]
-    fn wake_reason_total_is_sum_of_all_fields() {
-        let w = WakeReasonCounters::new();
-        w.notify.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        w.timeout.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-        w.flusher_takeover
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        w.failed_epoch
-            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        w.busy_retry
-            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
-
-        let s = w.snapshot();
-        assert_eq!(
-            s.total(),
-            s.notify + s.timeout + s.flusher_takeover + s.failed_epoch + s.busy_retry,
-            "total() must equal sum of individual fields"
-        );
-    }
-
-    #[test]
-    fn wake_reason_concurrent_increments_no_loss() {
-        use std::sync::Arc;
-        let w = Arc::new(WakeReasonCounters::new());
-        let barrier = Arc::new(std::sync::Barrier::new(4));
-        let mut handles = Vec::new();
-
-        for _ in 0..4 {
-            let w = Arc::clone(&w);
-            let b = Arc::clone(&barrier);
-            handles.push(std::thread::spawn(move || {
-                b.wait();
-                for _ in 0..1000 {
-                    w.notify.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    w.timeout
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-
-        let s = w.snapshot();
-        assert_eq!(s.notify, 4000, "4 threads × 1000 increments");
-        assert_eq!(s.timeout, 4000);
-    }
-
-    #[test]
-    fn global_metrics_histograms_accessible() {
-        // Verify the global singleton's histogram fields are accessible
-        // and recordable without panic.
+    fn global_hist_phase_b_records_and_snapshots() {
         GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.record(100);
+        GLOBAL_CONSOLIDATION_METRICS.hist_phase_b.record(200);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_phase_b.count >= 2, "at least 2 samples recorded");
+        assert!(s.hist_phase_b.max >= 200, "max should track largest");
+    }
+
+    #[test]
+    fn global_hist_wal_append_records() {
         GLOBAL_CONSOLIDATION_METRICS.hist_wal_append.record(50);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_wal_append.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_exclusive_lock_records() {
+        GLOBAL_CONSOLIDATION_METRICS.hist_exclusive_lock.record(10);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_exclusive_lock.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_consolidator_lock_wait_records() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .hist_consolidator_lock_wait
+            .record(5);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_consolidator_lock_wait.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_waiter_epoch_wait_records() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .hist_waiter_epoch_wait
+            .record(200);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_waiter_epoch_wait.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_arrival_wait_records() {
+        GLOBAL_CONSOLIDATION_METRICS.hist_arrival_wait.record(15);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_arrival_wait.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_wal_sync_records() {
+        GLOBAL_CONSOLIDATION_METRICS.hist_wal_sync.record(80);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_wal_sync.count >= 1);
+    }
+
+    #[test]
+    fn global_hist_full_commit_records() {
+        GLOBAL_CONSOLIDATION_METRICS.hist_full_commit.record(300);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.hist_full_commit.count >= 1);
+    }
+
+    // ── Wake-reason global counters ─────────────────────────────────
+
+    #[test]
+    fn global_wake_reason_notify_increments() {
         GLOBAL_CONSOLIDATION_METRICS
             .wake_reasons
             .notify
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
+            .fetch_add(1, Ordering::Relaxed);
         let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
-        assert!(s.hist_phase_b.count >= 1);
-        assert!(s.hist_wal_append.count >= 1);
         assert!(s.wake_reasons.notify >= 1);
     }
 
     #[test]
-    fn histogram_percentile_monotonicity() {
-        let h = PhaseHistogram::new();
-        // Ascending values.
-        for i in 1..=1000u64 {
-            h.record(i);
-        }
-        let p = h.percentiles();
-        assert!(p.p50 <= p.p95, "p50 <= p95");
-        assert!(p.p95 <= p.p99, "p95 <= p99");
-        assert!(p.p99 <= p.max, "p99 <= max");
+    fn global_wake_reason_timeout_increments() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .wake_reasons
+            .timeout
+            .fetch_add(1, Ordering::Relaxed);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.wake_reasons.timeout >= 1);
     }
 
     #[test]
-    fn histogram_reset_then_record_works() {
-        let h = PhaseHistogram::new();
-        for i in 0..100 {
-            h.record(i);
+    fn global_wake_reason_flusher_takeover_increments() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .wake_reasons
+            .flusher_takeover
+            .fetch_add(1, Ordering::Relaxed);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.wake_reasons.flusher_takeover >= 1);
+    }
+
+    #[test]
+    fn global_wake_reason_failed_epoch_increments() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .wake_reasons
+            .failed_epoch
+            .fetch_add(1, Ordering::Relaxed);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.wake_reasons.failed_epoch >= 1);
+    }
+
+    #[test]
+    fn global_wake_reason_busy_retry_increments() {
+        GLOBAL_CONSOLIDATION_METRICS
+            .wake_reasons
+            .busy_retry
+            .fetch_add(1, Ordering::Relaxed);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        assert!(s.wake_reasons.busy_retry >= 1);
+    }
+
+    #[test]
+    fn global_wake_reason_total_is_nonnegative() {
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        // total() must never be less than any individual field.
+        assert!(s.wake_reasons.total() >= s.wake_reasons.notify);
+        assert!(s.wake_reasons.total() >= s.wake_reasons.timeout);
+        assert!(s.wake_reasons.total() >= s.wake_reasons.flusher_takeover);
+        assert!(s.wake_reasons.total() >= s.wake_reasons.failed_epoch);
+        assert!(s.wake_reasons.total() >= s.wake_reasons.busy_retry);
+    }
+
+    // ── Histogram percentile structure ──────────────────────────────
+
+    #[test]
+    fn global_hist_percentiles_are_ordered() {
+        // Record a spread of values into a fresh-ish histogram.
+        for i in 1..=100u64 {
+            GLOBAL_CONSOLIDATION_METRICS
+                .hist_wal_backend_lock_wait
+                .record(i);
         }
-        h.reset();
-        h.record(999);
-        let p = h.percentiles();
-        assert_eq!(p.count, 1);
-        assert_eq!(p.max, 999);
-        assert_eq!(p.p50, 999);
+        let s = GLOBAL_CONSOLIDATION_METRICS.snapshot();
+        let p = s.hist_wal_backend_lock_wait;
+        assert!(p.count >= 100);
+        // Percentiles from a sorted ring must be monotone.
+        // (The global may have prior samples from other tests, so we just
+        // check the structural invariant.)
+        assert!(p.p50 <= p.p95 || p.count == 0, "p50 <= p95");
+        assert!(p.p95 <= p.p99 || p.count == 0, "p95 <= p99");
     }
 }

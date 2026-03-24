@@ -34,7 +34,10 @@ use fsqlite_vdbe::engine::{
 };
 use fsqlite_vfs::GLOBAL_VFS_METRICS;
 use fsqlite_vfs::metrics::MetricsSnapshot as VfsMetricsSnapshot;
-use fsqlite_wal::{WalTelemetrySnapshot, wal_telemetry_snapshot};
+use fsqlite_wal::{
+    GLOBAL_CONSOLIDATION_METRICS, GLOBAL_GROUP_COMMIT_METRICS, GLOBAL_WAL_METRICS,
+    WalTelemetrySnapshot, wal_telemetry_snapshot,
+};
 
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
 use crate::report::{
@@ -43,7 +46,7 @@ use crate::report::{
     HotPathOpcodeCount, HotPathRetryBreakdown, HotPathRetryKindBreakdown,
     HotPathRetryPhaseBreakdown, HotPathValueHistogram, ParserHotPathProfile,
     ResultRowHotPathProfile, RuntimePhaseTimingEvidence, StorageWiringReport, VdbeHotPathProfile,
-    VfsHotPathProfile, WalHotPathProfile,
+    VfsHotPathProfile, WalCommitPathProfile, WalHotPathProfile,
 };
 use crate::sqlite_executor;
 use crate::{E2eError, E2eResult};
@@ -271,6 +274,9 @@ impl HotPathMetricsCapture {
             reset_semantic_metrics();
             reset_vdbe_metrics();
             reset_btree_metrics();
+            GLOBAL_WAL_METRICS.reset();
+            GLOBAL_GROUP_COMMIT_METRICS.reset();
+            GLOBAL_CONSOLIDATION_METRICS.reset();
             // Keep connection-level counters aligned with parser/VDBE/B-tree
             // counters so setup SQL does not leak into the measured hot path.
             if hot_path_profile_enabled() {
@@ -400,7 +406,89 @@ fn vfs_delta(after: &VfsMetricsSnapshot, before: &VfsMetricsSnapshot) -> VfsHotP
     }
 }
 
+fn saturating_ratio_basis_points(numerator: u64, denominator: u64) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    u32::try_from(
+        numerator
+            .saturating_mul(10_000)
+            .checked_div(denominator)
+            .unwrap_or(0),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 fn wal_delta(after: &WalTelemetrySnapshot, before: &WalTelemetrySnapshot) -> WalHotPathProfile {
+    let prepare_us_total = after
+        .consolidation
+        .prepare_us_total
+        .saturating_sub(before.consolidation.prepare_us_total);
+    let consolidator_lock_wait_us_total = after
+        .consolidation
+        .consolidator_lock_wait_us_total
+        .saturating_sub(before.consolidation.consolidator_lock_wait_us_total);
+    let consolidator_flushing_wait_us_total = after
+        .consolidation
+        .consolidator_flushing_wait_us_total
+        .saturating_sub(before.consolidation.consolidator_flushing_wait_us_total);
+    let flusher_arrival_wait_us_total = after
+        .consolidation
+        .flusher_arrival_wait_us_total
+        .saturating_sub(before.consolidation.flusher_arrival_wait_us_total);
+    let wal_backend_lock_wait_us_total = after
+        .consolidation
+        .inner_lock_wait_us_total
+        .saturating_sub(before.consolidation.inner_lock_wait_us_total);
+    let exclusive_lock_us_total = after
+        .consolidation
+        .exclusive_lock_us_total
+        .saturating_sub(before.consolidation.exclusive_lock_us_total);
+    let wal_append_us_total = after
+        .consolidation
+        .wal_append_us_total
+        .saturating_sub(before.consolidation.wal_append_us_total);
+    let wal_sync_us_total = after
+        .consolidation
+        .wal_sync_us_total
+        .saturating_sub(before.consolidation.wal_sync_us_total);
+    let waiter_epoch_wait_us_total = after
+        .consolidation
+        .waiter_epoch_wait_us_total
+        .saturating_sub(before.consolidation.waiter_epoch_wait_us_total);
+    let flusher_commits = after
+        .consolidation
+        .flusher_commits
+        .saturating_sub(before.consolidation.flusher_commits);
+    let waiter_commits = after
+        .consolidation
+        .waiter_commits
+        .saturating_sub(before.consolidation.waiter_commits);
+    let commit_phase_a_us_total = after
+        .consolidation
+        .commit_phase_a_us_total
+        .saturating_sub(before.consolidation.commit_phase_a_us_total);
+    let commit_phase_b_us_total = after
+        .consolidation
+        .commit_phase_b_us_total
+        .saturating_sub(before.consolidation.commit_phase_b_us_total);
+    let commit_phase_c1_us_total = after
+        .consolidation
+        .commit_phase_c1_us_total
+        .saturating_sub(before.consolidation.commit_phase_c1_us_total);
+    let commit_phase_c2_us_total = after
+        .consolidation
+        .commit_phase_c2_us_total
+        .saturating_sub(before.consolidation.commit_phase_c2_us_total);
+    let commit_phase_count = after
+        .consolidation
+        .commit_phase_count
+        .saturating_sub(before.consolidation.commit_phase_count);
+    let flusher_lock_wait_us_total = consolidator_flushing_wait_us_total
+        .saturating_add(wal_backend_lock_wait_us_total)
+        .saturating_add(exclusive_lock_us_total);
+    let wal_service_us_total = wal_append_us_total.saturating_add(wal_sync_us_total);
+
     WalHotPathProfile {
         frames_written_total: after
             .wal
@@ -438,6 +526,67 @@ fn wal_delta(after: &WalTelemetrySnapshot, before: &WalTelemetrySnapshot) -> Wal
             .group_commit
             .commit_latency_us_total
             .saturating_sub(before.group_commit.commit_latency_us_total),
+        commit_path: WalCommitPathProfile {
+            prepare_us_total,
+            consolidator_lock_wait_us_total,
+            consolidator_flushing_wait_us_total,
+            flusher_arrival_wait_us_total,
+            wal_backend_lock_wait_us_total,
+            exclusive_lock_us_total,
+            wal_append_us_total,
+            wal_sync_us_total,
+            waiter_epoch_wait_us_total,
+            flusher_commits,
+            waiter_commits,
+            commit_phase_a_us_total,
+            commit_phase_b_us_total,
+            commit_phase_c1_us_total,
+            commit_phase_c2_us_total,
+            commit_phase_count,
+            flusher_lock_wait_us_total,
+            wal_service_us_total,
+            flusher_lock_wait_basis_points: saturating_ratio_basis_points(
+                flusher_lock_wait_us_total,
+                flusher_lock_wait_us_total.saturating_add(wal_service_us_total),
+            ),
+            lock_topology_limited: flusher_lock_wait_us_total > wal_service_us_total,
+            hist_consolidator_lock_wait: after.consolidation.hist_consolidator_lock_wait,
+            hist_arrival_wait: after.consolidation.hist_arrival_wait,
+            hist_wal_backend_lock_wait: after.consolidation.hist_wal_backend_lock_wait,
+            hist_wal_append: after.consolidation.hist_wal_append,
+            hist_exclusive_lock: after.consolidation.hist_exclusive_lock,
+            hist_waiter_epoch_wait: after.consolidation.hist_waiter_epoch_wait,
+            hist_phase_b: after.consolidation.hist_phase_b,
+            hist_wal_sync: after.consolidation.hist_wal_sync,
+            hist_full_commit: after.consolidation.hist_full_commit,
+            wake_reasons: fsqlite_wal::WakeReasonSnapshot {
+                notify: after
+                    .consolidation
+                    .wake_reasons
+                    .notify
+                    .saturating_sub(before.consolidation.wake_reasons.notify),
+                timeout: after
+                    .consolidation
+                    .wake_reasons
+                    .timeout
+                    .saturating_sub(before.consolidation.wake_reasons.timeout),
+                flusher_takeover: after
+                    .consolidation
+                    .wake_reasons
+                    .flusher_takeover
+                    .saturating_sub(before.consolidation.wake_reasons.flusher_takeover),
+                failed_epoch: after
+                    .consolidation
+                    .wake_reasons
+                    .failed_epoch
+                    .saturating_sub(before.consolidation.wake_reasons.failed_epoch),
+                busy_retry: after
+                    .consolidation
+                    .wake_reasons
+                    .busy_retry
+                    .saturating_sub(before.consolidation.wake_reasons.busy_retry),
+            },
+        },
     }
 }
 
@@ -2643,6 +2792,20 @@ mod tests {
     }
 
     #[test]
+    fn hot_path_metrics_capture_resets_wal_globals_before_snapshotting() {
+        let _guard = hot_path_test_guard();
+        GLOBAL_WAL_METRICS.record_frame_write(4096);
+        GLOBAL_GROUP_COMMIT_METRICS.record_group_commit(3, 120);
+        GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(5, 7, 11, true, 13, 17, 19, 23, 29, 0);
+
+        let capture = HotPathMetricsCapture::new(true);
+
+        assert_eq!(capture.wal_before.wal.frames_written_total, 0);
+        assert_eq!(capture.wal_before.group_commit.group_commits_total, 0);
+        assert_eq!(capture.wal_before.consolidation.total_commits(), 0);
+    }
+
+    #[test]
     fn run_oplog_fsqlite_excludes_setup_from_connection_hot_path_counters() {
         let _guard = hot_path_test_guard();
         let _profile_guard = ConnectionHotPathProfileGuard::new();
@@ -3096,6 +3259,43 @@ mod tests {
             "expected prepared DML reuse to keep parsed statements below executed insert ops: parsed={} ops={}",
             profile.parser.parsed_statements_total,
             report.ops_total
+        );
+    }
+
+    #[test]
+    fn file_backed_hot_path_profile_captures_wal_commit_path_split() {
+        let _guard = hot_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("wal-commit-path-profile.db");
+        let oplog = preset_commutative_inserts_disjoint_keys("wal-commit-path", 29, 1, 8);
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(&db_path, &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert!(profile.wal.commit_path.flusher_commits > 0, "{profile:?}");
+        assert!(
+            profile.wal.commit_path.commit_phase_count > 0,
+            "{profile:?}"
+        );
+        assert_eq!(
+            profile.wal.commit_path.wal_service_us_total,
+            profile
+                .wal
+                .commit_path
+                .wal_append_us_total
+                .saturating_add(profile.wal.commit_path.wal_sync_us_total)
+        );
+        assert!(
+            profile.wal.commit_path.hist_phase_b.count > 0,
+            "{profile:?}"
         );
     }
 

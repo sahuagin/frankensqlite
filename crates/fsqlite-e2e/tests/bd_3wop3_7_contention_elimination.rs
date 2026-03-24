@@ -1,13 +1,14 @@
-//! D-TEST: Contention elimination test suite + regression gates (bd-3wop3.7).
+//! D-TEST: historical contention-elimination suite + placeholder gates (bd-3wop3.7).
 //!
-//! This test suite verifies all Phase 1 contention fixes (D1-D5) work together
-//! and establishes regression gates for 8t/16t performance.
+//! As of 2026-03-23 this file is **not** the canonical threshold authority for
+//! the overlay scorecard. The truthful benchmark surface lives in:
+//! - `crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs`
+//! - `artifacts/perf/2026-03-23-local/canonical_{mvcc,single_writer}.{md,jsonl}`
+//! - the still-blocked governance lane (`bd-db300.1.7.4`, `bd-db300.7.9.1`,
+//!   `bd-3wop3.1.5`) that owns final c1/4/8 and persistent 2/4/8/16 gate truth
 //!
-//! ## Benchmark Gates
-//! - 8t throughput >= 1.5x C SQLite (target: flip 0.67x → 1.5x+)
-//! - 16t throughput >= 1.0x C SQLite (target: flip 0.53x → 1.0x+)
-//! - p99 latency at 8t < 50ms
-//! - Zero corruption at any thread count
+//! The ignored throughput gates in this file therefore remain historical
+//! scaffolding only; they must not be read as current pass/fail policy.
 //!
 //! ## Contention Tests
 //! 1. test_no_global_locks_in_commit_fast_path
@@ -47,10 +48,10 @@ const SCALING_THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 16];
 /// Rows per thread for throughput tests.
 const ROWS_PER_THREAD: u64 = 10_000;
 
-/// 8-thread throughput gate: must be >= 1.5x C SQLite.
+/// Historical 8-thread placeholder gate from the pre-overlay contention file.
 const GATE_8T_SPEEDUP: f64 = 1.5;
 
-/// 16-thread throughput gate: must be >= 1.0x C SQLite.
+/// Historical 16-thread placeholder gate from the pre-overlay contention file.
 const GATE_16T_SPEEDUP: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
@@ -136,20 +137,19 @@ fn measure_csqlite_throughput(thread_count: usize, rows_per_thread: u64) -> Thro
 // Placeholder: FrankenSQLite throughput measurement
 // ---------------------------------------------------------------------------
 
-/// Measure FrankenSQLite throughput at the given thread count.
+/// Measure the old FrankenSQLite placeholder control used by this file.
 ///
-/// NOTE: This is a placeholder. Full implementation requires D1 (parallel WAL)
-/// to be complete for true concurrent writes.
-fn measure_fsqlite_throughput(thread_count: usize, rows_per_thread: u64) -> ThroughputResult {
-    // TODO(D1): Implement concurrent write measurement once parallel WAL is wired.
-    //
-    // Current implementation runs sequential writes as a baseline. Once D1 is
-    // complete, this will spawn `thread_count` threads, each with its own
-    // Connection, inserting into non-overlapping key ranges.
-    //
-    // The parallel WAL ensures each thread writes to its own WAL segment without
-    // acquiring the global WAL append gate, enabling true O(N) scaling.
-
+/// This is intentionally **not** a truthful concurrent-writer benchmark:
+/// - it uses one in-memory connection,
+/// - it runs sequentially,
+/// - it bypasses the persistent-path harnesses that the 2026-03-23 overlay uses.
+///
+/// Keep this helper only so the historical ignored scaffolding compiles until
+/// the blocked governance and matrix work replaces it with a real gate.
+fn measure_fsqlite_placeholder_sequential_control(
+    thread_count: usize,
+    rows_per_thread: u64,
+) -> ThroughputResult {
     let conn = fsqlite::Connection::open(":memory:").expect("open");
     conn.execute("PRAGMA journal_mode = WAL").ok();
     conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, val INTEGER)")
@@ -379,24 +379,16 @@ fn test_ebr_no_gc_pauses() {
     );
 }
 
-/// Test 6: Verify scaling curve is monotonic up to 8 threads.
+/// Test 6: Historical scaling-curve placeholder.
 ///
-/// Measures throughput at 1, 2, 4, 8 threads and asserts each level improves
-/// over the previous (until contention plateaus).
+/// The real 2026-03-23 scaling story is owned by the canonical matrix and the
+/// persistent benchmark harness, not by this file's sequential control.
 #[test]
-#[ignore = "requires D1 (parallel WAL) for accurate concurrent measurement"]
+#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_scaling_curve() {
-    // TODO(D1): Enable once parallel WAL is complete.
-    //
-    // Strategy:
-    // 1. Measure FrankenSQLite throughput at 1, 2, 4, 8 threads
-    // 2. Assert throughput[N] > throughput[N/2] * 1.3 (diminishing returns OK)
-    // 3. Assert 8t throughput > 1t throughput * 3.0 (meaningful scaling)
-    //
-    // With parallel WAL, we expect near-linear scaling up to 8 threads before
-    // CPU cache effects dominate.
-
-    panic!("test_scaling_curve: D1 not yet implemented");
+    panic!(
+        "test_scaling_curve: stale placeholder gate; use the canonical matrix and persistent benchmark surfaces instead"
+    );
 }
 
 // ===========================================================================
@@ -405,45 +397,25 @@ fn test_scaling_curve() {
 
 /// Regression gate: 8-thread throughput >= 1.5x C SQLite.
 ///
-/// This is the primary performance gate. Failing this test blocks merges.
+/// Historical note only: this function is blocked because the helper below is a
+/// sequential in-memory control, not a truthful persistent concurrent benchmark.
 #[test]
-#[ignore = "requires D1 (parallel WAL) for accurate concurrent measurement"]
+#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_8t_throughput_regression_gate() {
-    let fsqlite_result = measure_fsqlite_throughput(8, ROWS_PER_THREAD);
-    let csqlite_result = measure_csqlite_throughput(8, ROWS_PER_THREAD);
-
-    let speedup = fsqlite_result.ops_per_sec / csqlite_result.ops_per_sec;
-
-    println!(
-        "[8t regression gate] FrankenSQLite: {:.0} ops/s, C SQLite: {:.0} ops/s, speedup: {:.2}x",
-        fsqlite_result.ops_per_sec, csqlite_result.ops_per_sec, speedup
-    );
-
-    assert!(
-        speedup >= GATE_8T_SPEEDUP,
-        "bd-3wop3.7 REGRESSION: 8t speedup {speedup:.2}x < {GATE_8T_SPEEDUP}x gate"
+    panic!(
+        "test_8t_throughput_regression_gate: historical {GATE_8T_SPEEDUP}x placeholder is non-authoritative; final 8t gate belongs to the overlay benchmark contract"
     );
 }
 
 /// Regression gate: 16-thread throughput >= 1.0x C SQLite.
 ///
-/// At 16 threads, we target parity with C SQLite (which is also contended).
+/// Historical note only: persistent 16-thread truth is part of the blocked
+/// overlay contract and must not be inferred from this file's placeholder path.
 #[test]
-#[ignore = "requires D1 (parallel WAL) for accurate concurrent measurement"]
+#[ignore = "stale placeholder; pending bd-3wop3.1.5, bd-db300.1.7.4, and bd-db300.7.9.1"]
 fn test_16t_throughput_regression_gate() {
-    let fsqlite_result = measure_fsqlite_throughput(16, ROWS_PER_THREAD);
-    let csqlite_result = measure_csqlite_throughput(16, ROWS_PER_THREAD);
-
-    let speedup = fsqlite_result.ops_per_sec / csqlite_result.ops_per_sec;
-
-    println!(
-        "[16t regression gate] FrankenSQLite: {:.0} ops/s, C SQLite: {:.0} ops/s, speedup: {:.2}x",
-        fsqlite_result.ops_per_sec, csqlite_result.ops_per_sec, speedup
-    );
-
-    assert!(
-        speedup >= GATE_16T_SPEEDUP,
-        "bd-3wop3.7 REGRESSION: 16t speedup {speedup:.2}x < {GATE_16T_SPEEDUP}x gate"
+    panic!(
+        "test_16t_throughput_regression_gate: historical {GATE_16T_SPEEDUP}x placeholder is non-authoritative; final persistent 16t gate belongs to the overlay benchmark contract"
     );
 }
 
@@ -458,8 +430,8 @@ fn test_16t_throughput_regression_gate() {
 #[test]
 #[ignore = "manual contention stress test"]
 fn test_64_thread_no_deadlock() {
-    // This test runs with current implementation (sequential fallback).
-    // Once D1 is complete, it will exercise true concurrent writes.
+    // This stress test already exercises the current file-backed concurrent path.
+    // It is separate from the historical placeholder throughput helper above.
 
     let (_dir, path) = create_fsqlite_file_backed_db(
         "64_thread_no_deadlock.db",
@@ -906,12 +878,12 @@ fn test_split_lock_wal_io_does_not_block_prepare() {
 #[ignore = "manual benchmark - run with --ignored"]
 fn scaling_report() {
     println!("\n=== D-TEST Scaling Report (bd-3wop3.7) ===\n");
-    println!("Thread | C SQLite ops/s | FrankenSQLite ops/s | Speedup");
-    println!("-------|----------------|---------------------|--------");
+    println!("Thread | C SQLite ops/s | FS placeholder ops/s | Speedup");
+    println!("-------|----------------|----------------------|--------");
 
     for &threads in SCALING_THREAD_COUNTS {
         let csqlite = measure_csqlite_throughput(threads, ROWS_PER_THREAD / 10);
-        let fsqlite = measure_fsqlite_throughput(threads, ROWS_PER_THREAD / 10);
+        let fsqlite = measure_fsqlite_placeholder_sequential_control(threads, ROWS_PER_THREAD / 10);
         let speedup = fsqlite.ops_per_sec / csqlite.ops_per_sec;
 
         println!(
@@ -920,5 +892,7 @@ fn scaling_report() {
         );
     }
 
-    println!("\nNote: FrankenSQLite results are sequential baseline until D1 completes.");
+    println!(
+        "\nNote: FrankenSQLite numbers here come from a historical sequential placeholder control, not the authoritative 2026-03-23 persistent benchmark surface."
+    );
 }

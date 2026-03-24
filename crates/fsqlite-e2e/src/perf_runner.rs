@@ -25,18 +25,18 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use fsqlite_btree::BtreeCopyProfileSnapshot;
 use fsqlite_core::connection::{
-    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
 };
 
-use crate::HarnessSettings;
-use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
 use crate::fixture_select::{BenchmarkArtifactCommand, BenchmarkArtifactToolVersion};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
-use crate::report::{EngineRunReport, HotPathRetryBreakdown};
-use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
+use crate::report::{EngineRunReport, HotPathRetryBreakdown, WalHotPathProfile};
+use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
 use crate::sqlite_executor::run_oplog_sqlite;
+use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -411,6 +411,8 @@ pub struct HotPathSubsystemProfilePack {
     pub btree_copy_kernel_targets: Vec<HotPathRankingEntry>,
     pub record_decode: HotPathRecordDecodeProfile,
     pub row_materialization: HotPathRowMaterializationProfile,
+    #[serde(default)]
+    pub wal: WalHotPathProfile,
     pub mvcc_write: HotPathMvccWriteProfile,
     pub page_data_motion: HotPathPageDataMotionProfile,
     pub connection_ceremony: HotPathConnectionCeremonyProfile,
@@ -488,6 +490,47 @@ pub struct HotPathWallTimeComponentEntry {
     pub rationale: String,
     pub implication: String,
     pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathCausalEvidence {
+    pub artifact: String,
+    pub metric_path: String,
+    pub metric_kind: String,
+    pub metric_value: u64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathCausalBucketEntry {
+    pub rank: u32,
+    pub bucket: String,
+    pub dominant: bool,
+    pub estimated_time_ns: u64,
+    pub wall_share_basis_points: u32,
+    pub score_basis_points: u32,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+    pub evidence: Vec<HotPathCausalEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathCausalClassificationSummary {
+    pub dominant_bucket: String,
+    pub dominant_estimated_time_ns: u64,
+    pub dominant_wall_share_basis_points: u32,
+    pub dominant_score_basis_points: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_up_bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_up_estimated_time_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_up_score_basis_points: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_up_gap_basis_points: Option<u32>,
+    pub mixed_or_ambiguous: bool,
+    pub rationale: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -589,6 +632,8 @@ pub struct HotPathActionableRanking {
     pub named_hotspots: Vec<HotPathActionableRankingEntry>,
     pub microarchitectural_signatures: Vec<HotPathMicroarchitecturalSignatureEntry>,
     pub wall_time_components: Vec<HotPathWallTimeComponentEntry>,
+    pub causal_classification: HotPathCausalClassificationSummary,
+    pub causal_buckets: Vec<HotPathCausalBucketEntry>,
     pub cost_components: Vec<HotPathCostComponentEntry>,
     pub allocator_pressure: Vec<HotPathActionableRankingEntry>,
     pub top_opcodes: Vec<HotPathOpcodeProfileEntry>,
@@ -1850,6 +1895,77 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## Causal Classification\n");
+    let _ = writeln!(
+        out,
+        "- Dominant bucket: {} (estimated_time_ns={}, wall_share_bps={}, score_bps={}, mixed_or_ambiguous={})",
+        actionable_ranking.causal_classification.dominant_bucket,
+        actionable_ranking
+            .causal_classification
+            .dominant_estimated_time_ns,
+        actionable_ranking
+            .causal_classification
+            .dominant_wall_share_basis_points,
+        actionable_ranking
+            .causal_classification
+            .dominant_score_basis_points,
+        actionable_ranking.causal_classification.mixed_or_ambiguous
+    );
+    if let Some(runner_up_bucket) = &actionable_ranking.causal_classification.runner_up_bucket {
+        let _ = writeln!(
+            out,
+            "- Runner-up: {} (estimated_time_ns={}, score_bps={}, gap_bps={})",
+            runner_up_bucket,
+            actionable_ranking
+                .causal_classification
+                .runner_up_estimated_time_ns
+                .unwrap_or(0),
+            actionable_ranking
+                .causal_classification
+                .runner_up_score_basis_points
+                .unwrap_or(0),
+            actionable_ranking
+                .causal_classification
+                .runner_up_gap_basis_points
+                .unwrap_or(0)
+        );
+    }
+    let _ = writeln!(
+        out,
+        "- Rationale: {}",
+        actionable_ranking.causal_classification.rationale
+    );
+    for entry in &actionable_ranking.causal_buckets {
+        let _ = writeln!(
+            out,
+            "- rank {} {}: dominant={}, estimated_time_ns={}, wall_share_bps={}, score_bps={} -> {} [{}]",
+            entry.rank,
+            entry.bucket,
+            entry.dominant,
+            entry.estimated_time_ns,
+            entry.wall_share_basis_points,
+            entry.score_basis_points,
+            entry.implication,
+            entry.mapped_beads.join(", ")
+        );
+        for evidence in &entry.evidence {
+            let _ = writeln!(
+                out,
+                "  evidence {} {}: {}={} -> {}",
+                evidence.artifact,
+                evidence.metric_path,
+                evidence.metric_kind,
+                evidence.metric_value,
+                evidence.rationale
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "- note: `mixed` becomes dominant when the leader concrete bucket is too small or within 1,000 score-bps of the runner-up, so near-ties stay explicit until more evidence lands."
+    );
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Microarchitectural Signatures\n");
     for entry in &actionable_ranking.microarchitectural_signatures {
         let secondary = if entry.secondary_signatures.is_empty() {
@@ -1911,7 +2027,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- `subsystem_profile.json` — raw execution-subsystem timing, heap profile, and B-tree copy-kernel target list for this run"
+        "- `subsystem_profile.json` — raw execution-subsystem timing, heap profile, WAL commit-path split/tail metrics, and B-tree copy-kernel target list for this run"
     );
     let _ = writeln!(
         out,
@@ -2154,8 +2270,13 @@ fn component_signature_shape(
         "durability" => {
             push_unique_signature_evidence(
                 &mut evidence_sources,
-                "wal_runtime:group_commit_latency_us_total",
+                "wal_runtime:wal_service_us_total",
             );
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:wal_append_us_total",
+            );
+            push_unique_signature_evidence(&mut evidence_sources, "wal_runtime:wal_sync_us_total");
             push_unique_signature_evidence(
                 &mut evidence_sources,
                 "wal_runtime:checkpoint_duration_us_total",
@@ -2167,12 +2288,25 @@ fn component_signature_shape(
                 false,
                 evidence_sources,
                 String::from(
-                    "WAL group-commit/checkpoint latency is directly measured on the commit-finalize path, so this cell is a genuine durability-pressure lane rather than a generic executor slowdown.",
+                    "WAL append, sync, and checkpoint service time are measured directly on the commit-finalize path, so this cell is a genuine durability-pressure lane rather than a generic executor slowdown.",
                 ),
             )
         }
         "synchronization" => {
             let mut secondary = Vec::new();
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:flusher_lock_wait_us_total",
+            );
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:wal_backend_lock_wait_us_total",
+            );
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:hist_wal_backend_lock_wait",
+            );
+            push_unique_signature_evidence(&mut evidence_sources, "wal_runtime:wake_reasons");
             if has_capture("remote_access") || has_capture("migration") {
                 secondary.push("remote_numa_traffic");
             }
@@ -2191,7 +2325,7 @@ fn component_signature_shape(
                 true,
                 evidence_sources,
                 String::from(
-                    "BEGIN/COMMIT/ROLLBACK boundary time is visible, and the topology-aware capture set points at coordination traffic, but without raw counter values this remains an honest mixed synchronization story rather than a fabricated single cause.",
+                    "BEGIN/COMMIT/ROLLBACK boundary time is visible, and the split WAL lock-wait plus wake evidence distinguishes coordination topology from durable append/sync service without inventing a single cause.",
                 ),
             )
         }
@@ -2468,6 +2602,76 @@ fn actionable_entry(
         rationale: entry.rationale.clone(),
         implication: implication.to_owned(),
         mapped_beads: mapped_beads.iter().map(|bead| (*bead).to_owned()).collect(),
+    }
+}
+
+fn causal_evidence(
+    artifact: &str,
+    metric_path: &str,
+    metric_kind: &str,
+    metric_value: u64,
+    rationale: &str,
+) -> HotPathCausalEvidence {
+    HotPathCausalEvidence {
+        artifact: artifact.to_owned(),
+        metric_path: metric_path.to_owned(),
+        metric_kind: metric_kind.to_owned(),
+        metric_value,
+        rationale: rationale.to_owned(),
+    }
+}
+
+fn find_wall_time_component<'a>(
+    entries: &'a [HotPathWallTimeComponentEntry],
+    component: &str,
+) -> Option<&'a HotPathWallTimeComponentEntry> {
+    entries.iter().find(|entry| entry.component == component)
+}
+
+fn find_cost_component<'a>(
+    entries: &'a [HotPathCostComponentEntry],
+    component: &str,
+) -> Option<&'a HotPathCostComponentEntry> {
+    entries.iter().find(|entry| entry.component == component)
+}
+
+fn find_baseline_waste_component<'a>(
+    entries: &'a [HotPathBaselineWasteLedgerEntry],
+    component: &str,
+) -> Option<&'a HotPathBaselineWasteLedgerEntry> {
+    entries.iter().find(|entry| entry.component == component)
+}
+
+fn push_mapped_beads(target: &mut Vec<String>, source: &[String]) {
+    for bead in source {
+        push_unique_signature_evidence(target, bead.clone());
+    }
+}
+
+fn causal_bucket_implication(bucket: &str) -> &'static str {
+    match bucket {
+        "service" => {
+            "Service-dominant rows should be explained with parser/decode/materialization evidence before blaming contention or durability."
+        }
+        "queueing" => {
+            "Queueing-dominant rows are spending time inside failed BUSY attempts; steer fixes toward contention topology rather than allocator cleanup."
+        }
+        "synchronization" => {
+            "Synchronization-dominant rows are paying boundary or MVCC coordination cost; keep publish-plane and page-topology work ahead of generic copy tuning."
+        }
+        "allocation" => {
+            "Allocation-dominant rows are burning time or bytes on value/page copies; use the ownership-preserving and page-buffer lanes before broader executor work."
+        }
+        "io" => {
+            "I/O-dominant rows are durability-bound, so WAL/VFS evidence should steer the next cut instead of retry or parser hypotheses."
+        }
+        "retries" => {
+            "Retry-dominant rows are losing wall time to configured backoff, which is distinct from in-attempt queueing and should stay explicit."
+        }
+        "mixed" => {
+            "Mixed stays available as a deliberate fallback when the top concrete buckets are too close to call with the current evidence pack."
+        }
+        _ => "Secondary causal bucket.",
     }
 }
 
@@ -2776,18 +2980,7 @@ fn build_hot_path_baseline_waste_ledger(
         .parser
         .parse_single_calls
         .saturating_add(report.parser.parse_multi_calls);
-    let wal_durability_time_ns =
-        report
-            .engine_report
-            .hot_path_profile
-            .as_ref()
-            .map_or(0, |hot_path_profile| {
-                hot_path_profile
-                    .wal
-                    .group_commit_latency_us_total
-                    .saturating_add(hot_path_profile.wal.checkpoint_duration_us_total)
-                    .saturating_mul(1_000)
-            });
+    let wal_durability_time_ns = wal_durability_time_ns(report);
     let durability_time_ns =
         wal_durability_time_ns.min(runtime_phase_timing.commit_finalize_time_ns);
     let boundary_coordination_time_ns = runtime_phase_timing
@@ -3148,18 +3341,7 @@ fn build_hot_path_wall_time_components(
         .engine_report
         .runtime_phase_timing
         .unwrap_or_default();
-    let wal_durability_time_ns =
-        report
-            .engine_report
-            .hot_path_profile
-            .as_ref()
-            .map_or(0, |hot_path_profile| {
-                hot_path_profile
-                    .wal
-                    .group_commit_latency_us_total
-                    .saturating_add(hot_path_profile.wal.checkpoint_duration_us_total)
-                    .saturating_mul(1_000)
-            });
+    let wal_durability_time_ns = wal_durability_time_ns(report);
     let durability_time_ns =
         wal_durability_time_ns.min(runtime_phase_timing.commit_finalize_time_ns);
     let synchronization_time_ns = runtime_phase_timing
@@ -3247,7 +3429,7 @@ fn build_hot_path_wall_time_components(
             time_ns: durability_time_ns,
             wall_share_basis_points: ratio_basis_points(durability_time_ns, wall_time_ns),
             rationale:
-                "WAL group-commit and checkpoint latency captured by runtime telemetry, clipped to observed COMMIT finalize time"
+                "WAL append, sync, and checkpoint service time captured by runtime telemetry, clipped to observed COMMIT finalize time"
                     .to_owned(),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -3292,6 +3474,572 @@ fn build_hot_path_wall_time_components(
     entries
 }
 
+fn build_hot_path_causal_classification(
+    report: &HotPathProfileReport,
+    wall_time_components: &[HotPathWallTimeComponentEntry],
+    cost_components: &[HotPathCostComponentEntry],
+    baseline_waste_ledger: &[HotPathBaselineWasteLedgerEntry],
+) -> (
+    HotPathCausalClassificationSummary,
+    Vec<HotPathCausalBucketEntry>,
+) {
+    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let runtime_phase_timing = report
+        .engine_report
+        .runtime_phase_timing
+        .unwrap_or_default();
+    let hot_path_profile = report.engine_report.hot_path_profile.as_ref();
+    let queueing_time_ns =
+        find_wall_time_component(wall_time_components, "queueing").map_or(0, |entry| entry.time_ns);
+    let retry_time_ns =
+        find_wall_time_component(wall_time_components, "retry").map_or(0, |entry| entry.time_ns);
+    let service_time_ns =
+        find_wall_time_component(wall_time_components, "service").map_or(0, |entry| entry.time_ns);
+    let allocation_time_ns = find_wall_time_component(wall_time_components, "allocator_copy")
+        .map_or(0, |entry| entry.time_ns);
+    let io_time_ns = find_wall_time_component(wall_time_components, "durability")
+        .map_or(0, |entry| entry.time_ns);
+    let synchronization_boundary_time_ns =
+        find_wall_time_component(wall_time_components, "synchronization")
+            .map_or(0, |entry| entry.time_ns);
+    let mvcc_wait_time_ns = find_wall_time_component(wall_time_components, "mvcc_wait")
+        .map_or(0, |entry| entry.time_ns);
+    let mvcc_commit_surface_time_ns =
+        find_wall_time_component(wall_time_components, "mvcc_commit_surface")
+            .map_or(0, |entry| entry.time_ns);
+    let synchronization_time_ns = synchronization_boundary_time_ns
+        .saturating_add(mvcc_wait_time_ns)
+        .saturating_add(mvcc_commit_surface_time_ns);
+    let classified_total_ns = service_time_ns
+        .saturating_add(queueing_time_ns)
+        .saturating_add(synchronization_time_ns)
+        .saturating_add(allocation_time_ns)
+        .saturating_add(io_time_ns)
+        .saturating_add(retry_time_ns);
+    let vfs_lock_ops = hot_path_profile.map_or(0, |profile| profile.vfs.lock_ops);
+    let vfs_sync_ops = hot_path_profile.map_or(0, |profile| profile.vfs.sync_ops);
+    let vfs_write_bytes_total = hot_path_profile.map_or(0, |profile| profile.vfs.write_bytes_total);
+    let wal_frames_written_total =
+        hot_path_profile.map_or(0, |profile| profile.wal.frames_written_total);
+    let wal_bytes_written_total =
+        hot_path_profile.map_or(0, |profile| profile.wal.bytes_written_total);
+    let wal_commit_path_service_us_total =
+        hot_path_profile.map_or(0, |profile| profile.wal.commit_path.wal_service_us_total);
+    let wal_group_commit_latency_us_total =
+        hot_path_profile.map_or(0, |profile| profile.wal.group_commit_latency_us_total);
+    let runtime_retries_total = report.mvcc_write.runtime_retry.total_retries;
+    let runtime_aborts_total = report.mvcc_write.runtime_retry.total_aborts;
+    let page_data_normalization_bytes =
+        find_baseline_waste_component(baseline_waste_ledger, "page_data_normalization")
+            .map_or(0, |entry| entry.metric_value);
+    let page_data_motion_allocator_bytes = find_cost_component(cost_components, "page_data_motion")
+        .map_or(0, |entry| entry.allocator_pressure_bytes);
+    let mut service_beads = Vec::new();
+    if let Some(entry) = find_wall_time_component(wall_time_components, "service") {
+        push_mapped_beads(&mut service_beads, &entry.mapped_beads);
+    }
+    for component in ["parser_ast_churn", "record_decode", "row_materialization"] {
+        if let Some(entry) = find_cost_component(cost_components, component) {
+            push_mapped_beads(&mut service_beads, &entry.mapped_beads);
+        }
+    }
+    let mut queueing_beads = Vec::new();
+    if let Some(entry) = find_wall_time_component(wall_time_components, "queueing") {
+        push_mapped_beads(&mut queueing_beads, &entry.mapped_beads);
+    }
+    if let Some(entry) = find_baseline_waste_component(baseline_waste_ledger, "busy_retry_queueing")
+    {
+        push_mapped_beads(&mut queueing_beads, &entry.mapped_beads);
+    }
+    let mut synchronization_beads = Vec::new();
+    for component in ["synchronization", "mvcc_wait", "mvcc_commit_surface"] {
+        if let Some(entry) = find_wall_time_component(wall_time_components, component) {
+            push_mapped_beads(&mut synchronization_beads, &entry.mapped_beads);
+        }
+    }
+    let mut allocation_beads = Vec::new();
+    for component in ["allocator_copy"] {
+        if let Some(entry) = find_wall_time_component(wall_time_components, component) {
+            push_mapped_beads(&mut allocation_beads, &entry.mapped_beads);
+        }
+    }
+    for component in ["row_materialization", "page_data_motion"] {
+        if let Some(entry) = find_cost_component(cost_components, component) {
+            push_mapped_beads(&mut allocation_beads, &entry.mapped_beads);
+        }
+    }
+    if let Some(entry) =
+        find_baseline_waste_component(baseline_waste_ledger, "page_data_normalization")
+    {
+        push_mapped_beads(&mut allocation_beads, &entry.mapped_beads);
+    }
+    let mut io_beads = Vec::new();
+    if let Some(entry) = find_wall_time_component(wall_time_components, "durability") {
+        push_mapped_beads(&mut io_beads, &entry.mapped_beads);
+    }
+    let mut retry_beads = Vec::new();
+    if let Some(entry) = find_wall_time_component(wall_time_components, "retry") {
+        push_mapped_beads(&mut retry_beads, &entry.mapped_beads);
+    }
+    if let Some(entry) = find_baseline_waste_component(baseline_waste_ledger, "busy_retry_queueing")
+    {
+        push_mapped_beads(&mut retry_beads, &entry.mapped_beads);
+    }
+
+    let service_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"service\") | .time_ns",
+            "time_ns",
+            service_time_ns,
+            "service starts from executor body time after the explicit allocator-copy carve-out",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.runtime_phase_timing.body_execution_time_ns",
+            "time_ns",
+            runtime_phase_timing.body_execution_time_ns,
+            "raw executor body time anchors the useful-work lane before allocation is split out",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".cost_components[] | select(.component == \"parser_ast_churn\") | .time_ns",
+            "time_ns",
+            find_cost_component(cost_components, "parser_ast_churn")
+                .map_or(0, |entry| entry.time_ns),
+            "parser/prepare churn is already exposed as a named cost component inside service work",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".cost_components[] | select(.component == \"record_decode\") | .time_ns",
+            "time_ns",
+            find_cost_component(cost_components, "record_decode").map_or(0, |entry| entry.time_ns),
+            "record decode remains one of the direct measured contributors to useful in-engine service time",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".cost_components[] | select(.component == \"row_materialization\") | .time_ns",
+            "time_ns",
+            find_cost_component(cost_components, "row_materialization")
+                .map_or(0, |entry| entry.time_ns),
+            "row materialization is kept visible so service and allocation can be reasoned about together instead of conflated",
+        ),
+    ];
+    let queueing_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"queueing\") | .time_ns",
+            "time_ns",
+            queueing_time_ns,
+            "queueing is the wall-time lane for time spent inside BUSY attempts that later retried",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.runtime_phase_timing.busy_attempt_time_ns",
+            "time_ns",
+            runtime_phase_timing.busy_attempt_time_ns,
+            "runtime phase timing captures the raw busy-attempt wall time directly",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".baseline_waste_ledger[] | select(.component == \"busy_retry_queueing\") | .metric_value",
+            "time_ns",
+            find_baseline_waste_component(baseline_waste_ledger, "busy_retry_queueing")
+                .map_or(0, |entry| entry.metric_value),
+            "the spillover ledger keeps busy-attempt queueing visible alongside the separate retry-backoff lane",
+        ),
+    ];
+    let synchronization_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"synchronization\") | .time_ns",
+            "time_ns",
+            synchronization_boundary_time_ns,
+            "boundary coordination already has its own explicit wall-time component",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"mvcc_wait\") | .time_ns",
+            "time_ns",
+            mvcc_wait_time_ns,
+            "page-lock handoff wait is the strongest direct MVCC coordination counter the profile exposes today",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"mvcc_commit_surface\") | .time_ns",
+            "time_ns",
+            mvcc_commit_surface_time_ns,
+            "page-one tracking plus pending-surface maintenance are already split out as a separate coordination lane",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.vfs.lock_ops",
+            "count",
+            vfs_lock_ops,
+            "VFS lock activity is emitted in the hot-path profile and helps explain synchronization-heavy rows without inventing a new counter",
+        ),
+    ];
+    let allocation_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"allocator_copy\") | .time_ns",
+            "time_ns",
+            allocation_time_ns,
+            "allocator/copy wall time is already isolated at the VDBE boundary",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".baseline_waste_ledger[] | select(.component == \"page_data_normalization\") | .metric_value",
+            "bytes",
+            page_data_normalization_bytes,
+            "page normalization bytes are the clearest existing artifact for write-path allocation and copy pressure",
+        ),
+        causal_evidence(
+            "actionable_ranking.json",
+            ".cost_components[] | select(.component == \"page_data_motion\") | .allocator_pressure_bytes",
+            "bytes",
+            page_data_motion_allocator_bytes,
+            "page-data motion already exposes allocator pressure even when the surrounding wall time lives inside service work",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".allocator_pressure.result_value_heap_bytes_total",
+            "bytes",
+            report.allocator_pressure.result_value_heap_bytes_total,
+            "result-row heap bytes keep value materialization pressure attached to the allocation bucket",
+        ),
+    ];
+    let io_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"durability\") | .time_ns",
+            "time_ns",
+            io_time_ns,
+            "durability is the explicit wall-time lane for commit-path I/O pressure",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.wal.commit_path.wal_service_us_total",
+            "time_us",
+            wal_commit_path_service_us_total,
+            "commit-path WAL service time is the direct source for the durability wall-time lane when raw WAL telemetry is present",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.vfs.sync_ops",
+            "count",
+            vfs_sync_ops,
+            "VFS sync operations are already exposed in the raw hot-path profile",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.vfs.write_bytes_total",
+            "bytes",
+            vfs_write_bytes_total,
+            "VFS write-byte volume anchors file-system I/O intensity",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.wal.frames_written_total",
+            "count",
+            wal_frames_written_total,
+            "WAL frames written quantify commit-path write volume without needing a new artifact",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.wal.bytes_written_total",
+            "bytes",
+            wal_bytes_written_total,
+            "WAL byte volume is the clearest existing counter for log-heavy I/O rows",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.hot_path_profile.wal.group_commit_latency_us_total",
+            "time_us",
+            wal_group_commit_latency_us_total,
+            "group-commit latency keeps the durability bucket connected to real commit-path timing",
+        ),
+    ];
+    let retries_evidence = vec![
+        causal_evidence(
+            "actionable_ranking.json",
+            ".wall_time_components[] | select(.component == \"retry\") | .time_ns",
+            "time_ns",
+            retry_time_ns,
+            "retry bucket maps to explicit configured backoff sleep rather than in-attempt wait time",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.runtime_phase_timing.retry_backoff_time_ns",
+            "time_ns",
+            runtime_phase_timing.retry_backoff_time_ns,
+            "runtime phase timing already exposes aggregate retry-backoff sleep directly",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".engine_report.retries",
+            "count",
+            report.engine_report.retries,
+            "top-level engine retries keep the wall-time lane tied to observed retry frequency",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".mvcc_write.runtime_retry.total_retries",
+            "count",
+            runtime_retries_total,
+            "structured retry taxonomy refines the retry bucket without collapsing it into generic queueing",
+        ),
+        causal_evidence(
+            "profile.json",
+            ".mvcc_write.runtime_retry.total_aborts",
+            "count",
+            runtime_aborts_total,
+            "abort counts remain adjacent evidence for retry-heavy rows that fail to converge cleanly",
+        ),
+    ];
+
+    let mut entries = vec![
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "service".to_owned(),
+            dominant: false,
+            estimated_time_ns: service_time_ns,
+            wall_share_basis_points: ratio_basis_points(service_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(service_time_ns, classified_total_ns),
+            rationale: "Service bucket is anchored to executor body time after allocator-copy work is carved out, then cross-checked against parser/decode/materialization artifacts already emitted in the actionable ranking.".to_owned(),
+            implication: causal_bucket_implication("service").to_owned(),
+            mapped_beads: service_beads,
+            evidence: service_evidence,
+        },
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "queueing".to_owned(),
+            dominant: false,
+            estimated_time_ns: queueing_time_ns,
+            wall_share_basis_points: ratio_basis_points(queueing_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(queueing_time_ns, classified_total_ns),
+            rationale: "Queueing bucket uses the explicit BUSY-attempt wall-time lane and keeps it separate from retry-backoff sleep.".to_owned(),
+            implication: causal_bucket_implication("queueing").to_owned(),
+            mapped_beads: queueing_beads,
+            evidence: queueing_evidence,
+        },
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "synchronization".to_owned(),
+            dominant: false,
+            estimated_time_ns: synchronization_time_ns,
+            wall_share_basis_points: ratio_basis_points(synchronization_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(synchronization_time_ns, classified_total_ns),
+            rationale: "Synchronization bucket intentionally aggregates executor boundary coordination, MVCC page-lock wait, and commit-surface maintenance because those are the explicit coordination counters the code exposes today.".to_owned(),
+            implication: causal_bucket_implication("synchronization").to_owned(),
+            mapped_beads: synchronization_beads,
+            evidence: synchronization_evidence,
+        },
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "allocation".to_owned(),
+            dominant: false,
+            estimated_time_ns: allocation_time_ns,
+            wall_share_basis_points: ratio_basis_points(allocation_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(allocation_time_ns, classified_total_ns),
+            rationale: "Allocation bucket starts with explicit allocator-copy wall time and is reinforced by emitted heap-byte and page-normalization artifacts.".to_owned(),
+            implication: causal_bucket_implication("allocation").to_owned(),
+            mapped_beads: allocation_beads,
+            evidence: allocation_evidence,
+        },
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "io".to_owned(),
+            dominant: false,
+            estimated_time_ns: io_time_ns,
+            wall_share_basis_points: ratio_basis_points(io_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(io_time_ns, classified_total_ns),
+            rationale: "I/O bucket maps directly onto the durability wall-time lane and the VFS/WAL byte, frame, and sync counters already present in the raw profile artifact.".to_owned(),
+            implication: causal_bucket_implication("io").to_owned(),
+            mapped_beads: io_beads,
+            evidence: io_evidence,
+        },
+        HotPathCausalBucketEntry {
+            rank: 0,
+            bucket: "retries".to_owned(),
+            dominant: false,
+            estimated_time_ns: retry_time_ns,
+            wall_share_basis_points: ratio_basis_points(retry_time_ns, wall_time_ns),
+            score_basis_points: ratio_basis_points(retry_time_ns, classified_total_ns),
+            rationale: "Retries bucket isolates configured backoff sleep and retry counters so passive waiting is not conflated with queueing or synchronization work.".to_owned(),
+            implication: causal_bucket_implication("retries").to_owned(),
+            mapped_beads: retry_beads,
+            evidence: retries_evidence,
+        },
+    ];
+    let mut concrete_ranking = entries.clone();
+    concrete_ranking.sort_by(|lhs, rhs| {
+        rhs.score_basis_points
+            .cmp(&lhs.score_basis_points)
+            .then_with(|| rhs.estimated_time_ns.cmp(&lhs.estimated_time_ns))
+            .then_with(|| lhs.bucket.cmp(&rhs.bucket))
+    });
+    let leader = concrete_ranking.first().cloned();
+    let runner_up = concrete_ranking.get(1).cloned();
+    let runner_up_gap_basis_points = match (&leader, &runner_up) {
+        (Some(leader), Some(runner_up)) => Some(
+            leader
+                .score_basis_points
+                .saturating_sub(runner_up.score_basis_points),
+        ),
+        _ => None,
+    };
+    let mixed_or_ambiguous = match (&leader, &runner_up) {
+        (Some(leader), Some(runner_up)) => {
+            leader.estimated_time_ns == 0
+                || leader.score_basis_points <= 2_500
+                || leader
+                    .score_basis_points
+                    .saturating_sub(runner_up.score_basis_points)
+                    <= 1_000
+        }
+        (Some(leader), None) => leader.estimated_time_ns == 0 || leader.score_basis_points <= 2_500,
+        (None, _) => true,
+    };
+    let mut mixed_beads = Vec::new();
+    let mut mixed_evidence = Vec::new();
+    if let Some(leader) = &leader {
+        push_mapped_beads(&mut mixed_beads, &leader.mapped_beads);
+        if let Some(evidence) = leader.evidence.first() {
+            mixed_evidence.push(evidence.clone());
+        }
+    }
+    if let Some(runner_up) = &runner_up {
+        push_mapped_beads(&mut mixed_beads, &runner_up.mapped_beads);
+        if let Some(evidence) = runner_up.evidence.first() {
+            if !mixed_evidence.iter().any(|existing| {
+                existing.artifact == evidence.artifact
+                    && existing.metric_path == evidence.metric_path
+            }) {
+                mixed_evidence.push(evidence.clone());
+            }
+        }
+    }
+    let mixed_time_ns = if mixed_or_ambiguous {
+        leader
+            .as_ref()
+            .map_or(0, |entry| entry.estimated_time_ns)
+            .saturating_add(
+                runner_up
+                    .as_ref()
+                    .map_or(0, |entry| entry.estimated_time_ns),
+            )
+    } else {
+        0
+    };
+    let mixed_wall_share_basis_points = ratio_basis_points(mixed_time_ns, wall_time_ns);
+    let mixed_score_basis_points = ratio_basis_points(mixed_time_ns, classified_total_ns);
+    let summary_rationale = match (&leader, &runner_up) {
+        (Some(leader), Some(runner_up)) if mixed_or_ambiguous => format!(
+            "Top concrete buckets `{}` ({}) and `{}` ({}) are still too close for a clean single-cause call, so the scaffold keeps a `mixed` lane until the upstream evidence beads land.",
+            leader.bucket,
+            leader.score_basis_points,
+            runner_up.bucket,
+            runner_up.score_basis_points
+        ),
+        (Some(leader), Some(runner_up)) => format!(
+            "`{}` leads the concrete bucket ranking by {} score bps over `{}` using classified hot-path time derived from the existing wall-time, waste-ledger, and cost-component artifacts.",
+            leader.bucket,
+            leader
+                .score_basis_points
+                .saturating_sub(runner_up.score_basis_points),
+            runner_up.bucket
+        ),
+        (Some(leader), None) if mixed_or_ambiguous => format!(
+            "Only `{}` has a measurable classified signal and it remains too small to treat as a confident dominant cause, so the scaffold falls back to `mixed`.",
+            leader.bucket
+        ),
+        (Some(leader), None) => format!(
+            "`{}` is the only non-zero classified bucket exposed by the current artifact set.",
+            leader.bucket
+        ),
+        (None, _) => "All classified causal buckets are currently zero, so the scaffold falls back to `mixed` until more evidence is captured.".to_owned(),
+    };
+    let dominant_bucket = if mixed_or_ambiguous {
+        "mixed".to_owned()
+    } else {
+        leader
+            .as_ref()
+            .map_or_else(|| "mixed".to_owned(), |entry| entry.bucket.clone())
+    };
+    for entry in &mut entries {
+        entry.dominant = !mixed_or_ambiguous
+            && leader
+                .as_ref()
+                .is_some_and(|leader| entry.bucket == leader.bucket);
+    }
+    entries.push(HotPathCausalBucketEntry {
+        rank: 0,
+        bucket: "mixed".to_owned(),
+        dominant: mixed_or_ambiguous,
+        estimated_time_ns: mixed_time_ns,
+        wall_share_basis_points: mixed_wall_share_basis_points,
+        score_basis_points: mixed_score_basis_points,
+        rationale: "Mixed is a deliberate fallback lane for rows where the concrete bucket leaderboard is too flat or too small to defend a single dominant cause with the current artifact set.".to_owned(),
+        implication: causal_bucket_implication("mixed").to_owned(),
+        mapped_beads: mixed_beads,
+        evidence: mixed_evidence,
+    });
+    entries.sort_by(|lhs, rhs| {
+        rhs.dominant
+            .cmp(&lhs.dominant)
+            .then_with(|| rhs.score_basis_points.cmp(&lhs.score_basis_points))
+            .then_with(|| rhs.estimated_time_ns.cmp(&lhs.estimated_time_ns))
+            .then_with(|| lhs.bucket.cmp(&rhs.bucket))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+    }
+
+    let summary = if mixed_or_ambiguous {
+        HotPathCausalClassificationSummary {
+            dominant_bucket,
+            dominant_estimated_time_ns: mixed_time_ns,
+            dominant_wall_share_basis_points: mixed_wall_share_basis_points,
+            dominant_score_basis_points: mixed_score_basis_points,
+            runner_up_bucket: leader.as_ref().map(|entry| entry.bucket.clone()),
+            runner_up_estimated_time_ns: leader.as_ref().map(|entry| entry.estimated_time_ns),
+            runner_up_score_basis_points: leader.as_ref().map(|entry| entry.score_basis_points),
+            runner_up_gap_basis_points,
+            mixed_or_ambiguous: true,
+            rationale: summary_rationale,
+        }
+    } else if let Some(leader) = leader {
+        HotPathCausalClassificationSummary {
+            dominant_bucket,
+            dominant_estimated_time_ns: leader.estimated_time_ns,
+            dominant_wall_share_basis_points: leader.wall_share_basis_points,
+            dominant_score_basis_points: leader.score_basis_points,
+            runner_up_bucket: runner_up.as_ref().map(|entry| entry.bucket.clone()),
+            runner_up_estimated_time_ns: runner_up.as_ref().map(|entry| entry.estimated_time_ns),
+            runner_up_score_basis_points: runner_up.as_ref().map(|entry| entry.score_basis_points),
+            runner_up_gap_basis_points,
+            mixed_or_ambiguous: false,
+            rationale: summary_rationale,
+        }
+    } else {
+        HotPathCausalClassificationSummary {
+            dominant_bucket,
+            dominant_estimated_time_ns: 0,
+            dominant_wall_share_basis_points: 0,
+            dominant_score_basis_points: 0,
+            runner_up_bucket: None,
+            runner_up_estimated_time_ns: None,
+            runner_up_score_basis_points: None,
+            runner_up_gap_basis_points: None,
+            mixed_or_ambiguous: true,
+            rationale: summary_rationale,
+        }
+    };
+
+    (summary, entries)
+}
+
 #[must_use]
 pub fn build_hot_path_opcode_profile(report: &HotPathProfileReport) -> HotPathOpcodeProfilePack {
     let mut opcodes = report.opcode_profile.clone();
@@ -3318,6 +4066,23 @@ pub fn build_hot_path_opcode_profile(report: &HotPathProfileReport) -> HotPathOp
 }
 
 #[must_use]
+fn wal_hot_path_profile(report: &HotPathProfileReport) -> WalHotPathProfile {
+    report
+        .engine_report
+        .hot_path_profile
+        .as_ref()
+        .map(|profile| profile.wal)
+        .unwrap_or_default()
+}
+
+fn wal_durability_time_ns(report: &HotPathProfileReport) -> u64 {
+    let wal = wal_hot_path_profile(report);
+    wal.commit_path
+        .wal_service_us_total
+        .saturating_add(wal.checkpoint_duration_us_total)
+        .saturating_mul(1_000)
+}
+
 pub fn build_hot_path_subsystem_profile(
     report: &HotPathProfileReport,
 ) -> HotPathSubsystemProfilePack {
@@ -3340,6 +4105,7 @@ pub fn build_hot_path_subsystem_profile(
         btree_copy_kernel_targets: report.btree_copy_kernel_targets.clone(),
         record_decode: report.record_decode.clone(),
         row_materialization: report.row_materialization.clone(),
+        wal: wal_hot_path_profile(report),
         mvcc_write: report.mvcc_write.clone(),
         page_data_motion: report.page_data_motion.clone(),
         connection_ceremony: report.connection_ceremony.clone(),
@@ -3380,6 +4146,12 @@ pub fn build_hot_path_actionable_ranking(
     );
     let wall_time_components = build_hot_path_wall_time_components(report);
     let cost_components = build_hot_path_cost_components(report);
+    let (causal_classification, causal_buckets) = build_hot_path_causal_classification(
+        report,
+        &wall_time_components,
+        &cost_components,
+        &baseline_waste_ledger,
+    );
     let top_opcodes = build_hot_path_opcode_profile(report)
         .opcodes
         .into_iter()
@@ -3403,6 +4175,8 @@ pub fn build_hot_path_actionable_ranking(
         named_hotspots,
         microarchitectural_signatures,
         wall_time_components,
+        causal_classification,
+        causal_buckets,
         cost_components,
         allocator_pressure,
         top_opcodes,
@@ -3481,8 +4255,9 @@ pub fn write_hot_path_profile_artifacts(
                 path: "subsystem_profile.json".to_owned(),
                 bytes: u64::try_from(subsystem_profile_json.len()).unwrap_or(u64::MAX),
                 sha256: hot_path_artifact_sha256(subsystem_profile_json.as_bytes()),
-                description: "raw execution-subsystem timing and heap profile for the run"
-                    .to_owned(),
+                description:
+                    "raw execution-subsystem timing, heap profile, and WAL commit-path split/tail metrics for the run"
+                        .to_owned(),
             },
             HotPathArtifactFile {
                 path: "summary.md".to_owned(),
@@ -3874,6 +4649,8 @@ mod tests {
                 prepared_cache_hits: 1,
                 prepared_cache_misses: 1,
                 compile_time_ns: 900,
+                fast_path_executions: 2,
+                slow_path_executions: 1,
             },
             background_status_checks: 2,
             op_cx_background_gates: 1,
@@ -3885,6 +4662,11 @@ mod tests {
             memory_autocommit_fast_path_begins: 1,
             cached_read_snapshot_reuses: 1,
             cached_read_snapshot_parks: 1,
+            begin_refresh_count: 1,
+            commit_refresh_count: 1,
+            memdb_refresh_count: 1,
+            cached_write_txn_reuses: 1,
+            cached_write_txn_parks: 1,
             column_default_evaluation_passes: 2,
             prepared_table_engine_fresh_allocs: 1,
             prepared_table_engine_reuses: 1,
@@ -4111,16 +4893,12 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Sqlite3
-                && c.fixture_id == "fix1"
-                && c.concurrency == 1)
-        );
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Fsqlite
-                && c.fixture_id == "fix2"
-                && c.concurrency == 4)
-        );
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
     }
 
     fn focused_perf_workspace_root() -> PathBuf {
@@ -4511,6 +5289,7 @@ mod tests {
         assert!(!actionable_ranking.named_hotspots.is_empty());
         assert_eq!(actionable_ranking.microarchitectural_signatures.len(), 8);
         assert_eq!(actionable_ranking.wall_time_components.len(), 8);
+        assert_eq!(actionable_ranking.causal_buckets.len(), 7);
         assert!(!actionable_ranking.cost_components.is_empty());
         assert_eq!(actionable_ranking.allocator_pressure.len(), 4);
         assert_eq!(
@@ -4522,50 +5301,39 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
         );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## B-Tree Copy Kernel Targets")
-        );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## Baseline Reuse Ledger")
-        );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## MVCC Write Path")
-        );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## PageData Motion")
-        );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## Baseline Waste Ledger")
-        );
-        assert!(
-            std::fs::read_to_string(artifact_dir.join("summary.md"))
-                .unwrap()
-                .contains("## Wall-Time Decomposition")
-        );
-        assert!(
-            actionable_ranking
-                .named_hotspots
-                .iter()
-                .flat_map(|entry| entry.mapped_beads.iter())
-                .any(|bead| bead == "bd-db300.10.2"
-                    || bead == "bd-db300.5.2.1"
-                    || bead == "bd-db300.5.5.1"
-                    || bead == "bd-db300.10.3"
-                    || bead == "bd-db300.10.4"
-                    || bead == "bd-db300.10.5"
-                    || bead == "bd-db300.10.6"
-                    || bead == "bd-db300.10.7")
-        );
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## B-Tree Copy Kernel Targets"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## Baseline Reuse Ledger"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## MVCC Write Path"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## PageData Motion"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## Baseline Waste Ledger"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## Wall-Time Decomposition"));
+        assert!(std::fs::read_to_string(artifact_dir.join("summary.md"))
+            .unwrap()
+            .contains("## Causal Classification"));
+        assert!(actionable_ranking
+            .named_hotspots
+            .iter()
+            .flat_map(|entry| entry.mapped_beads.iter())
+            .any(|bead| bead == "bd-db300.10.2"
+                || bead == "bd-db300.5.2.1"
+                || bead == "bd-db300.5.5.1"
+                || bead == "bd-db300.10.3"
+                || bead == "bd-db300.10.4"
+                || bead == "bd-db300.10.5"
+                || bead == "bd-db300.10.6"
+                || bead == "bd-db300.10.7"));
         assert_eq!(actionable_ranking.cost_components.len(), 4);
         let wall_component_names = actionable_ranking
             .wall_time_components
@@ -4580,37 +5348,82 @@ mod tests {
         assert!(wall_component_names.contains(&"durability"));
         assert!(wall_component_names.contains(&"mvcc_wait"));
         assert!(wall_component_names.contains(&"mvcc_commit_surface"));
-        assert!(
+        let causal_bucket_names = actionable_ranking
+            .causal_buckets
+            .iter()
+            .map(|entry| entry.bucket.as_str())
+            .collect::<Vec<_>>();
+        assert!(causal_bucket_names.contains(&"service"));
+        assert!(causal_bucket_names.contains(&"queueing"));
+        assert!(causal_bucket_names.contains(&"synchronization"));
+        assert!(causal_bucket_names.contains(&"allocation"));
+        assert!(causal_bucket_names.contains(&"io"));
+        assert!(causal_bucket_names.contains(&"retries"));
+        assert!(causal_bucket_names.contains(&"mixed"));
+        assert_eq!(
             actionable_ranking
-                .microarchitectural_signatures
+                .causal_buckets
                 .iter()
-                .all(|entry| entry.fixture_id == report.fixture_id)
+                .filter(|entry| entry.dominant)
+                .count(),
+            1
         );
-        assert!(
+        assert_eq!(
+            actionable_ranking.causal_classification.dominant_bucket,
+            "synchronization"
+        );
+        assert_eq!(
             actionable_ranking
-                .microarchitectural_signatures
-                .iter()
-                .all(|entry| entry.row_id.as_deref()
-                    == Some(microarchitectural_context.row_id.as_str()))
+                .causal_buckets
+                .first()
+                .map(|entry| entry.bucket.as_str()),
+            Some("synchronization")
         );
-        assert!(
+        assert_eq!(
             actionable_ranking
-                .microarchitectural_signatures
-                .iter()
-                .all(|entry| entry.mode_id.as_deref()
-                    == Some(microarchitectural_context.mode_id.as_str()))
+                .causal_buckets
+                .first()
+                .map(|entry| entry.dominant),
+            Some(true)
         );
-        assert!(
+        assert_eq!(
             actionable_ranking
-                .microarchitectural_signatures
-                .iter()
-                .all(
-                    |entry| entry.placement_profile_id.as_deref() == Some("baseline_unpinned")
-                        && entry.hardware_class_id.as_deref() == Some("linux_x86_64_any")
-                        && entry.hardware_signature.as_deref() == Some("linux:x86_64:any")
-                        && !entry.evidence_sources.is_empty()
-                )
+                .causal_classification
+                .runner_up_bucket
+                .as_deref(),
+            Some("queueing")
         );
+        assert_eq!(
+            actionable_ranking
+                .causal_classification
+                .runner_up_gap_basis_points,
+            Some(5_288)
+        );
+        assert!(!actionable_ranking.causal_classification.mixed_or_ambiguous);
+        assert!(actionable_ranking
+            .microarchitectural_signatures
+            .iter()
+            .all(|entry| entry.fixture_id == report.fixture_id));
+        assert!(actionable_ranking
+            .microarchitectural_signatures
+            .iter()
+            .all(
+                |entry| entry.row_id.as_deref() == Some(microarchitectural_context.row_id.as_str())
+            ));
+        assert!(actionable_ranking
+            .microarchitectural_signatures
+            .iter()
+            .all(|entry| entry.mode_id.as_deref()
+                == Some(microarchitectural_context.mode_id.as_str())));
+        assert!(actionable_ranking
+            .microarchitectural_signatures
+            .iter()
+            .all(
+                |entry| entry.placement_profile_id.as_deref() == Some("baseline_unpinned")
+                    && entry.hardware_class_id.as_deref() == Some("linux_x86_64_any")
+                    && entry.hardware_signature.as_deref() == Some("linux:x86_64:any")
+                    && !entry.evidence_sources.is_empty()
+            ));
         let component_names = actionable_ranking
             .cost_components
             .iter()
@@ -4620,12 +5433,10 @@ mod tests {
         assert!(component_names.contains(&"record_decode"));
         assert!(component_names.contains(&"row_materialization"));
         assert!(component_names.contains(&"page_data_motion"));
-        assert!(
-            actionable_ranking
-                .allocator_pressure
-                .iter()
-                .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty())
-        );
+        assert!(actionable_ranking
+            .allocator_pressure
+            .iter()
+            .all(|entry| !entry.implication.is_empty() && !entry.mapped_beads.is_empty()));
 
         let parser_component = actionable_ranking
             .cost_components
@@ -4776,6 +5587,63 @@ mod tests {
             page_data_normalization.mapped_beads,
             vec!["bd-db300.10.3".to_owned(), "bd-db300.10.6".to_owned()]
         );
+
+        let synchronization_bucket = actionable_ranking
+            .causal_buckets
+            .iter()
+            .find(|entry| entry.bucket == "synchronization")
+            .unwrap();
+        assert!(synchronization_bucket.dominant);
+        assert_eq!(synchronization_bucket.estimated_time_ns, 4_800_000);
+        assert_eq!(synchronization_bucket.score_basis_points, 7_051);
+        assert!(synchronization_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path
+                == ".wall_time_components[] | select(.component == \"mvcc_wait\") | .time_ns"
+        }));
+        assert!(synchronization_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path == ".engine_report.hot_path_profile.vfs.lock_ops"
+        }));
+
+        let service_bucket = actionable_ranking
+            .causal_buckets
+            .iter()
+            .find(|entry| entry.bucket == "service")
+            .unwrap();
+        assert_eq!(service_bucket.estimated_time_ns, 5_000);
+        assert!(service_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path == ".engine_report.runtime_phase_timing.body_execution_time_ns"
+        }));
+
+        let allocation_bucket = actionable_ranking
+            .causal_buckets
+            .iter()
+            .find(|entry| entry.bucket == "allocation")
+            .unwrap();
+        assert_eq!(allocation_bucket.estimated_time_ns, 2_500);
+        assert!(allocation_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path
+                == ".baseline_waste_ledger[] | select(.component == \"page_data_normalization\") | .metric_value"
+        }));
+
+        let io_bucket = actionable_ranking
+            .causal_buckets
+            .iter()
+            .find(|entry| entry.bucket == "io")
+            .unwrap();
+        assert_eq!(io_bucket.estimated_time_ns, 0);
+        assert!(io_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path == ".engine_report.hot_path_profile.wal.bytes_written_total"
+        }));
+
+        let retries_bucket = actionable_ranking
+            .causal_buckets
+            .iter()
+            .find(|entry| entry.bucket == "retries")
+            .unwrap();
+        assert_eq!(retries_bucket.estimated_time_ns, 800_000);
+        assert!(retries_bucket.evidence.iter().any(|evidence| {
+            evidence.metric_path == ".engine_report.runtime_phase_timing.retry_backoff_time_ns"
+        }));
     }
 
     #[test]

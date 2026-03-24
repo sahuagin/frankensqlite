@@ -35,6 +35,7 @@
 //!   flushing (default: 1ms). Bounded to ensure tail latency.
 
 use fsqlite_types::sync_primitives::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -186,11 +187,7 @@ pub struct PhaseHistogram {
 }
 
 impl PhaseHistogram {
-    const fn new() -> Self {
-        // SAFETY: AtomicU64 has the same layout as u64, and 0 is valid.
-        // We need const init for static. Using array::from_fn is not const.
-        // Workaround: macro-generate or use a helper. For now, use a const
-        // block with transmute-free initialization.
+    pub const fn new() -> Self {
         const ZERO: AtomicU64 = AtomicU64::new(0);
         Self {
             samples: [ZERO; PHASE_HISTOGRAM_CAPACITY],
@@ -280,7 +277,7 @@ impl PhaseHistogram {
 }
 
 /// Percentile snapshot from a `PhaseHistogram`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PhasePercentiles {
     pub p50: u64,
     pub p95: u64,
@@ -342,7 +339,7 @@ impl WakeReasonCounters {
 }
 
 /// Point-in-time snapshot of wake reasons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WakeReasonSnapshot {
     pub notify: u64,
     pub timeout: u64,
@@ -640,15 +637,15 @@ impl ConsolidationMetrics {
             commit_phase_c2_us_total: self.commit_phase_c2_us_total.load(Ordering::Relaxed),
             commit_phase_count: self.commit_phase_count.load(Ordering::Relaxed),
             // Per-phase distributions (bd-db300.3.8.1)
-            dist_consolidator_lock_wait: self.hist_consolidator_lock_wait.percentiles(),
-            dist_arrival_wait: self.hist_arrival_wait.percentiles(),
-            dist_wal_backend_lock_wait: self.hist_wal_backend_lock_wait.percentiles(),
-            dist_wal_append: self.hist_wal_append.percentiles(),
-            dist_exclusive_lock: self.hist_exclusive_lock.percentiles(),
-            dist_waiter_epoch_wait: self.hist_waiter_epoch_wait.percentiles(),
-            dist_phase_b: self.hist_phase_b.percentiles(),
-            dist_wal_sync: self.hist_wal_sync.percentiles(),
-            dist_full_commit: self.hist_full_commit.percentiles(),
+            hist_consolidator_lock_wait: self.hist_consolidator_lock_wait.percentiles(),
+            hist_arrival_wait: self.hist_arrival_wait.percentiles(),
+            hist_wal_backend_lock_wait: self.hist_wal_backend_lock_wait.percentiles(),
+            hist_wal_append: self.hist_wal_append.percentiles(),
+            hist_exclusive_lock: self.hist_exclusive_lock.percentiles(),
+            hist_waiter_epoch_wait: self.hist_waiter_epoch_wait.percentiles(),
+            hist_phase_b: self.hist_phase_b.percentiles(),
+            hist_wal_sync: self.hist_wal_sync.percentiles(),
+            hist_full_commit: self.hist_full_commit.percentiles(),
             wake_reasons: self.wake_reasons.snapshot(),
         }
     }
@@ -704,7 +701,7 @@ impl Default for ConsolidationMetrics {
 }
 
 /// Point-in-time snapshot of consolidation metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsolidationMetricsSnapshot {
     pub groups_flushed: u64,
     pub frames_consolidated: u64,
@@ -733,15 +730,15 @@ pub struct ConsolidationMetricsSnapshot {
     pub commit_phase_c2_us_total: u64,
     pub commit_phase_count: u64,
     // ── Per-phase distributions (bd-db300.3.8.1) ──
-    pub dist_consolidator_lock_wait: PhasePercentiles,
-    pub dist_arrival_wait: PhasePercentiles,
-    pub dist_wal_backend_lock_wait: PhasePercentiles,
-    pub dist_wal_append: PhasePercentiles,
-    pub dist_exclusive_lock: PhasePercentiles,
-    pub dist_waiter_epoch_wait: PhasePercentiles,
-    pub dist_phase_b: PhasePercentiles,
-    pub dist_wal_sync: PhasePercentiles,
-    pub dist_full_commit: PhasePercentiles,
+    pub hist_consolidator_lock_wait: PhasePercentiles,
+    pub hist_arrival_wait: PhasePercentiles,
+    pub hist_wal_backend_lock_wait: PhasePercentiles,
+    pub hist_wal_append: PhasePercentiles,
+    pub hist_exclusive_lock: PhasePercentiles,
+    pub hist_waiter_epoch_wait: PhasePercentiles,
+    pub hist_phase_b: PhasePercentiles,
+    pub hist_wal_sync: PhasePercentiles,
+    pub hist_full_commit: PhasePercentiles,
     // ── Wake reasons (bd-db300.3.8.1) ──
     pub wake_reasons: WakeReasonSnapshot,
 }
@@ -1402,8 +1399,8 @@ pub fn write_consolidated_frames<F: VfsFile>(
 #[cfg(test)]
 mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
-    use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::traits::Vfs;
+    use fsqlite_vfs::MemoryVfs;
 
     use super::*;
     use crate::checksum::WalSalts;
@@ -1925,6 +1922,39 @@ mod tests {
         assert!(s.contains("reduction=5x"));
     }
 
+    #[test]
+    fn test_consolidation_metrics_snapshot_serializes_phase_distributions() {
+        let m = ConsolidationMetrics::new();
+        m.record_phase_timing(10, 5, 2, true, 20, 3, 8, 50, 30, 0);
+        m.record_phase_timing(11, 6, 2, false, 0, 0, 0, 0, 0, 100);
+        m.wake_reasons.notify.fetch_add(1, Ordering::Relaxed);
+        m.wake_reasons.timeout.fetch_add(2, Ordering::Relaxed);
+
+        let encoded =
+            serde_json::to_value(m.snapshot()).expect("consolidation snapshot should serialize");
+
+        assert_eq!(
+            encoded["hist_wal_append"]["count"].as_u64(),
+            Some(1),
+            "flusher histogram should serialize sample counts"
+        );
+        assert_eq!(
+            encoded["hist_waiter_epoch_wait"]["count"].as_u64(),
+            Some(1),
+            "waiter histogram should serialize sample counts"
+        );
+        assert_eq!(
+            encoded["wake_reasons"]["notify"].as_u64(),
+            Some(1),
+            "wake reasons should serialize nested counters"
+        );
+        assert_eq!(
+            encoded["wake_reasons"]["timeout"].as_u64(),
+            Some(2),
+            "wake reasons should preserve all fields"
+        );
+    }
+
     /// Deterministic proof that consolidation achieves fsync reduction.
     ///
     /// Without consolidation: N transactions × 1 fsync each = N fsyncs.
@@ -2197,23 +2227,41 @@ mod tests {
 
         for i in 0..10u64 {
             GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                10 + i, 5 + i, 2, true, 20 + i, 3 + i, 8 + i, 50 + i, 30 + i, 0,
+                10 + i,
+                5 + i,
+                2,
+                true,
+                20 + i,
+                3 + i,
+                8 + i,
+                50 + i,
+                30 + i,
+                0,
             );
         }
         for i in 0..5u64 {
             GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
-                10 + i, 5 + i, 2, false, 0, 0, 0, 0, 0, 100 + i,
+                10 + i,
+                5 + i,
+                2,
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                100 + i,
             );
         }
 
         let snap = GLOBAL_CONSOLIDATION_METRICS.snapshot();
-        assert_eq!(snap.dist_consolidator_lock_wait.count, 15);
-        assert_eq!(snap.dist_arrival_wait.count, 10);
-        assert_eq!(snap.dist_wal_append.count, 10);
-        assert_eq!(snap.dist_waiter_epoch_wait.count, 5);
-        assert_eq!(snap.dist_phase_b.count, 15);
-        assert!(snap.dist_wal_append.p50 > 0);
-        assert!(snap.dist_wal_append.max >= 59);
+        assert_eq!(snap.hist_consolidator_lock_wait.count, 15);
+        assert_eq!(snap.hist_arrival_wait.count, 10);
+        assert_eq!(snap.hist_wal_append.count, 10);
+        assert_eq!(snap.hist_waiter_epoch_wait.count, 5);
+        assert_eq!(snap.hist_phase_b.count, 15);
+        assert!(snap.hist_wal_append.p50 > 0);
+        assert!(snap.hist_wal_append.max >= 59);
 
         GLOBAL_CONSOLIDATION_METRICS.reset();
     }
