@@ -70,6 +70,71 @@ impl WaitPathMode {
 const GROUP_COMMIT_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
 const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEventcount;
 const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
+const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
+const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrivalWaitObservation {
+    pending_batch_count: usize,
+    should_flush_now: bool,
+    fill_age: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrivalWaitDecision {
+    wait_budget: Duration,
+    policy: &'static str,
+    reason: &'static str,
+    fill_age: Duration,
+    used_legacy_fallback: bool,
+}
+
+impl ArrivalWaitDecision {
+    fn skip(reason: &'static str, fill_age: Duration) -> Self {
+        Self {
+            wait_budget: Duration::ZERO,
+            policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
+            reason,
+            fill_age,
+            used_legacy_fallback: false,
+        }
+    }
+
+    fn legacy_fallback(fill_age: Duration) -> Self {
+        Self {
+            wait_budget: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+            policy: GROUP_COMMIT_ARRIVAL_WAIT_POLICY,
+            reason: "legacy_fallback",
+            fill_age,
+            used_legacy_fallback: true,
+        }
+    }
+
+    fn wait_budget_us(self) -> u64 {
+        self.wait_budget.as_micros() as u64
+    }
+
+    fn fill_age_us(self) -> u64 {
+        self.fill_age.as_micros() as u64
+    }
+}
+
+fn decide_group_commit_arrival_wait(
+    observation: Option<ArrivalWaitObservation>,
+) -> ArrivalWaitDecision {
+    match observation {
+        None => ArrivalWaitDecision::skip("promoted_follow_on", Duration::ZERO),
+        Some(observation) => {
+            if observation.pending_batch_count > 1 || observation.should_flush_now {
+                return ArrivalWaitDecision::skip("queue_already_flushable", observation.fill_age);
+            }
+            if observation.fill_age >= LEGACY_GROUP_COMMIT_ARRIVAL_WAIT {
+                return ArrivalWaitDecision::skip("fill_age_exhausted", observation.fill_age);
+            }
+            ArrivalWaitDecision::legacy_fallback(observation.fill_age)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyedWaitResult {
@@ -4083,8 +4148,10 @@ where
     /// Protocol:
     /// 1. Each thread builds a `TransactionFrameBatch` with OWNED frame data
     /// 2. Thread submits batch to consolidator, receives `Flusher` or `Waiter` role
-    /// 3. **Flusher**: Waits 50μs for more arrivals, then writes ALL batched
-    ///    frames from all transactions in ONE consolidated I/O + fsync
+    /// 3. **Flusher**: Uses a tail-safe arrival wait. Fresh epochs fall back to
+    ///    the legacy 20μs spin, but epochs that already spent that budget
+    ///    gathering peers flush immediately. The flusher then writes ALL
+    ///    batched frames from all transactions in ONE consolidated I/O + fsync
     /// 4. **Waiter**: Parks on condvar until flusher signals completion
     ///
     /// Benefits over immediate-flush:
@@ -4155,38 +4222,45 @@ where
                                 mut needs_arrival_wait: bool,
                                 mut prefetched_flush: Option<(Vec<TransactionFrameBatch>, u64)>|
          -> Result<()> {
-            let mut arrival_wait_us = 0u64;
-
             'flusher_loop: loop {
-                if prefetched_flush.is_none() && needs_arrival_wait {
-                    let t_arrival_wait_start = Instant::now();
-                    let already_full = {
+                let arrival_wait_decision = if prefetched_flush.is_none() && needs_arrival_wait {
+                    let observation = {
                         let consolidator = queue
                             .consolidator
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        consolidator.pending_batch_count() > 1 || consolidator.should_flush_now()
-                    };
-                    if !already_full {
-                        let deadline = Instant::now() + Duration::from_micros(20);
-                        loop {
-                            let should_flush = {
-                                let consolidator = queue
-                                    .consolidator
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                consolidator.should_flush_now()
-                            };
-                            if should_flush || Instant::now() >= deadline {
-                                break;
-                            }
-                            std::hint::spin_loop();
+                        ArrivalWaitObservation {
+                            pending_batch_count: consolidator.pending_batch_count(),
+                            should_flush_now: consolidator.should_flush_now(),
+                            fill_age: consolidator.fill_age(),
                         }
+                    };
+                    decide_group_commit_arrival_wait(Some(observation))
+                } else {
+                    decide_group_commit_arrival_wait(None)
+                };
+                let arrival_wait_us = if !arrival_wait_decision.wait_budget.is_zero() {
+                    let t_arrival_wait_start = Instant::now();
+                    let deadline = t_arrival_wait_start + arrival_wait_decision.wait_budget;
+                    loop {
+                        let should_flush = {
+                            let consolidator = queue
+                                .consolidator
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            consolidator.should_flush_now()
+                        };
+                        if should_flush || Instant::now() >= deadline {
+                            break;
+                        }
+                        std::hint::spin_loop();
                     }
-                    arrival_wait_us = Instant::now()
+                    Instant::now()
                         .duration_since(t_arrival_wait_start)
-                        .as_micros() as u64;
-                }
+                        .as_micros() as u64
+                } else {
+                    0
+                };
 
                 let (batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
                     prefetched
@@ -4400,6 +4474,12 @@ where
                             wal_append_us,
                             wal_sync_us,
                             arrival_wait_us,
+                            arrival_wait_policy = arrival_wait_decision.policy,
+                            arrival_wait_reason = arrival_wait_decision.reason,
+                            arrival_wait_budget_us = arrival_wait_decision.wait_budget_us(),
+                            arrival_wait_fill_age_us = arrival_wait_decision.fill_age_us(),
+                            arrival_wait_used_legacy_fallback =
+                                arrival_wait_decision.used_legacy_fallback,
                             "WAL backend commit: lock_wait={lock_wait_total_us}us \
                              service={wal_service_total_us}us \
                              (append={wal_append_us}us sync={wal_sync_us}us) \
@@ -4419,7 +4499,6 @@ where
                         if has_promoted {
                             record_initial_metrics = false;
                             needs_arrival_wait = false;
-                            arrival_wait_us = 0;
                             continue 'flusher_loop;
                         }
                     }
@@ -11041,6 +11120,90 @@ mod tests {
     }
 
     #[test]
+    fn test_build_group_commit_batch_clones_owned_frames_and_commit_boundary() {
+        let page_two = PageNumber::new(2).unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+        let mut write_set = HashMap::new();
+
+        let mut page2 = PageBuf::new(PageSize::DEFAULT);
+        page2.fill(0x22);
+        write_set.insert(page_two, StagedPage::from_buf(page2));
+
+        let mut page3 = PageBuf::new(PageSize::DEFAULT);
+        page3.fill(0x33);
+        write_set.insert(page_three, StagedPage::from_buf(page3));
+
+        let (batch, new_db_size) = build_group_commit_batch(2, &write_set, &[page_two, page_three])
+            .unwrap()
+            .expect("sorted write set should yield a group commit batch");
+        drop(write_set);
+
+        assert_eq!(
+            new_db_size, 3,
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_new_db_size"
+        );
+        assert_eq!(
+            batch.frames.len(),
+            2,
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_frame_count"
+        );
+        assert_eq!(
+            batch.frames[0].page_number,
+            page_two.get(),
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_sorted_first"
+        );
+        assert_eq!(
+            batch.frames[0].db_size_if_commit, 0,
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_non_commit_first"
+        );
+        assert_eq!(
+            batch.frames[1].page_number,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_sorted_last"
+        );
+        assert_eq!(
+            batch.frames[1].db_size_if_commit,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_commit_marker_last"
+        );
+        assert_eq!(
+            batch.frames[0].page_data[0], 0x22,
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_preserves_first_payload_after_source_drop"
+        );
+        assert_eq!(
+            batch.frames[1].page_data[0], 0x33,
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_preserves_second_payload_after_source_drop"
+        );
+    }
+
+    #[test]
+    fn test_build_group_commit_batch_returns_none_for_empty_write_set() {
+        let write_set = HashMap::new();
+        let batch = build_group_commit_batch(4, &write_set, &[]).unwrap();
+        assert!(
+            batch.is_none(),
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_empty_batch"
+        );
+    }
+
+    #[test]
+    fn test_build_group_commit_batch_errors_when_sorted_page_missing_from_write_set() {
+        let missing_page = PageNumber::new(4).unwrap();
+        let write_set = HashMap::new();
+        let err = match build_group_commit_batch(1, &write_set, &[missing_page]) {
+            Ok(_) => panic!(
+                "bead_id={BEAD_ID} case=group_commit_batch_helper_missing_page expected helper to fail"
+            ),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("missing page 4"),
+            "bead_id={BEAD_ID} case=group_commit_batch_helper_missing_page error={message}"
+        );
+    }
+
+    #[test]
     fn test_group_commit_queue_retains_failed_epoch_for_late_waiter() {
         let queue = GroupCommitQueue::new(GroupCommitConfig::default());
         queue.publish_failed_epoch(
@@ -11230,6 +11393,40 @@ mod tests {
     }
 
     #[test]
+    fn test_keyed_wait_slot_returns_signaled_after_generation_advance() {
+        let slot = KeyedWaitSlot::default();
+        let observed_generation = slot.generation();
+        slot.signal();
+
+        assert_eq!(
+            slot.wait_for_change(observed_generation, Duration::from_millis(1)),
+            KeyedWaitResult::Signaled,
+            "bead_id={BEAD_ID} case=keyed_wait_slot_pre_signaled_generation_must_not_timeout"
+        );
+    }
+
+    #[test]
+    fn test_keyed_wait_registry_prunes_stale_slots_after_last_waiter_drops() {
+        let registry = KeyedWaitRegistry::new();
+        {
+            let _slot = registry.slot(23);
+            assert!(
+                registry.has_slot(23),
+                "bead_id={BEAD_ID} case=keyed_wait_registry_live_slot_visible_while_held"
+            );
+        }
+
+        assert!(
+            !registry.signal(23),
+            "bead_id={BEAD_ID} case=keyed_wait_registry_stale_slot_must_not_report_signal"
+        );
+        assert!(
+            !registry.has_slot(23),
+            "bead_id={BEAD_ID} case=keyed_wait_registry_prunes_stale_slot_after_signal_attempt"
+        );
+    }
+
+    #[test]
     fn test_group_commit_queue_promoted_waiter_wakes_on_targeted_publish() {
         let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
 
@@ -11307,6 +11504,312 @@ mod tests {
         assert_eq!(flush_epoch, 2);
         assert_eq!(batches.len(), 1);
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn test_group_commit_queue_completed_publish_wakes_target_and_next_epoch_waiters() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x31),
+                db_size_if_commit: 1,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(batch1).unwrap(),
+                SubmitOutcome::Flusher
+            );
+            let _ = consolidator.begin_flush().unwrap();
+            let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x32),
+                db_size_if_commit: 2,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(pipelined_batch).unwrap(),
+                SubmitOutcome::Waiter
+            );
+        }
+
+        let _target_slot = queue.epoch_waiters.slot(1);
+        let _next_slot = queue.epoch_waiters.slot(2);
+
+        let spawn_waiter = |target_epoch: u64| {
+            let waiter_queue = Arc::clone(&queue);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let guard = waiter_queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ready_tx.send(()).expect("waiter should signal readiness");
+                let outcome = waiter_queue.wait_for_epoch_outcome(guard, target_epoch);
+                done_tx.send(outcome).expect("waiter should report outcome");
+            });
+            (handle, ready_rx, done_rx)
+        };
+
+        let (target_handle, target_ready_rx, target_done_rx) = spawn_waiter(1);
+        let (next_handle, next_ready_rx, next_done_rx) = spawn_waiter(2);
+
+        target_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target waiter should start");
+        next_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next-epoch waiter should start");
+        assert!(
+            target_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=group_commit_completed_publish_target_waiter_stays_parked_until_publish"
+        );
+        assert!(
+            next_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=group_commit_completed_publish_next_waiter_stays_parked_until_publish"
+        );
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                consolidator.complete_flush().unwrap(),
+                "bead_id={BEAD_ID} case=group_commit_completed_publish_must_promote_next_epoch"
+            );
+        }
+        queue.publish_completed_epoch(1, true);
+
+        let target_outcome = target_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("target waiter should wake")
+            .expect("target waiter should succeed");
+        assert!(
+            matches!(target_outcome, WaitForEpochOutcome::Completed),
+            "bead_id={BEAD_ID} case=group_commit_completed_publish_target_waiter_observes_completed_epoch outcome={target_outcome:?}"
+        );
+
+        let next_outcome = next_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("next-epoch waiter should wake")
+            .expect("next-epoch waiter should succeed");
+        let WaitForEpochOutcome::TakeOverFlusher {
+            flush_epoch,
+            batches,
+        } = next_outcome
+        else {
+            panic!(
+                "bead_id={BEAD_ID} case=group_commit_completed_publish_next_waiter_must_take_over_flusher outcome={next_outcome:?}"
+            );
+        };
+        assert_eq!(
+            flush_epoch, 2,
+            "bead_id={BEAD_ID} case=group_commit_completed_publish_next_waiter_flush_epoch"
+        );
+        assert_eq!(
+            batches.len(),
+            1,
+            "bead_id={BEAD_ID} case=group_commit_completed_publish_next_waiter_batch_count"
+        );
+
+        target_handle.join().unwrap();
+        next_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_group_commit_queue_failed_publish_wakes_failed_and_next_epoch_waiters() {
+        let queue = Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()));
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch1 = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: sample_page(0x41),
+                db_size_if_commit: 1,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(batch1).unwrap(),
+                SubmitOutcome::Flusher
+            );
+            let _ = consolidator.begin_flush().unwrap();
+            let pipelined_batch = TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: sample_page(0x42),
+                db_size_if_commit: 2,
+            }]);
+            assert_eq!(
+                consolidator.submit_batch(pipelined_batch).unwrap(),
+                SubmitOutcome::Waiter
+            );
+        }
+
+        let _failed_slot = queue.epoch_waiters.slot(1);
+        let _next_slot = queue.epoch_waiters.slot(2);
+
+        let spawn_waiter = |target_epoch: u64| {
+            let waiter_queue = Arc::clone(&queue);
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let guard = waiter_queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ready_tx.send(()).expect("waiter should signal readiness");
+                let outcome = waiter_queue.wait_for_epoch_outcome(guard, target_epoch);
+                done_tx.send(outcome).expect("waiter should report outcome");
+            });
+            (handle, ready_rx, done_rx)
+        };
+
+        let (failed_handle, failed_ready_rx, failed_done_rx) = spawn_waiter(1);
+        let (next_handle, next_ready_rx, next_done_rx) = spawn_waiter(2);
+
+        failed_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("failed-epoch waiter should start");
+        next_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next-epoch waiter should start");
+        assert!(
+            failed_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_failed_waiter_stays_parked_until_publish"
+        );
+        assert!(
+            next_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err(),
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_next_waiter_stays_parked_until_publish"
+        );
+
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            consolidator.abort_flush().unwrap();
+            assert!(
+                consolidator.has_flusher_vacancy(),
+                "bead_id={BEAD_ID} case=group_commit_failed_publish_abort_must_expose_flusher_vacancy"
+            );
+        }
+
+        let failure = FrankenError::internal("forced keyed failed epoch for proof coverage");
+        queue.publish_failed_epoch(1, &failure, true);
+
+        let failed_error = failed_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("failed-epoch waiter should wake")
+            .expect_err("failed-epoch waiter should surface the flush failure")
+            .to_string();
+        assert!(
+            failed_error.contains("epoch 1"),
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_failed_waiter_mentions_epoch error={failed_error}"
+        );
+        assert!(
+            failed_error.contains("forced keyed failed epoch for proof coverage"),
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_failed_waiter_preserves_detail error={failed_error}"
+        );
+
+        let next_outcome = next_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("next-epoch waiter should wake")
+            .expect("next-epoch waiter should succeed");
+        let WaitForEpochOutcome::TakeOverFlusher {
+            flush_epoch,
+            batches,
+        } = next_outcome
+        else {
+            panic!(
+                "bead_id={BEAD_ID} case=group_commit_failed_publish_next_waiter_must_take_over_flusher outcome={next_outcome:?}"
+            );
+        };
+        assert_eq!(
+            flush_epoch, 2,
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_next_waiter_flush_epoch"
+        );
+        assert_eq!(
+            batches.len(),
+            1,
+            "bead_id={BEAD_ID} case=group_commit_failed_publish_next_waiter_batch_count"
+        );
+
+        failed_handle.join().unwrap();
+        next_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_arrival_wait_policy_fresh_epoch_uses_legacy_fallback() {
+        let decision = decide_group_commit_arrival_wait(Some(ArrivalWaitObservation {
+            pending_batch_count: 1,
+            should_flush_now: false,
+            fill_age: Duration::from_micros(3),
+        }));
+
+        assert_eq!(
+            decision.wait_budget, LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_legacy_fallback"
+        );
+        assert_eq!(
+            decision.reason, "legacy_fallback",
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_reason"
+        );
+        assert!(
+            decision.used_legacy_fallback,
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fresh_epoch_marks_fallback"
+        );
+    }
+
+    #[test]
+    fn test_arrival_wait_policy_skips_after_legacy_window_is_already_spent() {
+        let decision = decide_group_commit_arrival_wait(Some(ArrivalWaitObservation {
+            pending_batch_count: 1,
+            should_flush_now: false,
+            fill_age: LEGACY_GROUP_COMMIT_ARRIVAL_WAIT,
+        }));
+
+        assert_eq!(
+            decision.wait_budget,
+            Duration::ZERO,
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_budget"
+        );
+        assert_eq!(
+            decision.reason, "fill_age_exhausted",
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_reason"
+        );
+        assert!(
+            !decision.used_legacy_fallback,
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_fill_age_exhausted_not_fallback"
+        );
+    }
+
+    #[test]
+    fn test_arrival_wait_policy_skips_promoted_follow_on_flushes() {
+        let decision = decide_group_commit_arrival_wait(None);
+
+        assert_eq!(
+            decision.wait_budget,
+            Duration::ZERO,
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_promoted_follow_on_budget"
+        );
+        assert_eq!(
+            decision.reason, "promoted_follow_on",
+            "bead_id=bd-db300.3.8.5 case=arrival_wait_promoted_follow_on_reason"
+        );
     }
 
     #[test]
@@ -15413,9 +15916,9 @@ mod tests {
     // ── bd-db300.3.8.7: targeted regression tests for lock-scope narrowing ──
 
     #[test]
-    fn test_read_page_from_wal_backend_uses_shared_lock_when_pinned() {
-        // Verify that read_page_from_wal_backend uses the read (shared)
-        // lock path when supports_pinned_reads() returns true.
+    fn test_read_page_from_wal_backend_falls_back_to_write_lock_when_pinned_reads_unsupported() {
+        // Verify that read_page_from_wal_backend falls back to the write-lock
+        // path when supports_pinned_reads() returns false.
         let wal_backend: SharedWalBackend = new_shared_wal_backend();
         let cx = Cx::new();
         let page_no = PageNumber::new(1).unwrap();
@@ -15443,6 +15946,109 @@ mod tests {
             result.unwrap(),
             None,
             "bead_id=bd-db300.3.8.7 unwritten page should return None"
+        );
+    }
+
+    #[test]
+    fn test_read_page_from_wal_backend_uses_pinned_read_without_write_fallback() {
+        use crate::traits::WalBackend;
+
+        struct PinnedReadBackend {
+            pinned_calls: Arc<Mutex<usize>>,
+            fallback_calls: Arc<Mutex<usize>>,
+            response: Vec<u8>,
+        }
+
+        impl WalBackend for PinnedReadBackend {
+            fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                *self.fallback_calls.lock().unwrap() += 1;
+                Ok(Some(vec![0xEE]))
+            }
+
+            fn read_page_pinned(
+                &self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                *self.pinned_calls.lock().unwrap() += 1;
+                Ok(Some(self.response.clone()))
+            }
+
+            fn supports_pinned_reads(&self) -> bool {
+                true
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                0
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                _mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                })
+            }
+        }
+
+        let pinned_calls = Arc::new(Mutex::new(0_usize));
+        let fallback_calls = Arc::new(Mutex::new(0_usize));
+        let expected = vec![0xAB, 0xCD, 0xEF];
+        let wal_backend: SharedWalBackend = new_shared_wal_backend();
+        *wal_backend.write().unwrap() = Some(Box::new(PinnedReadBackend {
+            pinned_calls: Arc::clone(&pinned_calls),
+            fallback_calls: Arc::clone(&fallback_calls),
+            response: expected.clone(),
+        }));
+
+        let cx = Cx::new();
+        let page_no = PageNumber::new(7).unwrap();
+        let result = read_page_from_wal_backend(&wal_backend, &cx, page_no).unwrap();
+
+        assert_eq!(
+            result,
+            Some(expected),
+            "bead_id=bd-db300.3.8.7 case=wal_read_scope_pinned_read_returns_data_without_fallback"
+        );
+        assert_eq!(
+            *pinned_calls.lock().unwrap(),
+            1,
+            "bead_id=bd-db300.3.8.7 case=wal_read_scope_pinned_read_call_count"
+        );
+        assert_eq!(
+            *fallback_calls.lock().unwrap(),
+            0,
+            "bead_id=bd-db300.3.8.7 case=wal_read_scope_pinned_read_must_not_take_write_lock_fallback"
         );
     }
 

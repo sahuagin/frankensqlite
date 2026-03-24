@@ -1165,6 +1165,13 @@ impl GroupCommitConsolidator {
             })
     }
 
+    /// Age of the current FILLING epoch from the first submitted batch.
+    #[must_use]
+    pub fn fill_age(&self) -> Duration {
+        self.filling_started
+            .map_or(Duration::ZERO, |started| started.elapsed())
+    }
+
     /// Transition to FLUSHING phase and take ownership of the pending batches.
     ///
     /// Returns the batches to be written and the page size needed for
