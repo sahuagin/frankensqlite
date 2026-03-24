@@ -818,6 +818,12 @@ impl ParallelWalCoordinator {
     }
 }
 
+impl Drop for ParallelWalCoordinator {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn enqueue_flush_batch(
     pending_batches: &Arc<Mutex<VecDeque<EpochFlushBatch>>>,
     batch: EpochFlushBatch,

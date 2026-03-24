@@ -2161,13 +2161,21 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
     if has_header {
         file.write_all(&header.to_bytes())?;
     } else {
-        // Rewrite the file with the header prepended using a buffered stream to avoid OOM
+        // Rewrite the file with the header prepended using a buffered stream to avoid OOM.
+        // Wrap in a closure so the temp file is cleaned up on any I/O error.
         let temp_path = sidecar_path.with_extension("wal-fec.tmp");
-        let mut temp_file = std::io::BufWriter::new(fs::File::create(&temp_path)?);
-        temp_file.write_all(&header.to_bytes())?;
-        std::io::copy(&mut file, &mut temp_file)?;
-        temp_file.flush()?;
-        fs::rename(&temp_path, sidecar_path)?;
+        let result = (|| -> Result<()> {
+            let mut temp_file = std::io::BufWriter::new(fs::File::create(&temp_path)?);
+            temp_file.write_all(&header.to_bytes())?;
+            std::io::copy(&mut file, &mut temp_file)?;
+            temp_file.flush()?;
+            fs::rename(&temp_path, sidecar_path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result?;
     }
 
     info!(
