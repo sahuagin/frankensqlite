@@ -110,6 +110,7 @@ impl TxnManager {
         // to ensure no race allows stable_commit_seq to jump past us.
         let mut active = self.active_commits.lock();
         let seq = self.next_commit_seq.fetch_add(1, Ordering::Release);
+        debug_assert!(seq < u64::MAX, "CommitSeq allocation overflow");
         // Sequences are monotonically increasing, so push to end maintains sorted order.
         active.push(seq);
         CommitSeq::new(seq)

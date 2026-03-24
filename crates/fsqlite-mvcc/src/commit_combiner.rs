@@ -217,6 +217,7 @@ impl CommitSequenceCombiner {
         let base_seq = self
             .next_commit_seq
             .fetch_add(pending_count, Ordering::AcqRel);
+        debug_assert!(base_seq < u64::MAX - pending_count, "CommitSeq allocation overflow");
 
         // Assign sequences to each pending slot.
         let mut assigned = 0u64;

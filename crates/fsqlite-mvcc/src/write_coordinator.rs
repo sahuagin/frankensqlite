@@ -280,10 +280,10 @@ impl WriteCoordinator {
 
     /// Allocate the next commit sequence number atomically.
     fn allocate_commit_seq(&self) -> CommitSeq {
-        CommitSeq::new(
-            self.next_commit_seq
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-        )
+        let seq = self.next_commit_seq
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        debug_assert!(seq < u64::MAX, "CommitSeq allocation overflow");
+        CommitSeq::new(seq)
     }
 
     /// Restore coordinator state from persistent storage (WAL/Marker stream).
