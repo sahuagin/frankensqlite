@@ -706,11 +706,20 @@ impl Vfs for UnixVfs {
         }
 
         let is_create = is_temp || flags.contains(VfsOpenFlags::CREATE);
-        let is_rw = is_temp || flags.contains(VfsOpenFlags::READWRITE) || is_create;
+        let requested_rw = is_temp || flags.contains(VfsOpenFlags::READWRITE) || is_create;
+        let promote_readonly_to_rw = !requested_rw
+            && path.is_some()
+            && self
+                .access(cx, &resolved, AccessFlags::READWRITE)
+                .unwrap_or(false);
 
         let file = OpenOptions::new()
             .read(true)
-            .write(is_rw)
+            // Prefer a canonical read-write fd whenever the underlying file is
+            // writable, even for read-only callers. Otherwise a later writable
+            // open in the same process would clone a read-only canonical fd and
+            // fail on writes or lock-related syscalls.
+            .write(requested_rw || promote_readonly_to_rw)
             .create(is_create)
             .create_new(create_new)
             .open(&resolved)
@@ -2306,6 +2315,34 @@ mod tests {
 
         reader_a.close(&cx).unwrap();
         reader_b.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_readonly_open_does_not_poison_later_writable_open() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("readonly_then_writable.db");
+
+        let (mut seed, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        seed.write(&cx, b"seed", 0).unwrap();
+        seed.close(&cx).unwrap();
+
+        let read_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READONLY;
+        let (mut readonly, _) = vfs.open(&cx, Some(&path), read_flags).unwrap();
+        let mut buf = [0_u8; 4];
+        assert_eq!(readonly.read(&cx, &mut buf, 0).unwrap(), 4);
+        assert_eq!(&buf, b"seed");
+
+        let write_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut writable, _) = vfs.open(&cx, Some(&path), write_flags).unwrap();
+        writable.write(&cx, b"done", 0).unwrap();
+
+        let mut check = [0_u8; 4];
+        assert_eq!(writable.read(&cx, &mut check, 0).unwrap(), 4);
+        assert_eq!(&check, b"done");
+
+        writable.close(&cx).unwrap();
+        readonly.close(&cx).unwrap();
     }
 
     #[test]

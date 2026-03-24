@@ -264,6 +264,12 @@ static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 // bd-6eyrg.1: Fast-path vs slow-path execution counters.
 static FSQLITE_FAST_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SLOW_PATH_EXECUTIONS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_BACKGROUND_STATUS_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_LOOKUP_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_BEGIN_SETUP_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_EXECUTE_BODY_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
@@ -321,9 +327,12 @@ pub struct ParserHotPathProfileSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathProfileSnapshot {
     pub parser: ParserHotPathProfileSnapshot,
+    pub background_status_time_ns: u64,
     pub background_status_checks: u64,
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
+    pub prepared_lookup_time_ns: u64,
+    pub prepared_schema_refresh_time_ns: u64,
     pub prepared_schema_refreshes: u64,
     pub prepared_schema_lightweight_refreshes: u64,
     pub prepared_schema_full_reloads: u64,
@@ -331,12 +340,15 @@ pub struct HotPathProfileSnapshot {
     pub memory_autocommit_fast_path_begins: u64,
     pub cached_read_snapshot_reuses: u64,
     pub cached_read_snapshot_parks: u64,
+    pub begin_setup_time_ns: u64,
     /// bd-db300.5.2.2.1: Times autocommit-begin did refresh work.
     pub begin_refresh_count: u64,
     /// bd-db300.5.2.2.1: Times autocommit-commit did publication refresh.
     pub commit_refresh_count: u64,
     /// bd-db300.5.2.2.1: Times memdb-from-pager refresh was executed (not skipped).
     pub memdb_refresh_count: u64,
+    pub execute_body_time_ns: u64,
+    pub finalize_post_publish_time_ns: u64,
     pub cached_write_txn_reuses: u64,
     pub cached_write_txn_parks: u64,
     pub column_default_evaluation_passes: u64,
@@ -389,6 +401,16 @@ pub fn set_hot_path_profile_enabled(enabled: bool) {
     }
 }
 
+#[inline]
+fn record_hot_path_duration(metric: &AtomicU64, start: Option<Instant>) {
+    if let Some(start) = start {
+        metric.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
+}
+
 pub fn reset_hot_path_profile() {
     FSQLITE_PARSE_SINGLE_CALLS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PARSE_MULTI_CALLS.store(0, AtomicOrdering::Relaxed);
@@ -407,6 +429,12 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FAST_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SLOW_PATH_EXECUTIONS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_BACKGROUND_STATUS_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_LOOKUP_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_BEGIN_SETUP_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_EXECUTE_BODY_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
@@ -463,9 +491,13 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             fast_path_executions: FSQLITE_FAST_PATH_EXECUTIONS.load(AtomicOrdering::Relaxed),
             slow_path_executions: FSQLITE_SLOW_PATH_EXECUTIONS.load(AtomicOrdering::Relaxed),
         },
+        background_status_time_ns: FSQLITE_BACKGROUND_STATUS_TIME_NS.load(AtomicOrdering::Relaxed),
         background_status_checks: FSQLITE_BACKGROUND_STATUS_CHECKS.load(AtomicOrdering::Relaxed),
         op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
         statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
+            .load(AtomicOrdering::Relaxed),
+        prepared_lookup_time_ns: FSQLITE_PREPARED_LOOKUP_TIME_NS.load(AtomicOrdering::Relaxed),
+        prepared_schema_refresh_time_ns: FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS
             .load(AtomicOrdering::Relaxed),
         prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES.load(AtomicOrdering::Relaxed),
         prepared_schema_lightweight_refreshes: FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
@@ -480,9 +512,13 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         cached_read_snapshot_parks: FSQLITE_CACHED_READ_SNAPSHOT_PARKS
             .load(AtomicOrdering::Relaxed),
+        begin_setup_time_ns: FSQLITE_BEGIN_SETUP_TIME_NS.load(AtomicOrdering::Relaxed),
         begin_refresh_count: FSQLITE_BEGIN_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         commit_refresh_count: FSQLITE_COMMIT_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         memdb_refresh_count: FSQLITE_MEMDB_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
+        execute_body_time_ns: FSQLITE_EXECUTE_BODY_TIME_NS.load(AtomicOrdering::Relaxed),
+        finalize_post_publish_time_ns: FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS
+            .load(AtomicOrdering::Relaxed),
         cached_write_txn_reuses: FSQLITE_CACHED_WRITE_TXN_REUSES.load(AtomicOrdering::Relaxed),
         cached_write_txn_parks: FSQLITE_CACHED_WRITE_TXN_PARKS.load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
@@ -3685,6 +3721,19 @@ impl Connection {
         *self.last_insert_rowid.borrow()
     }
 
+    fn current_btree_usable_size_in_txn(
+        cx: &Cx,
+        txn: &dyn TransactionHandle,
+    ) -> Result<u32> {
+        let page1 = txn.get_page(cx, PageNumber::ONE)?;
+        let page1_bytes = page1.as_ref();
+        if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < DATABASE_HEADER_SIZE {
+            return Ok(PageSize::DEFAULT.get());
+        }
+        let header = parse_database_header_checked(page1_bytes)?;
+        Ok(header.page_size.usable(header.reserved_per_page))
+    }
+
     fn with_attached_connection<T>(
         &self,
         schema: &str,
@@ -5294,48 +5343,55 @@ impl Connection {
         cx: &Cx,
         allow_lightweight_refresh: bool,
     ) -> Result<Option<BoundPagerPublication>> {
-        if hot_path_profile_enabled() {
+        let profile_enabled = hot_path_profile_enabled();
+        let start = profile_enabled.then(Instant::now);
+        if profile_enabled {
             FSQLITE_PREPARED_SCHEMA_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        // In-memory databases cannot become stale from external connections,
-        // so skip the staleness check entirely. Schema changes within the
-        // same connection are caught by the schema_generation comparison
-        // in ensure_schema_unchanged, not by memdb staleness.
-        if !*self.in_transaction.borrow() && !self.pager.is_memory() {
-            match self.try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)? {
-                PreparedSchemaRefreshResult {
-                    outcome: PreparedSchemaRefreshOutcome::Noop,
-                    publication,
-                } => return Ok(Some(publication)),
-                PreparedSchemaRefreshResult {
-                    outcome: PreparedSchemaRefreshOutcome::Lightweight,
-                    publication,
-                } => {
-                    if hot_path_profile_enabled() {
-                        FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
-                            .fetch_add(1, AtomicOrdering::Relaxed);
+        let result = (|| {
+            // In-memory databases cannot become stale from external connections,
+            // so skip the staleness check entirely. Schema changes within the
+            // same connection are caught by the schema_generation comparison
+            // in ensure_schema_unchanged, not by memdb staleness.
+            if !*self.in_transaction.borrow() && !self.pager.is_memory() {
+                match self.try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)? {
+                    PreparedSchemaRefreshResult {
+                        outcome: PreparedSchemaRefreshOutcome::Noop,
+                        publication,
+                    } => return Ok(Some(publication)),
+                    PreparedSchemaRefreshResult {
+                        outcome: PreparedSchemaRefreshOutcome::Lightweight,
+                        publication,
+                    } => {
+                        if profile_enabled {
+                            FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        return Ok(Some(publication));
                     }
-                    return Ok(Some(publication));
-                }
-                PreparedSchemaRefreshResult {
-                    outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
-                    publication,
-                } => {
-                    // bd-db300.4.5.2: Reuse the publication that
-                    // try_refresh_prepared_metadata_if_stale already bound,
-                    // avoiding a redundant bind_pager_publication call.
-                    self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)?;
-                    if hot_path_profile_enabled() {
-                        FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
+                    PreparedSchemaRefreshResult {
+                        outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                        publication,
+                    } => {
+                        // bd-db300.4.5.2: Reuse the publication that
+                        // try_refresh_prepared_metadata_if_stale already bound,
+                        // avoiding a redundant bind_pager_publication call.
+                        self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)?;
+                        if profile_enabled {
+                            FSQLITE_PREPARED_SCHEMA_FULL_RELOADS
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        // bd-db300.4.5.2: Pass the publication to the caller so
+                        // the autocommit begin path can reuse it instead of
+                        // calling bind_pager_publication a second time.
+                        return Ok(Some(publication));
                     }
-                    // bd-db300.4.5.2: Pass the publication to the caller so
-                    // the autocommit begin path can reuse it instead of
-                    // calling bind_pager_publication a second time.
-                    return Ok(Some(publication));
                 }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })();
+        record_hot_path_duration(&FSQLITE_PREPARED_SCHEMA_REFRESH_TIME_NS, start);
+        result
     }
 
     fn try_refresh_prepared_metadata_if_stale(
@@ -5679,21 +5735,28 @@ impl Connection {
     }
 
     fn prepare_after_background_status(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+        let profile_enabled = hot_path_profile_enabled();
+        let lookup_start = profile_enabled.then(Instant::now);
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed(sql);
         if let Some(cached) = self.lookup_prepared_cache(key, sql) {
-            if hot_path_profile_enabled() {
+            if profile_enabled {
                 FSQLITE_PREPARED_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
             self.log_statement_reuse_event("prepared", sql, true, "none", 0, 0, "none");
-            return Ok(cached.template.instantiate(self));
+            let prepared = cached.template.instantiate(self);
+            record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
+            return Ok(prepared);
         }
-        if hot_path_profile_enabled() {
+        if profile_enabled {
             FSQLITE_PREPARED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
+        record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, lookup_start);
         let prepared = self.prepare_uncached(sql)?;
+        let cache_insert_start = profile_enabled.then(Instant::now);
         self.insert_prepared_cache(key, sql, &prepared);
         self.log_statement_reuse_event("prepared", sql, false, "none", 0, 0, "none");
+        record_hot_path_duration(&FSQLITE_PREPARED_LOOKUP_TIME_NS, cache_insert_start);
         Ok(prepared)
     }
 
@@ -6144,8 +6207,9 @@ impl Connection {
             path = "fast",
             reason = if stmt.db.is_some() { "table_query" } else { "program_execute" },
         );
-        let mut rows = if stmt.db.is_some() {
-            stmt.execute_table_query(&op_cx, Some(params))?
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
+        let rows_result = if stmt.db.is_some() {
+            stmt.execute_table_query(&op_cx, Some(params))
         } else {
             execute_program_with_postprocess(
                 stmt.program.as_ref(),
@@ -6155,8 +6219,10 @@ impl Connection {
                 &op_cx,
                 stmt.expression_postprocess.as_ref(),
                 PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
-            )?
+            )
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
+        let mut rows = rows_result?;
         if stmt.distinct {
             dedup_rows(&mut rows);
         }
@@ -6259,6 +6325,7 @@ impl Connection {
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(execution_cx, "insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
@@ -6278,6 +6345,7 @@ impl Connection {
                 params,
             )
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
             Ok(result) => Ok(result),
             Err(error) => {
@@ -6364,6 +6432,7 @@ impl Connection {
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(execution_cx, "insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
@@ -6383,6 +6452,7 @@ impl Connection {
                 params,
             )
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
             Ok(affected) => Ok(affected),
             Err(error) => {
@@ -6534,6 +6604,7 @@ impl Connection {
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
@@ -6549,6 +6620,7 @@ impl Connection {
         } else {
             self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
             Ok(affected) => Ok(affected),
             Err(error) => {
@@ -6626,6 +6698,7 @@ impl Connection {
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
             && !preserve_prior_changes_on_constraint_violation;
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(
                 execution_cx,
@@ -6641,6 +6714,7 @@ impl Connection {
         } else {
             self.execute_precompiled_prepared_update_or_delete_dispatch(execution_cx, stmt, params)
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
             Ok(affected) => Ok(affected),
             Err(error) => {
@@ -7443,6 +7517,7 @@ impl Connection {
             );
         let rollback_on_constraint_violation =
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
+        let execute_body_start = hot_path_profile_enabled().then(Instant::now);
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint_and_cx(&op_cx, statement_kind, || {
                 self.execute_statement_dispatch_impl(
@@ -7455,6 +7530,7 @@ impl Connection {
         } else {
             self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
         };
+        record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
         let result = match result {
             Ok(rows) => Ok(rows),
             Err(error) => {
@@ -8640,9 +8716,9 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         source_rows: &[Row],
     ) -> Result<usize> {
-        if !insert.upsert.is_empty() || !insert.returning.is_empty() {
+        if !insert.returning.is_empty() {
             return Err(FrankenError::NotImplemented(
-                "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
+                "INSERT ... SELECT fallback does not support RETURNING".to_owned(),
             ));
         }
         let layout = self.resolve_insert_target_layout(insert)?;
@@ -8678,7 +8754,19 @@ impl Connection {
         };
         let insert_sql = if insert.columns.is_empty() {
             let placeholders = placeholders.collect::<Vec<_>>().join(", ");
-            format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});")
+            let upsert_sql = insert
+                .upsert
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if upsert_sql.is_empty() {
+                format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});")
+            } else {
+                format!(
+                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}) {upsert_sql};"
+                )
+            }
         } else {
             let quoted_targets = insert
                 .columns
@@ -8690,9 +8778,21 @@ impl Connection {
                 .map(|idx| format!("?{idx}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders});"
-            )
+            let upsert_sql = insert
+                .upsert
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if upsert_sql.is_empty() {
+                format!(
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders});"
+                )
+            } else {
+                format!(
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}) {upsert_sql};"
+                )
+            }
         };
 
         let preserve_prior_changes_on_constraint_violation =
@@ -10378,10 +10478,11 @@ impl Connection {
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
 
         self.with_pager_write_txn(|cx, txn| {
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 root,
-                PageSize::DEFAULT.get(),
+                usable_size,
                 true,
             );
 
@@ -11627,6 +11728,7 @@ impl Connection {
         if *self.in_transaction.borrow() || self.active_txn.borrow().is_some() {
             return Ok(false);
         }
+        let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
         let is_concurrent = mode == TransactionMode::Concurrent;
 
         // Persistent write transaction reuse: if we have a cached write
@@ -11649,6 +11751,7 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_CACHED_WRITE_TXN_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Ok(true);
         }
 
@@ -11677,6 +11780,7 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_CACHED_READ_SNAPSHOT_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Ok(true);
         }
 
@@ -11714,6 +11818,7 @@ impl Connection {
             // setup (which would try to access the registry we bypassed).
             *self.concurrent_txn.borrow_mut() = false;
             self.txn_metrics_mark_started();
+            record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Ok(true);
         }
 
@@ -11724,9 +11829,21 @@ impl Connection {
         let publication = if let Some(publication) = prebound_publication {
             publication
         } else if is_concurrent {
-            self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin")?
+            match self.refresh_memdb_if_stale_with_publication(cx, "autocommit_begin") {
+                Ok(publication) => publication,
+                Err(error) => {
+                    record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
+                    return Err(error);
+                }
+            }
         } else {
-            self.refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check")?
+            match self.refresh_memdb_if_stale_with_publication(cx, "memdb_staleness_check") {
+                Ok(publication) => publication,
+                Err(error) => {
+                    record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
+                    return Err(error);
+                }
+            }
         };
         // Bind the MVCC snapshot to the pager's published visibility plane
         // before opening the pager txn. This is still conservative: if a
@@ -11737,7 +11854,13 @@ impl Connection {
         } else {
             None
         };
-        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode)?;
+        let mut txn = match self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode) {
+            Ok(txn) => txn,
+            Err(error) => {
+                record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
+                return Err(error);
+            }
+        };
         let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
             let begin_result =
                 lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
@@ -11745,6 +11868,7 @@ impl Connection {
                 Ok(session_id) => Some(session_id),
                 Err(error) => {
                     let _ = txn.rollback(cx);
+                    record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                     return Err(match error {
                         MvccError::Busy => FrankenError::Busy,
                         _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
@@ -11759,6 +11883,7 @@ impl Connection {
         *self.concurrent_session_id.borrow_mut() = concurrent_session;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
         self.txn_metrics_mark_started();
+        record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
         Ok(true)
     }
 
@@ -11947,6 +12072,8 @@ impl Connection {
             {
                 match txn.commit_and_retain(cx) {
                     Ok(true) => {
+                        let finalize_post_publish_start =
+                            hot_path_profile_enabled().then(Instant::now);
                         // Park the retained transaction for the next autocommit.
                         let cookie = *self.schema_cookie.borrow();
                         // Discard any stale cached write transaction.
@@ -11979,6 +12106,10 @@ impl Connection {
                                 self.capture_time_travel_snapshot(committed_seq.get());
                             }
                         }
+                        record_hot_path_duration(
+                            &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
+                            finalize_post_publish_start,
+                        );
                         return Ok(());
                     }
                     Ok(false) => {} // Not retained — fall through to normal commit
@@ -12068,6 +12199,7 @@ impl Connection {
         }
 
         txn_result?;
+        let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         self.live_vtab_commit_all_best_effort(cx);
         self.finalize_live_vtab_registry_commit(cx);
 
@@ -12080,6 +12212,10 @@ impl Connection {
             }
             self.maybe_run_adaptive_autocheckpoint();
         }
+        record_hot_path_duration(
+            &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
+            finalize_post_publish_start,
+        );
         Ok(())
     }
 
@@ -12197,7 +12333,7 @@ impl Connection {
         sql: Option<&str>,
     ) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
-            let usable_size = PageSize::DEFAULT.get();
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 PageNumber::ONE,
@@ -12246,7 +12382,7 @@ impl Connection {
     /// object name (case-insensitive scan of the page 1 B-tree).
     fn delete_sqlite_master_row(&self, name: &str) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
-            let usable_size = PageSize::DEFAULT.get();
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 PageNumber::ONE,
@@ -12291,7 +12427,7 @@ impl Connection {
     /// corrupting the schema when the table already has indexes.
     fn update_sqlite_master_sql(&self, name: &str, new_sql: &str) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
-            let usable_size = PageSize::DEFAULT.get();
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 PageNumber::ONE,
@@ -12468,10 +12604,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(0);
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             is_table,
         );
         let mut count = 0_u64;
@@ -12497,10 +12634,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             is_table,
         );
         while cursor.first(cx)? {
@@ -12517,10 +12655,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(index.root_page).unwrap_or(0)) else {
             return Ok(None);
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             false,
         );
         let n_key_columns = index.key_term_count();
@@ -12605,10 +12744,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             true,
         );
 
@@ -12695,11 +12835,12 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(cache);
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
 
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             true,
         );
         tracing::trace!(root_page, "sqlite_sequence cache refresh begin");
@@ -12746,10 +12887,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(0);
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             true,
         );
         if cursor.last(cx)? {
@@ -12772,10 +12914,11 @@ impl Connection {
         let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
             return Ok(());
         };
+        let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(txn),
             root,
-            PageSize::DEFAULT.get(),
+            usable_size,
             true,
         );
 
@@ -12829,10 +12972,11 @@ impl Connection {
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
                 return Ok(());
             };
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 root,
-                PageSize::DEFAULT.get(),
+                usable_size,
                 true,
             );
             if !cursor.first(cx)? {
@@ -12881,10 +13025,11 @@ impl Connection {
             let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
                 return Ok(());
             };
+            let usable_size = Self::current_btree_usable_size_in_txn(cx, txn)?;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn),
                 root,
-                PageSize::DEFAULT.get(),
+                usable_size,
                 true,
             );
             if !cursor.first(cx)? {
@@ -16286,6 +16431,7 @@ impl Connection {
                 "cannot start a transaction within a transaction".to_owned(),
             ));
         }
+        let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
 
         // BEGIN only reaches this helper from the statement dispatcher, which
         // already performed the background-status gate for this SQL operation.
@@ -16319,7 +16465,15 @@ impl Connection {
         };
 
         let prebound_publication = if is_concurrent {
-            Some(self.refresh_memdb_if_stale_with_publication(&cx, "explicit_begin")?)
+            Some(
+                match self.refresh_memdb_if_stale_with_publication(&cx, "explicit_begin") {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
+                        return Err(error);
+                    }
+                },
+            )
         } else {
             None
         };
@@ -16329,7 +16483,13 @@ impl Connection {
         // over-abort), never newer (unsafe).
         let concurrent_snapshot = prebound_publication
             .map(|publication| self.concurrent_snapshot_from_publication(publication));
-        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
+        let mut txn = match self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode) {
+            Ok(txn) => txn,
+            Err(error) => {
+                record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
+                return Err(error);
+            }
+        };
         if !is_concurrent
             && let Some(bound_visible_commit_seq) = txn.published_visible_commit_seq_hint()
             && bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
@@ -16341,6 +16501,7 @@ impl Connection {
             )
         {
             let _ = txn.rollback(&cx);
+            record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
             return Err(error);
         }
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
@@ -16357,6 +16518,7 @@ impl Connection {
                 Ok(id) => id,
                 Err(err) => {
                     let _ = txn.rollback(&cx);
+                    record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
                     return Err(err);
                 }
             };
@@ -16372,6 +16534,7 @@ impl Connection {
         *self.in_transaction.borrow_mut() = true;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
         self.txn_metrics_mark_started();
+        record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
         Ok(())
     }
 
@@ -17026,6 +17189,7 @@ impl Connection {
         };
 
         // Commit succeeded; now consume and drop the handle.
+        let finalize_post_publish_start = hot_path_profile_enabled().then(Instant::now);
         *self.active_txn.borrow_mut() = None;
         self.live_vtab_commit_all_best_effort(cx);
         self.finalize_live_vtab_registry_commit(cx);
@@ -17053,6 +17217,10 @@ impl Connection {
             self.maybe_gc_tick();
         }
 
+        record_hot_path_duration(
+            &FSQLITE_FINALIZE_POST_PUBLISH_TIME_NS,
+            finalize_post_publish_start,
+        );
         Ok(())
     }
 
@@ -30103,20 +30271,27 @@ impl SharedMvccState {
     }
 
     fn background_status(&self) -> Result<()> {
-        if hot_path_profile_enabled() {
+        let profile_enabled = hot_path_profile_enabled();
+        let start = profile_enabled.then(Instant::now);
+        if profile_enabled {
             FSQLITE_BACKGROUND_STATUS_CHECKS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         // Fast path: single atomic load avoids mutex lock on every statement.
         // is_poisoned is only set when a background worker reports a fatal
         // error — on the normal hot path this is a single cache-line read.
-        if !self.is_poisoned.load(AtomicOrdering::Relaxed) {
-            return Ok(());
+        let result = if !self.is_poisoned.load(AtomicOrdering::Relaxed) {
+            Ok(())
+        } else {
+            let state = lock_unpoisoned(&self.runtime_state);
+            match &state.poisoned {
+                Some(details) => Err(FrankenError::BackgroundWorkerFailed(details.clone())),
+                None => Ok(()),
+            }
+        };
+        if profile_enabled {
+            record_hot_path_duration(&FSQLITE_BACKGROUND_STATUS_TIME_NS, start);
         }
-        let state = lock_unpoisoned(&self.runtime_state);
-        match &state.poisoned {
-            Some(details) => Err(FrankenError::BackgroundWorkerFailed(details.clone())),
-            None => Ok(()),
-        }
+        result
     }
 
     fn register_connection(&self) -> Result<(Region, Cx)> {
@@ -61089,6 +61264,88 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_writable_open_after_schema_only_open_on_c_sqlite_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_schema_only_then_write.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);
+                     INSERT INTO items(label) VALUES ('alpha');",
+                )
+                .unwrap();
+        }
+
+        let schema_only = Connection::open_schema_only(db_str)
+            .expect("schema-only open should succeed on a C SQLite database");
+        let rows = schema_only.query("SELECT COUNT(*) FROM items;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        let conn = Connection::open(db_str)
+            .expect("writable open must not inherit a read-only canonical fd");
+        conn.execute("INSERT INTO items(label) VALUES ('beta');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, label FROM items ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_open_and_write_c_sqlite_database_with_8192_page_size_and_overflow_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_page8192_overflow.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            let journal_mode: String = rconn
+                .query_row("PRAGMA journal_mode=DELETE;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+            rconn.execute_batch("PRAGMA page_size=8192; VACUUM;").unwrap();
+            let page_size: i64 = rconn.query_row("PRAGMA page_size;", [], |row| row.get(0)).unwrap();
+            assert_eq!(page_size, 8192);
+            rconn.execute("CREATE TABLE blobs(id INTEGER PRIMARY KEY, payload BLOB);", [])
+                .unwrap();
+            for rowid in 1_i64..=20 {
+                rconn.execute(
+                    "INSERT INTO blobs(id, payload) VALUES (?, zeroblob(12000));",
+                    rusqlite::params![rowid],
+                )
+                .unwrap();
+            }
+        }
+
+        let conn = Connection::open(db_str)
+            .expect("FrankenSQLite must open valid 8192-byte C SQLite files");
+        let rows = conn
+            .query("SELECT COUNT(*), length(payload) FROM blobs WHERE id = 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(12_000));
+
+        conn.execute("CREATE TABLE added(id INTEGER PRIMARY KEY, note TEXT);")
+            .expect("pager-backed writes must honor the opened database page size");
+        conn.execute("INSERT INTO added(note) VALUES ('ok');").unwrap();
+        let rows = conn
+            .query("SELECT id, note FROM added ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("ok".into()));
+    }
+
+    #[test]
     fn test_open_live_c_sqlite_wal_database_with_stale_main_header_page1() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("from_c_live_wal.db");
@@ -70419,6 +70676,10 @@ mod pager_routing_tests {
             profile.parser.compiled_cache_hits, 0,
             "prepared cache hit should bypass the compiled-program cache entirely: {profile:?}"
         );
+        assert!(
+            profile.prepared_lookup_time_ns > 0,
+            "prepare() should record prepared lookup time across the miss+hit pair: {profile:?}"
+        );
     }
 
     #[test]
@@ -71201,6 +71462,10 @@ mod pager_routing_tests {
 
         let profile = hot_path_profile_snapshot();
         assert_eq!(profile.prepared_schema_refreshes, 1);
+        assert!(
+            profile.prepared_schema_refresh_time_ns > 0,
+            "file-backed prepared refresh should accumulate schema-refresh time: {profile:?}"
+        );
         assert_eq!(
             profile.prepared_schema_lightweight_refreshes, 1,
             "schema-stable external DML should still use the lightweight prepared refresh path: {profile:?}"
@@ -71212,6 +71477,18 @@ mod pager_routing_tests {
         assert_eq!(
             profile.pager_publication_refreshes, 1,
             "prepared insert should reuse the schema-bound publication instead of rebinding during autocommit begin: {profile:?}"
+        );
+        assert!(
+            profile.begin_setup_time_ns > 0,
+            "file-backed prepared insert should accumulate begin/autocommit setup time: {profile:?}"
+        );
+        assert!(
+            profile.execute_body_time_ns > 0,
+            "prepared insert fast path should accumulate direct execute-body time: {profile:?}"
+        );
+        assert!(
+            profile.finalize_post_publish_time_ns > 0,
+            "autocommit commit cleanup/publish work should be visible after the write body: {profile:?}"
         );
         assert_eq!(
             profile.prepared_insert_fast_lane_hits, 1,
@@ -72569,6 +72846,10 @@ mod pager_routing_tests {
             assert_eq!(affected, 1);
         }
         let prepared_insert_profile = hot_path_profile_snapshot();
+        assert!(
+            prepared_insert_profile.background_status_time_ns > 0,
+            "prepared INSERT should record background-status time alongside the gate count: {prepared_insert_profile:?}"
+        );
         assert_eq!(
             prepared_insert_profile.statement_dispatch_background_gates, 0,
             "prepared INSERT should bypass the legacy execute_statement() background-status gate: {prepared_insert_profile:?}"
@@ -72586,6 +72867,10 @@ mod pager_routing_tests {
             );
         }
         let prepared_select_profile = hot_path_profile_snapshot();
+        assert!(
+            prepared_select_profile.background_status_time_ns > 0,
+            "prepared SELECT should record background-status time alongside the gate count: {prepared_select_profile:?}"
+        );
         assert_eq!(
             prepared_select_profile.statement_dispatch_background_gates, 0,
             "prepared SELECT should bypass the legacy execute_statement() background-status gate: {prepared_select_profile:?}"
