@@ -5240,7 +5240,12 @@ impl Connection {
             if hot_path_profile_enabled() {
                 FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            self.reload_memdb_from_pager(cx)?;
+            // bd-db300.4.5.2: Reuse the already-bound publication instead of
+            // calling bind_pager_publication again inside reload_memdb_from_pager.
+            self.reload_memdb_from_pager_with_prebound_publication(
+                cx,
+                &publication,
+            )?;
         }
         Ok(publication)
     }
@@ -5309,9 +5314,15 @@ impl Connection {
                 }
                 PreparedSchemaRefreshResult {
                     outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
-                    ..
+                    publication,
                 } => {
-                    self.refresh_memdb_if_stale(cx)?;
+                    // bd-db300.4.5.2: Reuse the publication that
+                    // try_refresh_prepared_metadata_if_stale already bound,
+                    // avoiding a redundant bind_pager_publication call.
+                    self.reload_memdb_from_pager_with_prebound_publication(
+                        cx,
+                        &publication,
+                    )?;
                     if hot_path_profile_enabled() {
                         FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
                     }
@@ -26087,6 +26098,25 @@ impl Connection {
         self.reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
     }
 
+    /// bd-db300.4.5.2: Reload memdb using an already-bound publication, avoiding
+    /// a redundant `bind_pager_publication` call on the hot path.
+    fn reload_memdb_from_pager_with_prebound_publication(
+        &self,
+        cx: &Cx,
+        publication: &BoundPagerPublication,
+    ) -> Result<()> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
+        let hydrate_rows = self.should_eagerly_hydrate_memdb_rows();
+        let bound_visible_commit_seq = publication.snapshot.visible_commit_seq;
+        let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
+        self.reload_memdb_from_txn_with_mode(
+            cx,
+            txn.as_mut(),
+            bound_visible_commit_seq,
+            hydrate_rows,
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
@@ -40759,9 +40789,11 @@ mod tests {
             worker_threads: 1,
             io_poll_strategy: IoPollStrategy::Auto,
         }));
-        let conn1 =
-            Connection::open_with_env(&db_path, ConnectionEnv::new(Arc::clone(&runtime_context_dormant)))
-                .expect("first connection should open");
+        let conn1 = Connection::open_with_env(
+            &db_path,
+            ConnectionEnv::new(Arc::clone(&runtime_context_dormant)),
+        )
+        .expect("first connection should open");
         let shared = Arc::clone(&conn1._shared_mvcc_state);
 
         {
@@ -50314,8 +50346,10 @@ mod tests {
         // (which supports GROUP BY), not the simple connection-level path.
         conn.execute("CREATE TABLE grp_test (v INTEGER);").unwrap();
         conn.execute("INSERT INTO grp_test VALUES (1);").unwrap();
-        let statement =
-            super::parse_single_statement("SELECT 1 WHERE 1 IN (SELECT v FROM grp_test GROUP BY v);").unwrap();
+        let statement = super::parse_single_statement(
+            "SELECT 1 WHERE 1 IN (SELECT v FROM grp_test GROUP BY v);",
+        )
+        .unwrap();
         let Statement::Select(select) = statement else {
             panic!("expected SELECT statement");
         };
@@ -52510,13 +52544,17 @@ mod tests {
 
         assert!(
             blob_ops.len() >= 1,
-            "expected at least one OP_Blob, found {}", blob_ops.len()
+            "expected at least one OP_Blob, found {}",
+            blob_ops.len()
         );
         // The blob literal's P4 bytes should appear in at least one OP_Blob.
-        let has_deadbeef = blob_ops.iter().any(|op| {
-            matches!(&op.p4, P4::Blob(bytes) if bytes == &vec![0xDE, 0xAD, 0xBE, 0xEF])
-        });
-        assert!(has_deadbeef, "expected at least one OP_Blob with P4::Blob([0xDE, 0xAD, 0xBE, 0xEF])");
+        let has_deadbeef = blob_ops
+            .iter()
+            .any(|op| matches!(&op.p4, P4::Blob(bytes) if bytes == &vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        assert!(
+            has_deadbeef,
+            "expected at least one OP_Blob with P4::Blob([0xDE, 0xAD, 0xBE, 0xEF])"
+        );
     }
 
     #[test]
@@ -62864,9 +62902,11 @@ mod schema_loading_tests {
         let db_path = dir.path().join("cache_reset_counters.db");
         let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
         // Create a table with data.
-        conn.execute("CREATE TABLE cache_pad (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE cache_pad (id INTEGER);")
+            .unwrap();
         for i in 1..=100 {
-            conn.execute(&format!("INSERT INTO cache_pad VALUES ({i});")).unwrap();
+            conn.execute(&format!("INSERT INTO cache_pad VALUES ({i});"))
+                .unwrap();
         }
 
         // Reset cache counters, then generate fresh cache accesses.
@@ -71075,8 +71115,7 @@ mod pager_routing_tests {
         // INSERT, so we may see either memory_autocommit_fast_path_begins=1
         // (fresh begin) or cached_write_txn_reuses=1 (reused from prior DDL).
         assert!(
-            profile.memory_autocommit_fast_path_begins >= 1
-                || profile.cached_write_txn_reuses >= 1,
+            profile.memory_autocommit_fast_path_begins >= 1 || profile.cached_write_txn_reuses >= 1,
             "default concurrent :memory: autocommit writes should use the isolated memory fast path or reuse a cached write txn: {profile:?}"
         );
     }
@@ -71101,8 +71140,7 @@ mod pager_routing_tests {
 
         let p1 = hot_path_profile_snapshot();
         assert!(
-            p1.memory_autocommit_fast_path_begins >= 1
-                || p1.cached_write_txn_reuses >= 1,
+            p1.memory_autocommit_fast_path_begins >= 1 || p1.cached_write_txn_reuses >= 1,
             "first write should use memory fast-path begin or reuse cached write txn: {p1:?}"
         );
         assert_eq!(
@@ -71136,7 +71174,10 @@ mod pager_routing_tests {
         );
 
         let p3 = hot_path_profile_snapshot();
-        assert!(p3.cached_write_txn_reuses >= 3, "third write reuses should be cumulative: {p3:?}");
+        assert!(
+            p3.cached_write_txn_reuses >= 3,
+            "third write reuses should be cumulative: {p3:?}"
+        );
         assert_eq!(p3.cached_write_txn_parks, 3);
     }
 
@@ -71169,8 +71210,7 @@ mod pager_routing_tests {
         // Either fresh begins or cached reuses are valid — the key invariant
         // is that the write succeeds and the schema is consistent.
         assert!(
-            p2.memory_autocommit_fast_path_begins >= 1
-                || p2.cached_write_txn_reuses >= 1,
+            p2.memory_autocommit_fast_path_begins >= 1 || p2.cached_write_txn_reuses >= 1,
             "write after DDL should either take fresh begin path or reuse DDL's cached txn: {p2:?}"
         );
     }
