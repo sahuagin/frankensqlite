@@ -5320,6 +5320,10 @@ impl Connection {
                     if hot_path_profile_enabled() {
                         FSQLITE_PREPARED_SCHEMA_FULL_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
                     }
+                    // bd-db300.4.5.2: Pass the publication to the caller so
+                    // the autocommit begin path can reuse it instead of
+                    // calling bind_pager_publication a second time.
+                    return Ok(Some(publication));
                 }
             }
         }
