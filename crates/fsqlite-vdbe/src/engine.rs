@@ -4089,6 +4089,8 @@ pub struct VdbeEngine {
     column_defaults_by_root_page: Arc<HashMap<i32, Vec<Option<SqliteValue>>>>,
     /// Per-index descending flags keyed by index root page number.
     index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
+    /// Per-index collation sequences keyed by index root page number.
+    index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Open virtual table cursors keyed by cursor number.
@@ -4494,6 +4496,7 @@ impl VdbeEngine {
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+            index_collations_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
@@ -4684,6 +4687,13 @@ impl VdbeEngine {
 
     fn index_desc_flags_for_root(&self, root_page: i32) -> Vec<bool> {
         self.index_desc_flags_by_root_page
+            .get(&root_page)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn index_collations_for_root(&self, root_page: i32) -> Vec<Option<String>> {
+        self.index_collations_by_root_page
             .get(&root_page)
             .cloned()
             .unwrap_or_default()
@@ -5108,6 +5118,14 @@ impl VdbeEngine {
     /// Reuse shared per-index descending flags keyed by index root page.
     pub fn set_shared_index_desc_flags_by_root_page(&mut self, map: Arc<HashMap<i32, Vec<bool>>>) {
         self.index_desc_flags_by_root_page = map;
+    }
+
+    /// Reuse shared per-index collation sequences keyed by index root page.
+    pub fn set_shared_index_collations_by_root_page(
+        &mut self,
+        map: Arc<HashMap<i32, Vec<Option<String>>>>,
+    ) {
+        self.index_collations_by_root_page = map;
     }
 
     /// Execute a VDBE program to completion.
@@ -8122,6 +8140,7 @@ impl VdbeEngine {
                         .copied()
                         .unwrap_or_default();
                     let desc_flags = self.index_desc_flags_for_root(root_page);
+                    let collations = self.index_collations_for_root(root_page);
 
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -8176,7 +8195,7 @@ impl VdbeEngine {
                             &sc.target_vals_buf,
                             n_compare,
                             &desc_flags,
-                            &[], // TODO: Per-index collations are not yet threaded here.
+                            &collations,
                             &coll_guard,
                         );
                         drop(coll_guard);
@@ -8209,13 +8228,14 @@ impl VdbeEngine {
                                 probe_fields.len()
                             };
                             let desc_flags = self.index_desc_flags_for_root(cursor.root_page);
+                            let idx_collations = self.index_collations_for_root(cursor.root_page);
                             let coll_guard = self.lock_collation();
                             let cmp = compare_index_prefix_keys(
                                 &row.values,
                                 &probe_fields,
                                 n_compare,
                                 &desc_flags,
-                                &[],
+                                &idx_collations,
                                 &coll_guard,
                             );
                             drop(coll_guard);

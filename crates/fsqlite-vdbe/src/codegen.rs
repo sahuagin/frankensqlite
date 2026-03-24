@@ -168,6 +168,11 @@ pub struct IndexSchema {
     pub where_clause: Option<String>,
     /// Whether this index enforces a UNIQUE constraint.
     pub is_unique: bool,
+    /// Per-key-term collation sequences (e.g. `NOCASE`, `RTRIM`).
+    ///
+    /// `None` means "use the default (BINARY) collation" for that position.
+    /// Empty vec means "all BINARY" for legacy callers/tests.
+    pub key_collations: Vec<Option<String>>,
 }
 
 impl IndexSchema {
@@ -198,6 +203,14 @@ impl IndexSchema {
             self.key_sort_directions.get(key_pos),
             Some(SortDirection::Desc)
         )
+    }
+
+    /// Return the collation sequence for the `key_pos`th key term, if any.
+    #[must_use]
+    pub fn key_term_collation(&self, key_pos: usize) -> Option<&str> {
+        self.key_collations
+            .get(key_pos)
+            .and_then(|c| c.as_deref())
     }
 
     /// Whether planner / lookup fast paths may safely treat this as a simple
@@ -13283,6 +13296,7 @@ mod tests {
                 key_sort_directions: vec![],
                 where_clause: None,
                 is_unique: false,
+                key_collations: vec![],
             }],
             strict: false,
             without_rowid: false,
@@ -13346,6 +13360,7 @@ mod tests {
                 key_sort_directions: vec![],
                 where_clause: None,
                 is_unique: false,
+                key_collations: vec![],
             }],
             strict: false,
             without_rowid: false,
@@ -13380,6 +13395,7 @@ mod tests {
                 key_sort_directions: vec![],
                 where_clause: None,
                 is_unique: false,
+                key_collations: vec![],
             }],
             strict: false,
             without_rowid: false,

@@ -2143,6 +2143,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
+                runtime_inputs.index_collations_by_root_page,
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
@@ -2177,6 +2178,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.table_column_count_by_root_page,
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
+                runtime_inputs.index_collations_by_root_page,
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
@@ -3019,6 +3021,7 @@ struct TableExecutionMetadataCacheEntry {
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     column_default_sql_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
+    index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
 }
 
 #[derive(Clone)]
@@ -3029,6 +3032,7 @@ struct TableExecutionRuntimeInputs {
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
+    index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
 }
 
 // ── Time-travel MemDatabase snapshots ──────────────────────────────────────
@@ -12988,6 +12992,7 @@ impl Connection {
             table_column_count_by_root_page: Arc::clone(&metadata.table_column_count_by_root_page),
             column_defaults_by_root_page,
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
+            index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
         }
     }
 
@@ -13012,6 +13017,7 @@ impl Connection {
         let mut column_default_sql_by_root_page = HbHashMap::new();
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
+        let mut index_collations_by_root_page = HbHashMap::with_capacity(index_count);
 
         for table in schema.iter() {
             let table_name_key = table.name.to_ascii_lowercase();
@@ -13038,6 +13044,12 @@ impl Connection {
                         .map(|key_pos| index.key_term_descending(key_pos))
                         .collect(),
                 );
+                index_collations_by_root_page.insert(
+                    index.root_page,
+                    (0..index.key_term_count())
+                        .map(|key_pos| index.key_term_collation(key_pos).map(str::to_owned))
+                        .collect(),
+                );
             }
         }
 
@@ -13048,6 +13060,7 @@ impl Connection {
             table_column_count_by_root_page: Arc::new(table_column_count_by_root_page),
             column_default_sql_by_root_page: Arc::new(column_default_sql_by_root_page),
             index_desc_flags_by_root_page: Arc::new(index_desc_flags_by_root_page),
+            index_collations_by_root_page: Arc::new(index_collations_by_root_page),
         });
         *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
         entry
@@ -13305,6 +13318,7 @@ impl Connection {
                             key_sort_directions: vec![SortDirection::Asc],
                             where_clause: None,
                             is_unique: true,
+                            key_collations: vec![],
                         });
                     }
                 }
@@ -13362,6 +13376,10 @@ impl Connection {
                                     .collect(),
                                 where_clause: None,
                                 is_unique: true,
+                                key_collations: normalized_terms
+                                    .iter()
+                                    .map(|term| term.collation.clone())
+                                    .collect(),
                             });
                         }
                     }
@@ -14667,6 +14685,10 @@ impl Connection {
                 where_clause: stmt.where_clause.as_ref().map(|e| e.to_string()),
                 root_page,
                 is_unique: stmt.unique,
+                key_collations: indexed_terms
+                    .iter()
+                    .map(|term| term.collation.clone())
+                    .collect(),
             });
         }
 
@@ -25949,6 +25971,7 @@ impl Connection {
             runtime_inputs.table_column_count_by_root_page,
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
+            runtime_inputs.index_collations_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.version_store)),
             PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
@@ -26642,6 +26665,7 @@ impl Connection {
                     columns: index_definition.columns,
                     key_expressions: index_definition.key_expressions,
                     key_sort_directions: index_definition.key_sort_directions,
+                    key_collations: index_definition.key_collations,
                     where_clause: index_definition.where_clause,
                     is_unique: index_definition.is_unique,
                 });
@@ -31566,6 +31590,7 @@ struct ReconstructedIndexDefinition {
     columns: Vec<String>,
     key_expressions: Vec<String>,
     key_sort_directions: Vec<SortDirection>,
+    key_collations: Vec<Option<String>>,
     where_clause: Option<String>,
     is_unique: bool,
 }
@@ -31675,6 +31700,7 @@ fn implicit_index_definitions_from_create_table_sql(
                 columns: vec![column.name.clone()],
                 key_expressions: vec![column.name.clone()],
                 key_sort_directions: vec![SortDirection::Asc],
+                key_collations: vec![],
                 where_clause: None,
                 is_unique: true,
             });
@@ -31694,6 +31720,10 @@ fn implicit_index_definitions_from_create_table_sql(
                 .map(|indexed| indexed.expr.to_string())
                 .collect::<Vec<_>>();
             if !key_expressions.is_empty() {
+                let normalized = idx_cols
+                    .iter()
+                    .map(normalize_indexed_column_term)
+                    .collect::<Option<Vec<_>>>();
                 definitions.push(ReconstructedIndexDefinition {
                     columns: extract_simple_index_columns(&idx_cols),
                     key_expressions,
@@ -31701,6 +31731,10 @@ fn implicit_index_definitions_from_create_table_sql(
                         .iter()
                         .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
                         .collect(),
+                    key_collations: normalized
+                        .as_ref()
+                        .map(|terms| terms.iter().map(|t| t.collation.clone()).collect())
+                        .unwrap_or_default(),
                     where_clause: None,
                     is_unique: true,
                 });
@@ -31722,6 +31756,11 @@ fn index_definition_from_create_index_statement(
     if key_expressions.is_empty() {
         return None;
     }
+    let normalized_terms = stmt
+        .columns
+        .iter()
+        .map(normalize_indexed_column_term)
+        .collect::<Option<Vec<_>>>();
     Some(ReconstructedIndexDefinition {
         columns: extract_simple_index_columns(&stmt.columns),
         key_expressions,
@@ -31730,6 +31769,10 @@ fn index_definition_from_create_index_statement(
             .iter()
             .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
             .collect(),
+        key_collations: normalized_terms
+            .as_ref()
+            .map(|terms| terms.iter().map(|t| t.collation.clone()).collect())
+            .unwrap_or_default(),
         where_clause: stmt.where_clause.as_ref().map(ToString::to_string),
         is_unique: stmt.unique,
     })
@@ -34125,6 +34168,7 @@ fn execute_table_program_with_db(
     table_column_count_by_root_page: Arc<HbHashMap<i32, usize>>,
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
+    index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
@@ -34185,6 +34229,7 @@ fn execute_table_program_with_db(
     engine.set_shared_table_column_count_by_root_page(table_column_count_by_root_page);
     engine.set_shared_column_defaults_by_root_page(column_defaults_by_root_page);
     engine.set_shared_index_desc_flags_by_root_page(index_desc_flags_by_root_page);
+    engine.set_shared_index_collations_by_root_page(index_collations_by_root_page);
     engine.set_collect_result_rows(collect_rows);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);

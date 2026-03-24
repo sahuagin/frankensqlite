@@ -753,6 +753,7 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 key_sort_directions: vec![SortDirection::Asc],
                 where_clause: None,
                 is_unique: true,
+                key_collations: vec![],
             });
             autoindex_ordinal += 1;
         }
@@ -794,6 +795,7 @@ fn extract_unique_constraint_indexes_from_sql(sql: &str, table_name: &str) -> Ve
                 .collect(),
             where_clause: None,
             is_unique: true,
+            key_collations: vec![],
         });
         autoindex_ordinal += 1;
     }
@@ -2744,6 +2746,7 @@ mod tests {
                 key_sort_directions: vec![SortDirection::Asc, SortDirection::Asc],
                 where_clause: None,
                 is_unique: true,
+                key_collations: vec![],
             }],
             strict: false,
             without_rowid: false,
