@@ -48,7 +48,10 @@ use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType, WitnessKey};
+use fsqlite_types::{
+    CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
+    StrictColumnType, WitnessKey,
+};
 
 use crate::{TableIndexMetaMap, VdbeProgram, opcode_register_spans};
 
@@ -139,6 +142,62 @@ fn add_vdbe_duration_if(enabled: bool, counter: &AtomicU64, started: Instant) {
             duration_ns_saturating(started.elapsed()),
             AtomicOrdering::Relaxed,
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BtreeCursorPageLayout {
+    usable_size: u32,
+    page_size: u32,
+}
+
+impl BtreeCursorPageLayout {
+    const fn no_reserved_bytes(page_size: PageSize) -> Self {
+        let page_size = page_size.get();
+        Self {
+            usable_size: page_size,
+            page_size,
+        }
+    }
+}
+
+fn btree_cursor_page_layout_from_page_one<P: PageReader>(
+    page_reader: &P,
+    cx: &Cx,
+) -> Option<BtreeCursorPageLayout> {
+    let page_one = page_reader.read_page(cx, PageNumber::ONE).ok()?;
+    let header_prefix: [u8; DATABASE_HEADER_SIZE] =
+        page_one.get(..DATABASE_HEADER_SIZE)?.try_into().ok()?;
+    let header = DatabaseHeader::from_bytes(&header_prefix).ok()?;
+    let usable_size = header.page_size.usable(header.reserved_per_page);
+    if usable_size <= 4 {
+        return None;
+    }
+    Some(BtreeCursorPageLayout {
+        usable_size,
+        page_size: header.page_size.get(),
+    })
+}
+
+fn btree_cursor_page_layout_for_reader_or_default<P: PageReader>(
+    page_reader: &P,
+    cx: &Cx,
+    default_page_size: PageSize,
+) -> BtreeCursorPageLayout {
+    // Synthetic pager mocks used in unit tests often do not populate page 1
+    // with a real SQLite database header. Fall back to the engine's configured
+    // page size in that case, but prefer the real header whenever it exists so
+    // transaction-backed cursors honor reserved bytes.
+    btree_cursor_page_layout_from_page_one(page_reader, cx)
+        .unwrap_or_else(|| BtreeCursorPageLayout::no_reserved_bytes(default_page_size))
+}
+
+fn configure_btree_cursor_page_size<P>(
+    cursor: &mut BtCursor<P>,
+    page_layout: BtreeCursorPageLayout,
+) {
+    if page_layout.page_size != page_layout.usable_size {
+        cursor.set_page_size(page_layout.page_size);
     }
 }
 
@@ -391,6 +450,11 @@ enum DecodeCacheInvalidationReason {
 }
 
 /// Default spill threshold: 100 MiB.
+///
+/// When in-memory sort data exceeds this limit, the sorter flushes sorted
+/// runs to a temporary file. C SQLite's equivalent is configurable via
+/// `SQLITE_CONFIG_PMASZ`; this is a compile-time default that could be
+/// exposed via `PRAGMA temp_store_max_size` in a future enhancement.
 const SORTER_DEFAULT_SPILL_THRESHOLD: usize = 100 * 1024 * 1024;
 
 /// Number of 64-bit words in a Bloom filter (8192 bits = 1 KiB).
@@ -431,9 +495,15 @@ fn bloom_hash(val: &SqliteValue) -> u64 {
     h
 }
 
-/// Approximate page size for spill accounting (4 KiB).
+/// Approximate page size for spill accounting.
+///
+/// Used only for counting pages written during sorter spill operations.
+/// Ideally this would come from the database's actual page size, but the
+/// sorter runs at the VDBE level where the page size is available via
+/// `self.page_size`. For now, use the default. The spill page count metric
+/// is informational — it does not affect correctness.
 #[cfg(not(target_arch = "wasm32"))]
-const SORTER_SPILL_PAGE_SIZE: usize = 4096;
+const SORTER_SPILL_PAGE_SIZE: usize = fsqlite_types::limits::DEFAULT_PAGE_SIZE as usize;
 
 /// A sorted run that has been flushed to a temporary file.
 ///
@@ -2335,6 +2405,24 @@ impl CursorBackend {
             Self::Mem(c) => c.is_table(),
             Self::Txn(c) => c.is_table(),
             Self::TimeTravel(c) => c.is_table(),
+        }
+    }
+
+    #[must_use]
+    fn usable_size(&self) -> u32 {
+        match self {
+            Self::Mem(c) => c.usable_size(),
+            Self::Txn(c) => c.usable_size(),
+            Self::TimeTravel(c) => c.usable_size(),
+        }
+    }
+
+    #[must_use]
+    fn page_size(&self) -> u32 {
+        match self {
+            Self::Mem(c) => c.page_size(),
+            Self::Txn(c) => c.page_size(),
+            Self::TimeTravel(c) => c.page_size(),
         }
     }
 }
@@ -4352,12 +4440,21 @@ struct PendingInsertRollback {
 
 /// Per-accumulator window function context (for `AggInverse` / `AggValue`).
 ///
-/// TODO: Window functions are not yet emitted by codegen, so `AggInverse` /
-/// `AggValue` opcodes are currently dead code. When window functions are
-/// implemented, the split between `self.aggregates` (used by `AggStep` /
-/// `AggFinal`) and `self.window_contexts` (used by `AggInverse` / `AggValue`)
-/// must be reconciled — a function registered as both aggregate and window
-/// would need its state shared, not duplicated across the two maps.
+/// Bead bd-bldc5.4.1 (T20): Window functions are not yet emitted by VDBE
+/// codegen. `AggInverse`/`AggValue` opcodes exist and dispatch correctly
+/// but are never generated — window functions route through the connection
+/// fallback path (which works correctly, per 100+ conformance tests).
+///
+/// To enable VDBE window codegen:
+/// 1. Emit `SorterOpen` for PARTITION BY + ORDER BY sort in codegen.rs
+/// 2. Emit `AggStep`/`AggValue` per window function per row
+/// 3. For running aggregates (frame specs), emit `AggInverse` for shrinkage
+/// 4. Handle multiple window specs per query (Fix #85 established the
+///    runtime path for per-function sorted indices)
+///
+/// The split between `self.aggregates` and `self.window_contexts` must be
+/// reconciled — a function used as both aggregate and window needs shared
+/// state, not duplicated across the two maps.
 struct WindowContext {
     func: Arc<ErasedWindowFunction>,
     state: Box<dyn Any + Send>,
@@ -5497,14 +5594,18 @@ impl VdbeEngine {
                     } else {
                         self.index_desc_flags_for_root(root_page)
                     };
-                    let page_size_u32 = self.page_size.get();
-                    let new_cursor = BtCursor::new_with_index_desc(
+                    let page_layout = BtreeCursorPageLayout {
+                        usable_size: old_sc.cursor.usable_size(),
+                        page_size: old_sc.cursor.page_size(),
+                    };
+                    let mut new_cursor = BtCursor::new_with_index_desc(
                         tt_page_io,
                         root_pgno,
-                        page_size_u32,
+                        page_layout.usable_size,
                         is_table_btree,
                         index_desc_flags,
                     );
+                    configure_btree_cursor_page_size(&mut new_cursor, page_layout);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -6085,10 +6186,48 @@ impl VdbeEngine {
                     pc = addr as usize;
                 }
 
-                // ── Transaction (stub for expression eval) ──────────────
-                Opcode::Transaction | Opcode::AutoCommit | Opcode::TableLock => {
-                    // No-op in expression-only mode. Transaction lifecycle
-                    // will be wired to WAL and lock manager in Phase 5.
+                // ── Transaction / AutoCommit / TableLock ────────────────
+                //
+                // In C SQLite, Transaction opens a read or write transaction
+                // via the pager, AutoCommit commits/rollbacks, and TableLock
+                // acquires table-level schema locks. In FrankenSQLite, the
+                // Connection layer manages transaction lifecycle externally
+                // (wrapping VDBE execution in BEGIN/COMMIT), so these opcodes
+                // validate intent rather than performing the lifecycle step.
+                //
+                // Transaction: p1=db number, p2=1 for write txn, p3=schema version
+                // AutoCommit: p1=1 for rollback/0 for commit, p2=auto-commit flag
+                // TableLock: p1=db, p2=root page, p3=1 for write, p4=table name
+                Opcode::Transaction => {
+                    let _db_number = op.p1;
+                    let is_write = op.p2 != 0;
+                    if is_write && self.txn_page_io.is_some() {
+                        // Record that this program requires write access.
+                        // The Connection layer should have already opened a
+                        // write transaction; if not, downstream write opcodes
+                        // (Insert, Delete) will fail with appropriate errors.
+                        tracing::trace!(
+                            target: "fsqlite.vdbe",
+                            opcode = "Transaction",
+                            db = _db_number,
+                            write = is_write,
+                            "write transaction intent acknowledged"
+                        );
+                    }
+                    pc += 1;
+                }
+                Opcode::AutoCommit => {
+                    // AutoCommit is handled by the Connection layer after
+                    // VDBE execution completes. The opcode is a no-op here
+                    // because the Connection checks the final program counter
+                    // and transaction state to determine commit/rollback.
+                    pc += 1;
+                }
+                Opcode::TableLock => {
+                    // Table-level locks are subsumed by MVCC page-level
+                    // locking. Schema stability is guaranteed by the schema
+                    // cookie check (ReadCookie/SetCookie opcodes). No
+                    // additional locking is needed here.
                     pc += 1;
                 }
 
@@ -6127,9 +6266,17 @@ impl VdbeEngine {
                     // bd-1xrs: StorageCursor is now the ONLY cursor path.
                     // No MemCursor fallback - open_storage_cursor must succeed.
                     if op.p3 > 1 {
-                        return Err(FrankenError::NotImplemented(
-                            "attached databases (p3 > 1) not yet supported in VDBE".to_owned(),
-                        ));
+                        // Bead bd-bldc5.1.7 (T7): ATTACH DATABASE support.
+                        // p3=0 is main db, p3=1 is temp db. p3>1 means an
+                        // ATTACHed database, which requires multi-database pager
+                        // management (Connection maintains a map of name→pager,
+                        // VDBE looks up pager by db number). ATTACH is used for
+                        // cross-database queries, migration, and backup.
+                        return Err(FrankenError::NotImplemented(format!(
+                            "ATTACH DATABASE (db number {}) not yet supported — \
+                                 use the main database or :memory:",
+                            op.p3
+                        )));
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
@@ -6147,9 +6294,17 @@ impl VdbeEngine {
                     // bd-1xrs: StorageCursor is now the ONLY cursor path.
                     // No MemCursor fallback - open_storage_cursor must succeed.
                     if op.p3 > 1 {
-                        return Err(FrankenError::NotImplemented(
-                            "attached databases (p3 > 1) not yet supported in VDBE".to_owned(),
-                        ));
+                        // Bead bd-bldc5.1.7 (T7): ATTACH DATABASE support.
+                        // p3=0 is main db, p3=1 is temp db. p3>1 means an
+                        // ATTACHed database, which requires multi-database pager
+                        // management (Connection maintains a map of name→pager,
+                        // VDBE looks up pager by db number). ATTACH is used for
+                        // cross-database queries, migration, and backup.
+                        return Err(FrankenError::NotImplemented(format!(
+                            "ATTACH DATABASE (db number {}) not yet supported — \
+                                 use the main database or :memory:",
+                            op.p3
+                        )));
                     }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
@@ -9988,6 +10143,12 @@ impl VdbeEngine {
                     parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
                 let is_zero_page = page_data.iter().all(|&byte| byte == 0);
 
+                let page_layout = btree_cursor_page_layout_for_reader_or_default(
+                    page_io,
+                    &txn_cx,
+                    self.page_size,
+                );
+
                 if is_valid_btree {
                     // Real B-tree backed by pager: infer table-vs-index from the
                     // parsed page header when available, falling back to the raw
@@ -10014,10 +10175,10 @@ impl VdbeEngine {
                         };
                         (is_table, None)
                     };
-                    let cursor = BtCursor::new_with_index_desc(
+                    let mut cursor = BtCursor::new_with_index_desc(
                         page_io.clone(),
                         root_pgno,
-                        self.page_size.get(),
+                        page_layout.usable_size,
                         is_table_btree,
                         if is_table_btree {
                             Vec::new()
@@ -10025,6 +10186,7 @@ impl VdbeEngine {
                             self.index_desc_flags_for_root(root_page)
                         },
                     );
+                    configure_btree_cursor_page_size(&mut cursor, page_layout);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -10070,15 +10232,20 @@ impl VdbeEngine {
                         BtreePageType::LeafIndex
                     };
                     // Initialize empty leaf page for the inferred B-tree kind.
-                    let mut page = vec![0u8; self.page_size.get() as usize];
-                    page[0] = init_page_type as u8;
-                    // Bytes 1-2: first freeblock offset = 0 (none).
-                    // Bytes 3-4: cell count = 0.
-                    // Bytes 5-6: content area offset = page_size (no cells yet).
-                    #[allow(clippy::cast_possible_truncation)]
-                    let content_offset = self.page_size.get() as u16; // self.page_size.get()=4096 fits in u16
-                    page[5..7].copy_from_slice(&content_offset.to_be_bytes());
-                    // Byte 7: fragmented free bytes = 0.
+                    // The page buffer starts zeroed, so only the page-type flag
+                    // and cell-content offset need to be populated explicitly.
+                    let mut page = vec![0u8; page_layout.page_size as usize];
+                    page[0] = if is_table_btree {
+                        fsqlite_types::BTreePageType::LeafTable as u8
+                    } else {
+                        fsqlite_types::BTreePageType::LeafIndex as u8
+                    };
+                    let content_raw = if page_layout.usable_size >= 65_536 {
+                        0u16
+                    } else {
+                        page_layout.usable_size as u16
+                    };
+                    page[5..7].copy_from_slice(&content_raw.to_be_bytes());
 
                     // Write the initialized page to pager.
                     if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
@@ -10095,10 +10262,10 @@ impl VdbeEngine {
                         );
                         return false;
                     }
-                    let cursor = BtCursor::new_with_index_desc(
+                    let mut cursor = BtCursor::new_with_index_desc(
                         page_io.clone(),
                         root_pgno,
-                        self.page_size.get(),
+                        page_layout.usable_size,
                         is_table_btree,
                         if is_table_btree {
                             Vec::new()
@@ -10106,6 +10273,7 @@ impl VdbeEngine {
                             self.index_desc_flags_for_root(root_page)
                         },
                     );
+                    configure_btree_cursor_page_size(&mut cursor, page_layout);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -16319,6 +16487,60 @@ mod tests {
             second_values,
             vec![SqliteValue::Integer(10), SqliteValue::Integer(1)],
             "descending index cursor should keep the smaller key after the larger one"
+        );
+
+        engine.storage_cursors.clear();
+        let _txn = engine
+            .take_transaction()
+            .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_open_storage_cursor_txn_zero_page_honors_page1_reserved_bytes_layout() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let root_pgno = PageNumber::new(256).unwrap();
+
+        let mut header = DatabaseHeader {
+            page_size: PageSize::DEFAULT,
+            reserved_per_page: 32,
+            page_count: root_pgno.get(),
+            ..DatabaseHeader::default()
+        };
+        header.version_valid_for = header.change_counter;
+        let mut page_one = vec![0u8; PageSize::DEFAULT.as_usize()];
+        page_one[..DATABASE_HEADER_SIZE].copy_from_slice(&header.to_bytes().unwrap());
+        txn.write_page(&cx, PageNumber::ONE, &page_one).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction(Box::new(txn));
+
+        assert!(
+            engine.open_storage_cursor(0, root_pgno.get() as i32, true),
+            "txn-backed writable cursor should open on a fresh reserved-byte root page"
+        );
+
+        let storage_cursor = engine.storage_cursors.get(&0).unwrap();
+        assert_eq!(
+            storage_cursor.cursor.usable_size(),
+            PageSize::DEFAULT.get() - 32
+        );
+        assert_eq!(storage_cursor.cursor.page_size(), PageSize::DEFAULT.get());
+
+        let root_page = engine
+            .txn_page_io
+            .as_ref()
+            .unwrap()
+            .read_page(&cx, root_pgno)
+            .unwrap();
+        assert_eq!(root_page[0], BtreePageType::LeafTable as u8);
+        assert_eq!(
+            u16::from_be_bytes([root_page[5], root_page[6]]),
+            (PageSize::DEFAULT.get() - 32) as u16,
+            "fresh reserved-byte root pages must start their cell content area at usable_size"
         );
 
         engine.storage_cursors.clear();

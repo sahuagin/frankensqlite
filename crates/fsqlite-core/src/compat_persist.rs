@@ -35,7 +35,7 @@ use fsqlite_types::record::{
 };
 use fsqlite_types::value::SqliteValue;
 #[cfg(not(target_arch = "wasm32"))]
-use fsqlite_types::{PageNumber, PageSize};
+use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(all(not(target_arch = "wasm32"), unix))]
@@ -52,6 +52,42 @@ const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 /// Default page size used for newly-created databases.
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
+    let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1_bytes
+        .get(..DATABASE_HEADER_SIZE)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database header truncated: expected at least {DATABASE_HEADER_SIZE} bytes, found {}",
+                page1_bytes.len()
+            ),
+        })?
+        .try_into()
+        .map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "database header is not a fixed-size 100-byte prefix".to_owned(),
+        })?;
+    let header = DatabaseHeader::from_bytes(header_bytes).map_err(|error| {
+        FrankenError::DatabaseCorrupt {
+            detail: format!("invalid database header: {error}"),
+        }
+    })?;
+    Ok((
+        header.page_size.usable(header.reserved_per_page),
+        header.page_size.get(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn configure_btree_cursor_page_size<P: fsqlite_btree::PageReader>(
+    cursor: &mut fsqlite_btree::BtCursor<P>,
+    usable_size: u32,
+    page_size: u32,
+) {
+    if page_size != usable_size {
+        cursor.set_page_size(page_size);
+    }
+}
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -227,10 +263,8 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let vfs = PlatformVfs::new();
     let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
     let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;
-
-    let ps = pager.page_size().as_usize();
-    let usable_size =
-        u32::try_from(ps).map_err(|_| FrankenError::internal("page size exceeds u32"))?;
+    let page1 = txn.get_page(cx, PageNumber::ONE)?;
+    let (usable_size, page_size) = load_sqlite_cursor_sizes_from_page1(page1.as_ref())?;
 
     // Read sqlite_master entries from page 1.
     let master_entries = {
@@ -242,6 +276,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             usable_size,
             true,
         );
+        configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if cursor.first(cx)? {
             loop {
@@ -373,6 +408,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             usable_size,
             true,
         );
+        configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
             let mut unique_groups = Vec::<Vec<usize>>::new();
@@ -901,6 +937,8 @@ pub(crate) struct CreateIndexSqlTerm<'a> {
 }
 
 /// Reconstruct a `CREATE INDEX` statement from index metadata.
+/// Needed for sqlite_master row generation during schema persistence — not
+/// yet wired into the live schema write-back path.
 #[allow(dead_code)]
 pub(crate) fn build_create_index_sql(
     index_name: &str,
@@ -1871,6 +1909,8 @@ fn type_to_affinity(type_str: &str) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     fn persist_test_db(
         path: &Path,
@@ -2110,6 +2150,85 @@ mod tests {
         assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
         assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].0, 20);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
+    }
+
+    #[test]
+    fn test_load_sqlite3_created_file_with_nondefault_page_size_and_reserved_bytes() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            eprintln!("skipping: sqlite3 binary not found");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_reserved_bytes.db");
+
+        let mut child = Command::new("sqlite3")
+            .arg(&db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sqlite3 process should start");
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("sqlite3 stdin should be available");
+            stdin
+                .write_all(
+                    br"PRAGMA journal_mode=DELETE;
+PRAGMA page_size=8192;
+VACUUM;
+.filectrl reserve_bytes 32
+VACUUM;
+CREATE TABLE items (val INTEGER, label TEXT);
+INSERT INTO items VALUES (10, 'alpha');
+INSERT INTO items VALUES (20, 'beta');
+PRAGMA integrity_check;
+",
+                )
+                .expect("sqlite3 setup should accept the script");
+        }
+        let output = child
+            .wait_with_output()
+            .expect("sqlite3 process should finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && (stdout.contains("unknown")
+                || stdout.contains("Usage:")
+                || stderr.contains("unknown")
+                || stderr.contains("Usage:"))
+        {
+            eprintln!(
+                "skipping: sqlite3 shell does not support .filectrl reserve_bytes: stdout={stdout} stderr={stderr}"
+            );
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "sqlite3 reserved-byte setup failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.lines().any(|line| line.trim() == "ok"),
+            "sqlite3 should report integrity_check=ok for the reserved-byte database: stdout={stdout} stderr={stderr}"
+        );
+
+        let loaded = load_test_db(&db_path).unwrap_or_else(|error| {
+            panic!(
+                "compat loader must read valid C SQLite files with non-default page sizes and reserved bytes: {error}"
+            )
+        });
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
         assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }

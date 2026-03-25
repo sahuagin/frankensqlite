@@ -257,18 +257,33 @@ pub struct WriteCoordinator {
     wal_offset: AtomicU64,
     /// Coordinator lease.
     lease: RwLock<Option<CoordinatorLease>>,
+    /// Authoritative page size from the database header. Used for WAL frame
+    /// size calculations. Previously, `infer_page_size()` guessed 4096 when
+    /// the write set was empty, which is wrong for non-default page sizes.
+    page_size: u64,
 }
 
 impl WriteCoordinator {
     /// Create a new write coordinator in the given mode.
+    ///
+    /// `page_size` is the authoritative database page size (from the database
+    /// header). It must be a valid SQLite page size (512..=65536, power of 2).
+    /// Defaults to 4096 only if no page size is known at construction time.
     #[must_use]
     pub fn new(mode: CoordinatorMode) -> Self {
+        Self::with_page_size(mode, 4096)
+    }
+
+    /// Create a new write coordinator with an explicit page size.
+    #[must_use]
+    pub fn with_page_size(mode: CoordinatorMode, page_size: u64) -> Self {
         Self {
             mode,
             next_commit_seq: AtomicU64::new(1),
             commit_page_index: RwLock::new(HashMap::new()),
             wal_offset: AtomicU64::new(0),
             lease: RwLock::new(None),
+            page_size,
         }
     }
 
@@ -547,15 +562,18 @@ impl WriteCoordinator {
             // This MUST be inside the index lock to ensure that the physical WAL
             // order strictly matches the logical commit sequence.
             let frame_header_size = 24_u64;
-            let page_size = Self::infer_page_size(&req.write_set);
+            let page_size = self.infer_page_size(&req.write_set);
             let batch_bytes = page_numbers.len() as u64 * (frame_header_size + page_size);
             let offset = self.wal_offset.fetch_add(batch_bytes, Ordering::SeqCst);
 
             (seq, offset)
         };
 
-        // Step 4: "sync" — fsync placeholder. In the full implementation,
-        // this is the group commit fsync point.
+        // Step 4: sync — NOT needed here in compatibility mode because the
+        // pager's commit_wal_group_commit() path handles WAL fsync via
+        // VfsFile::sync(). This placeholder is only relevant for future
+        // Native mode (ECS commit stream) where durability flows through
+        // the write coordinator directly instead of the pager/WAL stack.
 
         // Step 5: Update commit index (publish).
         // (Already reserved eagerly in Step 1 to prevent races)
@@ -642,7 +660,7 @@ impl WriteCoordinator {
             } else {
                 // Phase 2: Allocate commit_seq and WAL offset.
                 let commit_seq = self.allocate_commit_seq();
-                let page_size = Self::infer_page_size(&req.write_set);
+                let page_size = self.infer_page_size(&req.write_set);
                 let page_count = req.write_set.page_count() as u64;
                 let commit_bytes = page_count * (frame_header_size + page_size);
                 let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::SeqCst);
@@ -669,7 +687,9 @@ impl WriteCoordinator {
 
         let accepted_count = accepted_commits.len();
 
-        // Phase 3: Single fsync (placeholder).
+        // Phase 3: sync — NOT needed here in compatibility mode.
+        // The pager's commit_wal_group_commit() handles WAL fsync. This
+        // placeholder is for future Native mode (ECS commit stream).
         debug!(
             bead_id = "bd-389e",
             batch_size = accepted_count,
@@ -697,17 +717,20 @@ impl WriteCoordinator {
         self.lease.read().is_some()
     }
 
-    /// Infer page size from the write set (V1: assume 4096 if no data).
-    fn infer_page_size(write_set: &CommitWriteSet) -> u64 {
+    /// Infer page size from the write set, falling back to the authoritative
+    /// page size stored in the coordinator (set at construction from the
+    /// database header). Never falls back to a hardcoded 4096.
+    fn infer_page_size(&self, write_set: &CommitWriteSet) -> u64 {
         match write_set {
-            CommitWriteSet::Inline(pages) => {
-                pages.values().next().map_or(4096, |pd| pd.len() as u64)
-            }
+            CommitWriteSet::Inline(pages) => pages
+                .values()
+                .next()
+                .map_or(self.page_size, |pd| pd.len() as u64),
             CommitWriteSet::Spilled(spilled) => spilled
                 .pages
                 .values()
                 .next()
-                .map_or(4096, |loc| u64::from(loc.len)),
+                .map_or(self.page_size, |loc| u64::from(loc.len)),
         }
     }
 

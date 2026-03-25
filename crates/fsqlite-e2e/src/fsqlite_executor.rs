@@ -3778,6 +3778,50 @@ mod tests {
     }
 
     #[test]
+    fn run_oplog_fsqlite_mixed_read_write_on_c_sqlite_copy_with_8192_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("from_c_page8192_overflow_source.db");
+        let work_path = dir.path().join("from_c_page8192_overflow_work.db");
+
+        {
+            let rconn = rusqlite::Connection::open(&source_path).unwrap();
+            let journal_mode: String = rconn
+                .query_row("PRAGMA journal_mode=DELETE;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+            rconn
+                .execute_batch("PRAGMA page_size=8192; VACUUM;")
+                .unwrap();
+            rconn
+                .execute(
+                    "CREATE TABLE blobs(id INTEGER PRIMARY KEY, payload BLOB);",
+                    [],
+                )
+                .unwrap();
+            for rowid in 1_i64..=20 {
+                rconn
+                    .execute(
+                        "INSERT INTO blobs(id, payload) VALUES (?, zeroblob(12000));",
+                        rusqlite::params![rowid],
+                    )
+                    .unwrap();
+            }
+        }
+
+        std::fs::copy(&source_path, &work_path).unwrap();
+
+        let oplog = crate::oplog::preset_mixed_read_write("page8192-copy", 0, 1, 10);
+        let report = run_oplog_fsqlite(&work_path, &oplog, &FsqliteExecConfig::default()).unwrap();
+
+        assert!(
+            report.error.is_none(),
+            "copied C SQLite 8192-page database should survive mixed executor setup/workload: {:?}",
+            report.error
+        );
+        assert!(report.ops_total > 0);
+    }
+
+    #[test]
     fn report_serialization_roundtrip() {
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 1, 1, 5);
         let report =
