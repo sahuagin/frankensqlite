@@ -20,9 +20,11 @@ const RECORD_FIXED_OVERHEAD_BYTES: usize = 48;
 /// Epoch advance interval for flushing batched WAL entries.
 const DEFAULT_EPOCH_ADVANCE_INTERVAL_MS: u64 = 10;
 
-/// Default number of buffer slots. With 128 slots, 16 threads have only
-/// 12.5% probability of two threads landing on the same slot. For systems
-/// with fewer cores, a smaller slot count reduces memory overhead.
+/// Default number of buffer slots.
+///
+/// With 128 slots, 16 threads have only 12.5% probability of two threads
+/// landing on the same slot. For systems with fewer cores, a smaller slot
+/// count reduces memory overhead.
 pub const DEFAULT_BUFFER_SLOT_COUNT: usize = 128;
 
 /// Global counter for assigning thread-local buffer slot indices.

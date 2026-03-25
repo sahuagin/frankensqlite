@@ -127,9 +127,11 @@ impl Error for ParseError {}
 // Parser
 // ---------------------------------------------------------------------------
 
-/// Maximum expression nesting depth. Matches C SQLite's default
-/// `SQLITE_MAX_EXPR_DEPTH` (1000). C SQLite allows compile-time override;
-/// this constant could be made generic or builder-configurable if needed.
+/// Maximum expression nesting depth.
+///
+/// Matches C SQLite's default `SQLITE_MAX_EXPR_DEPTH` (1000). C SQLite
+/// allows compile-time override; this constant could be made generic or
+/// builder-configurable if needed.
 pub const MAX_PARSE_DEPTH: u32 = 1000;
 
 pub struct Parser {

@@ -61,11 +61,13 @@ impl std::error::Error for DispatchError {}
 /// Result alias for dispatcher operations.
 pub type DispatchResult<T> = std::result::Result<T, DispatchError>;
 
-/// Fallback L2 cache size used for morsel auto-tuning when host details are
-/// unavailable. On modern server CPUs (2-4 MiB per core), 1 MiB is a
-/// conservative underestimate. A future enhancement could detect the actual
-/// L2 cache size at startup via `/sys/devices/system/cpu/cpu0/cache/` on
-/// Linux or `sysctl hw.l2cachesize` on macOS.
+/// Fallback L2 cache size for morsel auto-tuning.
+///
+/// Used when host cache details are unavailable. On modern server CPUs
+/// (2-4 MiB per core), 1 MiB is a conservative underestimate. A future
+/// enhancement could detect the actual L2 cache size at startup via
+/// `/sys/devices/system/cpu/cpu0/cache/` on Linux or
+/// `sysctl hw.l2cachesize` on macOS.
 pub const DEFAULT_L2_CACHE_BYTES: usize = 1_048_576;
 /// Default database page size used for morsel auto-tuning.
 ///
