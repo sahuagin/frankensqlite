@@ -685,6 +685,16 @@ pub const MAX_FILE_FORMAT_VERSION: u8 = 2;
 /// This matches SQLite 3.52.0 (`3052000`), which is the conformance target for this project.
 pub const FRANKENSQLITE_SQLITE_VERSION_NUMBER: u32 = 3_052_000;
 
+/// SQLite version string for the conformance target.
+///
+/// **Single source of truth for the version string.** All runtime paths
+/// (`sqlite_version()`, `PRAGMA sqlite_version`, harness configs) must use
+/// this constant — never use a bare `"3.52.0"` literal.
+pub const FRANKENSQLITE_SQLITE_VERSION: &str = "3.52.0";
+
+/// Full source ID string returned by `sqlite_source_id()`.
+pub const FRANKENSQLITE_SOURCE_ID: &str = "FrankenSQLite 0.1.0 (compatible with SQLite 3.52.0)";
+
 /// Database file open mode derived from the header's read/write version bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DatabaseOpenMode {

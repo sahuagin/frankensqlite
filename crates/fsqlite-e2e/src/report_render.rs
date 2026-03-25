@@ -821,7 +821,7 @@ mod tests {
             engine: EngineInfo {
                 name: engine.to_owned(),
                 sqlite_version: if engine == "sqlite3" {
-                    Some("3.52.0".to_owned())
+                    Some(fsqlite_types::FRANKENSQLITE_SQLITE_VERSION.to_owned())
                 } else {
                     None
                 },

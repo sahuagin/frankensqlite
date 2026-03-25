@@ -1550,7 +1550,7 @@ impl ExtensionParityMatrix {
 
         Self {
             schema_version: MATRIX_SCHEMA_VERSION,
-            target_sqlite_version: "3.52.0".to_owned(),
+            target_sqlite_version: fsqlite_types::FRANKENSQLITE_SQLITE_VERSION.to_owned(),
             feature_flags,
             entries,
         }

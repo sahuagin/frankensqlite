@@ -23,7 +23,7 @@ pub const BEAD_ID: &str = "bd-2yqp6.5.1";
 /// Schema version for forward-compatible consumers.
 pub const MATRIX_SCHEMA_VERSION: u32 = 1;
 
-const TARGET_SQLITE_VERSION: &str = "3.52.0";
+const TARGET_SQLITE_VERSION: &str = fsqlite_types::FRANKENSQLITE_SQLITE_VERSION;
 
 /// High-level built-in function family for grouping and reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

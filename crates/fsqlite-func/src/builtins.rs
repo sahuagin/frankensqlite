@@ -1427,7 +1427,9 @@ pub struct SqliteVersionFunc;
 
 impl ScalarFunction for SqliteVersionFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(Arc::from("3.52.0")))
+        Ok(SqliteValue::Text(Arc::from(
+            fsqlite_types::FRANKENSQLITE_SQLITE_VERSION,
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -1446,7 +1448,7 @@ pub struct SqliteSourceIdFunc;
 impl ScalarFunction for SqliteSourceIdFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
         Ok(SqliteValue::Text(Arc::from(
-            "FrankenSQLite 0.1.0 (compatible with SQLite 3.52.0)",
+            fsqlite_types::FRANKENSQLITE_SOURCE_ID,
         )))
     }
 

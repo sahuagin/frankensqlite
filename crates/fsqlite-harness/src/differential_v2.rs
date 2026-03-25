@@ -40,7 +40,7 @@ const BEAD_ID: &str = "bd-1dp9.1.2";
 const SUBJECT_IDENTITY_LABEL: &str = "frankensqlite";
 const REFERENCE_IDENTITY_LABEL: &str = "csqlite-oracle";
 /// Canonical C SQLite target version for parity reports.
-pub const TARGET_SQLITE_VERSION: &str = "3.52.0";
+pub const TARGET_SQLITE_VERSION: &str = fsqlite_types::FRANKENSQLITE_SQLITE_VERSION;
 /// Canonical version contract path embedded in parity report metadata.
 pub const SQLITE_VERSION_CONTRACT_PATH: &str = "sqlite_version_contract.toml";
 
@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn parity_mode_hard_fails_when_statement_stream_is_empty() {
         let envelope = ExecutionEnvelope::builder(42)
-            .engines("0.1.0", "3.52.0")
+            .engines("0.1.0", fsqlite_types::FRANKENSQLITE_SQLITE_VERSION)
             .build();
         let f = NoopExecutor {
             identity: EngineIdentity::FrankenSqlite,

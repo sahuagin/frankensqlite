@@ -10,7 +10,8 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 /// Default maximum trigger nesting depth (matches C SQLite `SQLITE_MAX_TRIGGER_DEPTH`).
-pub const SQLITE_MAX_TRIGGER_DEPTH: usize = 1000;
+/// Derived from the canonical constant in `fsqlite-types::limits`.
+pub const SQLITE_MAX_TRIGGER_DEPTH: usize = fsqlite_types::limits::MAX_TRIGGER_DEPTH as usize;
 
 /// Result of evaluating a RAISE function inside a trigger body.
 ///

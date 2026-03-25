@@ -61,10 +61,18 @@ impl std::error::Error for DispatchError {}
 /// Result alias for dispatcher operations.
 pub type DispatchResult<T> = std::result::Result<T, DispatchError>;
 
-/// Fallback L2 cache size used for morsel auto-tuning when host details are unavailable.
+/// Fallback L2 cache size used for morsel auto-tuning when host details are
+/// unavailable. On modern server CPUs (2-4 MiB per core), 1 MiB is a
+/// conservative underestimate. A future enhancement could detect the actual
+/// L2 cache size at startup via `/sys/devices/system/cpu/cpu0/cache/` on
+/// Linux or `sysctl hw.l2cachesize` on macOS.
 pub const DEFAULT_L2_CACHE_BYTES: usize = 1_048_576;
 /// Default database page size used for morsel auto-tuning.
-pub const DEFAULT_PAGE_SIZE_BYTES: usize = 4_096;
+///
+/// Derived from the canonical default in `fsqlite-types::limits`. When the
+/// morsel dispatcher is invoked with a concrete `VdbeEngine`, the engine's
+/// actual `page_size` should be preferred over this constant.
+pub const DEFAULT_PAGE_SIZE_BYTES: usize = fsqlite_types::limits::DEFAULT_PAGE_SIZE as usize;
 
 // ── Morsel Dispatch Metrics (bd-1rw.2) ─────────────────────────────────────
 

@@ -635,7 +635,7 @@ mod tests {
     fn test_report_serialization() {
         let report = RunReport {
             sqlite3_bin: "sqlite3".to_owned(),
-            sqlite3_version: Some("3.52.0".to_owned()),
+            sqlite3_version: Some(fsqlite_types::FRANKENSQLITE_SQLITE_VERSION.to_owned()),
             db_path: "/tmp/test.db".to_owned(),
             preset: Some("test_preset".to_owned()),
             worker_count: 2,
