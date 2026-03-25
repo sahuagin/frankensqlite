@@ -339,7 +339,7 @@ impl SqliteValue {
     /// - Integer -> itself
     /// - Float -> truncated to i64
     /// - Text -> attempt to parse, 0 on failure
-    /// - Blob -> 0
+    /// - Blob -> parse bytes as numeric string, 0 on failure
     #[inline(always)]
     #[allow(clippy::inline_always)]
     #[allow(clippy::cast_possible_truncation)]
@@ -359,7 +359,7 @@ impl SqliteValue {
     /// - Integer -> as f64
     /// - Float -> itself
     /// - Text -> attempt to parse, 0.0 on failure
-    /// - Blob -> 0.0
+    /// - Blob -> parse bytes as numeric string, 0.0 on failure
     #[inline(always)]
     #[allow(clippy::inline_always)]
     #[allow(clippy::cast_precision_loss)]

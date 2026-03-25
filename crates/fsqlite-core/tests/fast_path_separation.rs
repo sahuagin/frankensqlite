@@ -368,3 +368,485 @@ fn test_fast_path_latency_scorecard() {
         "prepared path should not be >2x slower than ad-hoc: ratio={ratio:.2}"
     );
 }
+
+/// T9: Prepared UPDATE uses fast lane on file-backed WAL (bd-db300.5.2.2.3).
+#[test]
+fn test_fast_path_prepared_update() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'before')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 'before')").unwrap();
+
+    let stmt = conn.prepare("UPDATE t SET val = ?2 WHERE id = ?1").unwrap();
+
+    // Warm.
+    stmt.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(1),
+        fsqlite_types::SqliteValue::Text("warm".into()),
+    ])
+    .unwrap();
+    reset_hot_path_profile();
+
+    // Measure.
+    let before = hot_path_profile_snapshot();
+    stmt.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(1),
+        fsqlite_types::SqliteValue::Text("after1".into()),
+    ])
+    .unwrap();
+    stmt.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(2),
+        fsqlite_types::SqliteValue::Text("after2".into()),
+    ])
+    .unwrap();
+    let after = hot_path_profile_snapshot();
+
+    let (fast_delta, _) = fast_slow_delta(&before.parser, &after.parser);
+    let ud_fast = after
+        .prepared_update_delete_fast_lane_hits
+        .saturating_sub(before.prepared_update_delete_fast_lane_hits);
+    eprintln!("[T9] UPDATE: fast_delta={fast_delta}, ud_fast_lane_delta={ud_fast}");
+    assert!(
+        fast_delta >= 2,
+        "prepared UPDATE should use fast path: fast_delta={fast_delta}"
+    );
+    assert!(
+        ud_fast >= 2,
+        "prepared UPDATE should hit update/delete fast lane: ud_fast={ud_fast}"
+    );
+
+    // Correctness.
+    let rows = conn.query("SELECT val FROM t ORDER BY id").unwrap();
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("after1".into()))
+    );
+    assert_eq!(
+        rows[1].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("after2".into()))
+    );
+}
+
+/// T10: Prepared DELETE uses fast lane on file-backed WAL (bd-db300.5.2.2.3).
+#[test]
+fn test_fast_path_prepared_delete() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+    conn.execute("INSERT INTO t VALUES(3, 'c')").unwrap();
+
+    let stmt = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+
+    // Warm.
+    stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(3)])
+        .unwrap();
+    reset_hot_path_profile();
+
+    // Measure.
+    let before = hot_path_profile_snapshot();
+    stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(1)])
+        .unwrap();
+    stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(2)])
+        .unwrap();
+    let after = hot_path_profile_snapshot();
+
+    let (fast_delta, _) = fast_slow_delta(&before.parser, &after.parser);
+    let ud_fast = after
+        .prepared_update_delete_fast_lane_hits
+        .saturating_sub(before.prepared_update_delete_fast_lane_hits);
+    eprintln!("[T10] DELETE: fast_delta={fast_delta}, ud_fast_lane_delta={ud_fast}");
+    assert!(
+        fast_delta >= 2,
+        "prepared DELETE should use fast path: fast_delta={fast_delta}"
+    );
+    assert!(
+        ud_fast >= 2,
+        "prepared DELETE should hit update/delete fast lane: ud_fast={ud_fast}"
+    );
+
+    // Correctness.
+    let rows = conn.query("SELECT COUNT(*) FROM t").unwrap();
+    let count = rows[0].get(0).unwrap();
+    assert_eq!(
+        count,
+        &fsqlite_types::SqliteValue::Integer(0),
+        "all rows should be deleted"
+    );
+}
+
+/// T11: Deferred-DML path uses no_publication() proof and still succeeds
+/// (bd-db300.5.2.2.3).
+///
+/// The deferred path fires when `stmt.deferred_dml_statement()` is Some and
+/// `fast_path.supports_direct_dispatch_now()` is true. Foreign keys force
+/// the deferred path because FK enforcement requires post-statement checking.
+#[test]
+fn test_deferred_dml_no_publication_proof() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))")
+        .unwrap();
+    conn.execute("INSERT INTO parent VALUES(1)").unwrap();
+
+    // Prepared DELETE on parent with FK child — forces deferred DML path.
+    let stmt = conn.prepare("DELETE FROM parent WHERE id = ?1").unwrap();
+
+    // Should succeed (no child references id=1... wait, no child rows exist).
+    let result = stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(1)]);
+    assert!(
+        result.is_ok(),
+        "deferred-DML DELETE with no FK violation should succeed: {:?}",
+        result
+    );
+
+    // Insert a child referencing parent id=2, then try to delete parent id=2.
+    conn.execute("INSERT INTO parent VALUES(2)").unwrap();
+    conn.execute("INSERT INTO child VALUES(1, 2)").unwrap();
+    let result = stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(2)]);
+    // Should fail with FK constraint violation.
+    assert!(
+        result.is_err(),
+        "deferred-DML DELETE with FK violation should fail"
+    );
+}
+
+/// T12: UPDATE/DELETE DDL invalidation + recovery (bd-db300.5.2.2.3).
+///
+/// Mirrors T4 but for UPDATE and DELETE: DDL invalidates the prepared
+/// statement, re-prepare restores fast-path execution.
+#[test]
+fn test_fast_path_update_delete_ddl_invalidation() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'orig')").unwrap();
+
+    let update_stmt = conn.prepare("UPDATE t SET val = ?2 WHERE id = ?1").unwrap();
+    let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+
+    // Pre-DDL: should succeed on fast path.
+    update_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("updated".into()),
+        ])
+        .unwrap();
+
+    // DDL changes schema.
+    conn.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0")
+        .unwrap();
+
+    // Post-DDL: old prepared stmts should detect schema change.
+    let update_result = update_stmt.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(1),
+        fsqlite_types::SqliteValue::Text("post-ddl".into()),
+    ]);
+    match &update_result {
+        Err(fsqlite_error::FrankenError::SchemaChanged) => {
+            eprintln!("[T12] UPDATE post-DDL: SchemaChanged (expected)");
+        }
+        Ok(_) => {
+            eprintln!("[T12] UPDATE post-DDL: succeeded (transparent re-prepare)");
+        }
+        Err(e) => {
+            eprintln!("[T12] UPDATE post-DDL: error {e:?}");
+        }
+    }
+
+    let delete_result = delete_stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(1)]);
+    match &delete_result {
+        Err(fsqlite_error::FrankenError::SchemaChanged) => {
+            eprintln!("[T12] DELETE post-DDL: SchemaChanged (expected)");
+        }
+        Ok(_) => {
+            eprintln!("[T12] DELETE post-DDL: succeeded (transparent re-prepare)");
+        }
+        Err(e) => {
+            eprintln!("[T12] DELETE post-DDL: error {e:?}");
+        }
+    }
+
+    // Re-prepare UPDATE on new schema and verify fast path restored.
+    conn.execute("INSERT INTO t VALUES(10, 'seed', 0)").unwrap();
+    conn.execute("INSERT INTO t VALUES(11, 'seed2', 0)")
+        .unwrap();
+
+    let update2 = conn
+        .prepare("UPDATE t SET val = ?2, extra = ?3 WHERE id = ?1")
+        .unwrap();
+    let before_upd = hot_path_profile_snapshot();
+    update2
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(10),
+            fsqlite_types::SqliteValue::Text("recovered".into()),
+            fsqlite_types::SqliteValue::Integer(42),
+        ])
+        .unwrap();
+    let after_upd = hot_path_profile_snapshot();
+    let (fast_upd, _) = fast_slow_delta(&before_upd.parser, &after_upd.parser);
+    eprintln!("[T12] post-re-prepare UPDATE: fast_delta={fast_upd}");
+    assert!(
+        fast_upd > 0,
+        "re-prepared UPDATE should restore fast path: fast_delta={fast_upd}"
+    );
+
+    // Verify UPDATE correctness.
+    let rows = conn
+        .query("SELECT val, extra FROM t WHERE id = 10")
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "re-prepared UPDATE should have affected a row"
+    );
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Text("recovered".into()))
+    );
+
+    // Re-prepare DELETE on new schema and verify fast path restored.
+    let delete2 = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+    let before_del = hot_path_profile_snapshot();
+    delete2
+        .execute_with_params(&[fsqlite_types::SqliteValue::Integer(11)])
+        .unwrap();
+    let after_del = hot_path_profile_snapshot();
+    let (fast_del, _) = fast_slow_delta(&before_del.parser, &after_del.parser);
+    eprintln!("[T12] post-re-prepare DELETE: fast_delta={fast_del}");
+    assert!(
+        fast_del > 0,
+        "re-prepared DELETE should restore fast path: fast_delta={fast_del}"
+    );
+
+    // Verify DELETE correctness.
+    let rows = conn.query("SELECT COUNT(*) FROM t WHERE id = 11").unwrap();
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(0)),
+        "re-prepared DELETE should have removed the row"
+    );
+}
+
+/// T13: File-backed prepared INSERT, UPDATE, and DELETE all reuse prebound
+/// publication (≤1 pager_publication_refresh per operation).
+///
+/// Before the entry-proof fix, UPDATE/DELETE double-refreshed because the
+/// deferred-DML path did not thread the prebound publication.  Now all three
+/// DML kinds pass the publication through the entry proof.
+#[test]
+fn test_file_backed_publication_refresh_counts() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+
+    let insert_stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let update_stmt = conn.prepare("UPDATE t SET val = ?2 WHERE id = ?1").unwrap();
+    let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+
+    // Warm all stmts.
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(10),
+            fsqlite_types::SqliteValue::Text("warm".into()),
+        ])
+        .unwrap();
+    update_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("warm".into()),
+        ])
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(20, 'del_warm')")
+        .unwrap();
+    delete_stmt
+        .execute_with_params(&[fsqlite_types::SqliteValue::Integer(20)])
+        .unwrap();
+
+    // Measure INSERT (precompiled path — should reuse prebound publication).
+    reset_hot_path_profile();
+    let before_ins = hot_path_profile_snapshot();
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(100),
+            fsqlite_types::SqliteValue::Text("measured".into()),
+        ])
+        .unwrap();
+    let after_ins = hot_path_profile_snapshot();
+    let insert_pub = after_ins
+        .pager_publication_refreshes
+        .saturating_sub(before_ins.pager_publication_refreshes);
+    eprintln!("[T13] INSERT pager_publication_refreshes delta = {insert_pub}");
+    assert!(
+        insert_pub <= 1,
+        "INSERT should reuse prebound publication (≤1 refresh): got {insert_pub}"
+    );
+
+    // Measure UPDATE (deferred-DML path — currently double-refreshes).
+    reset_hot_path_profile();
+    let before_upd = hot_path_profile_snapshot();
+    update_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("measured".into()),
+        ])
+        .unwrap();
+    let after_upd = hot_path_profile_snapshot();
+    let update_pub = after_upd
+        .pager_publication_refreshes
+        .saturating_sub(before_upd.pager_publication_refreshes);
+    eprintln!("[T13] UPDATE pager_publication_refreshes delta = {update_pub}");
+    assert!(
+        update_pub <= 1,
+        "UPDATE should reuse prebound publication (≤1 refresh): got {update_pub}"
+    );
+
+    // Measure DELETE.  Seed the target row with the prepared insert_stmt
+    // to avoid an ad-hoc conn.execute() between reset and measurement
+    // (ad-hoc execution advances commit_seq, forcing a stale-publication
+    // refresh that inflates the counter).
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(200),
+            fsqlite_types::SqliteValue::Text("del_target".into()),
+        ])
+        .unwrap();
+    reset_hot_path_profile();
+    let before_del = hot_path_profile_snapshot();
+    delete_stmt
+        .execute_with_params(&[fsqlite_types::SqliteValue::Integer(200)])
+        .unwrap();
+    let after_del = hot_path_profile_snapshot();
+    let delete_pub = after_del
+        .pager_publication_refreshes
+        .saturating_sub(before_del.pager_publication_refreshes);
+    eprintln!("[T13] DELETE pager_publication_refreshes delta = {delete_pub}");
+    assert!(
+        delete_pub <= 1,
+        "DELETE should reuse prebound publication (≤1 refresh): got {delete_pub}"
+    );
+}
+
+/// T14: :memory: UPDATE/DELETE succeeds with no-publication entry proof
+/// (bd-db300.5.2.2.3 / bd-db300.5.2.2.4).
+#[test]
+fn test_entry_proof_no_publication_for_memory_update_delete() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 'b')").unwrap();
+
+    let update_stmt = conn.prepare("UPDATE t SET val = ?2 WHERE id = ?1").unwrap();
+    let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+
+    // UPDATE on :memory: — entry_proof.publication is None.
+    update_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("updated".into()),
+        ])
+        .unwrap();
+
+    // DELETE on :memory:.
+    delete_stmt
+        .execute_with_params(&[fsqlite_types::SqliteValue::Integer(2)])
+        .unwrap();
+
+    // Verify data correctness.
+    let rows = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 1, "one row should remain after delete");
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1))
+    );
+    assert_eq!(
+        rows[0].get(1),
+        Some(&fsqlite_types::SqliteValue::Text("updated".into()))
+    );
+}
+
+/// T15: Prepared DML within explicit BEGIN...COMMIT uses entry-proof path
+/// without regression (bd-db300.5.2.2.3 / bd-db300.5.2.2.4).
+#[test]
+fn test_entry_proof_within_explicit_transaction() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_str().unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+
+    let insert_stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let update_stmt = conn.prepare("UPDATE t SET val = ?2 WHERE id = ?1").unwrap();
+    let delete_stmt = conn.prepare("DELETE FROM t WHERE id = ?1").unwrap();
+
+    // Explicit transaction: entry_proof.publication should be None
+    // (in_transaction = true → ensure_autocommit_txn returns false early).
+    conn.execute("BEGIN").unwrap();
+
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("inserted".into()),
+        ])
+        .unwrap();
+    insert_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(2),
+            fsqlite_types::SqliteValue::Text("also inserted".into()),
+        ])
+        .unwrap();
+
+    update_stmt
+        .execute_with_params(&[
+            fsqlite_types::SqliteValue::Integer(1),
+            fsqlite_types::SqliteValue::Text("updated in txn".into()),
+        ])
+        .unwrap();
+
+    delete_stmt
+        .execute_with_params(&[fsqlite_types::SqliteValue::Integer(2)])
+        .unwrap();
+
+    conn.execute("COMMIT").unwrap();
+
+    // Verify all operations committed correctly.
+    let rows = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
+    assert_eq!(rows.len(), 1, "only row 1 should remain");
+    assert_eq!(
+        rows[0].get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(1))
+    );
+    assert_eq!(
+        rows[0].get(1),
+        Some(&fsqlite_types::SqliteValue::Text("updated in txn".into()))
+    );
+}

@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Verification gate for bd-db300.5.2.2.4:
-# fused prepared-DML entry proof, fallback, regime-atlas, and shadow-oracle pack.
+# Verification gate for bd-db300.5.2.2.4 (E2.2.d):
+# fused prepared-DML entry proof, fallback, and matrix regression pack.
+#
+# Covers: semantic equivalence, schema invalidation, fallback boundary,
+# publication reuse, concurrent round-refresh, fast-path separation,
+# statement-cache invalidation, regime-atlas contract, and behavior-
+# preservation proof note.
+#
+# Shadow-oracle differential and counterexample-capture remain deferred
+# until bd-db300.7.5.6 and packaging infrastructure land.
 
 set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BEAD_ID="bd-db300.5.2.2.4"
-SCENARIO_ID="${SCENARIO_ID:-E2-2-FUSED-ENTRY-52224}"
+BEAD_ID="${BEAD_ID:-bd-db300.5.2.2.4}"
+SCENARIO_ID="${SCENARIO_ID:-E2-2-D-PROOF-PACK-52224}"
 SEED="${SEED:-52224}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-${BEAD_ID}-${TIMESTAMP_UTC}-${SEED}}"
@@ -15,6 +23,7 @@ ARTIFACT_DIR="${WORKSPACE_ROOT}/artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
+PROOF_NOTE_MD="${ARTIFACT_DIR}/proof_note.md"
 HASHES_TXT="${ARTIFACT_DIR}/artifact_hashes.txt"
 USE_RCH="${USE_RCH:-0}"
 CARGO_TARGET_DIR_BASE="${CARGO_TARGET_DIR_BASE:-${WORKSPACE_ROOT}/.codex-target/e2_2_fused_entry}"
@@ -33,6 +42,7 @@ emit_event() {
   local outcome="$3"
   local elapsed_ms="$4"
   local message="$5"
+  local control_mode="${6:-auto}"
 
   jq -cn \
     --arg trace_id "${TRACE_ID}" \
@@ -43,6 +53,7 @@ emit_event() {
     --arg event_type "${event_type}" \
     --arg outcome "${outcome}" \
     --arg message "${message}" \
+    --arg control_mode "${control_mode}" \
     --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson seed "${SEED}" \
     --argjson elapsed_ms "${elapsed_ms}" \
@@ -57,7 +68,8 @@ emit_event() {
       elapsed_ms: $elapsed_ms,
       timestamp: $timestamp,
       seed: $seed,
-      message: $message
+      message: $message,
+      control_mode: $control_mode
     }' >> "${EVENTS_JSONL}"
 }
 
@@ -117,15 +129,108 @@ run_test_phase() {
     "compatibility_selector=${compatibility_selector}"
 }
 
+run_integration_test_phase() {
+  local phase="$1"
+  local logfile="$2"
+  local test_target="$3"
+  local compatibility_selector="$4"
+
+  local -a cmd=(
+    env
+    "CARGO_TARGET_DIR=${CARGO_TARGET_DIR_BASE}"
+    "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
+    "RUST_LOG=${RUST_LOG}"
+    "RUST_TEST_THREADS=${RUST_TEST_THREADS}"
+    "NO_COLOR=${NO_COLOR}"
+    cargo test -p fsqlite-core --test "${test_target}" -- --nocapture
+  )
+  if [[ "${USE_RCH}" == "1" ]]; then
+    cmd=(rch exec -- "${cmd[@]}")
+  fi
+
+  run_phase "${phase}" "${logfile}" "${cmd[@]}"
+  emit_event \
+    "${phase}" \
+    "compatibility_selector" \
+    "pass" \
+    0 \
+    "compatibility_selector=${compatibility_selector}"
+}
+
+run_harness_test_phase() {
+  local phase="$1"
+  local logfile="$2"
+  local test_target="$3"
+  local compatibility_selector="$4"
+
+  local -a cmd=(
+    env
+    "CARGO_TARGET_DIR=${CARGO_TARGET_DIR_BASE}"
+    "CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}"
+    "NO_COLOR=${NO_COLOR}"
+    cargo test -p fsqlite-harness --test "${test_target}" -- --nocapture
+  )
+  if [[ "${USE_RCH}" == "1" ]]; then
+    cmd=(rch exec -- "${cmd[@]}")
+  fi
+
+  run_phase "${phase}" "${logfile}" "${cmd[@]}"
+  emit_event \
+    "${phase}" \
+    "compatibility_selector" \
+    "pass" \
+    0 \
+    "compatibility_selector=${compatibility_selector}"
+}
+
+generate_proof_note() {
+  cat > "${PROOF_NOTE_MD}" <<'PROOF'
+# Behavior-Preservation Proof Note (E2.2.d)
+
+## Ordering
+The fused entry path (PreparedDmlEntryProof) threads the same prebound
+publication and op_cx through the same function call sequence as the
+conservative path.  No reordering of schema validation, publication bind,
+or autocommit begin is introduced.  The ensure_schema_unchanged check
+runs before ensure_autocommit_txn in both paths.
+
+## Visibility
+Publication binding uses the same BoundPagerPublication snapshot in both
+paths.  The fused path reuses the snapshot captured during schema
+validation rather than re-binding, but the snapshot content is identical
+because no schema change can intervene within one execute_prepared call.
+
+## Crash-Safety
+The fused path does not change the pager commit protocol (Phase A/B/C),
+WAL append, sync, or checkpoint behavior.  All durable state transitions
+remain under the same lock discipline.  The PreparedDmlEntryProof is a
+transient in-memory value that does not survive process restart.
+
+## Fallback Semantics
+When PreparedDmlEntryProof carries no_publication() (deferred-DML path),
+ensure_autocommit_txn_with_publication_hint receives None and falls
+through to the conservative refresh_memdb_if_stale_with_publication path.
+No fast-path bypass occurs without a valid prebound publication.
+
+## Control-Mode Equivalence
+The current implementation uses control_mode=auto exclusively.  The
+forced_fallback and shadow_compare modes are not yet implemented.  When
+they are, the PreparedDmlEntryProof must be extended with a control_mode
+field and the fast path must check it before bypassing any ceremony.
+This is tracked as deferred work.
+PROOF
+  emit_event "proof_note" "artifact" "pass" 0 "generated proof_note.md"
+}
+
 hash_artifacts() {
   : > "${HASHES_TXT}"
   (
     cd "${ARTIFACT_DIR}"
-    sha256sum ./*.log ./events.jsonl 2>/dev/null
+    sha256sum ./*.log ./*.md ./*.json ./events.jsonl 2>/dev/null || true
   ) > "${HASHES_TXT}"
 }
 
-echo "=== ${BEAD_ID}: fused entry proof pack ==="
+echo "=== ${BEAD_ID}: fused entry proof pack (E2.2.d) ==="
 echo "run_id=${RUN_ID}"
 echo "trace_id=${TRACE_ID}"
 echo "scenario_id=${SCENARIO_ID}"
@@ -133,6 +238,8 @@ echo "seed=${SEED}"
 echo "artifacts=${ARTIFACT_DIR}"
 
 emit_event "bootstrap" "start" "running" 0 "verification started"
+
+# ── E2.2.c phases (carried forward) ──────────────────────────────────
 
 run_test_phase \
   "semantic_equivalence" \
@@ -164,96 +271,73 @@ run_test_phase \
   "test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot" \
   "prepared_dml_round_refresh"
 
+run_integration_test_phase \
+  "fast_path_separation" \
+  "${ARTIFACT_DIR}/fast_path_separation.log" \
+  "fast_path_separation" \
+  "prepared_dml_fast_path_separation"
+
+run_integration_test_phase \
+  "statement_cache_invalidation" \
+  "${ARTIFACT_DIR}/statement_cache_invalidation.log" \
+  "statement_cache_invalidation" \
+  "prepared_dml_statement_cache_invalidation"
+
+# ── E2.2.d new phases ────────────────────────────────────────────────
+
+run_harness_test_phase \
+  "regime_atlas_contract" \
+  "${ARTIFACT_DIR}/regime_atlas_contract.log" \
+  "bd_db300_7_5_5_regime_atlas_contract" \
+  "regime_atlas_activation_frontier"
+
+generate_proof_note
+
+# ── Finalize ─────────────────────────────────────────────────────────
+
 hash_artifacts
 
 cat > "${SUMMARY_MD}" <<EOF
-# ${BEAD_ID} Fused Entry Proof Pack
+# ${BEAD_ID} Fused Entry Proof Pack (E2.2.d)
 
 - run_id: \`${RUN_ID}\`
 - trace_id: \`${TRACE_ID}\`
 - scenario_id: \`${SCENARIO_ID}\`
 - seed: \`${SEED}\`
 - bead: \`${BEAD_ID}\`
+- stage: E2.2.d (proof, fallback, and matrix regression pack)
 
 ## Direct Proof Surface Executed
 
 - semantic equivalence: \`test_prepared_insert_reuse_semantic_parity_with_execute\`
-- schema invalidation: \`test_prepared_dml_rejects_schema_change\`, \`test_prepared_dml_rejects_cross_connection_schema_change\`
-- fallback boundary: \`test_prepared_insert_select_uses_fallback\`, \`test_prepared_update_with_limit_uses_fallback\`, \`test_prepared_delete_with_limit_uses_fallback\`
-- control-mode publication equivalence anchor: \`test_prepared_file_backed_insert_reuses_schema_bound_publication_for_autocommit_begin\`, \`test_prepared_file_backed_single_writer_insert_reuses_schema_bound_publication\`
-- matrix regression anchor: \`test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot\`
+- schema invalidation: \`test_prepared_dml_rejects_*\`
+- fallback boundary: \`*_uses_fallback\`
+- publication reuse: \`*schema_bound_publication*\`
+- concurrent round-refresh: \`test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot\`
+- fast-path separation: \`fast_path_separation\` integration test suite
+- statement-cache invalidation: \`statement_cache_invalidation\` integration test suite
+- regime-atlas contract: \`bd_db300_7_5_5_regime_atlas_contract\` harness test
 
-## Activation And Fallback Rules
+## Behavior-Preservation Proof Note
 
-- \`control_mode=auto\`: fused entry is eligible only when the statement has a precompiled prepared-DML dispatch, schema identity is unchanged, publication binding is valid for the current file-backed or memory-backed regime, no static or dynamic fallback reason is active, and the regime atlas classifies the cell as at least \`regime_gated_default\`.
-- \`control_mode=forced_fallback\`: the conservative dispatcher remains authoritative and the fused path must be bypassed with an explicit \`fallback_reason\`.
-- \`control_mode=shadow_compare\`: the conservative dispatcher remains authoritative while the fused path is evaluated as the candidate path under the shadow-oracle contract.
-- Unclassified or hostile regimes must route to deterministic conservative behavior rather than implicitly enabling the fused path.
+See \`proof_note.md\` in this artifact directory.  Covers: ordering,
+visibility, crash-safety, fallback semantics, and control-mode equivalence.
 
-## Regime Atlas / Activation Frontier Contract
+## Delivered in E2.2.d (previously deferred)
 
-- Upstream contract bead: \`bd-db300.7.5.5\`
-- Named upstream validation entrypoint: \`scripts/verify_g5_5_regime_atlas.sh\`
-- Required activation states: \`universal_default\`, \`regime_gated_default\`, \`shadow_only\`, \`operator_opt_in\`, \`rejected\`
-- Required regime axes for this proof pack: engine mode, workload family, read/write mix, hot-page pressure, concurrency level, process/thread split, topology profile, durability shape, and control-mode override.
-- Required frontier outputs for fused entry: \`regime_id\`, \`activation_state\`, \`frontier_reason\`, \`breakpoint_metric\`, \`baseline_comparator\`, \`fallback_state\`, and explicit evidence or gap-conversion linkage.
+- Regime-atlas activation frontier contract (bd-db300.7.5.5 test phase)
+- Behavior-preservation proof note artifact
 
-## Shadow-Oracle Differential Contract
+## Honestly Deferred
 
-- Upstream contract bead: \`bd-db300.7.5.6\`
-- Named upstream validation entrypoint: \`scripts/verify_g5_6_shadow_oracle.sh\`
-- Oracle path: conservative dispatcher / deferred prepared-DML execution
-- Candidate path: fused prepared-DML transaction entry
-- Required equivalence scope: user-visible rows, affected-row count, transaction outcome, schema-invalidation response, visibility/publication state, and error-class identity
-- Required shadow modes: \`off\`, \`forced\`, \`sampled\`, \`shadow_canary\`
-- Divergence must never silently preserve the candidate result; conservative behavior stays authoritative until the shadow contract is satisfied
+- Shadow-oracle differential equivalence (awaiting bd-db300.7.5.6)
+- Counterexample-capture bundle packaging (no infrastructure yet)
+- Control-mode override routing tests (forced_fallback/shadow_compare not implemented)
 
-## Divergence Handling
-
-- Required divergence classes: \`result_mismatch\`, \`affected_rows_mismatch\`, \`error_class_mismatch\`, \`visibility_mismatch\`, \`fallback_mismatch\`, \`ordering_mismatch\`, \`trace_contract_missing\`
-- Any divergence forces \`fallback_state=active\`, records a first-failure bundle, and blocks promotion above \`shadow_only\`
-- Missing regime evidence or missing shadow evidence is not treated as success; it becomes tracked work through the gap-conversion rules from \`bd-db300.7.5.3\`
-
-## Counterexample Bundle Requirements
-
-- required fields: \`trace_id\`, \`run_id\`, \`scenario_id\`, \`shadow_run_id\`, \`oracle_path\`, \`candidate_path\`, \`control_mode\`, \`equivalence_scope\`, \`allowed_difference_policy\`, \`divergence_class\`, \`fallback_state\`, \`counterexample_bundle\`, \`compatibility_selector\`, \`schema_epoch\`, \`publication_seq\`, \`wal_generation\`, and first-failure diagnostics
-- required payload: replay commands, SQL template or prepared-statement identity, regime classification, artifact hashes, log file paths, and a minimized explanation of the first semantic mismatch
-
-## Named Script Obligations
-
-- \`scripts/verify_e2_2_fused_entry.sh\` — direct fused-entry proof surface and proof-note emission
-- \`scripts/verify_g5_5_regime_atlas.sh\` — regime atlas and activation-frontier validation dependency
-- \`scripts/verify_g5_6_shadow_oracle.sh\` — shadow-oracle and counterexample-capture validation dependency
-
-## Named Logging Obligations
-
-- \`trace_id\`
-- \`run_id\`
-- \`scenario_id\`
-- \`entry_ticket_state\`
-- \`control_mode\`
-- \`regime_id\`
-- \`activation_state\`
-- \`frontier_reason\`
-- \`shadow_run_id\`
-- \`shadow_verdict\`
-- \`oracle_path\`
-- \`candidate_path\`
-- \`equivalence_scope\`
-- \`allowed_difference_policy\`
-- \`compatibility_selector\`
-- \`fallback_reason\`
-- \`fallback_state\`
-- \`schema_epoch\`
-- \`publication_seq\`
-- \`wal_generation\`
-- \`counterexample_bundle\`
-- \`first_failure_diag\`
-
-## Replay Commands
+## Replay Command
 
 \`\`\`bash
-USE_RCH=${USE_RCH} CARGO_TARGET_DIR_BASE='${CARGO_TARGET_DIR_BASE}' bash scripts/verify_e2_2_fused_entry.sh
+BEAD_ID=${BEAD_ID} USE_RCH=${USE_RCH} CARGO_TARGET_DIR_BASE='${CARGO_TARGET_DIR_BASE}' bash scripts/verify_e2_2_fused_entry.sh
 \`\`\`
 
 ## Artifact Hashes
@@ -271,11 +355,13 @@ jq -n \
   --arg seed "${SEED}" \
   --arg events_jsonl "${EVENTS_JSONL}" \
   --arg summary_md "${SUMMARY_MD}" \
+  --arg proof_note_md "${PROOF_NOTE_MD}" \
   --arg hashes_txt "${HASHES_TXT}" \
   --arg use_rch "${USE_RCH}" \
   --arg cargo_target_dir_base "${CARGO_TARGET_DIR_BASE}" \
   '{
     bead_id: $bead_id,
+    stage: "E2.2.d",
     run_id: $run_id,
     trace_id: $trace_id,
     scenario_id: $scenario_id,
@@ -288,131 +374,40 @@ jq -n \
     },
     direct_test_surface: [
       "test_prepared_insert_reuse_semantic_parity_with_execute",
-      "test_prepared_dml_rejects_schema_change",
-      "test_prepared_dml_rejects_cross_connection_schema_change",
-      "test_prepared_insert_select_uses_fallback",
-      "test_prepared_update_with_limit_uses_fallback",
-      "test_prepared_delete_with_limit_uses_fallback",
-      "test_prepared_file_backed_insert_reuses_schema_bound_publication_for_autocommit_begin",
-      "test_prepared_file_backed_single_writer_insert_reuses_schema_bound_publication",
-      "test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot"
+      "test_prepared_dml_rejects_*",
+      "*_uses_fallback",
+      "*schema_bound_publication*",
+      "test_disjoint_concurrent_prepared_insert_reuse_across_rounds_refreshes_snapshot",
+      "fast_path_separation (integration suite)",
+      "statement_cache_invalidation (integration suite)",
+      "bd_db300_7_5_5_regime_atlas_contract (harness suite)"
     ],
     compatibility_selectors: [
       "prepared_dml_semantic_equivalence",
       "prepared_dml_schema_invalidation",
       "prepared_dml_fallback_boundary",
       "prepared_dml_publication_reuse",
-      "prepared_dml_round_refresh"
+      "prepared_dml_round_refresh",
+      "prepared_dml_fast_path_separation",
+      "prepared_dml_statement_cache_invalidation",
+      "regime_atlas_activation_frontier"
     ],
-    regime_atlas_contract: {
-      source_bead: "bd-db300.7.5.5",
-      validation_entrypoint: "scripts/verify_g5_5_regime_atlas.sh",
-      activation_states: [
-        "universal_default",
-        "regime_gated_default",
-        "shadow_only",
-        "operator_opt_in",
-        "rejected"
-      ],
-      activation_rules: [
-        {
-          control_mode: "auto",
-          candidate_path: "fused_prepared_dml_entry",
-          oracle_path: "deferred_dispatch",
-          fallback_on: [
-            "unclassified_regime",
-            "hostile_regime",
-            "schema_identity_mismatch",
-            "fallback_reason_present"
-          ]
-        },
-        {
-          control_mode: "forced_fallback",
-          candidate_path: "deferred_dispatch",
-          oracle_path: "deferred_dispatch",
-          fallback_on: ["always"]
-        },
-        {
-          control_mode: "shadow_compare",
-          candidate_path: "fused_prepared_dml_entry",
-          oracle_path: "deferred_dispatch",
-          fallback_on: ["any_divergence", "missing_shadow_contract"]
-        }
-      ]
-    },
-    shadow_oracle_contract: {
-      source_bead: "bd-db300.7.5.6",
-      validation_entrypoint: "scripts/verify_g5_6_shadow_oracle.sh",
-      oracle_path: "deferred_dispatch",
-      candidate_path: "fused_prepared_dml_entry",
-      shadow_modes: ["off", "forced", "sampled", "shadow_canary"],
-      equivalence_scope: [
-        "user_visible_result",
-        "affected_rows",
-        "transaction_outcome",
-        "schema_invalidation_response",
-        "visibility_state",
-        "error_class"
-      ],
-      divergence_classes: [
-        "result_mismatch",
-        "affected_rows_mismatch",
-        "error_class_mismatch",
-        "visibility_mismatch",
-        "fallback_mismatch",
-        "ordering_mismatch",
-        "trace_contract_missing"
-      ],
-      counterexample_bundle_required_fields: [
-        "trace_id",
-        "run_id",
-        "scenario_id",
-        "shadow_run_id",
-        "oracle_path",
-        "candidate_path",
-        "control_mode",
-        "equivalence_scope",
-        "allowed_difference_policy",
-        "divergence_class",
-        "fallback_state",
-        "counterexample_bundle",
-        "compatibility_selector",
-        "schema_epoch",
-        "publication_seq",
-        "wal_generation",
-        "first_failure_diag"
-      ]
-    },
-    logging_contract: [
-      "trace_id",
-      "run_id",
-      "scenario_id",
-      "entry_ticket_state",
-      "control_mode",
-      "regime_id",
-      "activation_state",
-      "frontier_reason",
-      "shadow_run_id",
-      "shadow_verdict",
-      "oracle_path",
-      "candidate_path",
-      "equivalence_scope",
-      "allowed_difference_policy",
-      "compatibility_selector",
-      "fallback_reason",
-      "fallback_state",
-      "schema_epoch",
-      "publication_seq",
-      "wal_generation",
-      "counterexample_bundle",
-      "first_failure_diag"
+    delivered_in_e22d: [
+      "regime_atlas_contract phase",
+      "behavior_preservation proof_note.md"
+    ],
+    honestly_deferred: [
+      "shadow_oracle_contract (awaiting bd-db300.7.5.6)",
+      "counterexample_bundle packaging (no infrastructure)",
+      "control_mode override routing (forced_fallback/shadow_compare not implemented)"
     ],
     artifacts: {
       events_jsonl: $events_jsonl,
       summary_md: $summary_md,
+      proof_note_md: $proof_note_md,
       artifact_hashes: $hashes_txt
     }
   }' > "${REPORT_JSON}"
 
 emit_event "finalize" "pass" "pass" 0 "report written to ${REPORT_JSON}"
-echo "[GATE PASS] ${BEAD_ID} fused entry proof pack passed"
+echo "[GATE PASS] ${BEAD_ID} fused entry proof pack (E2.2.d) passed"

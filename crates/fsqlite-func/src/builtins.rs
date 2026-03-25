@@ -2169,12 +2169,13 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 }
             }
             'w' => {
-                // Double-quote escaping for identifiers; NULL → "(NULL)".
-                // C SQLite %w only escapes internal double quotes (no surrounding quotes).
+                // Double-quote escaping for identifiers; NULL → empty.
+                // C SQLite %w with NULL produces nothing (empty string),
+                // and only escapes internal double quotes (no surrounding quotes).
                 let param = params.get(param_idx);
                 param_idx += 1;
                 if matches!(param, Some(SqliteValue::Null) | None) {
-                    result.push_str("(NULL)");
+                    // NULL: produce nothing (matches C SQLite).
                 } else {
                     let val = param.map(SqliteValue::to_text).unwrap_or_default();
                     let escaped = val.replace('"', "\"\"");
@@ -2272,7 +2273,8 @@ fn format_float_f(
     space_sign: bool,
     zero_pad: bool,
 ) -> String {
-    let sign = if val < 0.0 {
+    // Use is_sign_negative() to detect -0.0 (IEEE 754: -0.0 < 0.0 is false).
+    let sign = if val.is_sign_negative() {
         "-".to_owned()
     } else if show_sign {
         "+".to_owned()

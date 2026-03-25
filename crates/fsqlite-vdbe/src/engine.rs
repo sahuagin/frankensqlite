@@ -5724,9 +5724,12 @@ impl VdbeEngine {
                 }
 
                 Opcode::Copy => {
-                    // Copy register p1 to p2 (deep copy).
-                    let val = self.get_reg(op.p1).clone();
-                    self.set_reg_fast(op.p2, val);
+                    // Copy registers p1..p1+p3 to p2..p2+p3 (deep copy).
+                    // p3 = number of ADDITIONAL registers to copy (0 = just one).
+                    for i in 0..=op.p3 {
+                        let val = self.get_reg(op.p1 + i).clone();
+                        self.set_reg_fast(op.p2 + i, val);
+                    }
                     pc += 1;
                 }
 
@@ -6810,6 +6813,16 @@ impl VdbeEngine {
                     // table_move_to, triggering "table leaf cell has no rowid"
                     // on index pages. (Fixes br#138-140, #144, #145.)
                     let coll_arc = Arc::clone(&self.collation_registry);
+                    // Pre-fetch index collations before borrowing storage_cursors
+                    // mutably (needed by SeekGT/SeekLE equality skip loops).
+                    let seek_idx_collations = {
+                        let root_page = self
+                            .cursor_root_pages
+                            .get(&cursor_id)
+                            .copied()
+                            .unwrap_or_default();
+                        self.index_collations_for_root(root_page)
+                    };
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         if cursor.cursor.is_table_btree() {
                             // Table seek: key is a rowid (integer).
@@ -6878,6 +6891,11 @@ impl VdbeEngine {
                                             key_bytes,
                                             "SeekGT: malformed seek key record",
                                         )?;
+                                        // Use pre-fetched index collations for
+                                        // COLLATE NOCASE and similar — &[] would
+                                        // use binary comparison, breaking
+                                        // case-insensitive indexes.
+                                        let idx_collations = seek_idx_collations.as_slice();
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
@@ -6893,7 +6911,7 @@ impl VdbeEngine {
                                                 &cursor.cur_vals_buf,
                                                 &cursor.target_vals_buf,
                                                 cursor.target_vals_buf.len(),
-                                                &[],
+                                                idx_collations,
                                                 &coll,
                                             );
                                             drop(coll);
@@ -6913,6 +6931,7 @@ impl VdbeEngine {
                                             key_bytes,
                                             "SeekLE: malformed seek key record",
                                         )?;
+                                        let idx_collations = seek_idx_collations.as_slice();
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
@@ -6928,7 +6947,7 @@ impl VdbeEngine {
                                                 &cursor.cur_vals_buf,
                                                 &cursor.target_vals_buf,
                                                 cursor.target_vals_buf.len(),
-                                                &[],
+                                                idx_collations,
                                                 &coll,
                                             );
                                             drop(coll);

@@ -4442,9 +4442,17 @@ where
                             | FrankenError::BusySnapshot { .. },
                         ) if attempt + 1 < MAX_FLUSH_RETRIES => {
                             let base_delay_ms = 1u64 << attempt;
-                            let jitter_nanos =
-                                std::time::Instant::now().elapsed().subsec_nanos() as u64;
-                            let jitter_ms = jitter_nanos % (base_delay_ms / 2).max(1);
+                            // Use thread ID + attempt as a cheap entropy source
+                            // for jitter. The previous `Instant::now().elapsed()`
+                            // always returned ~0 (elapsed from now to now).
+                            let thread_hash = {
+                                use std::hash::{Hash, Hasher};
+                                let mut h = std::collections::hash_map::DefaultHasher::new();
+                                std::thread::current().id().hash(&mut h);
+                                attempt.hash(&mut h);
+                                h.finish()
+                            };
+                            let jitter_ms = thread_hash % (base_delay_ms / 2).max(1);
                             let delay_ms = base_delay_ms.saturating_add(jitter_ms);
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                             GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
@@ -5562,10 +5570,13 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            self.publish_committed_state(cx, publish_update);
-            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
+            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
+            // held — MUST happen before publish_committed_state (same order as
+            // `commit()`), so concurrent readers see the immutable snapshot
+            // before the seqlock commit_seq advances.
             self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
+            self.publish_committed_state(cx, publish_update);
 
             // Clear write set for reuse (no allocation — just clears existing maps).
             self.write_set.clear();
