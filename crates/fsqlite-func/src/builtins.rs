@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
-use fsqlite_types::value::format_sqlite_float;
+use fsqlite_types::value::{format_sqlite_float, sql_like};
 
 use crate::agg_builtins::register_aggregate_builtins;
 use crate::datetime::register_datetime_builtins;
@@ -1561,79 +1561,7 @@ fn single_char_escape(escape: &str) -> Result<char> {
 
 /// LIKE pattern matching (case-insensitive for ASCII).
 fn like_match(pattern: &str, string: &str, escape: Option<char>) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = string.chars().collect();
-    like_match_inner(&pat, &txt, 0, 0, escape)
-}
-
-fn like_match_inner(
-    pat: &[char],
-    txt: &[char],
-    mut pi: usize,
-    mut ti: usize,
-    escape: Option<char>,
-) -> bool {
-    while pi < pat.len() {
-        let pc = pat[pi];
-
-        if Some(pc) == escape {
-            // Next char is literal
-            pi += 1;
-            if pi >= pat.len() {
-                return false;
-            }
-            if ti >= txt.len() {
-                return false;
-            }
-            if !ascii_iequal(pat[pi], txt[ti]) {
-                return false;
-            }
-            pi += 1;
-            ti += 1;
-            continue;
-        }
-
-        match pc {
-            '%' => {
-                // Skip consecutive %
-                while pi < pat.len() && pat[pi] == '%' {
-                    pi += 1;
-                }
-                if pi >= pat.len() {
-                    return true; // trailing % matches everything
-                }
-                // Try matching rest of pattern at every position
-                for start in ti..=txt.len() {
-                    if like_match_inner(pat, txt, pi, start, escape) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            '_' => {
-                if ti >= txt.len() {
-                    return false;
-                }
-                pi += 1;
-                ti += 1;
-            }
-            _ => {
-                if ti >= txt.len() {
-                    return false;
-                }
-                if !ascii_iequal(pc, txt[ti]) {
-                    return false;
-                }
-                pi += 1;
-                ti += 1;
-            }
-        }
-    }
-    ti >= txt.len()
-}
-
-fn ascii_iequal(a: char, b: char) -> bool {
-    a.to_ascii_lowercase() == b.to_ascii_lowercase()
+    sql_like(pattern, string, escape)
 }
 
 // ── glob(PATTERN, STRING) ───────────────────────────────────────────────

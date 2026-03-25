@@ -643,6 +643,16 @@ pub fn unique_key_duplicates(a: &[SqliteValue], b: &[SqliteValue]) -> bool {
 /// - Case-insensitive for ASCII A-Z only (no Unicode case folding without ICU).
 /// - `escape` optionally specifies the escape character for literal `%`/`_`.
 pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
+    if let Some(fast_path) = classify_like_fast_path(pattern, escape) {
+        return match fast_path {
+            LikeFastPath::MatchAll => true,
+            LikeFastPath::Exact(literal) => ascii_ci_eq_bytes(literal.as_bytes(), text.as_bytes()),
+            LikeFastPath::Prefix(prefix) => ascii_ci_starts_with(text, prefix),
+            LikeFastPath::Suffix(suffix) => ascii_ci_ends_with(text, suffix),
+            LikeFastPath::Contains(needle) => ascii_ci_contains(text, needle),
+        };
+    }
+
     sql_like_inner(
         &pattern.chars().collect::<Vec<_>>(),
         &text.chars().collect::<Vec<_>>(),
@@ -650,6 +660,50 @@ pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
         0,
         0,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LikeFastPath<'a> {
+    MatchAll,
+    Exact(&'a str),
+    Prefix(&'a str),
+    Suffix(&'a str),
+    Contains(&'a str),
+}
+
+fn classify_like_fast_path(pattern: &str, escape: Option<char>) -> Option<LikeFastPath<'_>> {
+    if escape.is_some() || pattern.contains('_') {
+        return None;
+    }
+    if !pattern.contains('%') {
+        return Some(LikeFastPath::Exact(pattern));
+    }
+    if pattern.chars().all(|ch| ch == '%') {
+        return Some(LikeFastPath::MatchAll);
+    }
+
+    let trimmed_start = pattern.trim_start_matches('%');
+    let trimmed_end = pattern.trim_end_matches('%');
+    if pattern.starts_with('%') && pattern.ends_with('%') {
+        let core = trimmed_start.trim_end_matches('%');
+        if core.is_empty() {
+            return Some(LikeFastPath::MatchAll);
+        }
+        if !core.contains('%') {
+            return Some(LikeFastPath::Contains(core));
+        }
+    }
+    if !pattern.starts_with('%') && trimmed_end.len() < pattern.len() && !trimmed_end.contains('%')
+    {
+        return Some(LikeFastPath::Prefix(trimmed_end));
+    }
+    if !pattern.ends_with('%')
+        && trimmed_start.len() < pattern.len()
+        && !trimmed_start.contains('%')
+    {
+        return Some(LikeFastPath::Suffix(trimmed_start));
+    }
+    None
 }
 
 fn sql_like_inner(
@@ -724,6 +778,36 @@ fn ascii_ci_eq(a: char, b: char) -> bool {
     }
     // Only fold ASCII A-Z / a-z.
     a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b)
+}
+
+fn ascii_ci_eq_bytes(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+}
+
+fn ascii_ci_starts_with(text: &str, prefix: &str) -> bool {
+    let text = text.as_bytes();
+    let prefix = prefix.as_bytes();
+    text.len() >= prefix.len() && ascii_ci_eq_bytes(&text[..prefix.len()], prefix)
+}
+
+fn ascii_ci_ends_with(text: &str, suffix: &str) -> bool {
+    let text = text.as_bytes();
+    let suffix = suffix.as_bytes();
+    text.len() >= suffix.len() && ascii_ci_eq_bytes(&text[text.len() - suffix.len()..], suffix)
+}
+
+fn ascii_ci_contains(text: &str, needle: &str) -> bool {
+    let text = text.as_bytes();
+    let needle = needle.as_bytes();
+    needle.is_empty()
+        || (needle.len() <= text.len()
+            && text
+                .windows(needle.len())
+                .any(|window| ascii_ci_eq_bytes(window, needle)))
 }
 
 /// Accumulator for SQL `sum()` aggregate with SQLite overflow semantics.
@@ -1952,6 +2036,21 @@ mod tests {
         assert!(sql_like("", "", None));
         assert!(!sql_like("a", "", None));
         assert!(!sql_like("", "a", None));
+    }
+
+    #[test]
+    fn test_like_fast_path_repeated_percent_shapes() {
+        assert!(sql_like("ab%%", "ABcd", None));
+        assert!(sql_like("%%cd", "abCD", None));
+        assert!(sql_like("%%bc%%", "xxBCyy", None));
+        assert!(sql_like("%%%%", "anything", None));
+    }
+
+    #[test]
+    fn test_like_fast_path_preserves_mixed_unicode_and_ascii_semantics() {
+        assert!(sql_like("%éL%", "héllo", None));
+        assert!(!sql_like("%Él%", "héllo", None));
+        assert!(sql_like("Stra%", "straße", None));
     }
 
     // ── format_sqlite_float ────────────────────────────────────────────
