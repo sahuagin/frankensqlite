@@ -7,6 +7,7 @@ use std::fmt::Write;
 use fsqlite_vfs::host_fs;
 use sha2::{Digest, Sha256};
 
+use crate::fixture_metadata::FixtureMetadataV1;
 use crate::{E2eError, E2eResult};
 
 // ─── Golden directory discovery ────────────────────────────────────────
@@ -32,6 +33,54 @@ pub fn discover_golden_files(dir: &Path) -> E2eResult<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+fn fixture_metadata_path(dir: &Path, db_path: &Path) -> Option<PathBuf> {
+    let fixture_id = db_path.file_stem()?;
+    Some(
+        dir.parent()
+            .unwrap_or(dir)
+            .join("metadata")
+            .join(format!("{}.json", fixture_id.to_string_lossy())),
+    )
+}
+
+fn read_fixture_metadata(path: &Path) -> E2eResult<FixtureMetadataV1> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|err| E2eError::Io(std::io::Error::other(err)))
+}
+
+fn fixture_is_known_bad_baseline(metadata: &FixtureMetadataV1) -> bool {
+    metadata
+        .tags
+        .iter()
+        .any(|tag| matches!(tag.as_str(), "invalid" | "corrupt"))
+}
+
+/// Discover golden `.db` files that remain eligible as clean compatibility baselines.
+///
+/// Fixtures tagged `invalid` or `corrupt` stay in the corpus for
+/// corruption/recovery testing, but they are intentionally excluded from
+/// normal compatibility-baseline sweeps.
+pub fn discover_compatibility_baseline_golden_files(dir: &Path) -> E2eResult<Vec<PathBuf>> {
+    let files = discover_golden_files(dir)?;
+    let mut filtered = Vec::with_capacity(files.len());
+    for path in files {
+        let Some(meta_path) = fixture_metadata_path(dir, &path) else {
+            filtered.push(path);
+            continue;
+        };
+        if !meta_path.exists() {
+            filtered.push(path);
+            continue;
+        }
+        let metadata = read_fixture_metadata(&meta_path)?;
+        if fixture_is_known_bad_baseline(&metadata) {
+            continue;
+        }
+        filtered.push(path);
+    }
+    Ok(filtered)
 }
 
 /// Result of validating a single golden database file.
@@ -100,6 +149,17 @@ pub fn validate_golden_integrity(path: &Path) -> E2eResult<IntegrityReport> {
 /// `E2eError::Rusqlite` if a database cannot be opened.
 pub fn validate_all_golden(dir: &Path) -> E2eResult<Vec<IntegrityReport>> {
     let files = discover_golden_files(dir)?;
+    let mut reports = Vec::with_capacity(files.len());
+    for path in &files {
+        reports.push(validate_golden_integrity(path)?);
+    }
+    Ok(reports)
+}
+
+/// Validate only the golden copies that are expected to be clean
+/// compatibility baselines.
+pub fn validate_compatibility_baseline_golden(dir: &Path) -> E2eResult<Vec<IntegrityReport>> {
+    let files = discover_compatibility_baseline_golden_files(dir)?;
     let mut reports = Vec::with_capacity(files.len());
     for path in &files {
         reports.push(validate_golden_integrity(path)?);
@@ -1332,6 +1392,76 @@ mod tests {
             hash_before, hash_after,
             "canonicalization must never modify the source file"
         );
+    }
+
+    #[test]
+    fn compatibility_baseline_discovery_excludes_invalid_and_corrupt_metadata_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden_dir = dir.path().join("golden");
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir(&golden_dir).unwrap();
+        std::fs::create_dir(&metadata_dir).unwrap();
+
+        for fixture in ["valid", "invalid_fixture", "corrupt_fixture"] {
+            std::fs::write(golden_dir.join(format!("{fixture}.db")), b"db").unwrap();
+        }
+
+        let write_metadata = |db_id: &str, tags: &[&str]| {
+            std::fs::write(
+                metadata_dir.join(format!("{db_id}.json")),
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "db_id": db_id,
+                    "source_path": null,
+                    "golden_filename": format!("{db_id}.db"),
+                    "sha256_golden": "00",
+                    "size_bytes": 2,
+                    "sidecars_present": [],
+                    "sqlite_meta": {
+                        "page_size": 4096,
+                        "page_count": 1,
+                        "freelist_count": 0,
+                        "schema_version": 1,
+                        "encoding": "UTF-8",
+                        "user_version": 0,
+                        "application_id": 0,
+                        "journal_mode": "delete",
+                        "auto_vacuum": 0
+                    },
+                    "features": {
+                        "has_wal_sidecars_observed": false,
+                        "has_fts": false,
+                        "has_rtree": false,
+                        "has_triggers": false,
+                        "has_views": false,
+                        "has_foreign_keys": false
+                    },
+                    "tags": tags,
+                    "safety": {
+                        "pii_risk": "unlikely",
+                        "secrets_risk": "unlikely",
+                        "allowed_for_ci": false
+                    },
+                    "tables": [],
+                    "indices": [],
+                    "triggers": [],
+                    "views": []
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_metadata("valid", &["baseline"]);
+        write_metadata("invalid_fixture", &["invalid"]);
+        write_metadata("corrupt_fixture", &["corrupt"]);
+
+        let files = discover_compatibility_baseline_golden_files(&golden_dir).unwrap();
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["valid".to_owned()]);
     }
 
     // ─── sha256 hashing + mismatch reporting tests (bd-1w6k.5.3) ─────

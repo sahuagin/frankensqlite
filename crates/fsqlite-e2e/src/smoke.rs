@@ -104,17 +104,20 @@ fn check_golden_copies() -> E2eResult<String> {
         );
     }
 
-    let files = crate::golden::discover_golden_files(golden_dir)?;
+    let files = crate::golden::discover_compatibility_baseline_golden_files(golden_dir)?;
     if files.is_empty() {
-        return Ok("golden directory exists but contains no .db files — skipped".to_owned());
+        return Ok(
+            "golden directory exists but contains no clean compatibility baselines — skipped"
+                .to_owned(),
+        );
     }
 
-    let reports = crate::golden::validate_all_golden(golden_dir)?;
+    let reports = crate::golden::validate_compatibility_baseline_golden(golden_dir)?;
     let failed: Vec<_> = reports.iter().filter(|r| !r.integrity_ok).collect();
 
     if failed.is_empty() {
         Ok(format!(
-            "{} golden database(s) verified, all integrity checks passed",
+            "{} compatibility-baseline golden database(s) verified, all integrity checks passed",
             reports.len()
         ))
     } else {

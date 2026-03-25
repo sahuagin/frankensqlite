@@ -25,7 +25,8 @@ fn golden_dir() -> PathBuf {
 /// Returns `true` if the golden directory exists and contains at least one `.db` file.
 fn golden_available() -> bool {
     let dir = golden_dir();
-    dir.is_dir() && golden::discover_golden_files(&dir).is_ok_and(|v| !v.is_empty())
+    dir.is_dir()
+        && golden::discover_compatibility_baseline_golden_files(&dir).is_ok_and(|v| !v.is_empty())
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────
@@ -38,7 +39,8 @@ fn all_golden_pass_integrity_check() {
     }
 
     let dir = golden_dir();
-    let reports = golden::validate_all_golden(&dir).expect("failed to validate golden copies");
+    let reports = golden::validate_compatibility_baseline_golden(&dir)
+        .expect("failed to validate compatibility-baseline golden copies");
 
     assert!(
         !reports.is_empty(),
@@ -62,7 +64,7 @@ fn all_golden_pass_integrity_check() {
     );
 
     eprintln!(
-        "OK: {} golden databases passed integrity_check",
+        "OK: {} compatibility-baseline golden databases passed integrity_check",
         reports.len()
     );
 }
@@ -75,7 +77,8 @@ fn all_golden_have_nonzero_page_count() {
     }
 
     let dir = golden_dir();
-    let reports = golden::validate_all_golden(&dir).expect("failed to validate golden copies");
+    let reports = golden::validate_compatibility_baseline_golden(&dir)
+        .expect("failed to validate compatibility-baseline golden copies");
 
     let mut failures = Vec::new();
     for report in &reports {
@@ -91,7 +94,7 @@ fn all_golden_have_nonzero_page_count() {
     );
 
     eprintln!(
-        "OK: {} golden databases have non-zero page_count",
+        "OK: {} compatibility-baseline golden databases have non-zero page_count",
         reports.len()
     );
 }
@@ -104,7 +107,8 @@ fn all_golden_have_at_least_one_table() {
     }
 
     let dir = golden_dir();
-    let reports = golden::validate_all_golden(&dir).expect("failed to validate golden copies");
+    let reports = golden::validate_compatibility_baseline_golden(&dir)
+        .expect("failed to validate compatibility-baseline golden copies");
 
     let mut failures = Vec::new();
     for report in &reports {
@@ -123,7 +127,7 @@ fn all_golden_have_at_least_one_table() {
     );
 
     eprintln!(
-        "OK: {} golden databases have at least one schema object",
+        "OK: {} compatibility-baseline golden databases have at least one schema object",
         reports.len()
     );
 }
@@ -467,4 +471,27 @@ fn checksums_sha256_no_duplicate_filenames() {
         duplicates.is_empty(),
         "duplicate filenames in checksums.sha256: {duplicates:?}"
     );
+}
+
+#[test]
+fn known_bad_fixtures_are_tagged_in_metadata() {
+    for (db_id, expected_tag) in [
+        ("beads_rust_beads", "invalid"),
+        ("mcp_agent_mail_storage", "corrupt"),
+    ] {
+        let path = metadata_path(db_id);
+        assert!(path.exists(), "missing metadata for {db_id}: {path:?}");
+        let raw = std::fs::read_to_string(&path).expect("failed to read metadata");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("metadata must be JSON");
+        let tags = json["tags"]
+            .as_array()
+            .expect("metadata.tags must be an array")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            tags.contains(&expected_tag),
+            "{db_id} must be tagged `{expected_tag}` so it is not treated as a clean compatibility baseline"
+        );
+    }
 }
