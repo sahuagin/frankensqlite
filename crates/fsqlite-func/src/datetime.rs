@@ -780,10 +780,12 @@ fn parse_args(args: &[SqliteValue]) -> Option<(f64, bool)> {
         _ => return None,
     };
 
-    let modifiers: Vec<String> = args[1..]
-        .iter()
-        .filter_map(|a| if a.is_null() { None } else { Some(a.to_text()) })
-        .collect();
+    // C SQLite: a NULL modifier causes the entire function to return NULL
+    // (date.c:1127). Previously, NULL modifiers were silently skipped.
+    if args[1..].iter().any(SqliteValue::is_null) {
+        return None;
+    }
+    let modifiers: Vec<String> = args[1..].iter().map(SqliteValue::to_text).collect();
 
     apply_modifiers(input, &modifiers)
 }

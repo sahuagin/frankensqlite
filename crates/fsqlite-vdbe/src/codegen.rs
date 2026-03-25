@@ -2986,6 +2986,112 @@ fn codegen_select_count_star_indexed_in_scan(
     let probe_cursor = cursor + 2;
     let source_cursor = cursor + 3;
 
+    if let CountIndexedInTarget::ProbeSource(probe_source) = &in_target
+        && count_probe_source_can_skip_materialization(&probe_source)
+    {
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::OpenRead,
+            source_cursor,
+            probe_source.table.root_page,
+            0,
+            P4::Table(probe_source.table.name.clone()),
+            0,
+        );
+
+        let r_probe_value = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_probe_record = b.alloc_reg();
+        let r_current_key = b.alloc_reg();
+
+        let probe_done = b.emit_label();
+        let probe_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, probe_done, P4::None, 0);
+        let skip_row = probe_source.where_clause.map(|_| b.emit_label());
+        if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_row) {
+            emit_where_filter(
+                b,
+                where_expr,
+                source_cursor,
+                probe_source.table,
+                probe_source.table_alias,
+                schema,
+                skip_label,
+            );
+        }
+
+        let probe_scan = ScanCtx {
+            cursor: source_cursor,
+            table: probe_source.table,
+            table_alias: probe_source.table_alias,
+            schema: Some(schema),
+            register_base: None,
+            secondary: None,
+        };
+        emit_in_probe_value(b, source_cursor, probe_source, r_probe_value, &probe_scan);
+
+        let next_probe = b.emit_label();
+        b.emit_jump_to_label(Opcode::IsNull, r_probe_value, 0, next_probe, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(
+            Opcode::MakeRecord,
+            r_probe_value,
+            2,
+            r_probe_record,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            r_probe_record,
+            next_probe,
+            P4::None,
+            0,
+        );
+
+        let idx_loop_top = b.current_addr();
+        b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            r_probe_value,
+            r_current_key,
+            next_probe,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+
+        if let Some(skip_label) = skip_row {
+            b.resolve_label(skip_label);
+        }
+        b.resolve_label(next_probe);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let probe_loop_body = (probe_start + 1) as i32;
+        b.emit_op(Opcode::Next, source_cursor, probe_loop_body, 0, P4::None, 0);
+
+        b.resolve_label(probe_done);
+        b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+        return Ok(());
+    }
+
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
@@ -3049,12 +3155,7 @@ fn codegen_select_count_star_indexed_in_scan(
                 register_base: None,
                 secondary: None,
             };
-            match probe_source.value {
-                InProbeValue::Expr(expr) => emit_expr(b, expr, r_value, Some(&probe_scan)),
-                InProbeValue::FirstColumn => {
-                    b.emit_op(Opcode::Column, source_cursor, 0, r_value, P4::None, 0);
-                }
-            }
+            emit_in_probe_value(b, source_cursor, &probe_source, r_value, &probe_scan);
 
             let skip_insert = b.emit_label();
             let next_value = b.emit_label();
@@ -11464,18 +11565,14 @@ fn emit_in_probe_value(
 fn probe_source_value_is_unique(probe_source: &InProbeSource<'_>) -> bool {
     match probe_source.value {
         InProbeValue::Rowid => true,
-        InProbeValue::FirstColumn => probe_source
-            .table
-            .columns
-            .first()
-            .is_some_and(|column| {
-                column.is_ipk
-                    || column.unique
-                    || probe_source
-                        .table
-                        .index_for_column(&column.name)
-                        .is_some_and(|idx| idx.is_unique && idx.key_term_count() == 1)
-            }),
+        InProbeValue::FirstColumn => probe_source.table.columns.first().is_some_and(|column| {
+            column.is_ipk
+                || column.unique
+                || probe_source
+                    .table
+                    .index_for_column(&column.name)
+                    .is_some_and(|idx| idx.is_unique && idx.key_term_count() == 1)
+        }),
         InProbeValue::Expr(expr) => {
             let Expr::Column(col_ref, _) = expr else {
                 return false;
@@ -12071,12 +12168,7 @@ fn emit_in_probe_expr(
         register_base: None,
         secondary: None,
     };
-    match probe_source.value {
-        InProbeValue::Expr(expr) => emit_expr(b, expr, r_probe, Some(&probe_scan)),
-        InProbeValue::FirstColumn => {
-            b.emit_op(Opcode::Column, probe_cursor, 0, r_probe, P4::None, 0);
-        }
-    }
+    emit_in_probe_value(b, probe_cursor, probe_source, r_probe, &probe_scan);
     b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
     // If probe value was NULL, flag it (Eq never matches NULLs).
     let after_flag = b.emit_label();
@@ -12929,12 +13021,7 @@ fn emit_once_materialized_in_probe_source(
     };
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
-    match probe_source.value {
-        InProbeValue::Expr(expr) => emit_expr(b, expr, r_value, Some(&probe_scan)),
-        InProbeValue::FirstColumn => {
-            b.emit_op(Opcode::Column, source_cursor, 0, r_value, P4::None, 0);
-        }
-    }
+    emit_in_probe_value(b, source_cursor, probe_source, r_value, &probe_scan);
     let next_value = b.emit_label();
     let saw_null_label = b.emit_label();
     b.emit_jump_to_label(Opcode::IsNull, r_value, 0, saw_null_label, P4::None, 0);
@@ -19055,6 +19142,47 @@ mod tests {
         assert!(
             !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
             "count(*) with indexed IN-subquery should avoid reopening the base table"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_count_star_exists_semijoin_uses_index_probe_expansion() {
+        let stmt = agg_count_star_exists_rowid_probe();
+        let schema = test_schema_with_index_and_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(
+                |op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")
+            ),
+            "count(*) EXISTS semijoin fast path should open the outer index"
+        );
+        assert!(
+            prog.ops().iter().any(
+                |op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "s")
+            ),
+            "count(*) EXISTS semijoin fast path should read the inner probe source"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "count(*) EXISTS semijoin fast path should seek into the outer index per inner key"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
+            "count(*) EXISTS semijoin fast path should avoid reopening the outer base table"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
+            "count(*) EXISTS semijoin fast path should stay on the direct counter path"
         );
     }
 
