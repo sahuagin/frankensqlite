@@ -11,10 +11,10 @@ use std::sync::Arc;
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
-    FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder,
-    OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection,
-    Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
-    UpsertClause, UpsertTarget,
+    FunctionArgs, InSet, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal,
+    NullsOrder, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement,
+    SortDirection, Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement,
+    UpsertAction, UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
@@ -2807,6 +2807,7 @@ fn is_simple_count_star(columns: &[ResultColumn]) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
 fn codegen_select_count_star(
     b: &mut ProgramBuilder,
     cursor: i32,
@@ -2819,6 +2820,47 @@ fn codegen_select_count_star(
     end_label: crate::Label,
     rowid_range: Option<RowidRangeTarget<'_>>,
 ) -> Result<(), CodegenError> {
+    let scan_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondary: None,
+    };
+    if let Some((idx_schema, probe_target)) =
+        extract_count_indexed_exists_target(where_clause, table, table_alias, schema)
+    {
+        return codegen_select_count_star_indexed_in_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            idx_schema,
+            probe_target,
+        );
+    }
+    if let Some((idx_schema, in_target)) =
+        extract_count_indexed_in_target(where_clause, table, table_alias, schema, &scan_ctx)
+    {
+        return codegen_select_count_star_indexed_in_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            out_regs,
+            done_label,
+            end_label,
+            idx_schema,
+            in_target,
+        );
+    }
+
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
     b.emit_op(
@@ -2922,6 +2964,172 @@ fn codegen_select_count_star(
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_count_star_indexed_in_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    _table: &TableSchema,
+    _table_alias: Option<&str>,
+    schema: &[TableSchema],
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    in_target: CountIndexedInTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let probe_cursor = cursor + 2;
+    let source_cursor = cursor + 3;
+
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_op(Opcode::OpenAutoindex, probe_cursor, 1, 0, P4::None, 0);
+
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    match in_target {
+        CountIndexedInTarget::List(values) => {
+            for value_expr in values {
+                emit_expr(b, value_expr, r_value, None);
+                let next_value = b.emit_label();
+                let skip_insert = b.emit_label();
+                b.emit_jump_to_label(Opcode::IsNull, r_value, 0, next_value, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_insert, P4::None, 0);
+                b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+                b.resolve_label(skip_insert);
+                b.resolve_label(next_value);
+            }
+        }
+        CountIndexedInTarget::ProbeSource(probe_source) => {
+            b.emit_op(
+                Opcode::OpenRead,
+                source_cursor,
+                probe_source.table.root_page,
+                0,
+                P4::Table(probe_source.table.name.clone()),
+                0,
+            );
+
+            let build_done = b.emit_label();
+            let build_start = b.current_addr();
+            b.emit_jump_to_label(Opcode::Rewind, source_cursor, 0, build_done, P4::None, 0);
+            let skip_row = probe_source.where_clause.map(|_| b.emit_label());
+            if let (Some(where_expr), Some(skip_label)) = (probe_source.where_clause, skip_row) {
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    source_cursor,
+                    probe_source.table,
+                    probe_source.table_alias,
+                    schema,
+                    skip_label,
+                );
+            }
+
+            let probe_scan = ScanCtx {
+                cursor: source_cursor,
+                table: probe_source.table,
+                table_alias: probe_source.table_alias,
+                schema: Some(schema),
+                register_base: None,
+                secondary: None,
+            };
+            match probe_source.value {
+                InProbeValue::Expr(expr) => emit_expr(b, expr, r_value, Some(&probe_scan)),
+                InProbeValue::FirstColumn => {
+                    b.emit_op(Opcode::Column, source_cursor, 0, r_value, P4::None, 0);
+                }
+            }
+
+            let skip_insert = b.emit_label();
+            let next_value = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, r_value, 0, next_value, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_insert, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+            b.resolve_label(skip_insert);
+            b.resolve_label(next_value);
+
+            if let Some(skip_label) = skip_row {
+                b.resolve_label(skip_label);
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let build_loop_body = (build_start + 1) as i32;
+            b.emit_op(Opcode::Next, source_cursor, build_loop_body, 0, P4::None, 0);
+            b.resolve_label(build_done);
+            b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
+        }
+    }
+    b.free_temp(r_key);
+    b.free_temp(r_value);
+
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+
+    let r_probe_value = b.alloc_reg();
+    let r_min_rowid = b.alloc_reg();
+    let r_probe_record = b.alloc_reg();
+    let r_current_key = b.alloc_reg();
+
+    let probe_loop_top = b.current_addr();
+    b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
+    b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+    b.emit_op(
+        Opcode::MakeRecord,
+        r_probe_value,
+        2,
+        r_probe_record,
+        P4::None,
+        0,
+    );
+    let next_probe = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        r_probe_record,
+        next_probe,
+        P4::None,
+        0,
+    );
+
+    let idx_loop_top = b.current_addr();
+    b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        r_probe_value,
+        r_current_key,
+        next_probe,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let idx_loop_body = idx_loop_top as i32;
+    b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+
+    b.resolve_label(next_probe);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let probe_loop_body = probe_loop_top as i32;
+    b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
     Ok(())
@@ -4117,8 +4325,8 @@ fn codegen_join_select(
         Opcode::OpenRead,
         left_cursor,
         left_table.root_page,
-        left_table.columns.len() as i32,
-        P4::None,
+        0,
+        P4::Table(left_table.name.clone()),
         0,
     );
     let mut right_cursors: Vec<i32> = Vec::new();
@@ -4128,8 +4336,8 @@ fn codegen_join_select(
             Opcode::OpenRead,
             cursor_id,
             rt.root_page,
-            rt.columns.len() as i32,
-            P4::None,
+            0,
+            P4::Table(rt.name.clone()),
             0,
         );
         right_cursors.push(cursor_id);
@@ -10803,6 +11011,124 @@ fn extract_column_eq_target<'a>(
     None
 }
 
+enum CountIndexedInTarget<'a> {
+    List(&'a [Expr]),
+    ProbeSource(InProbeSource<'a>),
+}
+
+fn extract_count_indexed_in_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&'a str>,
+    schema: &'a [TableSchema],
+    scan_ctx: &ScanCtx<'a>,
+) -> Option<(&'a IndexSchema, CountIndexedInTarget<'a>)> {
+    let expr = where_clause?;
+    let Expr::In {
+        expr: operand,
+        set,
+        not: false,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    let column_name = column_name(operand, table, table_alias)?;
+    let idx_schema = table.index_for_column(&column_name)?;
+    if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0) {
+        return None;
+    }
+
+    match set {
+        InSet::List(values)
+            if can_use_once_materialized_in_list(values, operand, Some(scan_ctx)) =>
+        {
+            Some((idx_schema, CountIndexedInTarget::List(values)))
+        }
+        InSet::Subquery(_) | InSet::Table(_) => {
+            let probe_source = resolve_in_probe_source(set, schema)?;
+            can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
+                .then_some((idx_schema, CountIndexedInTarget::ProbeSource(probe_source)))
+        }
+        InSet::List(_) => None,
+    }
+}
+
+fn extract_count_indexed_exists_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'a TableSchema,
+    table_alias: Option<&'a str>,
+    schema: &'a [TableSchema],
+) -> Option<(&'a IndexSchema, CountIndexedInTarget<'a>)> {
+    let expr = where_clause?;
+    let Expr::Exists {
+        subquery,
+        not: false,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if subquery.with.is_some()
+        || !subquery.body.compounds.is_empty()
+        || !subquery.order_by.is_empty()
+        || subquery.limit.is_some()
+    {
+        return None;
+    }
+
+    let SelectCore::Select {
+        from,
+        where_clause: Some(sub_where),
+        group_by,
+        having,
+        windows,
+        ..
+    } = &subquery.body.select
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+        return None;
+    }
+    let from_clause = from.as_ref()?;
+    if !from_clause.joins.is_empty() {
+        return None;
+    }
+    let (sub_table_name, sub_alias) = match &from_clause.source {
+        TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => return None,
+    };
+    let sub_table = find_table(schema, sub_table_name).ok()?;
+    let (probe_expr, residual_terms) = extract_exists_rowid_probe(sub_where, sub_table, sub_alias)?;
+    let outer_column_name = column_name(probe_expr, table, table_alias)?;
+    let idx_schema = table.index_for_column(&outer_column_name)?;
+    if idx_schema.key_term_count() != 1 || idx_schema.key_term_descending(0) {
+        return None;
+    }
+    if residual_terms
+        .iter()
+        .any(|term| expr_references_scan(term, table, table_alias))
+    {
+        return None;
+    }
+    let residual_where = match residual_terms.as_slice() {
+        [] => None,
+        [single] => Some(*single),
+        _ => return None,
+    };
+    Some((
+        idx_schema,
+        CountIndexedInTarget::ProbeSource(InProbeSource {
+            table: sub_table,
+            table_alias: sub_alias,
+            where_clause: residual_where,
+            value: InProbeValue::Rowid,
+        }),
+    ))
+}
+
 #[derive(Clone, Copy)]
 enum ColumnRangeSlot {
     Lower,
@@ -11107,6 +11433,7 @@ struct SecondaryScan<'a> {
 enum InProbeValue<'a> {
     Expr(&'a Expr),
     FirstColumn,
+    Rowid,
 }
 
 struct InProbeSource<'a> {
@@ -11114,6 +11441,66 @@ struct InProbeSource<'a> {
     table_alias: Option<&'a str>,
     where_clause: Option<&'a Expr>,
     value: InProbeValue<'a>,
+}
+
+fn emit_in_probe_value(
+    b: &mut ProgramBuilder,
+    source_cursor: i32,
+    probe_source: &InProbeSource<'_>,
+    reg: i32,
+    probe_scan: &ScanCtx<'_>,
+) {
+    match probe_source.value {
+        InProbeValue::Expr(expr) => emit_expr(b, expr, reg, Some(probe_scan)),
+        InProbeValue::FirstColumn => {
+            b.emit_op(Opcode::Column, source_cursor, 0, reg, P4::None, 0);
+        }
+        InProbeValue::Rowid => {
+            b.emit_op(Opcode::Rowid, source_cursor, reg, 0, P4::None, 0);
+        }
+    }
+}
+
+fn probe_source_value_is_unique(probe_source: &InProbeSource<'_>) -> bool {
+    match probe_source.value {
+        InProbeValue::Rowid => true,
+        InProbeValue::FirstColumn => probe_source
+            .table
+            .columns
+            .first()
+            .is_some_and(|column| {
+                column.is_ipk
+                    || column.unique
+                    || probe_source
+                        .table
+                        .index_for_column(&column.name)
+                        .is_some_and(|idx| idx.is_unique && idx.key_term_count() == 1)
+            }),
+        InProbeValue::Expr(expr) => {
+            let Expr::Column(col_ref, _) = expr else {
+                return false;
+            };
+            if is_rowid_ref(col_ref, Some(probe_source.table), probe_source.table_alias) {
+                return true;
+            }
+            probe_source
+                .table
+                .column_index(&col_ref.column)
+                .and_then(|idx| probe_source.table.columns.get(idx))
+                .is_some_and(|column| {
+                    column.is_ipk
+                        || column.unique
+                        || probe_source
+                            .table
+                            .index_for_column(&column.name)
+                            .is_some_and(|idx| idx.is_unique && idx.key_term_count() == 1)
+                })
+        }
+    }
+}
+
+fn count_probe_source_can_skip_materialization(probe_source: &InProbeSource<'_>) -> bool {
+    probe_source_value_is_unique(probe_source)
 }
 
 fn resolve_in_probe_source<'a>(
@@ -11618,6 +12005,19 @@ fn emit_in_probe_expr(
         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         return;
     };
+
+    if can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx) {
+        emit_once_materialized_in_probe_source(
+            b,
+            operand,
+            &probe_source,
+            not,
+            reg,
+            scan_ctx,
+            schema,
+        );
+        return;
+    }
 
     // Keep probe cursors far from primary scan/sorter cursors used by main paths.
     let probe_cursor = scan_ctx.cursor + 64;
@@ -12279,6 +12679,121 @@ fn can_use_once_materialized_in_list(
     }
 }
 
+fn probe_expr_references_outer_scan(
+    expr: &Expr,
+    probe_source: &InProbeSource<'_>,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    match expr {
+        Expr::Column(_, _) => {
+            if resolve_column_ref(expr, probe_source.table, probe_source.table_alias).is_some() {
+                return false;
+            }
+            resolve_column_ref(expr, scan_ctx.table, scan_ctx.table_alias).is_some()
+                || scan_ctx.secondary.as_ref().is_some_and(|secondary| {
+                    resolve_column_ref(expr, secondary.table, secondary.table_alias).is_some()
+                })
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            probe_expr_references_outer_scan(left, probe_source, scan_ctx)
+                || probe_expr_references_outer_scan(right, probe_source, scan_ctx)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+                || probe_expr_references_outer_scan(low, probe_source, scan_ctx)
+                || probe_expr_references_outer_scan(high, probe_source, scan_ctx)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+                || matches!(
+                    set,
+                    fsqlite_ast::InSet::List(items)
+                        if items
+                            .iter()
+                            .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx))
+                )
+        }
+        Expr::FunctionCall { args, .. } => {
+            matches!(
+                args,
+                FunctionArgs::List(items)
+                    if items
+                        .iter()
+                        .any(|item| probe_expr_references_outer_scan(item, probe_source, scan_ctx))
+            )
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|inner| {
+                probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+            }) || whens.iter().any(|(cond, then_expr)| {
+                probe_expr_references_outer_scan(cond, probe_source, scan_ctx)
+                    || probe_expr_references_outer_scan(then_expr, probe_source, scan_ctx)
+            }) || else_expr.as_ref().is_some_and(|inner| {
+                probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+            })
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+                || probe_expr_references_outer_scan(pattern, probe_source, scan_ctx)
+                || escape.as_ref().is_some_and(|inner| {
+                    probe_expr_references_outer_scan(inner, probe_source, scan_ctx)
+                })
+        }
+        Expr::Exists { .. } | Expr::Subquery(_, _) => true,
+        _ => false,
+    }
+}
+
+fn in_probe_source_references_outer_scan(
+    probe_source: &InProbeSource<'_>,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    probe_source.where_clause.is_some_and(|where_expr| {
+        probe_expr_references_outer_scan(where_expr, probe_source, scan_ctx)
+    }) || matches!(
+        probe_source.value,
+        InProbeValue::Expr(expr)
+            if probe_expr_references_outer_scan(expr, probe_source, scan_ctx)
+    )
+}
+
+fn can_use_once_materialized_in_probe_source(
+    probe_source: &InProbeSource<'_>,
+    operand: &Expr,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    if in_probe_source_references_outer_scan(probe_source, scan_ctx) {
+        return false;
+    }
+    match effective_collation_ctx(operand, Some(scan_ctx)) {
+        Some(collation) => collation.eq_ignore_ascii_case("BINARY"),
+        None => true,
+    }
+}
+
 fn emit_once_materialized_in_list(
     b: &mut ProgramBuilder,
     operand: &Expr,
@@ -12316,6 +12831,127 @@ fn emit_once_materialized_in_list(
         b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
         b.resolve_label(next_value);
     }
+    b.free_temp(r_key);
+    b.free_temp(r_value);
+    b.resolve_label(build_done);
+
+    let r_probe_key = b.alloc_temp();
+    b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Found,
+        autoindex_cursor,
+        r_probe_key,
+        found_label,
+        P4::None,
+        0,
+    );
+    b.free_temp(r_probe_key);
+
+    b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+    b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(found_label);
+    b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(null_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    b.resolve_label(done_label);
+    b.free_temp(r_operand);
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_once_materialized_in_probe_source(
+    b: &mut ProgramBuilder,
+    operand: &Expr,
+    probe_source: &InProbeSource<'_>,
+    not: bool,
+    reg: i32,
+    scan_ctx: &ScanCtx<'_>,
+    schema: &[TableSchema],
+) {
+    let r_operand = b.alloc_temp();
+    emit_expr(b, operand, r_operand, Some(scan_ctx));
+
+    let null_label = b.emit_label();
+    let found_label = b.emit_label();
+    let done_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+
+    let source_cursor = 8192 + b.current_addr() as i32;
+    let autoindex_cursor = 12288 + b.current_addr() as i32;
+    let r_saw_null = b.alloc_reg();
+    let build_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Once, 0, 0, build_done, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
+    b.emit_op(Opcode::OpenAutoindex, autoindex_cursor, 1, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::OpenRead,
+        source_cursor,
+        probe_source.table.root_page,
+        0,
+        P4::Table(probe_source.table.name.clone()),
+        0,
+    );
+
+    let build_scan_done = b.emit_label();
+    let build_scan_start = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        source_cursor,
+        0,
+        build_scan_done,
+        P4::None,
+        0,
+    );
+
+    let skip_label = probe_source.where_clause.map(|_| b.emit_label());
+    if let (Some(where_expr), Some(skip)) = (probe_source.where_clause, skip_label) {
+        emit_where_filter(
+            b,
+            where_expr,
+            source_cursor,
+            probe_source.table,
+            probe_source.table_alias,
+            schema,
+            skip,
+        );
+    }
+
+    let probe_scan = ScanCtx {
+        cursor: source_cursor,
+        table: probe_source.table,
+        table_alias: probe_source.table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondary: None,
+    };
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    match probe_source.value {
+        InProbeValue::Expr(expr) => emit_expr(b, expr, r_value, Some(&probe_scan)),
+        InProbeValue::FirstColumn => {
+            b.emit_op(Opcode::Column, source_cursor, 0, r_value, P4::None, 0);
+        }
+    }
+    let next_value = b.emit_label();
+    let saw_null_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_value, 0, saw_null_label, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+    b.emit_op(Opcode::IdxInsert, autoindex_cursor, r_key, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_value, P4::None, 0);
+    b.resolve_label(saw_null_label);
+    b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+    b.resolve_label(next_value);
+
+    if let Some(skip) = skip_label {
+        b.resolve_label(skip);
+    }
+    let loop_body = (build_scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, source_cursor, loop_body, 0, P4::None, 0);
+    b.resolve_label(build_scan_done);
+    b.emit_op(Opcode::Close, source_cursor, 0, 0, P4::None, 0);
     b.free_temp(r_key);
     b.free_temp(r_value);
     b.resolve_label(build_done);
@@ -12633,6 +13269,39 @@ fn emit_scalar_subquery(
             done_label,
         );
     } else {
+        if let Some(where_expr) = where_clause
+            && let Some((probe_expr, residual_terms)) =
+                extract_exists_rowid_probe(where_expr, table, sub_alias)
+        {
+            let probe_reg = b.alloc_temp();
+            emit_expr_with_fallback(b, probe_expr, probe_reg, &sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                sub_cursor,
+                probe_reg,
+                done_label,
+                P4::None,
+                0,
+            );
+            b.free_temp(probe_reg);
+
+            for residual_term in residual_terms {
+                let residual_reg = b.alloc_temp();
+                emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
+                b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, done_label, P4::None, 0);
+                b.free_temp(residual_reg);
+            }
+
+            if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
+                emit_expr_with_fallback(b, expr, reg, &sub_ctx, Some(outer_ctx));
+            }
+
+            b.resolve_label(done_label);
+            b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+            return;
+        }
+
         // Non-aggregate scalar subquery: grab first row's first column value.
         let rewind_addr = b.current_addr();
         b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
@@ -13873,6 +14542,45 @@ mod tests {
                     },
                 ],
                 indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![ColumnInfo::basic("b", 'd', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn test_schema_with_index_and_subquery_source() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("a", 'd', false),
+                    ColumnInfo::basic("b", 'd', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_t_b".to_owned(),
+                    root_page: 4,
+                    columns: vec!["b".to_owned()],
+                    key_expressions: vec!["b".to_owned()],
+                    key_sort_directions: vec![],
+                    where_clause: None,
+                    is_unique: false,
+                    key_collations: vec![],
+                }],
                 strict: false,
                 without_rowid: false,
                 primary_key_constraints: Vec::new(),
@@ -18005,6 +18713,538 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Found),
             "large IN lists should probe membership via Found"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_uncorrelated_in_subquery_uses_once_materialized_autoindex() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(FromClause {
+                            source: TableOrSubquery::Table {
+                                name: QualifiedName::bare("s"),
+                                alias: Some("s".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            joins: vec![],
+                        }),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(
+                                ColumnRef::qualified("s", "b"),
+                                Span::ZERO,
+                            )),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Once),
+            "uncorrelated IN subqueries should materialize once per statement"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "uncorrelated IN subqueries should build an ephemeral autoindex"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxInsert),
+            "uncorrelated IN subqueries should populate the ephemeral autoindex"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Found),
+            "uncorrelated IN subqueries should probe membership via Found"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_uncorrelated_in_subquery_with_overlapping_column_names_materializes_once()
+     {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(from_table("s")),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "local subquery columns that overlap outer column names must still materialize once"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_correlated_in_subquery_does_not_use_once_materialization() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(FromClause {
+                            source: TableOrSubquery::Table {
+                                name: QualifiedName::bare("s"),
+                                alias: Some("s".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            joins: vec![],
+                        }),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(
+                                ColumnRef::qualified("s", "b"),
+                                Span::ZERO,
+                            )),
+                            op: AstBinaryOp::Eq,
+                            right: Box::new(Expr::Column(
+                                ColumnRef::qualified("t", "a"),
+                                Span::ZERO,
+                            )),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "correlated IN subqueries must not materialize once because they depend on outer-row values"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_count_star_indexed_in_list_uses_index_probe_expansion() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            set: InSet::List(
+                (1..=8)
+                    .map(|value| Expr::Literal(Literal::Integer(value), Span::ZERO))
+                    .collect(),
+            ),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(Box::new(where_expr)),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
+            "count(*) with indexed IN-list should open the outer index"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "count(*) with indexed IN-list should build a deduplicated probe set"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "count(*) with indexed IN-list should seek into the outer index per probe value"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
+            "count(*) with indexed IN-list should not fall back to opening the base table"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
+            "count(*) with indexed IN-list should stay on the direct counter path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_count_star_indexed_in_subquery_uses_index_probe_expansion() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(from_table("s")),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(Box::new(where_expr)),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_index_and_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| matches!(&op.p4, P4::Index(name) if op.opcode == Opcode::OpenRead && name == "idx_t_b")),
+            "count(*) with indexed IN-subquery should open the outer index"
+        );
+        assert!(
+            prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "s")),
+            "count(*) with indexed IN-subquery should still read the inner probe source once"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "count(*) with indexed IN-subquery should seek into the outer index per probe value"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
+            "count(*) with indexed IN-subquery should avoid reopening the base table"
+        );
+    }
+
+    #[test]
+    fn test_codegen_scalar_subquery_uses_rowid_probe_when_available() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Subquery(
+                                Box::new(SelectStatement {
+                                    with: None,
+                                    body: SelectBody {
+                                        select: SelectCore::Select {
+                                            distinct: Distinctness::All,
+                                            columns: vec![ResultColumn::Expr {
+                                                expr: Expr::Column(
+                                                    ColumnRef::qualified("s", "b"),
+                                                    Span::ZERO,
+                                                ),
+                                                alias: None,
+                                            }],
+                                            from: Some(FromClause {
+                                                source: TableOrSubquery::Table {
+                                                    name: QualifiedName::bare("s"),
+                                                    alias: Some("s".to_owned()),
+                                                    index_hint: None,
+                                                    time_travel: None,
+                                                },
+                                                joins: vec![],
+                                            }),
+                                            where_clause: Some(Box::new(Expr::BinaryOp {
+                                                left: Box::new(Expr::Column(
+                                                    ColumnRef::qualified("s", "rowid"),
+                                                    Span::ZERO,
+                                                )),
+                                                op: AstBinaryOp::Eq,
+                                                right: Box::new(Expr::Column(
+                                                    ColumnRef::qualified("t", "a"),
+                                                    Span::ZERO,
+                                                )),
+                                                span: Span::ZERO,
+                                            })),
+                                            group_by: vec![],
+                                            having: None,
+                                            windows: vec![],
+                                        },
+                                        compounds: vec![],
+                                    },
+                                    order_by: vec![],
+                                    limit: None,
+                                }),
+                                Span::ZERO,
+                            ),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "scalar subquery on inner rowid should probe directly with SeekRowid"
+        );
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+        assert_eq!(
+            rewind_count, 1,
+            "only the outer scan should rewind when scalar subquery lowers to a direct rowid probe"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_correlated_in_subquery_value_expr_does_not_use_once_materialization() {
+        let where_expr = Expr::In {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            set: InSet::Subquery(Box::new(SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO),
+                            alias: None,
+                        }],
+                        from: Some(from_table("s")),
+                        where_clause: Some(Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                            op: AstBinaryOp::Le,
+                            right: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            span: Span::ZERO,
+                        })),
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            })),
+            not: false,
+            span: Span::ZERO,
+        };
+        let stmt = simple_select(&["a"], "t", Some(Box::new(where_expr)));
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "IN subqueries whose selected probe values depend on outer-row values must not materialize once"
+        );
+    }
+
+    #[test]
+    #[ignore = "ScanCtx/SecondaryScanCtx/InProbeSource structs not yet defined"]
+    fn test_in_probe_source_reference_detection_considers_secondary_outer_scan() {
+        let schema = test_schema_with_subquery_source();
+        let outer_table = &schema[0];
+        let probe_table = &schema[1];
+        let secondary_table = TableSchema {
+            name: "u".to_owned(),
+            root_page: 4,
+            columns: vec![ColumnInfo::basic("b", 'd', false)],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let scan_ctx = ScanCtx {
+            cursor: 0,
+            table: outer_table,
+            table_alias: Some("t"),
+            schema: Some(&schema),
+            register_base: None,
+            secondary: Some(SecondaryScan {
+                cursor: 1,
+                table: &secondary_table,
+                table_alias: Some("u"),
+            }),
+        };
+        let probe_source = InProbeSource {
+            table: probe_table,
+            table_alias: Some("s"),
+            where_clause: Some(&Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "b"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            value: InProbeValue::FirstColumn,
+        };
+
+        assert!(
+            in_probe_source_references_outer_scan(&probe_source, &scan_ctx),
+            "secondary outer scan references must keep IN probe sources on the correlated path"
         );
     }
 
