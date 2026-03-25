@@ -5265,6 +5265,25 @@ impl VdbeEngine {
         clippy::cast_possible_wrap
     )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
+        self.execute_with_borrowed_bindings(program, None)
+    }
+
+    /// Execute a program using a borrowed binding slice for this run only.
+    ///
+    /// This avoids cloning bound parameters into the engine when the caller
+    /// already owns a short-lived binding slice for a single execution.
+    #[allow(
+        clippy::too_many_lines,
+        clippy::match_same_arms,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap
+    )]
+    pub fn execute_with_borrowed_bindings(
+        &mut self,
+        program: &VdbeProgram,
+        borrowed_bindings: Option<&[SqliteValue]>,
+    ) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
         if !self.statement_state_clean {
             self.clear_statement_cold_state();
@@ -7960,16 +7979,26 @@ impl VdbeEngine {
                             0
                         }
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        // Walk the cursor to count rows.
-                        let has_first = sc.cursor.first(&sc.cx)?;
-                        if !has_first {
-                            0
+                        if !sc.cursor.is_time_travel()
+                            && let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied()
+                            && let Some(db) = self.db.as_ref()
+                            && let Some(table) = db.get_table(root_page)
+                        {
+                            i64::try_from(table.rows.len()).unwrap_or(0)
                         } else {
-                            let mut n: i64 = 1;
-                            while sc.cursor.next(&sc.cx)? {
-                                n += 1;
+                            // Fall back to walking the cursor when the visible
+                            // snapshot is not represented by the live MemDatabase
+                            // mirror, such as time-travel cursors.
+                            let has_first = sc.cursor.first(&sc.cx)?;
+                            if !has_first {
+                                0
+                            } else {
+                                let mut n: i64 = 1;
+                                while sc.cursor.next(&sc.cx)? {
+                                    n += 1;
+                                }
+                                n
                             }
-                            n
                         }
                     } else {
                         0
@@ -7997,7 +8026,11 @@ impl VdbeEngine {
                         .ok()
                         .and_then(|one_based| one_based.checked_sub(1));
                     let value = idx
-                        .and_then(|idx| self.bindings.get(idx))
+                        .and_then(|idx| {
+                            borrowed_bindings
+                                .and_then(|bindings| bindings.get(idx))
+                                .or_else(|| self.bindings.get(idx))
+                        })
                         .cloned()
                         .unwrap_or(SqliteValue::Null);
                     self.set_reg(op.p2, value);
@@ -11883,6 +11916,33 @@ mod tests {
             "single-parameter statements should keep bindings inline"
         );
         assert_eq!(engine.bindings[0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_execute_with_borrowed_bindings_uses_override_for_single_run() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Variable, 1, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_bindings_slice(&[SqliteValue::Integer(7)]);
+
+        let outcome = engine
+            .execute_with_borrowed_bindings(&program, Some(&[SqliteValue::Integer(11)]))
+            .expect("execution should succeed");
+
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            engine.take_results().into_iter().next().unwrap().into_vec(),
+            vec![SqliteValue::Integer(11)]
+        );
+        assert_eq!(
+            engine.bindings[0],
+            SqliteValue::Integer(7),
+            "borrowed bindings should not overwrite the cached owned binding set"
+        );
     }
 
     #[test]
@@ -15844,6 +15904,28 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_count_uses_exact_cardinality_for_storage_cursor() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::Count, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(3)]]);
     }
 
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────

@@ -2987,7 +2987,7 @@ fn codegen_select_count_star_indexed_in_scan(
     let source_cursor = cursor + 3;
 
     if let CountIndexedInTarget::ProbeSource(probe_source) = &in_target
-        && count_probe_source_can_skip_materialization(&probe_source)
+        && count_probe_source_can_skip_materialization(probe_source)
     {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
         b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
@@ -7695,6 +7695,12 @@ fn codegen_insert_values(
                         existing_hidden_rowid_reg,
                         excluded_hidden_rowid_reg,
                     )?;
+                    // Constraint checks after assignments (matches regular
+                    // UPDATE path). Previously missing — UPSERT DO UPDATE
+                    // could write data violating STRICT, CHECK, or NOT NULL.
+                    emit_strict_type_check(b, table, existing_regs);
+                    emit_check_constraints(b, table, existing_regs, None);
+                    emit_not_null_constraints(b, table, existing_regs, None);
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -7740,6 +7746,10 @@ fn codegen_insert_values(
                         existing_hidden_rowid_reg,
                         excluded_hidden_rowid_reg,
                     )?;
+                    // Constraint checks (same as WHERE branch above).
+                    emit_strict_type_check(b, table, existing_regs);
+                    emit_check_constraints(b, table, existing_regs, None);
+                    emit_not_null_constraints(b, table, existing_regs, None);
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -12168,7 +12178,7 @@ fn emit_in_probe_expr(
         register_base: None,
         secondary: None,
     };
-    emit_in_probe_value(b, probe_cursor, probe_source, r_probe, &probe_scan);
+    emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
     b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
     // If probe value was NULL, flag it (Eq never matches NULLs).
     let after_flag = b.emit_label();
@@ -18452,7 +18462,7 @@ mod tests {
                                             )),
                                             op: AstBinaryOp::Eq,
                                             right: Box::new(Expr::Column(
-                                                ColumnRef::bare("a"),
+                                                ColumnRef::qualified("t", "b"),
                                                 Span::ZERO,
                                             )),
                                             span: Span::ZERO,
@@ -19184,6 +19194,81 @@ mod tests {
                 .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
             "count(*) EXISTS semijoin fast path should stay on the direct counter path"
         );
+    }
+
+    #[test]
+    fn test_extract_count_indexed_exists_target_matches_indexed_outer_column() {
+        let stmt = agg_count_star_exists_rowid_probe();
+        let schema = test_schema_with_index_and_subquery_source();
+        let SelectCore::Select {
+            from, where_clause, ..
+        } = &stmt.body.select
+        else {
+            panic!("expected SELECT core");
+        };
+        let FromClause { source, .. } = from.as_ref().expect("outer FROM should exist");
+        let TableOrSubquery::Table { alias, .. } = source else {
+            panic!("expected plain outer table");
+        };
+        let table = find_table(&schema, "t").expect("outer table should exist");
+        let Expr::Exists { subquery, .. } =
+            where_clause.as_deref().expect("outer WHERE should exist")
+        else {
+            panic!("expected EXISTS predicate");
+        };
+        let SelectCore::Select {
+            from: Some(sub_from),
+            where_clause: Some(sub_where),
+            ..
+        } = &subquery.body.select
+        else {
+            panic!("expected simple subquery shape");
+        };
+        let TableOrSubquery::Table {
+            name: sub_name,
+            alias: sub_alias,
+            ..
+        } = &sub_from.source
+        else {
+            panic!("expected plain inner table");
+        };
+        let sub_table = find_table(&schema, &sub_name.name).expect("inner table should exist");
+        let (probe_expr, residual_terms) =
+            extract_exists_rowid_probe(sub_where, sub_table, sub_alias.as_deref())
+                .expect("rowid probe should match");
+
+        assert_eq!(
+            column_name(probe_expr, table, alias.as_deref()).as_deref(),
+            Some("b"),
+            "outer probe should resolve to the indexed outer column"
+        );
+        assert_eq!(
+            residual_terms.len(),
+            1,
+            "fixture should leave exactly one inner residual term"
+        );
+        assert!(
+            table.index_for_column("b").is_some(),
+            "outer fixture should expose an index on b"
+        );
+
+        let extracted = extract_count_indexed_exists_target(
+            where_clause.as_deref(),
+            table,
+            alias.as_deref(),
+            &schema,
+        )
+        .expect("indexed EXISTS target should match");
+
+        assert_eq!(extracted.0.name, "idx_t_b");
+        match extracted.1 {
+            CountIndexedInTarget::ProbeSource(probe_source) => {
+                assert!(matches!(probe_source.value, InProbeValue::Rowid));
+            }
+            CountIndexedInTarget::List(_) => {
+                panic!("EXISTS target should lower to a probe source");
+            }
+        }
     }
 
     #[test]
