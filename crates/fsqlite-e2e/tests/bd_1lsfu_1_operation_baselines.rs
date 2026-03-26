@@ -1135,11 +1135,7 @@ fn manual_hot_path_profile_large_prepared_insert_single_transaction_10k() {
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
 
     let profile = hot_path_profile_snapshot();
-    log_manual_insert_hot_path_profile(
-        "large_prepared_insert_single_txn_10k",
-        wall,
-        &profile,
-    );
+    log_manual_insert_hot_path_profile("large_prepared_insert_single_txn_10k", wall, &profile);
 }
 
 #[test]

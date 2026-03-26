@@ -4914,8 +4914,7 @@ fn grouped_inner_join_count_sum_plan<'a>(
     else {
         return Ok(None);
     };
-    let (Expr::Column(on_left_col, _), Expr::Column(on_right_col, _)) =
-        (&**on_left, &**on_right)
+    let (Expr::Column(on_left_col, _), Expr::Column(on_right_col, _)) = (&**on_left, &**on_right)
     else {
         return Ok(None);
     };
@@ -4924,7 +4923,8 @@ fn grouped_inner_join_count_sum_plan<'a>(
     }
 
     let ResultColumn::Expr {
-        expr: group_key_expr, ..
+        expr: group_key_expr,
+        ..
     } = &columns[0]
     else {
         return Ok(None);
@@ -4937,7 +4937,9 @@ fn grouped_inner_join_count_sum_plan<'a>(
     };
     if group_key_col.table.is_none()
         || group_by_col.table.is_none()
-        || !group_key_col.column.eq_ignore_ascii_case(&group_by_col.column)
+        || !group_key_col
+            .column
+            .eq_ignore_ascii_case(&group_by_col.column)
         || !group_key_col
             .table
             .as_deref()
@@ -4978,9 +4980,7 @@ fn grouped_inner_join_count_sum_plan<'a>(
             filter: None,
             over: None,
             ..
-        } if name.eq_ignore_ascii_case("sum") && order_by.is_empty() && args.len() == 1 => {
-            &args[0]
-        }
+        } if name.eq_ignore_ascii_case("sum") && order_by.is_empty() && args.len() == 1 => &args[0],
         _ => return Ok(None),
     };
     let Expr::Column(sum_arg_col, _) = sum_arg_expr else {
@@ -5048,7 +5048,8 @@ fn codegen_grouped_inner_join_count_sum_select(
     let out_regs = b.alloc_regs(3);
     let left_cursor = 0_i32;
     let right_cursor = 1_i32;
-    let index_cursor = if let SingleJoinLookupTarget::Index(index) = &plan.join_lookup.lookup_target {
+    let index_cursor = if let SingleJoinLookupTarget::Index(index) = &plan.join_lookup.lookup_target
+    {
         let cursor = 2_i32;
         b.emit_op(
             Opcode::OpenRead,
@@ -5087,7 +5088,7 @@ fn codegen_grouped_inner_join_count_sum_select(
     b.emit_op(
         Opcode::SorterOpen,
         sorter_cursor,
-        1,
+        2,
         0,
         P4::Str("+".to_owned()),
         0,
@@ -5242,7 +5243,14 @@ fn codegen_grouped_inner_join_count_sum_select(
     b.emit_op(Opcode::Column, sorter_cursor, 0, cur_key_reg, P4::None, 0);
 
     let first_row_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::IfPos, first_flag_reg, 1, first_row_label, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::IfPos,
+        first_flag_reg,
+        1,
+        first_row_label,
+        P4::None,
+        0,
+    );
 
     let new_group_label = b.emit_label();
     let same_group_label = b.emit_label();
@@ -5274,22 +5282,8 @@ fn codegen_grouped_inner_join_count_sum_select(
         0,
     );
     b.emit_op(Opcode::Copy, prev_key_reg, out_regs, 0, P4::None, 0);
-    b.emit_op(
-        Opcode::Copy,
-        count_accum_reg,
-        out_regs + 1,
-        0,
-        P4::None,
-        0,
-    );
-    b.emit_op(
-        Opcode::Copy,
-        sum_accum_reg,
-        out_regs + 2,
-        0,
-        P4::None,
-        0,
-    );
+    b.emit_op(Opcode::Copy, count_accum_reg, out_regs + 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, sum_accum_reg, out_regs + 2, 0, P4::None, 0);
     b.emit_op(Opcode::ResultRow, out_regs, 3, 0, P4::None, 0);
     b.emit_op(Opcode::Null, 0, count_accum_reg, 0, P4::None, 0);
     b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
@@ -5342,22 +5336,8 @@ fn codegen_grouped_inner_join_count_sum_select(
         0,
     );
     b.emit_op(Opcode::Copy, prev_key_reg, out_regs, 0, P4::None, 0);
-    b.emit_op(
-        Opcode::Copy,
-        count_accum_reg,
-        out_regs + 1,
-        0,
-        P4::None,
-        0,
-    );
-    b.emit_op(
-        Opcode::Copy,
-        sum_accum_reg,
-        out_regs + 2,
-        0,
-        P4::None,
-        0,
-    );
+    b.emit_op(Opcode::Copy, count_accum_reg, out_regs + 1, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, sum_accum_reg, out_regs + 2, 0, P4::None, 0);
     b.emit_op(Opcode::ResultRow, out_regs, 3, 0, P4::None, 0);
 
     b.resolve_label(done_label);
@@ -16718,10 +16698,7 @@ mod tests {
                         }],
                     }),
                     where_clause: None,
-                    group_by: vec![Expr::Column(
-                        ColumnRef::qualified("c", "name"),
-                        Span::ZERO,
-                    )],
+                    group_by: vec![Expr::Column(ColumnRef::qualified("c", "name"), Span::ZERO)],
                     having: None,
                     windows: vec![],
                 },
@@ -16804,10 +16781,7 @@ mod tests {
                         }],
                     }),
                     where_clause: None,
-                    group_by: vec![Expr::Column(
-                        ColumnRef::qualified("c", "name"),
-                        Span::ZERO,
-                    )],
+                    group_by: vec![Expr::Column(ColumnRef::qualified("c", "name"), Span::ZERO)],
                     having: None,
                     windows: vec![],
                 },
@@ -20463,7 +20437,9 @@ mod tests {
         let prog = b.finish().unwrap();
 
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::LikeConstFast),
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::LikeConstFast),
             "literal LIKE should use LikeConstFast opcode"
         );
         assert!(
@@ -20471,10 +20447,10 @@ mod tests {
             "literal LIKE fast path should bypass generic PureFunc dispatch"
         );
         assert!(
-            prog.ops().iter().any(
-                |op| op.opcode == Opcode::LikeConstFast
-                    && op.p4 == P4::Str("prefix".to_owned())
-            ),
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::LikeConstFast
+                    && op.p4 == P4::Str("prefix".to_owned())),
             "prefix LIKE should hoist the trimmed literal into LikeConstFast"
         );
     }
@@ -21922,7 +21898,10 @@ mod tests {
             .filter(|op| op.opcode == Opcode::Rewind)
             .count();
 
-        assert_eq!(rewind_count, 1, "lookup join should only rewind the outer table");
+        assert_eq!(
+            rewind_count, 1,
+            "lookup join should only rewind the outer table"
+        );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
             "lookup join should seek into the right-side index"
@@ -22004,7 +21983,10 @@ mod tests {
             .filter(|op| op.opcode == Opcode::Rewind)
             .count();
 
-        assert_eq!(rewind_count, 1, "lookup left join should only rewind the outer table");
+        assert_eq!(
+            rewind_count, 1,
+            "lookup left join should only rewind the outer table"
+        );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
             "left join should seek into the right-side index"
@@ -22086,7 +22068,10 @@ mod tests {
             .filter(|op| op.opcode == Opcode::Rewind)
             .count();
 
-        assert_eq!(rewind_count, 1, "rowid lookup join should only rewind the outer table");
+        assert_eq!(
+            rewind_count, 1,
+            "rowid lookup join should only rewind the outer table"
+        );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
             "join against an INTEGER PRIMARY KEY should seek by rowid"
@@ -22124,7 +22109,9 @@ mod tests {
             "grouped lookup join should fetch rowids from the right-side index"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SorterInsert),
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SorterInsert),
             "grouped lookup join should still materialize rows for grouped aggregation"
         );
     }
@@ -22654,7 +22641,10 @@ mod tests {
             .iter()
             .filter(|op| op.opcode == Opcode::AggFinal)
             .count();
-        assert_eq!(final_count, 1, "COUNT(*) + SUM(a) should only finalize SUM(a)");
+        assert_eq!(
+            final_count, 1,
+            "COUNT(*) + SUM(a) should only finalize SUM(a)"
+        );
 
         // ResultRow should cover 2 columns.
         let rr = prog

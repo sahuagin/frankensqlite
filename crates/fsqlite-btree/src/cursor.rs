@@ -2494,12 +2494,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// rowid stream and want to try the rightmost-leaf append path before
     /// falling back to a full seek.
     #[doc(hidden)]
-    pub fn table_insert_rightmost_hint(
-        &mut self,
-        cx: &Cx,
-        rowid: i64,
-        data: &[u8],
-    ) -> Result<()> {
+    pub fn table_insert_rightmost_hint(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             let has_last = cursor.last(cx)?;
             if has_last {

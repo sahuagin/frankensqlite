@@ -47,9 +47,7 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
-use fsqlite_types::value::{
-    SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches,
-};
+use fsqlite_types::value::{SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches};
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
     StrictColumnType, WitnessKey,
@@ -349,10 +347,16 @@ impl MemTable {
 
     /// Count rows whose rowid is in `[lower_inclusive, upper_exclusive)`.
     pub fn count_rowid_range(&self, lower_inclusive: i64, upper_exclusive: i64) -> usize {
-        let start = match self.rows.binary_search_by_key(&lower_inclusive, |r| r.rowid) {
+        let start = match self
+            .rows
+            .binary_search_by_key(&lower_inclusive, |r| r.rowid)
+        {
             Ok(idx) | Err(idx) => idx,
         };
-        let end = match self.rows.binary_search_by_key(&upper_exclusive, |r| r.rowid) {
+        let end = match self
+            .rows
+            .binary_search_by_key(&upper_exclusive, |r| r.rowid)
+        {
             Ok(idx) | Err(idx) => idx,
         };
         end.saturating_sub(start)
@@ -364,10 +368,16 @@ impl MemTable {
         lower_inclusive: i64,
         upper_exclusive: i64,
     ) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
-        let start = match self.rows.binary_search_by_key(&lower_inclusive, |r| r.rowid) {
+        let start = match self
+            .rows
+            .binary_search_by_key(&lower_inclusive, |r| r.rowid)
+        {
             Ok(idx) | Err(idx) => idx,
         };
-        let end = match self.rows.binary_search_by_key(&upper_exclusive, |r| r.rowid) {
+        let end = match self
+            .rows
+            .binary_search_by_key(&upper_exclusive, |r| r.rowid)
+        {
             Ok(idx) | Err(idx) => idx,
         };
         let end = end.max(start);
@@ -687,23 +697,24 @@ impl SorterCursor {
                     .collation_registry
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                self.find_worst_row_index(&coll_guard).and_then(|worst_idx| {
-                    let ordering = compare_sorter_rows(
-                        &new_row.values,
-                        &self.rows[worst_idx].values,
-                        self.key_columns,
-                        &self.sort_key_orders,
-                        &self.collations,
-                        &coll_guard,
-                    );
-                    (ordering == Ordering::Less).then(|| {
-                        let replaced_size = Self::estimate_row_size(
+                self.find_worst_row_index(&coll_guard)
+                    .and_then(|worst_idx| {
+                        let ordering = compare_sorter_rows(
+                            &new_row.values,
                             &self.rows[worst_idx].values,
-                            &self.rows[worst_idx].blob,
+                            self.key_columns,
+                            &self.sort_key_orders,
+                            &self.collations,
+                            &coll_guard,
                         );
-                        (worst_idx, replaced_size)
+                        (ordering == Ordering::Less).then(|| {
+                            let replaced_size = Self::estimate_row_size(
+                                &self.rows[worst_idx].values,
+                                &self.rows[worst_idx].blob,
+                            );
+                            (worst_idx, replaced_size)
+                        })
                     })
-                })
             };
 
             if let Some((worst_idx, replaced_size)) = replacement {
@@ -4380,10 +4391,10 @@ pub struct VdbeEngine {
     statement_cold_state: StatementColdState,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ExactResultRowOutcome {
     NoRows,
-    Row(smallvec::SmallVec<[SqliteValue; 16]>),
+    Row(Box<smallvec::SmallVec<[SqliteValue; 16]>>),
     MultipleRows,
 }
 
@@ -8938,13 +8949,14 @@ impl VdbeEngine {
                                 "AggStep opcode executed without function registry".to_owned(),
                             )
                         })?;
-                        let func = registry
-                            .find_aggregate(func_name, arg_count)
-                            .ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "no such aggregate function: {func_name}/{arg_count}",
-                                ))
-                            })?;
+                        let func =
+                            registry
+                                .find_aggregate(func_name, arg_count)
+                                .ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "no such aggregate function: {func_name}/{arg_count}",
+                                    ))
+                                })?;
                         self.aggregate_function_cache
                             .insert(func_pc, Arc::clone(&func));
                         func
@@ -9019,13 +9031,14 @@ impl VdbeEngine {
                                 "AggFinal opcode executed without function registry".to_owned(),
                             )
                         })?;
-                        let func = registry
-                            .find_aggregate(func_name, arg_count)
-                            .ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "no such aggregate function: {func_name}/{arg_count}",
-                                ))
-                            })?;
+                        let func =
+                            registry
+                                .find_aggregate(func_name, arg_count)
+                                .ok_or_else(|| {
+                                    FrankenError::Internal(format!(
+                                        "no such aggregate function: {func_name}/{arg_count}",
+                                    ))
+                                })?;
                         self.aggregate_function_cache
                             .insert(func_pc, Arc::clone(&func));
                         func
@@ -9175,7 +9188,8 @@ impl VdbeEngine {
                                     "no such function: {func_name}/{arg_count}",
                                 ))
                             })?;
-                        self.scalar_function_cache.insert(func_pc, Arc::clone(&func));
+                        self.scalar_function_cache
+                            .insert(func_pc, Arc::clone(&func));
                         func
                     };
 
@@ -9871,11 +9885,11 @@ impl VdbeEngine {
     pub fn take_exactly_one_result_row(&mut self) -> ExactResultRowOutcome {
         match self.results.len() {
             0 => ExactResultRowOutcome::NoRows,
-            1 => ExactResultRowOutcome::Row(
+            1 => ExactResultRowOutcome::Row(Box::new(
                 self.results
                     .pop()
                     .expect("one-row result set should contain one row"),
-            ),
+            )),
             _ => {
                 self.results.clear();
                 ExactResultRowOutcome::MultipleRows
@@ -12207,7 +12221,7 @@ mod tests {
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(
             engine.take_exactly_one_result_row(),
-            ExactResultRowOutcome::Row(smallvec::smallvec![SqliteValue::Integer(7)]),
+            ExactResultRowOutcome::Row(Box::new(smallvec::smallvec![SqliteValue::Integer(7)])),
         );
         assert_eq!(
             engine.result_buffer_capacity(),
@@ -17920,7 +17934,10 @@ mod tests {
         let program = b.finish().expect("program should build");
         let _ = execute_program_with_engine(&mut engine, &program);
 
-        let cursor = engine.storage_cursors.get(&0).expect("cursor should still exist");
+        let cursor = engine
+            .storage_cursors
+            .get(&0)
+            .expect("cursor should still exist");
 
         assert!(
             cursor.cur_vals_buf.is_empty(),
@@ -17959,14 +17976,7 @@ mod tests {
             );
             b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
 
-            b.emit_op(
-                Opcode::String8,
-                0,
-                r_input,
-                0,
-                P4::Str("zzz".to_owned()),
-                0,
-            );
+            b.emit_op(Opcode::String8, 0, r_input, 0, P4::Str("zzz".to_owned()), 0);
             b.emit_op(
                 Opcode::LikeConstFast,
                 r_input,

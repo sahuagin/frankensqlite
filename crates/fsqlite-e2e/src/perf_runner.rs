@@ -4728,6 +4728,12 @@ mod tests {
             direct_rowid_lookup_query_row_hits: 0,
             direct_count_star_rowid_range_query_row_hits: 0,
             direct_count_indexed_rowid_probe_query_row_hits: 0,
+            prepared_direct_insert_executions: 0,
+            prepared_direct_insert_row_build_time_ns: 0,
+            prepared_direct_insert_cursor_setup_time_ns: 0,
+            prepared_direct_insert_serialize_time_ns: 0,
+            prepared_direct_insert_btree_insert_time_ns: 0,
+            prepared_direct_insert_memdb_apply_time_ns: 0,
             btree_copy_kernels: BtreeCopyProfileSnapshot {
                 local_payload_copy_calls: 2,
                 local_payload_copy_bytes: 96,
