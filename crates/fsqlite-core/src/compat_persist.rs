@@ -153,8 +153,9 @@ pub fn persist_to_sqlite(
     let usable_size =
         u32::try_from(ps).map_err(|_| FrankenError::internal("page size exceeds u32"))?;
 
-    // Track (name, root_page, create_sql) for sqlite_master entries.
-    let mut master_entries: Vec<(String, u32, String)> = Vec::new();
+    // Track (type, name, tbl_name, root_page, create_sql) for sqlite_master entries.
+    // Extended from just tables to also include indexes, views, and triggers.
+    let mut master_entries: Vec<(&str, String, String, u32, String)> = Vec::new();
 
     // Write each table's data into its own B-tree.
     for table in schema {
@@ -184,7 +185,86 @@ pub fn persist_to_sqlite(
 
         // Build CREATE TABLE SQL for sqlite_master.
         let create_sql = build_create_table_sql(table);
-        master_entries.push((table.name.clone(), root_page.get(), create_sql));
+        let table_name = table.name.clone();
+        master_entries.push(("table", table_name.clone(), table_name.clone(), root_page.get(), create_sql));
+
+        // Write index B-trees for explicitly created indexes (not autoindexes).
+        for index in &table.indexes {
+            if index.name.starts_with("sqlite_autoindex_") || index.columns.is_empty() {
+                continue;
+            }
+            // Allocate and initialize root page as leaf index page (0x0A).
+            let idx_root = txn.allocate_page(cx)?;
+            init_leaf_index_page(cx, &mut txn, idx_root, ps)?;
+
+            // Populate the index B-tree from table rows.
+            {
+                let mut idx_cursor = fsqlite_btree::BtCursor::new(
+                    TransactionPageIo::new(&mut txn),
+                    idx_root,
+                    usable_size,
+                    true,
+                );
+                if let Some(mem_table) = db.get_table(table.root_page) {
+                    for (rowid, values) in mem_table.iter_rows() {
+                        // Build index key: (indexed_column_values..., rowid).
+                        let mut key_values: Vec<SqliteValue> = Vec::new();
+                        for col_name in &index.columns {
+                            let col_idx = table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(col_name));
+                            if let Some(idx) = col_idx {
+                                key_values
+                                    .push(values.get(idx).cloned().unwrap_or(SqliteValue::Null));
+                            } else {
+                                key_values.push(SqliteValue::Null);
+                            }
+                        }
+                        key_values.push(SqliteValue::Integer(rowid));
+                        let key = serialize_record(&key_values);
+                        idx_cursor.index_insert(cx, &key)?;
+                    }
+                }
+            }
+
+            // Build CREATE INDEX SQL.
+            let terms: Vec<CreateIndexSqlTerm<'_>> = index
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, col)| CreateIndexSqlTerm {
+                    column_name: col.as_str(),
+                    collation: index
+                        .key_collations
+                        .get(i)
+                        .and_then(|c| c.as_deref()),
+                    direction: index.key_sort_directions.get(i).copied(),
+                })
+                .collect();
+            // Parse WHERE clause from string if present.
+            let idx_sql = build_create_index_sql(
+                &index.name,
+                &table_name,
+                index.is_unique,
+                &terms,
+                None, // WHERE clause from string is already in index.where_clause
+            );
+            // Append WHERE clause text if present (the build function takes an
+            // Expr, but we have a String — append directly).
+            let idx_sql = if let Some(ref wc) = index.where_clause {
+                format!("{idx_sql} WHERE {wc}")
+            } else {
+                idx_sql
+            };
+            master_entries.push((
+                "index",
+                index.name.clone(),
+                table_name.clone(),
+                idx_root.get(),
+                idx_sql,
+            ));
+        }
     }
 
     // Write sqlite_master entries into page 1's B-tree.
