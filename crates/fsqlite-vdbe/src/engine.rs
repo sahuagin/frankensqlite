@@ -47,7 +47,9 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
-use fsqlite_types::value::SqliteValue;
+use fsqlite_types::value::{
+    SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches,
+};
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
     StrictColumnType, WitnessKey,
@@ -303,6 +305,10 @@ impl MemTable {
         if rowid >= self.next_rowid {
             self.next_rowid = rowid.saturating_add(1);
         }
+        if self.rows.last().is_none_or(|row| row.rowid < rowid) {
+            self.rows.push(MemRow { rowid, values });
+            return;
+        }
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
@@ -332,6 +338,42 @@ impl MemTable {
     /// Find a row by rowid. Returns the index.
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()
+    }
+
+    /// Return the values for a rowid, if present.
+    pub fn row_values_by_rowid(&self, rowid: i64) -> Option<&[SqliteValue]> {
+        self.find_by_rowid(rowid)
+            .and_then(|idx| self.rows.get(idx))
+            .map(|row| row.values.as_slice())
+    }
+
+    /// Count rows whose rowid is in `[lower_inclusive, upper_exclusive)`.
+    pub fn count_rowid_range(&self, lower_inclusive: i64, upper_exclusive: i64) -> usize {
+        let start = match self.rows.binary_search_by_key(&lower_inclusive, |r| r.rowid) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        let end = match self.rows.binary_search_by_key(&upper_exclusive, |r| r.rowid) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        end.saturating_sub(start)
+    }
+
+    /// Iterate rows whose rowid is in `[lower_inclusive, upper_exclusive)`.
+    pub fn iter_rows_in_rowid_range(
+        &self,
+        lower_inclusive: i64,
+        upper_exclusive: i64,
+    ) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
+        let start = match self.rows.binary_search_by_key(&lower_inclusive, |r| r.rowid) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        let end = match self.rows.binary_search_by_key(&upper_exclusive, |r| r.rowid) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        let end = end.max(start);
+        self.rows[start..end]
+            .iter()
+            .map(|row| (row.rowid, row.values.as_slice()))
     }
 
     /// Iterate all rows as `(rowid, values)` pairs.
@@ -441,6 +483,10 @@ struct SorterCursor {
     spill_threshold: usize,
     /// Sorted runs that have been spilled to disk.
     spill_runs: Vec<SpillRun>,
+    /// Keep only the best N rows during insertion when ORDER BY is paired with
+    /// a simple LIMIT. This avoids sorting the full input when the tail can
+    /// never survive to the final output.
+    top_n_limit: Option<usize>,
     /// Total rows sorted (across all runs + final merge).
     rows_sorted_total: u64,
     /// Total pages spilled to disk.
@@ -550,6 +596,7 @@ impl SorterCursor {
             sort_key_orders,
             collations,
             Arc::new(Mutex::new(CollationRegistry::new())),
+            None,
         )
     }
 
@@ -558,6 +605,7 @@ impl SorterCursor {
         mut sort_key_orders: Vec<SortKeyOrder>,
         collations: Vec<Option<String>>,
         collation_registry: Arc<Mutex<CollationRegistry>>,
+        top_n_limit: Option<usize>,
     ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
@@ -576,9 +624,32 @@ impl SorterCursor {
             memory_used: 0,
             spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
             spill_runs: Vec::new(),
+            top_n_limit,
             rows_sorted_total: 0,
             spill_pages_total: 0,
         }
+    }
+
+    fn find_worst_row_index(&self, collation_registry: &CollationRegistry) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+
+        let mut worst_idx = 0usize;
+        for idx in 1..self.rows.len() {
+            let ordering = compare_sorter_rows(
+                &self.rows[idx].values,
+                &self.rows[worst_idx].values,
+                self.key_columns,
+                &self.sort_key_orders,
+                &self.collations,
+                collation_registry,
+            );
+            if ordering != Ordering::Less {
+                worst_idx = idx;
+            }
+        }
+        Some(worst_idx)
     }
 
     /// Estimate the memory footprint of a sorter row.
@@ -597,6 +668,53 @@ impl SorterCursor {
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
+        if let Some(limit) = self.top_n_limit {
+            if limit == 0 {
+                return Ok(());
+            }
+
+            let new_row_size = Self::estimate_row_size(&values, &blob);
+            let new_row = SorterRow { values, blob };
+            if self.rows.len() < limit {
+                self.memory_used += new_row_size;
+                self.rows.push(new_row);
+                self.invalidate_output_row_cache();
+                return Ok(());
+            }
+
+            let replacement = {
+                let coll_guard = self
+                    .collation_registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.find_worst_row_index(&coll_guard).and_then(|worst_idx| {
+                    let ordering = compare_sorter_rows(
+                        &new_row.values,
+                        &self.rows[worst_idx].values,
+                        self.key_columns,
+                        &self.sort_key_orders,
+                        &self.collations,
+                        &coll_guard,
+                    );
+                    (ordering == Ordering::Less).then(|| {
+                        let replaced_size = Self::estimate_row_size(
+                            &self.rows[worst_idx].values,
+                            &self.rows[worst_idx].blob,
+                        );
+                        (worst_idx, replaced_size)
+                    })
+                })
+            };
+
+            if let Some((worst_idx, replaced_size)) = replacement {
+                self.memory_used = self.memory_used.saturating_sub(replaced_size);
+                self.memory_used = self.memory_used.saturating_add(new_row_size);
+                self.rows[worst_idx] = new_row;
+                self.invalidate_output_row_cache();
+            }
+            return Ok(());
+        }
+
         self.memory_used += Self::estimate_row_size(&values, &blob);
         self.rows.push(SorterRow { values, blob });
         self.invalidate_output_row_cache();
@@ -4145,6 +4263,10 @@ pub struct VdbeEngine {
     storage_cursor_memdb_count_shortcuts_safe: bool,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
+    /// Resolved scalar functions keyed by opcode address.
+    scalar_function_cache: HashMap<usize, Arc<dyn fsqlite_func::ScalarFunction>>,
+    /// Resolved aggregate functions keyed by opcode address.
+    aggregate_function_cache: HashMap<usize, Arc<ErasedAggregateFunction>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Aggregate accumulators keyed by accumulator register.
@@ -4256,6 +4378,13 @@ pub struct VdbeEngine {
     /// Tracks which cold subsystems were actually touched by the last statement
     /// so common-case reuse can skip blanket clears of unused collections.
     statement_cold_state: StatementColdState,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ExactResultRowOutcome {
+    NoRows,
+    Row(smallvec::SmallVec<[SqliteValue; 16]>),
+    MultipleRows,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -4604,6 +4733,8 @@ impl VdbeEngine {
             memdb_rows_loaded: false,
             storage_cursor_memdb_count_shortcuts_safe: false,
             func_registry: None,
+            scalar_function_cache: HashMap::new(),
+            aggregate_function_cache: HashMap::new(),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             aggregates: SwissIndex::new(),
             schema_cookie: 0,
@@ -4737,6 +4868,8 @@ impl VdbeEngine {
         self.memdb_rows_loaded = false;
         self.storage_cursor_memdb_count_shortcuts_safe = false;
         self.func_registry = None;
+        self.scalar_function_cache.clear();
+        self.aggregate_function_cache.clear();
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
         self.schema_cookie = 0;
@@ -4945,9 +5078,12 @@ impl VdbeEngine {
             self.collect_vdbe_metrics,
             DecodeCacheInvalidationReason::WriteMutation,
         );
+        let rollback_cursor_id = rollback.cursor_id;
+        let rollback_rowid = rollback.rowid;
         self.changes = self.changes.checked_sub(1).ok_or_else(|| {
             FrankenError::internal("secondary-index rollback underflowed change counter")
         })?;
+        self.sync_storage_table_delete_into_memdb_mirror(rollback_cursor_id, rollback_rowid);
         if let Some(update_restore) = rollback.update_restore {
             self.restore_pending_update_after_conflict(update_restore)?;
         }
@@ -5005,6 +5141,7 @@ impl VdbeEngine {
                         }
                     }
                 }
+                self.sync_storage_table_restore_into_memdb_mirror(cursor_id, rowid, &payload);
             }
             PendingUpdateRestore::Mem {
                 root_page,
@@ -5031,10 +5168,98 @@ impl VdbeEngine {
         self.memdb_rows_loaded = loaded;
     }
 
-    /// Declare whether storage-cursor `Count` may trust the attached
-    /// `MemDatabase` row mirror for exact cardinality.
+    /// Declare whether storage-cursor `Count` and row-mirror scan fast paths
+    /// may trust the attached `MemDatabase` row mirror.
     pub fn set_storage_cursor_memdb_count_shortcuts_safe(&mut self, safe: bool) {
         self.storage_cursor_memdb_count_shortcuts_safe = safe;
+    }
+
+    /// Whether the attached `MemDatabase` row mirror still exactly matches
+    /// storage-backed table contents for fast-path reads.
+    pub fn storage_cursor_memdb_count_shortcuts_safe(&self) -> bool {
+        self.storage_cursor_memdb_count_shortcuts_safe
+    }
+
+    fn storage_memdb_row_mirror_enabled(&self) -> bool {
+        self.memdb_rows_loaded && self.storage_cursor_memdb_count_shortcuts_safe
+    }
+
+    fn sync_storage_table_insert_into_memdb_mirror(
+        &mut self,
+        cursor_id: i32,
+        rowid: i64,
+        record: &SqliteValue,
+    ) {
+        if !self.storage_memdb_row_mirror_enabled() {
+            return;
+        }
+
+        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Ok(values) = decode_record_with_metrics(record, self.collect_vdbe_metrics) else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Some(db) = self.db.as_mut() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        if db.get_table(root_page).is_none() {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        }
+        db.upsert_row(root_page, rowid, values);
+    }
+
+    fn sync_storage_table_delete_into_memdb_mirror(&mut self, cursor_id: i32, rowid: i64) {
+        if !self.storage_memdb_row_mirror_enabled() {
+            return;
+        }
+
+        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Some(db) = self.db.as_mut() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Some(table) = db.get_table_mut(root_page) else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        table.delete_by_rowid(rowid);
+    }
+
+    fn sync_storage_table_restore_into_memdb_mirror(
+        &mut self,
+        cursor_id: i32,
+        rowid: i64,
+        payload: &[u8],
+    ) {
+        if !self.storage_memdb_row_mirror_enabled() {
+            return;
+        }
+
+        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Some(values) = parse_record(payload) else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        let Some(db) = self.db.as_mut() else {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        };
+        if db.get_table(root_page).is_none() {
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            return;
+        }
+        db.upsert_row(root_page, rowid, values);
     }
 
     /// Take ownership of the in-memory database back from the engine.
@@ -6468,6 +6693,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
+                    let top_n_limit = usize::try_from(op.p3).ok().filter(|limit| *limit > 0);
                     // P4::Str format: ORDER_CHARS or ORDER_CHARS|COLL1,COLL2,...
                     // where ORDER_CHARS are '+'/'-' per key column,
                     // and COLL values are collation names (empty = BINARY).
@@ -6512,6 +6738,7 @@ impl VdbeEngine {
                             sort_key_orders,
                             collations,
                             Arc::clone(&self.collation_registry),
+                            top_n_limit,
                         ),
                     );
                     // A cursor id cannot be both table and sorter cursor.
@@ -7382,6 +7609,7 @@ impl VdbeEngine {
                     // StorageCursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
                     let mut actually_inserted = false;
+                    let mut inserted_via_storage = false;
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let blob = record_blob_bytes(&record_val);
@@ -7432,6 +7660,7 @@ impl VdbeEngine {
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
                                     sc2.last_successful_insert_rowid = Some(rowid);
+                                    inserted_via_storage = true;
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
@@ -7457,6 +7686,7 @@ impl VdbeEngine {
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
                                 sc.last_successful_insert_rowid = Some(rowid);
+                                inserted_via_storage = true;
                                 actually_inserted = true;
                             }
                         }
@@ -7529,6 +7759,13 @@ impl VdbeEngine {
                             }
                         }
                     }
+                    if inserted_via_storage {
+                        self.sync_storage_table_insert_into_memdb_mirror(
+                            cursor_id,
+                            rowid,
+                            &record_val,
+                        );
+                    }
 
                     // Track last insert rowid only when a row was actually inserted.
                     // C SQLite does not update last_insert_rowid() when IGNORE skips.
@@ -7575,16 +7812,18 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let mut deleted = false;
+                    let mut deleted_storage_rowid = None;
                     let mut update_restore = None;
                     // Phase 5B.3 (bd-1r0d): write-through — route ONLY through
                     // storage cursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
+                            let current_rowid = sc.cursor.rowid(&sc.cx)?;
                             if is_update {
                                 update_restore = Some(PendingUpdateRestore::Storage {
                                     cursor_id,
-                                    rowid: sc.cursor.rowid(&sc.cx)?,
+                                    rowid: current_rowid,
                                     payload: sc.cursor.payload(&sc.cx)?,
                                 });
                             }
@@ -7594,6 +7833,7 @@ impl VdbeEngine {
                                 self.collect_vdbe_metrics,
                                 DecodeCacheInvalidationReason::WriteMutation,
                             );
+                            deleted_storage_rowid = Some(current_rowid);
                             deleted = true;
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -7622,6 +7862,9 @@ impl VdbeEngine {
                                 deleted = true;
                             }
                         }
+                    }
+                    if let Some(storage_rowid) = deleted_storage_rowid {
+                        self.sync_storage_table_delete_into_memdb_mirror(cursor_id, storage_rowid);
                     }
                     if deleted {
                         if is_update && update_restore.is_some() {
@@ -8044,6 +8287,28 @@ impl VdbeEngine {
                         0
                     };
                     self.set_reg_int(op.p2, count);
+                    pc += 1;
+                }
+
+                Opcode::CountIndexEqRun => {
+                    let probe_value = self.get_reg(op.p3).clone();
+                    let matched = if probe_value.is_null() {
+                        0
+                    } else {
+                        let cursor = self.storage_cursors.get_mut(&op.p1).ok_or_else(|| {
+                            FrankenError::internal(
+                                "CountIndexEqRun requires an open storage cursor",
+                            )
+                        })?;
+                        if cursor.cursor.is_table_btree() {
+                            return Err(FrankenError::internal(
+                                "CountIndexEqRun requires an index cursor",
+                            ));
+                        }
+                        storage_cursor_count_equal_first_key_run(op.p1, cursor, &probe_value)?
+                    };
+                    let next_count = self.get_reg(op.p2).to_integer().wrapping_add(matched);
+                    self.set_reg_int(op.p2, next_count);
                     pc += 1;
                 }
 
@@ -8663,20 +8928,27 @@ impl VdbeEngine {
                         }
                     };
 
-                    let registry = self.func_registry.as_ref().ok_or_else(|| {
-                        FrankenError::Internal(
-                            "AggStep opcode executed without function registry".to_owned(),
-                        )
-                    })?;
-
                     let arg_count = i32::from(op.p5);
-                    let func = registry
-                        .find_aggregate(func_name, arg_count)
-                        .ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "no such aggregate function: {func_name}/{arg_count}",
-                            ))
+                    let func_pc = pc;
+                    let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
+                        Arc::clone(func)
+                    } else {
+                        let registry = self.func_registry.as_ref().ok_or_else(|| {
+                            FrankenError::Internal(
+                                "AggStep opcode executed without function registry".to_owned(),
+                            )
                         })?;
+                        let func = registry
+                            .find_aggregate(func_name, arg_count)
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "no such aggregate function: {func_name}/{arg_count}",
+                                ))
+                            })?;
+                        self.aggregate_function_cache
+                            .insert(func_pc, Arc::clone(&func));
+                        func
+                    };
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
@@ -8737,20 +9009,27 @@ impl VdbeEngine {
                         }
                     };
 
-                    let registry = self.func_registry.as_ref().ok_or_else(|| {
-                        FrankenError::Internal(
-                            "AggFinal opcode executed without function registry".to_owned(),
-                        )
-                    })?;
-
                     let arg_count = op.p2;
-                    let func = registry
-                        .find_aggregate(func_name, arg_count)
-                        .ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "no such aggregate function: {func_name}/{arg_count}",
-                            ))
+                    let func_pc = pc;
+                    let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
+                        Arc::clone(func)
+                    } else {
+                        let registry = self.func_registry.as_ref().ok_or_else(|| {
+                            FrankenError::Internal(
+                                "AggFinal opcode executed without function registry".to_owned(),
+                            )
                         })?;
+                        let func = registry
+                            .find_aggregate(func_name, arg_count)
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "no such aggregate function: {func_name}/{arg_count}",
+                                ))
+                            })?;
+                        self.aggregate_function_cache
+                            .insert(func_pc, Arc::clone(&func));
+                        func
+                    };
 
                     let accum_reg = op.p1;
                     observe_execution_cancellation(&self.execution_cx)?;
@@ -8879,20 +9158,26 @@ impl VdbeEngine {
                     let first_arg_reg = op.p2;
                     let output_reg = op.p3;
 
-                    let registry = self.func_registry.as_ref().ok_or_else(|| {
-                        FrankenError::Internal(
-                            "Function opcode executed without function registry".to_owned(),
-                        )
-                    })?;
-
+                    let func_pc = pc;
                     #[allow(clippy::cast_possible_wrap)]
-                    let func = registry
-                        .find_scalar_precanonical(func_name, arg_count as i32)
-                        .ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "no such function: {func_name}/{arg_count}",
-                            ))
+                    let func = if let Some(func) = self.scalar_function_cache.get(&func_pc) {
+                        Arc::clone(func)
+                    } else {
+                        let registry = self.func_registry.as_ref().ok_or_else(|| {
+                            FrankenError::Internal(
+                                "Function opcode executed without function registry".to_owned(),
+                            )
                         })?;
+                        let func = registry
+                            .find_scalar_precanonical(func_name, arg_count as i32)
+                            .ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "no such function: {func_name}/{arg_count}",
+                                ))
+                            })?;
+                        self.scalar_function_cache.insert(func_pc, Arc::clone(&func));
+                        func
+                    };
 
                     // Use a direct slice into the register file instead of
                     // allocating a SmallVec via collect_reg_range.  Same pattern as
@@ -8935,6 +9220,44 @@ impl VdbeEngine {
                     fsqlite_func::record_func_call_count_only();
 
                     self.set_reg(output_reg, result);
+                    pc += 1;
+                }
+
+                Opcode::LikeConstFast => {
+                    let kind = SqlLikeFastPathKind::from_opcode_tag(op.p3).ok_or_else(|| {
+                        FrankenError::Internal(
+                            "LikeConstFast opcode has invalid fast-path tag".to_owned(),
+                        )
+                    })?;
+                    let literal = match &op.p4 {
+                        P4::Str(text) => text.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "LikeConstFast opcode missing P4::Str literal".to_owned(),
+                            ));
+                        }
+                    };
+                    let input = self.get_reg(op.p1);
+                    let result = if input.is_null() {
+                        SqliteValue::Null
+                    } else {
+                        let matched = match input {
+                            SqliteValue::Text(text) => {
+                                sql_like_fast_path_matches(kind, literal, text)
+                            }
+                            SqliteValue::Blob(bytes) => {
+                                let text = String::from_utf8_lossy(bytes);
+                                sql_like_fast_path_matches(kind, literal, &text)
+                            }
+                            _ => {
+                                let text = input.to_text();
+                                sql_like_fast_path_matches(kind, literal, &text)
+                            }
+                        };
+                        let final_match = if op.p5 != 0 { !matched } else { matched };
+                        SqliteValue::Integer(i64::from(final_match))
+                    };
+                    self.set_reg(op.p2, result);
                     pc += 1;
                 }
 
@@ -9542,6 +9865,22 @@ impl VdbeEngine {
         let mut results = Vec::with_capacity(self.results.capacity());
         std::mem::swap(&mut results, &mut self.results);
         results
+    }
+
+    /// Take exactly one result row without replacing the backing results buffer.
+    pub fn take_exactly_one_result_row(&mut self) -> ExactResultRowOutcome {
+        match self.results.len() {
+            0 => ExactResultRowOutcome::NoRows,
+            1 => ExactResultRowOutcome::Row(
+                self.results
+                    .pop()
+                    .expect("one-row result set should contain one row"),
+            ),
+            _ => {
+                self.results.clear();
+                ExactResultRowOutcome::MultipleRows
+            }
+        }
     }
 
     #[cfg(test)]
@@ -10656,6 +10995,17 @@ fn coerce_for_comparison<'a>(
     (Cow::Borrowed(lhs), Cow::Borrowed(rhs))
 }
 
+fn values_equal_without_collation(lhs: &SqliteValue, rhs: &SqliteValue) -> bool {
+    if lhs.is_null() || rhs.is_null() {
+        return false;
+    }
+    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (lhs, rhs) {
+        return a == b;
+    }
+    let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, 0);
+    cmp_lhs.partial_cmp(&cmp_rhs) == Some(Ordering::Equal)
+}
+
 /// Try to parse a text string as a numeric value for comparison coercion.
 fn try_coerce_text_to_numeric_cmp(s: &str) -> Option<SqliteValue> {
     let trimmed = s.trim();
@@ -10808,6 +11158,59 @@ fn storage_cursor_no_conflict_prefix_match(
     let prefix_len = cursor.target_vals_buf.len();
     Ok(cursor.cur_vals_buf.len() >= prefix_len
         && cursor.cur_vals_buf[..prefix_len] == cursor.target_vals_buf[..])
+}
+
+fn storage_cursor_current_first_index_key(
+    cursor: &mut StorageCursor,
+    malformed_detail: &'static str,
+) -> Result<SqliteValue> {
+    ensure_storage_cursor_row_cache(cursor, false)?;
+    let Some(col) = cursor.row_decode.column_offset(0).copied() else {
+        return Err(FrankenError::internal(
+            "CountIndexEqRun: index entry missing first key column",
+        ));
+    };
+
+    if cursor.row_decode.cached_value_ready(0) {
+        return cursor
+            .row_decode
+            .cached_value(0)
+            .cloned()
+            .ok_or_else(|| FrankenError::internal(malformed_detail));
+    }
+
+    let hint = cursor.row_decode.cached_value(0);
+    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+        &cursor.payload_buf,
+        &col,
+        hint,
+        false,
+    )
+    .ok_or_else(|| FrankenError::internal(malformed_detail))?;
+    cursor.row_decode.cache_decoded(0, value.clone());
+    Ok(value)
+}
+
+fn storage_cursor_count_equal_first_key_run(
+    _cursor_id: i32,
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+) -> Result<i64> {
+    let mut matched = 0_i64;
+    while !cursor.cursor.eof() {
+        let current_key = storage_cursor_current_first_index_key(
+            cursor,
+            "CountIndexEqRun: malformed index entry record",
+        )?;
+        if !values_equal_without_collation(&current_key, probe_value) {
+            break;
+        }
+        matched = matched.wrapping_add(1);
+        if !cursor.cursor.next(&cursor.cx)? {
+            break;
+        }
+    }
+    Ok(matched)
 }
 
 fn find_conflicting_rowid_in_index(
@@ -11781,6 +12184,61 @@ mod tests {
             engine.result_buffer_capacity(),
             64,
             "taking results should preserve buffer capacity for the next execution"
+        );
+    }
+
+    #[test]
+    fn test_take_exactly_one_result_row_preserves_result_buffer_capacity_for_reuse() {
+        let mut one_row_builder = ProgramBuilder::new();
+        let one_row_end = one_row_builder.emit_label();
+        one_row_builder.emit_jump_to_label(Opcode::Init, 0, 0, one_row_end, P4::None, 0);
+        let one_row_reg = one_row_builder.alloc_reg();
+        one_row_builder.emit_op(Opcode::Integer, 7, one_row_reg, 0, P4::None, 0);
+        one_row_builder.emit_op(Opcode::ResultRow, one_row_reg, 1, 0, P4::None, 0);
+        one_row_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        one_row_builder.resolve_label(one_row_end);
+        let one_row_program = one_row_builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(one_row_program.register_count());
+        let initial_capacity = engine.result_buffer_capacity();
+        let outcome = engine
+            .execute(&one_row_program)
+            .expect("one-row execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            engine.take_exactly_one_result_row(),
+            ExactResultRowOutcome::Row(smallvec::smallvec![SqliteValue::Integer(7)]),
+        );
+        assert_eq!(
+            engine.result_buffer_capacity(),
+            initial_capacity,
+            "exact-one-row drain should preserve the reusable result buffer"
+        );
+
+        let mut many_rows_builder = ProgramBuilder::new();
+        let many_rows_end = many_rows_builder.emit_label();
+        many_rows_builder.emit_jump_to_label(Opcode::Init, 0, 0, many_rows_end, P4::None, 0);
+        let many_rows_reg = many_rows_builder.alloc_reg();
+        many_rows_builder.emit_op(Opcode::Integer, 1, many_rows_reg, 0, P4::None, 0);
+        many_rows_builder.emit_op(Opcode::ResultRow, many_rows_reg, 1, 0, P4::None, 0);
+        many_rows_builder.emit_op(Opcode::Integer, 2, many_rows_reg, 0, P4::None, 0);
+        many_rows_builder.emit_op(Opcode::ResultRow, many_rows_reg, 1, 0, P4::None, 0);
+        many_rows_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        many_rows_builder.resolve_label(many_rows_end);
+        let many_rows_program = many_rows_builder.finish().expect("program should build");
+
+        let outcome = engine
+            .execute(&many_rows_program)
+            .expect("multi-row execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            engine.take_exactly_one_result_row(),
+            ExactResultRowOutcome::MultipleRows,
+        );
+        assert_eq!(
+            engine.result_buffer_capacity(),
+            initial_capacity,
+            "multiple-row drain should also preserve the reusable result buffer"
         );
     }
 
@@ -17392,6 +17850,160 @@ mod tests {
     }
 
     #[test]
+    fn test_count_index_eq_run_consumes_duplicate_run_and_leaves_cursor_on_next_key() {
+        let mut engine = VdbeEngine::new(8);
+        install_duplicate_prefix_index_fixture(&mut engine, 0);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_count = b.alloc_reg();
+        let r_next_key = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_probe, 0, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+        b.emit_op(Opcode::CountIndexEqRun, 0, r_count, r_probe, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNullRow, 0, 0, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_next_key, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_count, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(128), SqliteValue::Integer(8)]],
+            "CountIndexEqRun should count the full duplicate run and leave the cursor on the next key"
+        );
+    }
+
+    #[test]
+    fn test_count_index_eq_run_uses_cursor_row_decode_scratch() {
+        let mut engine = VdbeEngine::new(8);
+        install_duplicate_prefix_index_fixture(&mut engine, 0);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_count = b.alloc_reg();
+        let r_current_key = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_probe, 0, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_current_key, P4::None, 0);
+        b.emit_op(Opcode::CountIndexEqRun, 0, r_count, r_probe, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let _ = execute_program_with_engine(&mut engine, &program);
+
+        let cursor = engine.storage_cursors.get(&0).expect("cursor should still exist");
+
+        assert!(
+            cursor.cur_vals_buf.is_empty(),
+            "CountIndexEqRun should not populate the legacy full-record decode scratch"
+        );
+        assert!(
+            cursor.row_decode.cached_value_ready(0),
+            "CountIndexEqRun should leave the first index key cached in row-decode scratch"
+        );
+    }
+
+    #[test]
+    fn test_like_const_fast_handles_match_not_and_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_input = b.alloc_reg();
+            let r_result = b.alloc_reg();
+
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_input,
+                0,
+                P4::Str("Document 123".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::LikeConstFast,
+                r_input,
+                r_result,
+                SqlLikeFastPathKind::Prefix.opcode_tag(),
+                P4::Str("Document 1".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_input,
+                0,
+                P4::Str("zzz".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::LikeConstFast,
+                r_input,
+                r_result,
+                SqlLikeFastPathKind::Prefix.opcode_tag(),
+                P4::Str("Document 1".to_owned()),
+                1,
+            );
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Null, 0, r_input, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::LikeConstFast,
+                r_input,
+                r_result,
+                SqlLikeFastPathKind::Prefix.opcode_tag(),
+                P4::Str("Document 1".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Null],
+            ],
+            "LikeConstFast should preserve LIKE match, NOT LIKE inversion, and NULL propagation"
+        );
+    }
+
+    #[test]
     fn test_no_conflict_opcode_reset_for_reuse_reseeds_clean_scratch_state() {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()
@@ -18927,6 +19539,37 @@ mod tests {
             .collect();
         assert_eq!(values, vec![1, 2, 3, 4, 5]);
         assert_eq!(sorter.rows_sorted_total, 5);
+    }
+
+    #[test]
+    fn test_sorter_top_n_limit_keeps_only_best_rows() {
+        let mut sorter = SorterCursor::with_collation_registry(
+            1,
+            vec![SortKeyOrder::Asc],
+            Vec::new(),
+            Arc::new(Mutex::new(CollationRegistry::new())),
+            Some(3),
+        );
+
+        for value in [9i64, 1, 7, 3, 2] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
+                .expect("insert should succeed");
+        }
+
+        assert_eq!(
+            sorter.rows.len(),
+            3,
+            "top-N sorter should prune rows during insertion"
+        );
+        sorter.sort().expect("sort should succeed");
+
+        let values: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
+        assert_eq!(values, vec![1, 2, 3]);
     }
 
     // ── bd-2ttd8.1: Pager routing and parity-cert tests ──────────────

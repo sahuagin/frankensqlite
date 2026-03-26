@@ -88,6 +88,48 @@ fn test_fast_path_simple_insert() {
     );
 }
 
+#[test]
+#[ignore = "manual perf probe for wide prepared direct INSERT hot path"]
+fn manual_profile_large_prepared_direct_insert_single_txn_10k() {
+    const ROW_COUNT: i64 = 10_000;
+    const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, first_name TEXT NOT NULL, last_name TEXT NOT NULL, email TEXT NOT NULL, department TEXT NOT NULL, title TEXT NOT NULL, bio TEXT NOT NULL, address TEXT NOT NULL, notes TEXT NOT NULL, score INTEGER NOT NULL)";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('FirstName_' || ?1), ('LastName_' || ?1), ('employee' || ?1 || '@bigcorp.example.com'), ('Engineering_Dept_' || (?1 % 20)), ('Senior Software Engineer Level ' || (?1 % 5)), ('This is the biography for employee number ' || ?1 || '. They have been working at the company for many years and have contributed to numerous projects across multiple teams. Their expertise spans distributed systems, database internals, and performance optimization. They are known for their thorough code reviews and mentorship of junior engineers.'), (?1 || ' Technology Park, Building ' || (?1 % 50) || ', Suite ' || (?1 % 200) || ', Innovation City, CA 94000'), ('Internal notes: Employee ' || ?1 || ' - Performance rating: Exceeds Expectations. Last review date: 2026-01-15. Next review: 2026-07-15. Skills: Rust, C++, SQL, distributed systems, leadership.'), (?1 * 13))";
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute(CREATE_TABLE).unwrap();
+    conn.execute("BEGIN").unwrap();
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+
+    reset_hot_path_profile();
+    let started = std::time::Instant::now();
+    for i in 0..ROW_COUNT {
+        stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(i)])
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let wall = started.elapsed();
+    let profile = hot_path_profile_snapshot();
+
+    eprintln!(
+        concat!(
+            "[manual_large_insert_10k] wall_us={} execute_body_us={} ",
+            "row_build_us={} cursor_setup_us={} serialize_us={} ",
+            "btree_insert_us={} memdb_apply_us={} direct_execs={} fast_execs={}"
+        ),
+        wall.as_micros(),
+        profile.execute_body_time_ns / 1_000,
+        profile.prepared_direct_insert_row_build_time_ns / 1_000,
+        profile.prepared_direct_insert_cursor_setup_time_ns / 1_000,
+        profile.prepared_direct_insert_serialize_time_ns / 1_000,
+        profile.prepared_direct_insert_btree_insert_time_ns / 1_000,
+        profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
+        profile.prepared_direct_insert_executions,
+        profile.parser.fast_path_executions,
+    );
+}
+
 /// T2: Prepared SELECT records path metrics without double-counting.
 #[test]
 fn test_fast_path_simple_select() {

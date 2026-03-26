@@ -584,6 +584,30 @@ fn open_with_flags_read_write_creates_db() {
     assert!(path.exists(), "database file should be created");
 }
 
+#[test]
+fn open_with_flags_read_only_supports_datetime_builtin() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("readonly_datetime.db");
+    let path_str = path.to_str().unwrap();
+
+    let writable = open_with_flags(
+        path_str,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    writable.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    writable.execute("INSERT INTO t VALUES (1)").unwrap();
+    drop(writable);
+
+    let readonly = open_with_flags(path_str, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let row = readonly.query_row("SELECT datetime('now')").unwrap();
+    let value: String = row.get_typed(0).unwrap();
+    assert!(
+        !value.is_empty(),
+        "datetime('now') should return a non-empty timestamp on read-only compat connections"
+    );
+}
+
 // ===========================================================================
 // 9. PARAMS_FROM_ITER
 // ===========================================================================

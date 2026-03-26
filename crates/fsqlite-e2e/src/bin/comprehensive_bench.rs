@@ -292,6 +292,22 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
     }
 }
 
+fn collect_rusqlite_rows<P: rusqlite::Params>(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: P,
+) -> rusqlite::Result<Vec<Vec<rusqlite::types::Value>>> {
+    let col_count = stmt.column_count();
+    stmt.query_map(params, move |row| {
+        let mut values = Vec::with_capacity(col_count);
+        for idx in 0..col_count {
+            let value = row.get(idx).unwrap_or(rusqlite::types::Value::Null);
+            values.push(value);
+        }
+        Ok(values)
+    })?
+    .collect::<Result<Vec<_>, _>>()
+}
+
 struct BenchTask<T> {
     handle: BlockingTaskHandle,
     result_rx: mpsc::Receiver<Result<T, String>>,
@@ -1635,11 +1651,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let mut stmt = cs_conn.prepare("SELECT * FROM bench").unwrap();
             measure(&format!("cs_scan_{count}"), count, || {
-                let _rows: Vec<(i64,)> = stmt
-                    .query_map([], |row| Ok((row.get(0).unwrap(),)))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn.prepare("SELECT * FROM bench").unwrap();
@@ -1665,9 +1677,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT * FROM bench WHERE id = ?1")
                 .unwrap();
             measure(&format!("cs_pk_{count}"), 1, || {
-                let _: (i64,) = stmt
-                    .query_row(rusqlite::params![target_id], |r| Ok((r.get(0).unwrap(),)))
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, rusqlite::params![target_id]).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -1700,13 +1710,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT * FROM bench WHERE id >= ?1 AND id < ?2")
                 .unwrap();
             measure(&format!("cs_range_{count}"), range_size, || {
-                let _rows: Vec<(i64,)> = stmt
-                    .query_map(rusqlite::params![range_start, range_end], |row| {
-                        Ok((row.get(0).unwrap(),))
-                    })
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows =
+                    collect_rusqlite_rows(&mut stmt, rusqlite::params![range_start, range_end])
+                        .unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -1761,11 +1767,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             );
             let mut stmt = cs_conn.prepare(&sql).unwrap();
             measure(&format!("cs_groupby_{count}"), count, || {
-                let _rows: Vec<(i64,)> = stmt
-                    .query_map([], |row| Ok((row.get(0).unwrap(),)))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs = {
@@ -1798,13 +1800,9 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT * FROM bench WHERE name = ?1")
                 .unwrap();
             measure(&format!("cs_idx_{count}"), 1, || {
-                let _rows: Vec<(i64,)> = stmt
-                    .query_map(rusqlite::params![target_name], |row| {
-                        Ok((row.get(0).unwrap(),))
-                    })
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows =
+                    collect_rusqlite_rows(&mut stmt, rusqlite::params![target_name.clone()])
+                        .unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -1832,11 +1830,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT * FROM bench ORDER BY value DESC LIMIT 20")
                 .unwrap();
             measure(&format!("cs_order_{count}"), 20, || {
-                let _rows: Vec<(i64,)> = stmt
-                    .query_map([], |row| Ok((row.get(0).unwrap(),)))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2103,7 +2097,7 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
             let roll = rng.next_usize(100);
             if roll < 40 {
                 let id = (rng.next_usize(seed_rows) + 1) as i64;
-                let _ = select_pt.query_row(rusqlite::params![id], |_| Ok(()));
+                let _ = collect_rusqlite_rows(&mut select_pt, rusqlite::params![id]);
             } else if roll < 60 {
                 let start = (rng.next_usize(seed_rows.saturating_sub(50)) + 1) as i64;
                 let _: i64 = select_range
@@ -2293,11 +2287,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id").unwrap();
             measure(&format!("cs_inner_join_{count}"), count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2318,11 +2308,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id").unwrap();
             measure(&format!("cs_left_join_{count}"), count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2343,11 +2329,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         let cs = {
             let mut stmt = cs_conn.prepare("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name").unwrap();
             measure(&format!("cs_join_agg_{count}"), customer_count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2376,11 +2358,7 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
             );
             let mut stmt = cs_conn.prepare(&sql).unwrap();
             measure(&format!("cs_join_having_{count}"), customer_count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs = {
@@ -2488,11 +2466,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                 "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100"
             ).unwrap();
             measure(&format!("cs_scalar_sub_{count}"), 100, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2576,11 +2550,7 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
                  SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
             ).unwrap();
             measure(&format!("cs_cte_{count}"), count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2759,11 +2729,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs")
                 .unwrap();
             measure(&format!("cs_str_funcs_{count}"), count, || {
-                let _: Vec<i64> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn
@@ -2790,11 +2756,7 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                 .prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag")
                 .unwrap();
             measure(&format!("cs_group_concat_{count}"), count, || {
-                let _: Vec<String> = stmt
-                    .query_map([], |r| r.get(0))
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let _rows = collect_rusqlite_rows(&mut stmt, []).unwrap();
             })
         };
         let fs_stmt = fs_conn

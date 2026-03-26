@@ -1139,6 +1139,7 @@ dependencies = [
  "bitflags 2.11.0",
  "blake3",
  "fsqlite-error",
+ "memchr",
  "parking_lot",
  "proptest",
  "serde",

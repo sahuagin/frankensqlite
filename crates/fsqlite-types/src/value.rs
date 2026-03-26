@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::sync::Arc;
 
+use memchr::{memchr, memchr2};
+
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 
 /// Scan the longest SQLite numeric prefix from a byte slice.
@@ -643,14 +645,8 @@ pub fn unique_key_duplicates(a: &[SqliteValue], b: &[SqliteValue]) -> bool {
 /// - Case-insensitive for ASCII A-Z only (no Unicode case folding without ICU).
 /// - `escape` optionally specifies the escape character for literal `%`/`_`.
 pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
-    if let Some(fast_path) = classify_like_fast_path(pattern, escape) {
-        return match fast_path {
-            LikeFastPath::MatchAll => true,
-            LikeFastPath::Exact(literal) => ascii_ci_eq_bytes(literal.as_bytes(), text.as_bytes()),
-            LikeFastPath::Prefix(prefix) => ascii_ci_starts_with(text, prefix),
-            LikeFastPath::Suffix(suffix) => ascii_ci_ends_with(text, suffix),
-            LikeFastPath::Contains(needle) => ascii_ci_contains(text, needle),
-        };
+    if let Some((kind, literal)) = classify_sql_like_fast_path(pattern, escape) {
+        return sql_like_fast_path_matches(kind, literal, text);
     }
 
     sql_like_inner(
@@ -663,23 +659,63 @@ pub fn sql_like(pattern: &str, text: &str, escape: Option<char>) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LikeFastPath<'a> {
+pub enum SqlLikeFastPathKind {
     MatchAll,
-    Exact(&'a str),
-    Prefix(&'a str),
-    Suffix(&'a str),
-    Contains(&'a str),
+    Exact,
+    Prefix,
+    Suffix,
+    Contains,
 }
 
-fn classify_like_fast_path(pattern: &str, escape: Option<char>) -> Option<LikeFastPath<'_>> {
+impl SqlLikeFastPathKind {
+    #[must_use]
+    pub const fn opcode_tag(self) -> i32 {
+        match self {
+            Self::MatchAll => 0,
+            Self::Exact => 1,
+            Self::Prefix => 2,
+            Self::Suffix => 3,
+            Self::Contains => 4,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_opcode_tag(tag: i32) -> Option<Self> {
+        match tag {
+            0 => Some(Self::MatchAll),
+            1 => Some(Self::Exact),
+            2 => Some(Self::Prefix),
+            3 => Some(Self::Suffix),
+            4 => Some(Self::Contains),
+            _ => None,
+        }
+    }
+}
+
+#[must_use]
+pub fn sql_like_fast_path_matches(kind: SqlLikeFastPathKind, literal: &str, text: &str) -> bool {
+    match kind {
+        SqlLikeFastPathKind::MatchAll => true,
+        SqlLikeFastPathKind::Exact => ascii_ci_eq_bytes(literal.as_bytes(), text.as_bytes()),
+        SqlLikeFastPathKind::Prefix => ascii_ci_starts_with(text, literal),
+        SqlLikeFastPathKind::Suffix => ascii_ci_ends_with(text, literal),
+        SqlLikeFastPathKind::Contains => ascii_ci_contains(text, literal),
+    }
+}
+
+#[must_use]
+pub fn classify_sql_like_fast_path(
+    pattern: &str,
+    escape: Option<char>,
+) -> Option<(SqlLikeFastPathKind, &str)> {
     if escape.is_some() || pattern.contains('_') {
         return None;
     }
     if !pattern.contains('%') {
-        return Some(LikeFastPath::Exact(pattern));
+        return Some((SqlLikeFastPathKind::Exact, pattern));
     }
     if pattern.chars().all(|ch| ch == '%') {
-        return Some(LikeFastPath::MatchAll);
+        return Some((SqlLikeFastPathKind::MatchAll, ""));
     }
 
     let trimmed_start = pattern.trim_start_matches('%');
@@ -687,21 +723,21 @@ fn classify_like_fast_path(pattern: &str, escape: Option<char>) -> Option<LikeFa
     if pattern.starts_with('%') && pattern.ends_with('%') {
         let core = trimmed_start.trim_end_matches('%');
         if core.is_empty() {
-            return Some(LikeFastPath::MatchAll);
+            return Some((SqlLikeFastPathKind::MatchAll, ""));
         }
         if !core.contains('%') {
-            return Some(LikeFastPath::Contains(core));
+            return Some((SqlLikeFastPathKind::Contains, core));
         }
     }
     if !pattern.starts_with('%') && trimmed_end.len() < pattern.len() && !trimmed_end.contains('%')
     {
-        return Some(LikeFastPath::Prefix(trimmed_end));
+        return Some((SqlLikeFastPathKind::Prefix, trimmed_end));
     }
     if !pattern.ends_with('%')
         && trimmed_start.len() < pattern.len()
         && !trimmed_start.contains('%')
     {
-        return Some(LikeFastPath::Suffix(trimmed_start));
+        return Some((SqlLikeFastPathKind::Suffix, trimmed_start));
     }
     None
 }
@@ -827,15 +863,24 @@ fn ascii_ci_contains(text: &str, needle: &str) -> bool {
     }
 
     let max_start = text.len() - needle.len();
-    let first = ascii_fold_byte(needle[0]);
+    let first = needle[0];
+    let first_folded = ascii_fold_byte(first);
+    let first_alt = if first.is_ascii_alphabetic() {
+        first_folded.to_ascii_uppercase()
+    } else {
+        first_folded
+    };
     let mut start = 0;
     while start <= max_start {
-        while start <= max_start && ascii_fold_byte(text[start]) != first {
-            start += 1;
-        }
-        if start > max_start {
+        let rel = if first_folded == first_alt {
+            memchr(first_folded, &text[start..=max_start])
+        } else {
+            memchr2(first_folded, first_alt, &text[start..=max_start])
+        };
+        let Some(rel) = rel else {
             break;
-        }
+        };
+        start += rel;
         if ascii_ci_eq_bytes(&text[start + 1..start + needle.len()], &needle[1..]) {
             return true;
         }

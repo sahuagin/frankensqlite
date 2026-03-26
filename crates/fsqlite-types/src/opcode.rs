@@ -493,14 +493,18 @@ pub enum Opcode {
     /// The cursor becomes read-only; DML/DDL through it returns an error.
     SetSnapshot = 190,
 
-    // === Noop (always last) ===
+    // === Noop & FrankenSQLite extensions ===
     /// No operation.
     Noop = 191,
+    /// Evaluate a literal-pattern LIKE fast path directly against a register.
+    LikeConstFast = 192,
+    /// Count a run of equal first-column index keys, advancing the cursor.
+    CountIndexEqRun = 193,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 192;
+    pub const COUNT: usize = 194;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -697,13 +701,15 @@ impl Opcode {
             Self::ReleaseReg => "ReleaseReg",
             Self::SetSnapshot => "SetSnapshot",
             Self::Noop => "Noop",
+            Self::LikeConstFast => "LikeConstFast",
+            Self::CountIndexEqRun => "CountIndexEqRun",
         }
     }
 
     /// Try to convert a u8 to an Opcode.
     #[allow(clippy::too_many_lines)]
     pub const fn from_byte(byte: u8) -> Option<Self> {
-        if byte == 0 || byte > 191 {
+        if byte == 0 || byte > 193 {
             return None;
         }
         // SAFETY: All values 1..=191 are valid discriminants.
@@ -903,6 +909,8 @@ impl Opcode {
             189 => Some(Self::ReleaseReg),
             190 => Some(Self::SetSnapshot),
             191 => Some(Self::Noop),
+            192 => Some(Self::LikeConstFast),
+            193 => Some(Self::CountIndexEqRun),
             _ => None,
         }
     }

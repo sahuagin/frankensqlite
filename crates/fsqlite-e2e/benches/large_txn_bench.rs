@@ -15,6 +15,7 @@ use std::time::Duration;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::value::SqliteValue;
 
+const ROW_COUNT_10K: u64 = 10_000;
 const ROW_COUNT_100K: u64 = 100_000;
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
@@ -44,6 +45,85 @@ const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEX
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
+}
+
+// ─── 10K single-transaction INSERT ──────────────────────────────────────
+
+fn bench_large_txn_10k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("large_txn_prepared_insert_10k");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(20));
+    group.throughput(Throughput::Elements(ROW_COUNT_10K));
+
+    group.bench_function("csqlite", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute_batch("BEGIN").unwrap();
+                let mut stmt = conn
+                    .prepare(
+                        "INSERT INTO bench VALUES (\
+                             ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
+                             ('2026-01-' || ((?1 % 28) + 1))\
+                         )",
+                    )
+                    .unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 0..ROW_COUNT_10K as i64 {
+                    stmt.execute(rusqlite::params![i]).unwrap();
+                }
+                conn.execute_batch("COMMIT").unwrap();
+
+                let mut count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+                let count: i64 = count_stmt.query_row([], |r| r.get(0)).unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                let expected = ROW_COUNT_10K as i64;
+                assert_eq!(count, expected);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(CREATE_TABLE).unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                let stmt = conn
+                    .prepare(
+                        "INSERT INTO bench VALUES (\
+                             ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
+                             ('2026-01-' || ((?1 % 28) + 1))\
+                         )",
+                    )
+                    .unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 0..ROW_COUNT_10K as i64 {
+                    conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
+                        .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+
+                let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                let expected = ROW_COUNT_10K as i64;
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(expected));
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
 }
 
 // ─── 100K single-transaction INSERT ─────────────────────────────────────
@@ -209,6 +289,6 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
 criterion_group!(
     name = large_txn;
     config = criterion_config();
-    targets = bench_large_txn_100k, bench_large_txn_100k_batched
+    targets = bench_large_txn_10k, bench_large_txn_100k, bench_large_txn_100k_batched
 );
 criterion_main!(large_txn);

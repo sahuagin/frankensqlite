@@ -12,6 +12,9 @@
 //! 3. Full-table aggregate (`SELECT COUNT(*)`)
 //! 4. GROUP BY aggregate
 //! 5. ORDER BY + LIMIT
+//! 6. Correlated `EXISTS` subquery
+//! 7. `IN (SELECT ...)` subquery
+//! 8. Recursive CTE
 
 use std::time::Duration;
 
@@ -19,6 +22,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::value::SqliteValue;
 
 const SEED_ROWS: i64 = 1000;
+const COUNT_SEED_ROWS: i64 = 10_000;
+const SUBQUERY_ROWS: i64 = 10_000;
+const RECURSIVE_CTE_LIMIT: i64 = 1_000;
+const RECURSIVE_CTE_SUM: i64 = 500_500;
 
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
@@ -45,7 +52,7 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
 
 // ─── Setup helpers ──────────────────────────────────────────────────────
 
-fn setup_csqlite() -> rusqlite::Connection {
+fn setup_csqlite_with_rows(row_count: i64) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     apply_pragmas_csqlite(&conn);
     conn.execute_batch(
@@ -64,7 +71,7 @@ fn setup_csqlite() -> rusqlite::Connection {
                 "INSERT INTO bench VALUES (?1, ('name_' || ?1), ('cat_' || (?1 % 10)), (?1 * 7))",
             )
             .unwrap();
-        for i in 1..=SEED_ROWS {
+        for i in 1..=row_count {
             stmt.execute(rusqlite::params![i]).unwrap();
         }
     }
@@ -72,7 +79,11 @@ fn setup_csqlite() -> rusqlite::Connection {
     conn
 }
 
-fn setup_fsqlite() -> fsqlite::Connection {
+fn setup_csqlite() -> rusqlite::Connection {
+    setup_csqlite_with_rows(SEED_ROWS)
+}
+
+fn setup_fsqlite_with_rows(row_count: i64) -> fsqlite::Connection {
     let conn = fsqlite::Connection::open(":memory:").unwrap();
     apply_pragmas_fsqlite(&conn);
     conn.execute(
@@ -85,7 +96,7 @@ fn setup_fsqlite() -> fsqlite::Connection {
     )
     .unwrap();
     conn.execute("BEGIN").unwrap();
-    for i in 1..=SEED_ROWS {
+    for i in 1..=row_count {
         conn.execute(&format!(
             "INSERT INTO bench VALUES ({i}, 'name_{i}', 'cat_{}', {})",
             i % 10,
@@ -94,6 +105,73 @@ fn setup_fsqlite() -> fsqlite::Connection {
         .unwrap();
     }
     conn.execute("COMMIT").unwrap();
+    conn
+}
+
+fn setup_fsqlite() -> fsqlite::Connection {
+    setup_fsqlite_with_rows(SEED_ROWS)
+}
+
+fn setup_csqlite_subquery() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let category_count = (SUBQUERY_ROWS / 20).max(5);
+    apply_pragmas_csqlite(&conn);
+    conn.execute_batch(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER);\
+         CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut category_stmt = conn
+            .prepare("INSERT INTO categories VALUES (?1, ('cat_' || ?1))")
+            .unwrap();
+        for i in 1..=category_count {
+            category_stmt.execute(rusqlite::params![i]).unwrap();
+        }
+        let mut product_stmt = conn
+            .prepare(
+                "INSERT INTO products VALUES (?1, ('prod_' || ?1), (?1 * 3.14), ((?1 % ?2) + 1))",
+            )
+            .unwrap();
+        for i in 1..=SUBQUERY_ROWS {
+            product_stmt
+                .execute(rusqlite::params![i, category_count])
+                .unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    conn.execute_batch("CREATE INDEX idx_prod_cat ON products(category_id);")
+        .unwrap();
+    conn
+}
+
+fn setup_fsqlite_subquery() -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    let category_count = (SUBQUERY_ROWS / 20).max(5);
+    apply_pragmas_fsqlite(&conn);
+    conn.execute(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=category_count {
+        conn.execute(&format!("INSERT INTO categories VALUES ({i}, 'cat_{i}')"))
+            .unwrap();
+    }
+    for i in 1..=SUBQUERY_ROWS {
+        let category_id = (i % category_count) + 1;
+        let price = i as f64 * 3.14;
+        conn.execute(&format!(
+            "INSERT INTO products VALUES ({i}, 'prod_{i}', {price}, {category_id})"
+        ))
+        .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("CREATE INDEX idx_prod_cat ON products(category_id)")
+        .unwrap();
     conn
 }
 
@@ -213,6 +291,33 @@ fn bench_full_count(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_full_count_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_count_star_10000");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(15));
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite_with_rows(COUNT_SEED_ROWS);
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+        b.iter(|| {
+            let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            assert_eq!(count, COUNT_SEED_ROWS);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite_with_rows(COUNT_SEED_ROWS);
+        let stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(COUNT_SEED_ROWS));
+        });
+    });
+
+    group.finish();
+}
+
 // ─── 4. GROUP BY aggregate ──────────────────────────────────────────────
 
 fn bench_group_by(c: &mut Criterion) {
@@ -293,6 +398,99 @@ fn bench_order_limit(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_exists_subquery(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_exists_subquery_count");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(1));
+
+    let category_count = (SUBQUERY_ROWS / 20).max(5);
+    let half = category_count / 2;
+    let expected_count = SUBQUERY_ROWS / 2;
+    let sql = format!(
+        "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
+    );
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite_subquery();
+        let mut stmt = conn.prepare(&sql).unwrap();
+        b.iter(|| {
+            let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            assert_eq!(count, expected_count);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite_subquery();
+        let stmt = conn.prepare(&sql).unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_in_subquery(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_in_subquery_count");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(1));
+
+    let expected_count = 100_i64;
+    let sql = "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite_subquery();
+        let mut stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            assert_eq!(count, expected_count);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite_subquery();
+        let stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_recursive_cte(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_recursive_cte_sum_1000");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(RECURSIVE_CTE_LIMIT as u64));
+
+    let sql = "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt";
+
+    group.bench_function("csqlite", |b| {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let sum: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            assert_eq!(sum, RECURSIVE_CTE_SUM);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        let stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(RECURSIVE_CTE_SUM));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = read_heavy;
     config = criterion_config();
@@ -300,7 +498,11 @@ criterion_group!(
         bench_point_lookup,
         bench_range_scan,
         bench_full_count,
+        bench_full_count_large,
         bench_group_by,
-        bench_order_limit
+        bench_order_limit,
+        bench_exists_subquery,
+        bench_in_subquery,
+        bench_recursive_cte
 );
 criterion_main!(read_heavy);

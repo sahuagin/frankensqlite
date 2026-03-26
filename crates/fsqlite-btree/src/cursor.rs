@@ -2489,6 +2489,33 @@ impl<P: PageWriter> BtCursor<P> {
             cursor.table_insert_from_current_position(cx, rowid, data)
         })
     }
+
+    /// Fast insert path for callers that expect a monotonically increasing
+    /// rowid stream and want to try the rightmost-leaf append path before
+    /// falling back to a full seek.
+    #[doc(hidden)]
+    pub fn table_insert_rightmost_hint(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            let has_last = cursor.last(cx)?;
+            if has_last {
+                let last_rowid = cursor.rowid(cx)?;
+                if rowid <= last_rowid {
+                    let seek = cursor.table_seek_for_insert(cx, rowid)?;
+                    if seek.is_found() {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                    return cursor.table_insert_from_current_position(cx, rowid, data);
+                }
+                cursor.at_eof = true;
+            }
+            cursor.table_insert_from_current_position(cx, rowid, data)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4711,6 +4738,40 @@ mod tests {
     #[test]
     fn test_btree_insert_delete_sorted_order() {
         test_btree_insert_delete_5k();
+    }
+
+    #[test]
+    fn test_table_insert_rightmost_hint_appends_and_falls_back_for_midstream_key() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+        cursor
+            .table_insert_rightmost_hint(&cx, 3, payload_for_rowid(3).as_slice())
+            .unwrap();
+        cursor
+            .table_insert_rightmost_hint(&cx, 2, payload_for_rowid(2).as_slice())
+            .unwrap();
+
+        for rowid in 4..=256_i64 {
+            let payload = payload_for_rowid(rowid);
+            cursor
+                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .unwrap();
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=256_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
     }
 
     #[test]

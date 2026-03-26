@@ -4722,6 +4722,12 @@ mod tests {
             prepared_table_dml_affected_only_runs: 1,
             autoincrement_sequence_fast_path_updates: 1,
             autoincrement_sequence_scan_refreshes: 0,
+            direct_indexed_equality_query_hits: 0,
+            direct_rowid_range_query_hits: 0,
+            direct_count_star_query_row_hits: 0,
+            direct_rowid_lookup_query_row_hits: 0,
+            direct_count_star_rowid_range_query_row_hits: 0,
+            direct_count_indexed_rowid_probe_query_row_hits: 0,
             btree_copy_kernels: BtreeCopyProfileSnapshot {
                 local_payload_copy_calls: 2,
                 local_payload_copy_bytes: 96,
