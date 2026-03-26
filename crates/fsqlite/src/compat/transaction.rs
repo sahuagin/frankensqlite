@@ -154,9 +154,7 @@ impl<'a> Transaction<'a> {
 
     /// Get `last_insert_rowid()` within this transaction.
     pub fn last_insert_rowid(&self) -> Result<i64, FrankenError> {
-        let row = self.conn.query_row("SELECT last_insert_rowid();")?;
-        use super::RowExt;
-        row.get_typed::<i64>(0)
+        Ok(self.conn.last_insert_rowid())
     }
 }
 

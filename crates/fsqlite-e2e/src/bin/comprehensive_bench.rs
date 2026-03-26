@@ -127,48 +127,6 @@ impl RecordSize {
             }
         }
     }
-
-    fn insert_sql_fsqlite(self, i: i64) -> String {
-        match self {
-            Self::Tiny => format!("INSERT INTO bench VALUES ({i})"),
-            Self::Small => {
-                format!(
-                    "INSERT INTO bench VALUES ({i}, 'user_{i}', {})",
-                    f64::from(i as i32) * 0.137
-                )
-            }
-            Self::Medium => format!(
-                "INSERT INTO bench VALUES (\
-                    {i}, \
-                    'Alice_{i}', \
-                    'Smith_{i}', \
-                    'user{i}@example.com', \
-                    'Bio text for user number {i}. This is a medium-length description that adds some realistic payload to each row in the database.', \
-                    {}\
-                )",
-                i * 7,
-            ),
-            Self::Large => format!(
-                "INSERT INTO bench VALUES (\
-                    {i}, \
-                    'FirstName_{i}', \
-                    'LastName_{i}', \
-                    'employee{i}@bigcorp.example.com', \
-                    'Engineering_Dept_{}', \
-                    'Senior Software Engineer Level {}', \
-                    'This is the biography for employee number {i}. They have been working at the company for many years and have contributed to numerous projects across multiple teams. Their expertise spans distributed systems, database internals, and performance optimization. They are known for their thorough code reviews and mentorship of junior engineers.', \
-                    '{i} Technology Park, Building {}, Suite {}, Innovation City, CA 94000', \
-                    'Internal notes: Employee {i} - Performance rating: Exceeds Expectations. Last review date: 2026-01-15. Next review: 2026-07-15. Skills: Rust, C++, SQL, distributed systems, leadership.', \
-                    {}\
-                )",
-                i % 20,
-                i % 5,
-                i % 50,
-                i % 200,
-                i * 13,
-            ),
-        }
-    }
 }
 
 // ─── Measurement infrastructure ────────────────────────────────────────
@@ -1206,9 +1164,11 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                     let conn = fsqlite::Connection::open(":memory:").unwrap();
                     apply_pragmas_fsqlite(&conn);
                     conn.execute(create_sql).unwrap();
+                    let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                     #[allow(clippy::cast_possible_wrap)]
                     for i in 0..count as i64 {
-                        conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                            .unwrap();
                     }
                 })
             };
@@ -1252,13 +1212,13 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
                 conn.execute(create_sql).unwrap();
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 let num_batches = count.div_ceil(batch_size);
                 #[allow(clippy::cast_possible_wrap)]
                 for batch in 0..num_batches {
                     conn.execute("BEGIN").unwrap();
                     let start = (batch * batch_size) as i64;
                     let end = ((batch + 1) * batch_size).min(count) as i64;
-                    let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                     for i in start..end {
                         stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
                             .unwrap();
@@ -2129,14 +2089,15 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
         apply_pragmas_fsqlite(&conn);
         conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
             .unwrap();
+        let seed_insert = conn
+            .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         #[allow(clippy::cast_possible_wrap)]
         for i in 1..=seed_rows as i64 {
-            conn.execute(&format!(
-                "INSERT INTO bench VALUES ({i}, 'name_{i}', {})",
-                i * 7,
-            ))
-            .unwrap();
+            seed_insert
+                .execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+                .unwrap();
         }
         conn.execute("COMMIT").unwrap();
 

@@ -66,14 +66,18 @@ fn delete_reinsert_freeblock_accounting() {
     let path = dir.path().join("delete_reinsert.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_val ON t(val)").unwrap();
         for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
         }
-        conn.execute("DELETE FROM t WHERE id BETWEEN 20 AND 60").unwrap();
+        conn.execute("DELETE FROM t WHERE id BETWEEN 20 AND 60")
+            .unwrap();
         for i in 200..250 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'new_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'new_{i}')"))
+                .unwrap();
         }
         // Drop without close
     }
@@ -87,14 +91,17 @@ fn delete_all_reinsert_freelist() {
     let path = dir.path().join("delete_all.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_val ON t(val)").unwrap();
         for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
         }
         conn.execute("DELETE FROM t").unwrap();
         for i in 200..250 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'new_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'new_{i}')"))
+                .unwrap();
         }
     }
     assert_stock_sqlite_integrity(&path, "delete_all_reinsert");
@@ -107,7 +114,8 @@ fn multiple_indexes_balance() {
     let path = dir.path().join("multi_idx.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL, d INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c REAL, d INTEGER)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_b ON t(b)").unwrap();
         conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
         conn.execute("CREATE INDEX idx_d ON t(d)").unwrap();
@@ -130,12 +138,14 @@ fn overflow_pages() {
     let path = dir.path().join("overflow.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data BLOB)")
+            .unwrap();
         for i in 0..10 {
             let blob_hex: String = (0..8192)
                 .map(|j| format!("{:02x}", ((i * 7 + j) % 256) as u8))
                 .collect();
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, X'{blob_hex}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, X'{blob_hex}')"))
+                .unwrap();
         }
     }
     assert_stock_sqlite_integrity(&path, "overflow_pages");
@@ -148,10 +158,12 @@ fn updates_with_index() {
     let path = dir.path().join("updates.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_val ON t(val)").unwrap();
         for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'original_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'original_{i}')"))
+                .unwrap();
         }
         for i in (0..100).step_by(2) {
             conn.execute(&format!(
@@ -170,7 +182,8 @@ fn large_table_btree_splitting() {
     let path = dir.path().join("large.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c INTEGER)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_a ON t(a)").unwrap();
         conn.execute("CREATE INDEX idx_c ON t(c)").unwrap();
         for i in 0..2000 {
@@ -198,7 +211,8 @@ fn composite_primary_key() {
         .unwrap();
         for i in 0..30 {
             for j in 0..5 {
-                conn.execute(&format!("INSERT INTO edges VALUES ({i}, {j}, {i}.{j})")).unwrap();
+                conn.execute(&format!("INSERT INTO edges VALUES ({i}, {j}, {i}.{j})"))
+                    .unwrap();
             }
         }
     }
@@ -212,17 +226,16 @@ fn unique_constraint_delete_reinsert() {
     let path = dir.path().join("unique.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute(
-            "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
+            .unwrap();
         for i in 0..50 {
             conn.execute(&format!(
                 "INSERT INTO users VALUES ({i}, 'user{i}@example.com', 'User {i}')"
             ))
             .unwrap();
         }
-        conn.execute("DELETE FROM users WHERE id BETWEEN 20 AND 30").unwrap();
+        conn.execute("DELETE FROM users WHERE id BETWEEN 20 AND 30")
+            .unwrap();
         for i in 100..111 {
             conn.execute(&format!(
                 "INSERT INTO users VALUES ({i}, 'new{i}@example.com', 'New User {i}')"
@@ -240,16 +253,19 @@ fn transaction_rollback_then_commit() {
     let path = dir.path().join("txn.db");
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         for i in 0..20 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
         }
         conn.execute("BEGIN").unwrap();
         conn.execute("DELETE FROM t WHERE id > 10").unwrap();
         conn.execute("ROLLBACK").unwrap();
         conn.execute("BEGIN").unwrap();
         for i in 20..40 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
         }
         conn.execute("COMMIT").unwrap();
     }
@@ -264,10 +280,12 @@ fn wal_mode_checkpoint() {
     {
         let conn = fsqlite::Connection::open(path.to_str().unwrap()).unwrap();
         let _ = conn.execute("PRAGMA journal_mode=WAL");
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
         conn.execute("CREATE INDEX idx_val ON t(val)").unwrap();
         for i in 0..100 {
-            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')")).unwrap();
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'row_{i}')"))
+                .unwrap();
         }
     }
     assert_stock_sqlite_integrity(&path, "wal_mode");
