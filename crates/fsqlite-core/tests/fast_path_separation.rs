@@ -63,6 +63,30 @@ fn fast_slow_delta(
     )
 }
 
+fn assert_count_star_sum_row(
+    row: &fsqlite_core::connection::Row,
+    expected_count: i64,
+    expected_sum: Option<fsqlite_types::SqliteValue>,
+) {
+    assert_eq!(
+        row.get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(expected_count)),
+        "COUNT(*) should match the expected row count"
+    );
+    match expected_sum {
+        Some(expected_sum) => assert_eq!(
+            row.get(1),
+            Some(&expected_sum),
+            "SUM() should match the expected non-NULL total"
+        ),
+        None => assert_eq!(
+            row.get(1),
+            Some(&fsqlite_types::SqliteValue::Null),
+            "SUM() should be NULL when no non-NULL inputs contribute"
+        ),
+    }
+}
+
 /// T1: Prepared INSERT uses fast path.
 #[test]
 fn test_fast_path_simple_insert() {
@@ -1050,5 +1074,155 @@ fn future_query_row_rowid_range_uses_direct_counter() {
             fsqlite_error::FrankenError::QueryReturnedMultipleRows
         ),
         "multi-row rowid range should surface QueryReturnedMultipleRows"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_basic_correctness() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 3, Some(fsqlite_types::SqliteValue::Integer(60)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "prepared COUNT(*)+SUM() should stay on the fast prepared path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "prepared COUNT(*)+SUM() should not need slow-path execution"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_empty_table_returns_zero_and_null() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 0, None);
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "empty-table COUNT(*)+SUM() should still use the prepared fast path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "empty-table COUNT(*)+SUM() should not fall back to the slow path"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_skips_nulls_but_counts_rows() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, NULL), (2, 10), (3, NULL), (4, 5)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 4, Some(fsqlite_types::SqliteValue::Integer(15)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() with NULL values should stay on the prepared fast path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "COUNT(*)+SUM() with NULL values should not fall back to the slow path"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_sees_post_insert_visibility() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let baseline = stmt.query_row().unwrap();
+    assert_count_star_sum_row(&baseline, 2, Some(fsqlite_types::SqliteValue::Integer(30)));
+
+    conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    reset_hot_path_profile();
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 3, Some(fsqlite_types::SqliteValue::Integer(60)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() should see inserted rows without leaving the prepared fast path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "post-insert COUNT(*)+SUM() should not fall back to the slow path"
+    );
+}
+
+#[test]
+fn test_fast_path_count_star_sum_sees_post_delete_visibility() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, score INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    let stmt = conn.prepare("SELECT COUNT(*), SUM(score) FROM t").unwrap();
+
+    let baseline = stmt.query_row().unwrap();
+    assert_count_star_sum_row(&baseline, 3, Some(fsqlite_types::SqliteValue::Integer(60)));
+
+    conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+
+    reset_hot_path_profile();
+    let before = hot_path_profile_snapshot();
+    let row = stmt.query_row().unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_count_star_sum_row(&row, 2, Some(fsqlite_types::SqliteValue::Integer(40)));
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "COUNT(*)+SUM() should see deleted rows without leaving the prepared fast path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "post-delete COUNT(*)+SUM() should not fall back to the slow path"
     );
 }
