@@ -96,8 +96,8 @@ impl ConnectionExt for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compat::{OpenFlags, open_with_flags};
     use crate::compat::RowExt;
+    use crate::compat::{OpenFlags, open_with_flags};
     use rusqlite::params;
 
     #[test]
@@ -214,10 +214,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![
-                (1, 0, "first".to_owned()),
-                (2, 1, "second".to_owned()),
-            ],
+            vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
             "indexed equality scan should stay within the conversation_id=1 duplicate run",
         );
 
@@ -239,10 +236,7 @@ mod tests {
 
         assert_eq!(
             readonly_rows,
-            vec![
-                (1, 0, "first".to_owned()),
-                (2, 1, "second".to_owned()),
-            ],
+            vec![(1, 0, "first".to_owned()), (2, 1, "second".to_owned()),],
             "readonly indexed equality scan should stay within the conversation_id=1 duplicate run",
         );
     }
@@ -261,11 +255,9 @@ mod tests {
         let stmt = conn.prepare(query).expect("prepare real cass query");
         eprintln!("real_cass_query_explain:\n{}", stmt.explain());
         let rows: Vec<(i64, i64, String)> = conn
-            .query_map_collect(
-                query,
-                &[ParamValue::from(1_i64)],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
-            )
+            .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+            })
             .expect("query real cass db");
 
         assert_eq!(
@@ -275,5 +267,30 @@ mod tests {
         );
         assert_eq!(rows[0].0, 1);
         assert_eq!(rows[1].0, 2);
+    }
+
+    #[test]
+    #[ignore = "machine-local cass repro; run with FSQLITE_REAL_DB=/path/to/agent_search.db"]
+    fn query_rowid_lookup_real_cass_db_repro() {
+        let db_path = std::env::var("FSQLITE_REAL_DB").expect("FSQLITE_REAL_DB must be set");
+        let conn = open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open readonly real cass db");
+        let query = "SELECT id, conversation_id, idx, content
+                 FROM messages
+                 WHERE id = ?1";
+        let stmt = conn.prepare(query).expect("prepare real cass rowid query");
+        eprintln!("real_cass_rowid_query_explain:\n{}", stmt.explain());
+        let rows: Vec<(i64, i64, i64, String)> = conn
+            .query_map_collect(query, &[ParamValue::from(1_i64)], |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            })
+            .expect("query real cass db by rowid");
+
+        assert_eq!(rows, vec![(1, 1, 0, "hello".to_owned())]);
     }
 }

@@ -2243,15 +2243,15 @@ fn codegen_select_index_equality_scan(
         0,
     );
 
-        let idx_loop_top = b.current_addr();
-        b.emit_jump_to_label(
-            Opcode::IdxGT,
-            idx_cursor,
-            probe_record_reg,
-            duplicate_run_done,
-            P4::None,
-            1,
-        );
+    let idx_loop_top = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::IdxGT,
+        idx_cursor,
+        probe_record_reg,
+        duplicate_run_done,
+        P4::None,
+        1,
+    );
 
     let rowid_reg = b.alloc_reg();
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -3992,7 +3992,11 @@ fn codegen_select_index_ordered_scan(
     b.resolve_label(skip_row);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (loop_start + 1) as i32;
+    let loop_body = if use_bounded_prefix_scan {
+        loop_start as i32
+    } else {
+        (loop_start + 1) as i32
+    };
     if index_plan.descending {
         b.emit_op(Opcode::Prev, index_cursor, loop_body, 0, P4::None, 0);
     } else {
@@ -12456,26 +12460,6 @@ fn extract_index_equality_prefix_exprs<'a>(
     prefix_exprs
 }
 
-fn index_key_cmp_p5(table: &TableSchema, index: &IndexSchema, key_pos: usize) -> u16 {
-    let affinity = index
-        .columns
-        .get(key_pos)
-        .and_then(|column_name| table.column_index(column_name))
-        .map_or(b'A', |idx| {
-            table.columns[idx]
-                .type_name
-                .as_deref()
-                .map_or(table.columns[idx].affinity as u8, column_type_to_affinity)
-        });
-    0x80 | u16::from(affinity)
-}
-
-fn index_key_collation_p4(index: &IndexSchema, key_pos: usize) -> P4 {
-    index
-        .key_term_collation(key_pos)
-        .map_or(P4::None, |collation| P4::Collation(collation.to_owned()))
-}
-
 fn resolve_covering_output_sources(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -19727,6 +19711,91 @@ mod tests {
             int64.p2,
             make_record.p1 + 2,
             "rowid lower bound should be written after all indexed key terms"
+        );
+    }
+
+    #[test]
+    fn test_codegen_ordered_scan_with_composite_equality_rechecks_prefix_boundary_each_next() {
+        let schema = test_schema_with_composite_prefix_index();
+        let table = schema
+            .iter()
+            .find(|table| table.name == "messages")
+            .expect("messages table");
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("id"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("idx"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("content"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: None,
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: Some(col_eq_param("conversation_id", 1)),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("idx"), Span::ZERO),
+                direction: Some(fsqlite_ast::SortDirection::Asc),
+                nulls: None,
+            }],
+            limit: None,
+        };
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).expect("codegen ordered scan");
+        let prog = b.finish().expect("finish program");
+        let ops = prog.ops();
+
+        let idx_gt_addr = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::IdxGT)
+            .expect("bounded ordered scan should emit IdxGT boundary");
+        let next = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("ordered composite scan should iterate index entries");
+
+        assert_eq!(
+            next.p2, idx_gt_addr as i32,
+            "Next must jump back to the IdxGT boundary check so each scanned row stays within the equality-prefix duplicate run"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "sqlite_autoindex_messages_1")
+            }),
+            "ordered scan should open the composite autoindex"
+        );
+        assert_eq!(
+            table.indexes[0].columns,
+            vec!["conversation_id".to_owned(), "idx".to_owned()],
+            "test assumes the composite ordered index is keyed by conversation_id then idx"
         );
     }
 
