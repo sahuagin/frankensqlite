@@ -289,14 +289,18 @@ fn test_in_and_exists_combined() {
 #[test]
 fn guard_large_in_subquery_completes_within_budget() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE lookup(id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    conn.execute("CREATE TABLE lookup(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     for i in 1..=1000 {
-        conn.execute(&format!("INSERT INTO lookup VALUES({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO lookup VALUES({i})"))
+            .unwrap();
     }
     for i in 1..=100 {
-        conn.execute(&format!("INSERT INTO data VALUES({i}, 'v{i}')")).unwrap();
+        conn.execute(&format!("INSERT INTO data VALUES({i}, 'v{i}')"))
+            .unwrap();
     }
 
     let start = std::time::Instant::now();
@@ -322,11 +326,14 @@ fn guard_large_in_subquery_completes_within_budget() {
 #[test]
 fn guard_correlated_exists_completes_within_budget() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)")
+        .unwrap();
 
     for i in 1..=500 {
-        conn.execute(&format!("INSERT INTO parent VALUES({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO parent VALUES({i})"))
+            .unwrap();
     }
     // Every even parent has 10 children.
     for i in 1..=500 {
@@ -423,10 +430,13 @@ fn test_direct_probe_exists_with_range_filter() {
 #[test]
 fn test_direct_probe_not_exists() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)")
+        .unwrap();
     for i in 1..=100 {
-        conn.execute(&format!("INSERT INTO parent VALUES({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO parent VALUES({i})"))
+            .unwrap();
     }
     // Only even parents have children.
     for i in 1..=100 {
@@ -450,8 +460,10 @@ fn test_direct_probe_not_exists() {
 #[test]
 fn test_direct_probe_exists_multi_column() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE a(x INTEGER, y INTEGER)").unwrap();
-    conn.execute("CREATE TABLE b(p INTEGER, q INTEGER)").unwrap();
+    conn.execute("CREATE TABLE a(x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE b(p INTEGER, q INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO a VALUES(1, 10)").unwrap();
     conn.execute("INSERT INTO a VALUES(2, 20)").unwrap();
     conn.execute("INSERT INTO a VALUES(3, 30)").unwrap();
@@ -470,8 +482,10 @@ fn test_direct_probe_exists_multi_column() {
 #[test]
 fn test_direct_probe_exists_null_outer_value() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE t1(id INTEGER, fk INTEGER)").unwrap();
-    conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER, fk INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("INSERT INTO t1 VALUES(1, NULL)").unwrap();
     conn.execute("INSERT INTO t1 VALUES(2, 1)").unwrap();
     conn.execute("INSERT INTO t2 VALUES(1)").unwrap();
@@ -489,9 +503,12 @@ fn test_direct_probe_exists_null_outer_value() {
 #[test]
 fn test_fallthrough_exists_join_inner() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY)").unwrap();
-    conn.execute("CREATE TABLE t2(id INTEGER, t1_id INTEGER)").unwrap();
-    conn.execute("CREATE TABLE t3(id INTEGER, t2_id INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(id INTEGER, t1_id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE t3(id INTEGER, t2_id INTEGER)")
+        .unwrap();
     conn.execute("INSERT INTO t1 VALUES(1)").unwrap();
     conn.execute("INSERT INTO t1 VALUES(2)").unwrap();
     conn.execute("INSERT INTO t2 VALUES(10, 1)").unwrap();
@@ -512,7 +529,8 @@ fn test_fallthrough_exists_join_inner() {
 #[test]
 fn test_fallthrough_exists_group_by() {
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
     conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER, val INTEGER)")
         .unwrap();
     conn.execute("INSERT INTO parent VALUES(1)").unwrap();

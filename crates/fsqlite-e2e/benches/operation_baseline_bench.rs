@@ -559,6 +559,173 @@ fn bench_aggregation(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── bd-wwqen.3: Column-list vs no-column-list INSERT ───────────────────
+//
+// Documents the performance difference between:
+// - `INSERT INTO t VALUES (?, ?, ?)` → direct insert fast path
+// - `INSERT INTO t(a, b, c) VALUES (?, ?, ?)` → VDBE path (current behavior)
+//
+// The fix (tracked in bd-wwqen.3) should eliminate this gap by supporting
+// column reordering in the direct insert path.
+
+fn bench_column_list_insert_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("op_column_list_insert_prepared_1000");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(15));
+    group.throughput(Throughput::Elements(1000));
+
+    // FrankenSQLite: No column list (direct path)
+    group.bench_function("frankensqlite_no_col_list", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+                )
+                .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                // No column list → should hit direct insert path
+                let stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute_with_params(&[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Text(format!("name_{i}").into()),
+                        SqliteValue::Integer(i * 7),
+                    ])
+                    .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // FrankenSQLite: With column list, same order (currently VDBE path)
+    group.bench_function("frankensqlite_col_list_same_order", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+                )
+                .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                // Column list in same order → currently VDBE path, should be direct after fix
+                let stmt = conn
+                    .prepare("INSERT INTO bench(id, name, score) VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute_with_params(&[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Text(format!("name_{i}").into()),
+                        SqliteValue::Integer(i * 7),
+                    ])
+                    .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // FrankenSQLite: With column list, different order (reordering needed)
+    group.bench_function("frankensqlite_col_list_diff_order", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                apply_pragmas_fsqlite(&conn);
+                conn.execute(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+                )
+                .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                // Column list in different order → requires reordering
+                let stmt = conn
+                    .prepare("INSERT INTO bench(score, name, id) VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute_with_params(&[
+                        SqliteValue::Integer(i * 7),                   // score
+                        SqliteValue::Text(format!("name_{i}").into()), // name
+                        SqliteValue::Integer(i),                       // id
+                    ])
+                    .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // C SQLite baselines for comparison
+    group.bench_function("csqlite_no_col_list", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+                )
+                .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute_batch("BEGIN").unwrap();
+                let mut stmt = conn
+                    .prepare("INSERT INTO bench VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute(rusqlite::params![i, format!("name_{i}"), i * 7])
+                        .unwrap();
+                }
+                conn.execute_batch("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("csqlite_col_list_same_order", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                apply_pragmas_csqlite(&conn);
+                conn.execute_batch(
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+                )
+                .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute_batch("BEGIN").unwrap();
+                let mut stmt = conn
+                    .prepare("INSERT INTO bench(id, name, score) VALUES (?1, ?2, ?3)")
+                    .unwrap();
+                for i in 1..=1000_i64 {
+                    stmt.execute(rusqlite::params![i, format!("name_{i}"), i * 7])
+                        .unwrap();
+                }
+                conn.execute_batch("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = operation_baselines;
     config = criterion_config();
@@ -571,6 +738,7 @@ criterion_group!(
         bench_single_row_update,
         bench_single_row_delete,
         bench_two_way_join,
-        bench_aggregation
+        bench_aggregation,
+        bench_column_list_insert_prepared
 );
 criterion_main!(operation_baselines);
