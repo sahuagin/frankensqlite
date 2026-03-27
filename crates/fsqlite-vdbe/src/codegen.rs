@@ -3046,16 +3046,40 @@ fn codegen_select_count_star(
 
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
     b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
 
     if where_clause.is_none() {
+        // bd-wwqen.1: cheapest-index optimization for COUNT(*).
+        // Open the smallest non-partial index instead of the table when
+        // available — index B-trees have smaller rows and fewer pages.
+        // Uses the SAME cursor ID as the table would, so the rest of the
+        // program shape (Count, Close, Halt) is identical.
+        let cheapest_index = table
+            .indexes
+            .iter()
+            .filter(|idx| idx.where_clause.is_none())
+            .filter(|idx| !idx.columns.is_empty())
+            .min_by_key(|idx| idx.columns.len());
+
+        if let Some(idx) = cheapest_index {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                idx.root_page,
+                0,
+                P4::Index(idx.name.clone()),
+                0,
+            );
+        } else {
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                table.root_page,
+                0,
+                P4::Table(table.name.clone()),
+                0,
+            );
+        }
+
         b.emit_op(Opcode::Count, cursor, out_regs, 0, P4::None, 0);
         b.resolve_label(done_label);
         b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
@@ -3064,6 +3088,16 @@ fn codegen_select_count_star(
         b.resolve_label(end_label);
         return Ok(());
     }
+
+    // Non-COUNT path: open table cursor as before.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
 
     b.emit_op(Opcode::Integer, 0, out_regs, 0, P4::None, 0);
 
