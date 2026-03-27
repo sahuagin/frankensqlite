@@ -1300,6 +1300,43 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
+    /// Read only a prefix of a cell payload into the provided buffer.
+    fn read_cell_payload_prefix_into(
+        &self,
+        cx: &Cx,
+        entry: &StackEntry,
+        cell: &CellRef,
+        max_prefix_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let local = cell.local_payload(entry.page_data.as_bytes());
+        let target_size = usize::try_from(cell.payload_size)
+            .unwrap_or(usize::MAX)
+            .min(max_prefix_bytes);
+        if target_size == 0 {
+            out.clear();
+            return Ok(());
+        }
+
+        if let Some(first_overflow) = cell.overflow_page {
+            overflow::read_overflow_chain_prefix_into(
+                local,
+                first_overflow,
+                cell.payload_size,
+                self.usable_size,
+                target_size,
+                &mut |pgno| self.pager.read_page_data(cx, pgno).map(PageData::into_vec),
+                out,
+            )
+        } else {
+            out.clear();
+            let local_copy_len = local.len().min(target_size);
+            instrumentation::record_local_payload_copy(local_copy_len);
+            out.extend_from_slice(&local[..local_copy_len]);
+            Ok(())
+        }
+    }
+
     /// Read the full payload for a cell (resolving overflow if needed).
     fn read_cell_payload<'a>(
         &self,
@@ -3068,6 +3105,24 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
         self.read_cell_payload_into(cx, top, &cell, buf)
+    }
+
+    fn payload_prefix_into(
+        &self,
+        cx: &Cx,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        if self.at_eof || self.stack.is_empty() {
+            return Err(FrankenError::internal("cursor at EOF"));
+        }
+        let top = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        let cell = self.parse_cell_at(top, top.cell_idx)?;
+
+        self.read_cell_payload_prefix_into(cx, top, &cell, max_prefix_bytes, buf)
     }
 
     fn rowid(&self, cx: &Cx) -> Result<i64> {

@@ -548,6 +548,49 @@ pub fn parse_record_header_into(data: &[u8], offsets: &mut Vec<ColumnOffset>) ->
     Some(offsets.len())
 }
 
+/// Parse only the record header from a partial record prefix.
+///
+/// Unlike [`parse_record_header_into`], this only requires the full header
+/// bytes to be present. The body bytes may be truncated because callers can
+/// fetch more payload after learning which column end offset is needed.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_header_prefix_into(
+    data: &[u8],
+    offsets: &mut Vec<ColumnOffset>,
+) -> Option<usize> {
+    offsets.clear();
+    if data.is_empty() {
+        return None;
+    }
+
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+
+    while offset < header_size {
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+
+        let value_len_u64 = serial_type_len(serial_type)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        let body_start = body_offset;
+        body_offset = body_offset.checked_add(value_len)?;
+
+        offsets.push(ColumnOffset {
+            serial_type,
+            body_offset: u32::try_from(body_start).ok()?,
+            value_len: u32::try_from(value_len).ok()?,
+        });
+    }
+
+    Some(offsets.len())
+}
+
 /// Decode a single column from previously-parsed offset table + raw record data.
 ///
 /// This avoids re-scanning the header on each column access and only
@@ -665,6 +708,29 @@ impl RecordDecodeScratch {
             self.decoded_mask = 0;
             Some(false)
         }
+    }
+
+    /// Prepare the scratch from a partial record prefix.
+    ///
+    /// This parses only the record header and sizes the reusable value slots
+    /// so callers can later fetch and decode just the requested columns.
+    #[must_use]
+    pub fn prepare_for_record_prefix(&mut self, record: &[u8]) -> Option<usize> {
+        let col_count = match parse_record_header_prefix_into(record, &mut self.header_offsets) {
+            Some(col_count) => col_count,
+            None => {
+                self.invalidate();
+                return None;
+            }
+        };
+
+        if self.values.len() > col_count {
+            self.values.truncate(col_count);
+        } else if self.values.len() < col_count {
+            self.values.resize(col_count, SqliteValue::Null);
+        }
+        self.decoded_mask = 0;
+        Some(col_count)
     }
 
     /// Drop the cached layout and decoded values while preserving capacity for reuse.
@@ -1207,6 +1273,27 @@ mod tests {
             scratch.cached_value(64).and_then(SqliteValue::as_integer),
             Some(64)
         );
+    }
+
+    #[test]
+    fn parse_record_header_prefix_accepts_truncated_body() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(42),
+            SqliteValue::Text(Arc::from("hello")),
+            SqliteValue::Blob(Arc::from([1_u8, 2, 3, 4].as_slice())),
+        ]);
+        let (header_size_u64, _) = read_varint(&record).expect("record header should parse");
+        let header_size = usize::try_from(header_size_u64).expect("header size should fit");
+        let prefix = &record[..header_size + 1];
+
+        let mut offsets = Vec::new();
+        let count = parse_record_header_prefix_into(prefix, &mut offsets)
+            .expect("prefix parser should accept truncated body");
+
+        assert_eq!(count, 3);
+        assert_eq!(offsets[0].body_offset as usize, header_size);
+        assert_eq!(offsets[1].body_offset as usize, header_size + 1);
+        assert_eq!(offsets[2].body_offset as usize, header_size + 6);
     }
 
     #[test]

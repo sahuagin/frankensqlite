@@ -71,6 +71,44 @@ where
     F: FnMut(PageNumber) -> Result<P>,
     P: AsRef<[u8]>,
 {
+    read_overflow_chain_prefix_into(
+        local_data,
+        first_overflow,
+        total_payload_size,
+        usable_size,
+        usize::try_from(total_payload_size).unwrap_or(usize::MAX),
+        read_page,
+        out,
+    )?;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let total_size = total_payload_size as usize;
+    if out.len() != total_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "read overflow chain size mismatch: expected {}, got {}",
+                total_size,
+                out.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Read only a prefix of a payload that spans local data and an overflow chain.
+pub fn read_overflow_chain_prefix_into<F, P>(
+    local_data: &[u8],
+    first_overflow: PageNumber,
+    total_payload_size: u32,
+    usable_size: u32,
+    max_prefix_bytes: usize,
+    read_page: &mut F,
+    out: &mut Vec<u8>,
+) -> Result<()>
+where
+    F: FnMut(PageNumber) -> Result<P>,
+    P: AsRef<[u8]>,
+{
     out.clear();
     if total_payload_size > MAX_ALLOCATION_SIZE {
         return Err(FrankenError::TooBig);
@@ -86,12 +124,17 @@ where
 
     #[allow(clippy::cast_possible_truncation)]
     let total_size = total_payload_size as usize;
+    let target_size = total_size.min(max_prefix_bytes);
+    if target_size == 0 {
+        return Ok(());
+    }
+    let local_copy_len = local_data.len().min(target_size);
 
-    out.reserve(total_size);
-    out.extend_from_slice(local_data);
+    out.reserve(target_size);
+    out.extend_from_slice(&local_data[..local_copy_len]);
 
     let mut current_page = first_overflow;
-    let mut bytes_remaining = total_size.saturating_sub(local_data.len());
+    let mut bytes_remaining = target_size.saturating_sub(local_copy_len);
     let bytes_per_overflow = usable_size.saturating_sub(4) as usize;
     let mut chain_length = 0;
 
@@ -131,19 +174,9 @@ where
         }
     }
 
-    if out.len() != total_size {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "read overflow chain size mismatch: expected {}, got {}",
-                total_size,
-                out.len()
-            ),
-        });
-    }
-
     instrumentation::record_overflow_chain_reassembly(
-        local_data.len(),
-        total_size.saturating_sub(local_data.len()),
+        local_copy_len,
+        target_size.saturating_sub(local_copy_len),
         chain_length,
     );
 

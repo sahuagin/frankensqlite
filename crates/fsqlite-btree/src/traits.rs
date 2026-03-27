@@ -154,6 +154,15 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// clearing it first. This avoids allocations when repeatedly reading payloads.
     fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()>;
 
+    /// Read only a prefix of the payload at the current cursor position into
+    /// the provided buffer, clearing it first.
+    fn payload_prefix_into(
+        &self,
+        cx: &Cx,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()>;
+
     /// Read the rowid at the current cursor position.
     ///
     /// For table B-trees this is the integer key. For index B-trees this is
@@ -361,6 +370,21 @@ impl BtreeCursorOps for MockBtreeCursor {
         }
         buf.clear();
         buf.extend_from_slice(&self.entries[self.pos].1);
+        Ok(())
+    }
+
+    fn payload_prefix_into(
+        &self,
+        _cx: &Cx,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        if self.at_eof {
+            return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+        }
+        buf.clear();
+        let bytes = &self.entries[self.pos].1;
+        buf.extend_from_slice(&bytes[..bytes.len().min(max_prefix_bytes)]);
         Ok(())
     }
 

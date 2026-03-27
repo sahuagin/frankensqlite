@@ -45,7 +45,7 @@ use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
-    RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+    ColumnOffset, RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
 use fsqlite_types::value::{SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches};
 use fsqlite_types::{
@@ -62,6 +62,7 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// The low 4 bits of `Insert.p5` are reserved for OE_* conflict behavior in
 /// this engine, so the UPDATE marker must live above them.
 const OPFLAG_ISUPDATE: u16 = 0x10;
+const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct StatementColdState(u16);
@@ -2646,6 +2647,19 @@ impl CursorBackend {
             Self::Mem(c) => c.payload_into(cx, buf),
             Self::Txn(c) => c.payload_into(cx, buf),
             Self::TimeTravel(c) => c.payload_into(cx, buf),
+        }
+    }
+
+    fn payload_prefix_into(
+        &self,
+        cx: &Cx,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
+            Self::Txn(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
+            Self::TimeTravel(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
         }
     }
 
@@ -10121,7 +10135,8 @@ impl VdbeEngine {
             return Ok(true);
         }
 
-        let refresh_state = ensure_storage_cursor_row_cache(cursor, self.collect_vdbe_metrics)?;
+        let mut refresh_state =
+            ensure_storage_cursor_row_layout(cursor, 0, self.collect_vdbe_metrics)?;
 
         // ── Resolve IPK alias and payload column index ────────────
         let root_page = self.cursor_root_pages.get(&cursor_id).copied();
@@ -10129,6 +10144,14 @@ impl VdbeEngine {
         let ipk_col_idx = root_page
             .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
             .copied();
+        if let Some(ipk) = ipk_col_idx
+            && let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
+            && let Some(ipk_end) = column_payload_end(&ipk_col)
+        {
+            let ipk_refresh =
+                ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
+            refresh_state.refreshed |= ipk_refresh.refreshed;
+        }
         let payload_includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
             payload_includes_rowid_alias_lazy(
                 &mut cursor.row_decode,
@@ -10157,6 +10180,13 @@ impl VdbeEngine {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
 
         if payload_idx < cursor.row_decode.column_count() {
+            if let Some(col) = cursor.row_decode.column_offset(payload_idx).copied()
+                && let Some(col_end) = column_payload_end(&col)
+            {
+                let col_refresh =
+                    ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics)?;
+                refresh_state.refreshed |= col_refresh.refreshed;
+            }
             // Already decoded? Write from cache to register with buffer reuse.
             let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
             if cached_value_ready {
@@ -10262,13 +10292,22 @@ impl VdbeEngine {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            let refresh_state = ensure_storage_cursor_row_cache(cursor, collect_vdbe_metrics)?;
+            let mut refresh_state =
+                ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
             let root_page = self.cursor_root_pages.get(&cursor_id).copied();
             let rowid = cursor.cursor.rowid(&cursor.cx)?;
             let ipk_col_idx = root_page
                 .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
                 .copied();
+            if let Some(ipk_col_idx) = ipk_col_idx
+                && let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
+                && let Some(ipk_end) = column_payload_end(&ipk_col)
+            {
+                let ipk_refresh =
+                    ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
+                refresh_state.refreshed |= ipk_refresh.refreshed;
+            }
             let payload_includes_rowid_alias =
                 root_page
                     .zip(ipk_col_idx)
@@ -10298,6 +10337,13 @@ impl VdbeEngine {
 
             // ── Lazy column decode: decode on demand ─────────────────
             if payload_idx < cursor.row_decode.column_count() {
+                if let Some(col) = cursor.row_decode.column_offset(payload_idx).copied()
+                    && let Some(col_end) = column_payload_end(&col)
+                {
+                    let col_refresh =
+                        ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics)?;
+                    refresh_state.refreshed |= col_refresh.refreshed;
+                }
                 // Check if already decoded via bitmask.
                 let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
                 if cached_value_ready {
@@ -11396,10 +11442,93 @@ fn payload_includes_rowid_alias_lazy(
     }
 }
 
+fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
+    let start = usize::try_from(col.body_offset).ok()?;
+    let len = usize::try_from(col.value_len).ok()?;
+    start.checked_add(len)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct DecodeCacheRefreshState {
     refreshed: bool,
     eager_values_ready: bool,
+}
+
+fn ensure_storage_cursor_payload_prefix(
+    cursor: &mut StorageCursor,
+    min_payload_bytes: usize,
+) -> Result<()> {
+    if cursor.payload_buf.len() >= min_payload_bytes {
+        return Ok(());
+    }
+    cursor
+        .cursor
+        .payload_prefix_into(&cursor.cx, min_payload_bytes, &mut cursor.payload_buf)
+}
+
+fn ensure_storage_cursor_row_layout(
+    cursor: &mut StorageCursor,
+    min_payload_bytes: usize,
+    collect_vdbe_metrics: bool,
+) -> Result<DecodeCacheRefreshState> {
+    let position_stamp = cursor.cursor.position_stamp();
+    let mut refreshed = false;
+    if cursor.last_position_stamp != position_stamp {
+        if cursor.last_position_stamp.is_some() {
+            note_decode_cache_invalidation(
+                collect_vdbe_metrics,
+                DecodeCacheInvalidationReason::PositionChange,
+            );
+        }
+        cursor.row_decode.invalidate();
+        cursor.payload_buf.clear();
+        cursor.last_position_stamp = position_stamp;
+        refreshed = true;
+    }
+
+    let required_bytes = min_payload_bytes;
+    let mut requested_bytes = min_payload_bytes.max(STORAGE_CURSOR_LAYOUT_PREFIX_BYTES);
+
+    loop {
+        ensure_storage_cursor_payload_prefix(cursor, requested_bytes)?;
+
+        if cursor.row_decode.is_empty() {
+            if cursor
+                .row_decode
+                .prepare_for_record_prefix(&cursor.payload_buf)
+                .is_none()
+            {
+                let loaded = cursor.payload_buf.len();
+                if loaded < requested_bytes {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "malformed record header or payload in cursor payload".to_owned(),
+                    });
+                }
+                requested_bytes = requested_bytes
+                    .saturating_mul(2)
+                    .max(loaded.saturating_add(1));
+                continue;
+            }
+        }
+
+        if cursor.payload_buf.len() < required_bytes {
+            let loaded = cursor.payload_buf.len();
+            if loaded < requested_bytes {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "cursor payload shorter than required prefix: need {required_bytes}, have {loaded}"
+                    ),
+                });
+            }
+            requested_bytes = required_bytes.max(loaded.saturating_mul(2));
+            continue;
+        }
+
+        return Ok(DecodeCacheRefreshState {
+            refreshed,
+            eager_values_ready: false,
+        });
+    }
 }
 
 fn ensure_storage_cursor_row_cache(
