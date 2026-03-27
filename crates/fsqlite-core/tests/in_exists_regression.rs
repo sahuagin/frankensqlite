@@ -356,3 +356,178 @@ fn guard_correlated_exists_completes_within_budget() {
     );
     eprintln!("[B7 guard] 500-row correlated EXISTS: {:?}", elapsed);
 }
+
+// ── B2 EXISTS direct-probe validation matrix (bd-wwqen.2) ─────────────
+
+/// E1: Simple single-table correlated EXISTS with equality.
+#[test]
+fn test_direct_probe_exists_simple_correlated() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, cust_id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    for i in 1..=100 {
+        conn.execute(&format!("INSERT INTO customers VALUES({i}, 'c{i}')"))
+            .unwrap();
+    }
+    // 500 orders, each referencing a customer (cust_id = (i%100)+1).
+    for i in 1..=500 {
+        let cid = (i % 100) + 1;
+        conn.execute(&format!("INSERT INTO orders VALUES({i}, {cid})"))
+            .unwrap();
+    }
+
+    let start = std::time::Instant::now();
+    let rows = conn
+        .query("SELECT COUNT(*) FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id)")
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(100),
+        "all 100 customers have orders"
+    );
+    eprintln!("[E1] simple correlated EXISTS 500/100: {:?}", elapsed);
+}
+
+/// E2: Correlated EXISTS with equality + static range filter.
+#[test]
+fn test_direct_probe_exists_with_range_filter() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, cat_id INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    for i in 1..=50 {
+        conn.execute(&format!("INSERT INTO categories VALUES({i}, 'cat{i}')"))
+            .unwrap();
+    }
+    for i in 1..=200 {
+        let cat = (i % 50) + 1;
+        conn.execute(&format!("INSERT INTO products VALUES({i}, {cat})"))
+            .unwrap();
+    }
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.cat_id AND c.id <= 25)")
+        .unwrap();
+
+    // Products with cat_id 1-25 should match (half of 50 categories).
+    // Each category has 4 products (200/50), so 25*4 = 100.
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
+}
+
+/// E3: NOT EXISTS returns the complement set.
+#[test]
+fn test_direct_probe_not_exists() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)").unwrap();
+    for i in 1..=100 {
+        conn.execute(&format!("INSERT INTO parent VALUES({i})")).unwrap();
+    }
+    // Only even parents have children.
+    for i in 1..=100 {
+        if i % 2 == 0 {
+            conn.execute(&format!("INSERT INTO child VALUES({}, {})", i * 10, i))
+                .unwrap();
+        }
+    }
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM parent p WHERE NOT EXISTS (SELECT 1 FROM child c WHERE c.pid = p.id)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(50),
+        "50 odd parents have no children"
+    );
+}
+
+/// E4: Multi-column correlated EXISTS.
+#[test]
+fn test_direct_probe_exists_multi_column() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE a(x INTEGER, y INTEGER)").unwrap();
+    conn.execute("CREATE TABLE b(p INTEGER, q INTEGER)").unwrap();
+    conn.execute("INSERT INTO a VALUES(1, 10)").unwrap();
+    conn.execute("INSERT INTO a VALUES(2, 20)").unwrap();
+    conn.execute("INSERT INTO a VALUES(3, 30)").unwrap();
+    conn.execute("INSERT INTO b VALUES(1, 10)").unwrap();
+    conn.execute("INSERT INTO b VALUES(3, 30)").unwrap();
+
+    let rows = conn
+        .query("SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.p = a.x AND b.q = a.y) ORDER BY x")
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+}
+
+/// E-null: Correlated EXISTS where outer value is NULL.
+#[test]
+fn test_direct_probe_exists_null_outer_value() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER, fk INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(1, NULL)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(2, 1)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES(1)").unwrap();
+
+    // Row with fk=NULL: EXISTS (SELECT 1 FROM t2 WHERE t2.id = NULL) → FALSE
+    // Row with fk=1: EXISTS (SELECT 1 FROM t2 WHERE t2.id = 1) → TRUE
+    let rows = conn
+        .query("SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t1.fk) ORDER BY id")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+}
+
+/// F1: EXISTS with JOIN in inner query falls through correctly.
+#[test]
+fn test_fallthrough_exists_join_inner() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t2(id INTEGER, t1_id INTEGER)").unwrap();
+    conn.execute("CREATE TABLE t3(id INTEGER, t2_id INTEGER)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(1)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(2)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES(10, 1)").unwrap();
+    conn.execute("INSERT INTO t3 VALUES(100, 10)").unwrap();
+
+    let rows = conn
+        .query(
+            "SELECT id FROM t1 WHERE EXISTS \
+             (SELECT 1 FROM t2 JOIN t3 ON t3.t2_id = t2.id WHERE t2.t1_id = t1.id) \
+             ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+}
+
+/// F2: EXISTS with GROUP BY in inner query falls through correctly.
+#[test]
+fn test_fallthrough_exists_group_by() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER, val INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO parent VALUES(1)").unwrap();
+    conn.execute("INSERT INTO parent VALUES(2)").unwrap();
+    conn.execute("INSERT INTO child VALUES(1, 1, 10)").unwrap();
+    conn.execute("INSERT INTO child VALUES(2, 1, 20)").unwrap();
+
+    // EXISTS with GROUP BY + HAVING: only parent 1 has children summing > 15
+    let rows = conn
+        .query(
+            "SELECT id FROM parent p WHERE EXISTS \
+             (SELECT 1 FROM child c WHERE c.pid = p.id GROUP BY c.pid HAVING SUM(c.val) > 15) \
+             ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+}
