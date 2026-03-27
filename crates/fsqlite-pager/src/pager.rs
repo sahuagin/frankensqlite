@@ -5481,6 +5481,11 @@ where
             let must_write_page1 = if self.journal_mode == JournalMode::Wal {
                 wal_page1_plan.requires_page_one_rewrite()
                     || wal_page1_plan.requires_page_count_advance()
+            } else if self.vfs.is_memory() {
+                // B3.4: :memory: journal mode skips page 1 header update unless:
+                // 1. freelist_dirty (freelist count in header must match), OR
+                // 2. page 1 is explicitly dirty in write_set
+                freelist_dirty || self.write_set.contains_key(&PageNumber::ONE)
             } else {
                 true
             };

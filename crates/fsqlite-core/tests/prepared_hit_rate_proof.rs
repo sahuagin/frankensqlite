@@ -298,3 +298,43 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
     assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
     assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
 }
+
+/// B3.4 Probe: Measure commit_txn_roundtrip_time_ns for :memory: autocommit INSERTs.
+#[test]
+fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+
+    // Warmup
+    for i in 0..10 {
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(i),
+            SqliteValue::Text(format!("w{i}").into()),
+        ]).unwrap();
+    }
+    reset_hot_path_profile();
+
+    // Measurement: 1000 autocommit INSERTs
+    let n: i64 = 1000;
+    for i in 0..n {
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(i + 100),
+            SqliteValue::Text(format!("v{i}").into()),
+        ]).unwrap();
+    }
+
+    let snap = hot_path_profile_snapshot();
+    let commit_us = snap.commit_txn_roundtrip_time_ns as f64 / 1000.0;
+    let per_row_us = commit_us / n as f64;
+
+    eprintln!("=== B3.4 Probe ({n} :memory: INSERTs) ===");
+    eprintln!("commit_txn_roundtrip: {:.1} us total, {:.3} us/row", commit_us, per_row_us);
+    eprintln!("execute_body:         {:.1} us total, {:.3} us/row",
+              snap.execute_body_time_ns as f64 / 1000.0,
+              snap.execute_body_time_ns as f64 / 1000.0 / n as f64);
+    eprintln!("fast_lane_hits: {}", snap.prepared_insert_fast_lane_hits);
+
+    assert!(snap.prepared_insert_fast_lane_hits >= n as u64);
+}
