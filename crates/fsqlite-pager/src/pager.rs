@@ -5059,7 +5059,13 @@ where
             if raw == pending_byte_page {
                 raw = raw.saturating_add(1);
             }
-            inner.next_page = raw.saturating_add(1);
+            let next = raw.saturating_add(1);
+            // Stop the batch if next_page can no longer advance (u32::MAX
+            // saturation).  Continuing would hand out duplicate page numbers.
+            if next == raw {
+                break;
+            }
+            inner.next_page = next;
             if let Some(page) = PageNumber::new(raw) {
                 if first_page.is_none() {
                     first_page = Some(page);

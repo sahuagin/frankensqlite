@@ -7,11 +7,133 @@
 
 use std::time::Duration;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite::SqliteValue;
 
 fn criterion_config() -> Criterion {
     Criterion::default().configure_from_args()
+}
+
+const SUBQUERY_ROWS_100K: i64 = 100_000;
+
+fn apply_subquery_pragmas_csqlite(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "PRAGMA page_size = 4096;\
+         PRAGMA journal_mode = WAL;\
+         PRAGMA synchronous = NORMAL;\
+         PRAGMA cache_size = -64000;",
+    )
+    .ok();
+}
+
+fn apply_subquery_pragmas_fsqlite(conn: &fsqlite::Connection) {
+    for pragma in [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+    ] {
+        let _ = conn.execute(pragma);
+    }
+}
+
+fn setup_csqlite_exists_regression_bench(row_count: i64) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    apply_subquery_pragmas_csqlite(&conn);
+    conn.execute_batch(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);\
+         CREATE TABLE product_flags (product_id INTEGER PRIMARY KEY, active INTEGER NOT NULL);",
+    )
+    .unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut product_stmt = conn
+            .prepare("INSERT INTO products VALUES (?1, ('prod_' || ?1), (?1 * 3.14))")
+            .unwrap();
+        for i in 1..=row_count {
+            product_stmt.execute(rusqlite::params![i]).unwrap();
+        }
+
+        let mut flag_stmt = conn
+            .prepare("INSERT INTO product_flags VALUES (?1, 1)")
+            .unwrap();
+        for i in (1..=row_count).step_by(2) {
+            flag_stmt.execute(rusqlite::params![i]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    conn
+}
+
+fn setup_fsqlite_exists_regression_bench(row_count: i64) -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_subquery_pragmas_fsqlite(&conn);
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE product_flags (product_id INTEGER PRIMARY KEY, active INTEGER NOT NULL)",
+    )
+    .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=row_count {
+        let price = i as f64 * 3.14;
+        conn.execute(&format!(
+            "INSERT INTO products VALUES ({i}, 'prod_{i}', {price})"
+        ))
+        .unwrap();
+    }
+    for i in (1..=row_count).step_by(2) {
+        conn.execute(&format!("INSERT INTO product_flags VALUES ({i}, 1)"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn
+}
+
+fn setup_csqlite_in_regression_bench(row_count: i64) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    apply_subquery_pragmas_csqlite(&conn);
+    conn.execute_batch(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);\
+         CREATE TABLE selected_ids (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut product_stmt = conn
+            .prepare("INSERT INTO products VALUES (?1, ('prod_' || ?1), (?1 * 3.14))")
+            .unwrap();
+        let mut selected_stmt = conn
+            .prepare("INSERT INTO selected_ids VALUES (?1)")
+            .unwrap();
+        for i in 1..=row_count {
+            product_stmt.execute(rusqlite::params![i]).unwrap();
+            selected_stmt.execute(rusqlite::params![i]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    conn
+}
+
+fn setup_fsqlite_in_regression_bench(row_count: i64) -> fsqlite::Connection {
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_subquery_pragmas_fsqlite(&conn);
+    conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+        .unwrap();
+    conn.execute("CREATE TABLE selected_ids (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=row_count {
+        let price = i as f64 * 3.14;
+        conn.execute(&format!(
+            "INSERT INTO products VALUES ({i}, 'prod_{i}', {price})"
+        ))
+        .unwrap();
+        conn.execute(&format!("INSERT INTO selected_ids VALUES ({i})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn
 }
 
 // ─── Sequential INSERT benchmark (100 rows) ────────────────────────────
@@ -561,6 +683,66 @@ fn bench_read_heavy_select(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_exists_subquery_100k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_exists_subquery_count_100k");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+    group.throughput(Throughput::Elements(1));
+
+    let expected_count = SUBQUERY_ROWS_100K / 2;
+    let sql = "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM product_flags f WHERE f.product_id = p.id)";
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite_exists_regression_bench(SUBQUERY_ROWS_100K);
+        let mut stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(count, expected_count);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite_exists_regression_bench(SUBQUERY_ROWS_100K);
+        let stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_in_subquery_100k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_in_subquery_count_100k");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+    group.throughput(Throughput::Elements(1));
+
+    let expected_count = SUBQUERY_ROWS_100K;
+    let sql = "SELECT COUNT(*) FROM products WHERE id IN (SELECT id FROM selected_ids)";
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite_in_regression_bench(SUBQUERY_ROWS_100K);
+        let mut stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+            assert_eq!(count, expected_count);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite_in_regression_bench(SUBQUERY_ROWS_100K);
+        let stmt = conn.prepare(sql).unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(expected_count));
+        });
+    });
+
+    group.finish();
+}
+
 // ─── bd-1fez: Mixed OLTP workload (80% read / 20% write) ─────────────
 
 #[allow(clippy::too_many_lines)]
@@ -873,6 +1055,8 @@ criterion_group!(
         bench_write_throughput_batched,
         bench_write_throughput_single_txn,
         bench_read_heavy_select,
+        bench_exists_subquery_100k,
+        bench_in_subquery_100k,
         bench_mixed_oltp,
         bench_large_txn_100k,
         bench_large_txn_1m,

@@ -6,7 +6,7 @@
   "seed": 20260219,
   "overall_status": "pass",
   "timing": {
-    "selection_elapsed_us": 37
+    "selection_elapsed_us": 60
   },
   "checks": [
     {
@@ -26,7 +26,7 @@
     }
   ],
   "metric_delta": {
-    "full_table_scan": 2,
+    "full_table_scan": 39,
     "index_scan_equality": 4
   },
   "plan_fingerprint_blake3": "2526b7997729f6ec129ebc4a42dfb2ea3f68d13bb411cd29e8a581c9bca4fb8e",

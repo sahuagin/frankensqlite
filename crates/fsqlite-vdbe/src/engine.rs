@@ -2599,6 +2599,16 @@ impl CursorBackend {
         }
     }
 
+    /// bd-wwqen.1: Count all rows by walking leaf page headers without
+    /// decoding cell payloads. Much cheaper than first()/while next().
+    fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
+        match self {
+            Self::Mem(c) => c.count_all_rows(cx),
+            Self::Txn(c) => c.count_all_rows(cx),
+            Self::TimeTravel(c) => c.count_all_rows(cx),
+        }
+    }
+
     fn prev(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.prev(cx),
@@ -8283,16 +8293,9 @@ impl VdbeEngine {
                         if let Some(count) = memdb_count {
                             count
                         } else {
-                            let has_first = sc.cursor.first(&sc.cx)?;
-                            if !has_first {
-                                0
-                            } else {
-                                let mut n: i64 = 1;
-                                while sc.cursor.next(&sc.cx)? {
-                                    n += 1;
-                                }
-                                n
-                            }
+                            // bd-wwqen.1: Use count_all_rows which walks
+                            // leaf page headers without decoding payloads.
+                            sc.cursor.count_all_rows(&sc.cx)?
                         }
                     } else {
                         0

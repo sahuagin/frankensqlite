@@ -1724,23 +1724,44 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             }
         }
 
-        // col GLOB 'prefix*' — prefix-to-range optimisation.
+        // col GLOB 'prefix*' or col LIKE 'prefix%' — prefix-to-range optimisation.
         //
-        // LIKE is intentionally excluded: SQLite LIKE is case-INSENSITIVE by
-        // default (for ASCII), so converting `col LIKE 'abc%'` into the range
-        // `col >= 'abc' AND col < 'abd'` would miss rows like 'ABC…'.  The
-        // optimisation is only safe when `PRAGMA case_sensitive_like = ON` or
-        // when the column has BINARY collation; neither is tracked yet.
-        // GLOB is always case-sensitive, so prefix extraction is safe.
+        // GLOB is always case-sensitive, so prefix extraction is always safe.
+        //
+        // LIKE is case-INSENSITIVE by default (for ASCII), so converting
+        // `col LIKE 'abc%'` into the range `col >= 'abc' AND col < 'abd'`
+        // would miss rows like 'ABC…'. The optimisation is only safe when:
+        //   (a) PRAGMA case_sensitive_like = ON, OR
+        //   (b) The column has BINARY collation
+        //
+        // bd-wwqen.6: LIKE prefix optimization is now supported when the
+        // `like_prefix_optimization` feature is enabled AND collation is
+        // known to be case-sensitive. Until collation tracking is wired,
+        // LIKE falls through to the generic handler below.
         Expr::Like {
             expr: inner,
             pattern,
             op,
             not,
+            escape,
             ..
-        } if !not && matches!(op, LikeOp::Glob) => {
+        } if !not => {
             let column = extract_where_column(inner);
-            let (prefix, operator) = (extract_glob_prefix(pattern), "GLOB");
+            let (prefix, operator) = match op {
+                LikeOp::Glob => (extract_glob_prefix(pattern), "GLOB"),
+                LikeOp::Like => {
+                    // bd-wwqen.6: LIKE prefix optimization infrastructure.
+                    // Currently disabled: only enable when collation is BINARY
+                    // or case_sensitive_like pragma is ON.
+                    // TODO(bd-wwqen.6): Pass case_sensitive_like pragma or
+                    // column collation through planner context, then call
+                    // `extract_like_prefix(pattern, escape.as_deref())`.
+                    let _ = escape; // suppress unused warning
+                    (None, "LIKE")
+                }
+                // Match and Regexp are not optimizable via prefix-to-range.
+                LikeOp::Match | LikeOp::Regexp => (None, "MATCH/REGEXP"),
+            };
             if let Some(pfx) = prefix {
                 let upper_bound = like_prefix_upper_bound(&pfx);
                 tracing::debug!(
@@ -1823,6 +1844,60 @@ fn extract_glob_prefix(pattern: &Expr) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Extract a constant prefix from a LIKE pattern (e.g. `'abc%'` → `"abc"`).
+///
+/// Returns `None` if:
+/// - The pattern has no constant prefix (starts with `%` or `_`)
+/// - The pattern is not a string literal
+/// - The pattern uses escape sequences (which complicate prefix extraction)
+///
+/// bd-wwqen.6: This enables the LIKE prefix-to-range optimization when
+/// collation makes it safe (BINARY collation or case_sensitive_like = ON).
+#[allow(dead_code)] // bd-wwqen.6: Infrastructure for future LIKE prefix optimization
+fn extract_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> {
+    // Escape characters complicate prefix extraction; bail out for now.
+    // Future: handle escaped `%` and `_` in the prefix portion.
+    if escape.is_some() {
+        return None;
+    }
+
+    if let Expr::Literal(Literal::String(s), _) = pattern {
+        let mut prefix = String::new();
+        for ch in s.chars() {
+            if matches!(ch, '%' | '_') {
+                break;
+            }
+            prefix.push(ch);
+        }
+        if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        }
+    } else {
+        None
+    }
+}
+
+/// Check if LIKE prefix optimization is safe for the given column.
+///
+/// bd-wwqen.6: LIKE prefix-to-range optimization is only safe when:
+///   (a) The column has BINARY collation (case-sensitive), OR
+///   (b) `PRAGMA case_sensitive_like = ON` is set
+///
+/// Currently always returns `false` because collation tracking is not yet
+/// wired through the planner context. This stub exists to enable the
+/// optimization incrementally when collation information becomes available.
+///
+/// TODO(bd-wwqen.6): Accept `PlannerContext` or similar to access pragma state
+/// and schema collation metadata.
+#[allow(dead_code)]
+fn is_like_prefix_safe_for_column(_column: Option<&WhereColumn>) -> bool {
+    // Placeholder: will check column collation or pragma state when available.
+    // For now, conservatively return false to preserve correctness.
+    false
 }
 
 /// Compute the exclusive upper bound for a LIKE prefix range.
@@ -5811,6 +5886,56 @@ mod tests {
         // Non-string expression → None
         let pat = Expr::Literal(Literal::Integer(42), Span::ZERO);
         assert_eq!(extract_glob_prefix(&pat), None);
+    }
+
+    // ===================================================================
+    // LIKE prefix extraction (bd-wwqen.6)
+    // ===================================================================
+
+    #[test]
+    fn test_extract_like_prefix_percent_wildcard() {
+        // "abc%def" → prefix = "abc" (percent is wildcard)
+        let pat = Expr::Literal(Literal::String("abc%def".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_like_prefix_underscore_wildcard() {
+        // "abc_def" → prefix = "abc" (underscore is single-char wildcard)
+        let pat = Expr::Literal(Literal::String("abc_def".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_like_prefix_starts_with_wildcard() {
+        // "%abc" → None (no constant prefix)
+        let pat = Expr::Literal(Literal::String("%abc".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, None), None);
+
+        // "_abc" → None (no constant prefix)
+        let pat2 = Expr::Literal(Literal::String("_abc".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat2, None), None);
+    }
+
+    #[test]
+    fn test_extract_like_prefix_with_escape_bails_out() {
+        // With escape character, we bail out for safety
+        let pat = Expr::Literal(Literal::String("abc%".to_owned()), Span::ZERO);
+        let esc = Expr::Literal(Literal::String("\\".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, Some(&esc)), None);
+    }
+
+    #[test]
+    fn test_extract_like_prefix_non_string_expr() {
+        let pat = Expr::Literal(Literal::Integer(42), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, None), None);
+    }
+
+    #[test]
+    fn test_extract_like_prefix_exact_match() {
+        // "abc" (no wildcards) → full string as prefix
+        let pat = Expr::Literal(Literal::String("abc".to_owned()), Span::ZERO);
+        assert_eq!(extract_like_prefix(&pat, None), Some("abc".to_owned()));
     }
 
     // ===================================================================

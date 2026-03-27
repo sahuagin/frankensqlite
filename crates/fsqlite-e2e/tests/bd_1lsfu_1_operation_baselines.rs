@@ -710,6 +710,10 @@ fn setup_query_guard_bench(row_count: i64) -> fsqlite::Connection {
     conn
 }
 
+fn expected_bench_score_sum(row_count: i64) -> i64 {
+    7 * row_count * (row_count + 1) / 2
+}
+
 fn setup_subquery_guard_bench(row_count: i64) -> fsqlite::Connection {
     let conn = fsqlite::Connection::open(":memory:").unwrap();
     let category_count = (row_count / 20).max(5);
@@ -836,6 +840,10 @@ fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCachePr
 #[test]
 fn focused_read_guard_shapes_return_expected_results() {
     const ROW_COUNT: i64 = 10_000;
+    const COUNT_RANGE_START: i64 = 2_500;
+    const COUNT_RANGE_WIDTH: i64 = 50;
+    const COUNT_RANGE_END: i64 = COUNT_RANGE_START + COUNT_RANGE_WIDTH;
+    const UPDATED_SCORE: i64 = 1_400;
     const IN_SUBQUERY_EXPECTED_COUNT: i64 = 100;
     const EXISTS_SUBQUERY_EXPECTED_COUNT: i64 = ROW_COUNT / 2;
     const RECURSIVE_CTE_SUM: i64 = 500_500;
@@ -843,8 +851,75 @@ fn focused_read_guard_shapes_return_expected_results() {
 
     let count_conn = setup_query_guard_bench(ROW_COUNT);
     let count_stmt = count_conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+    let count_range_stmt = count_conn
+        .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+        .unwrap();
+    let count_sum_stmt = count_conn
+        .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+        .unwrap();
+
     let count_row = count_stmt.query_row().unwrap();
     assert_eq!(count_row.values()[0], SqliteValue::Integer(ROW_COUNT));
+    let count_range_row = count_range_stmt
+        .query_row_with_params(&[
+            SqliteValue::Integer(COUNT_RANGE_START),
+            SqliteValue::Integer(COUNT_RANGE_END),
+        ])
+        .unwrap();
+    assert_eq!(
+        count_range_row.values()[0],
+        SqliteValue::Integer(COUNT_RANGE_WIDTH)
+    );
+    let count_sum_row = count_sum_stmt.query_row().unwrap();
+    assert_eq!(count_sum_row.values()[0], SqliteValue::Integer(ROW_COUNT));
+    assert_eq!(
+        count_sum_row.values()[1],
+        SqliteValue::Integer(expected_bench_score_sum(ROW_COUNT))
+    );
+
+    let inserted_id = ROW_COUNT + 1;
+    let inserted_score = inserted_id * 7;
+    count_conn
+        .execute(&format!(
+            "INSERT INTO bench VALUES ({inserted_id}, 'name_{inserted_id}', 'cat_{}', {inserted_score})",
+            inserted_id % 10,
+        ))
+        .unwrap();
+    count_conn
+        .execute(&format!(
+            "UPDATE bench SET score = {UPDATED_SCORE} WHERE id = 2"
+        ))
+        .unwrap();
+    count_conn
+        .execute("DELETE FROM bench WHERE id = 1")
+        .unwrap();
+
+    let post_write_count_row = count_stmt.query_row().unwrap();
+    assert_eq!(
+        post_write_count_row.values()[0],
+        SqliteValue::Integer(ROW_COUNT)
+    );
+    let post_write_count_range_row = count_range_stmt
+        .query_row_with_params(&[
+            SqliteValue::Integer(COUNT_RANGE_START),
+            SqliteValue::Integer(COUNT_RANGE_END),
+        ])
+        .unwrap();
+    assert_eq!(
+        post_write_count_range_row.values()[0],
+        SqliteValue::Integer(COUNT_RANGE_WIDTH)
+    );
+    let post_write_count_sum_row = count_sum_stmt.query_row().unwrap();
+    let expected_sum_after_writes =
+        expected_bench_score_sum(ROW_COUNT) - 7 - 14 + UPDATED_SCORE + inserted_score;
+    assert_eq!(
+        post_write_count_sum_row.values()[0],
+        SqliteValue::Integer(ROW_COUNT)
+    );
+    assert_eq!(
+        post_write_count_sum_row.values()[1],
+        SqliteValue::Integer(expected_sum_after_writes)
+    );
 
     let category_count = (ROW_COUNT / 20).max(5);
     let subquery_conn = setup_subquery_guard_bench(ROW_COUNT);
@@ -906,6 +981,9 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
     const ROW_COUNT: i64 = 10_000;
     const WARMUP: u32 = 10;
     const ITERATIONS: u32 = 100;
+    const COUNT_RANGE_START: i64 = 2_500;
+    const COUNT_RANGE_WIDTH: i64 = 50;
+    const COUNT_RANGE_END: i64 = COUNT_RANGE_START + COUNT_RANGE_WIDTH;
     const IN_SUBQUERY_EXPECTED_COUNT: i64 = 100;
     const EXISTS_SUBQUERY_EXPECTED_COUNT: i64 = ROW_COUNT / 2;
     const RECURSIVE_CTE_SUM: i64 = 500_500;
@@ -913,9 +991,32 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
 
     let count_conn = setup_query_guard_bench(ROW_COUNT);
     let count_stmt = count_conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+    let count_range_stmt = count_conn
+        .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+        .unwrap();
+    let count_sum_stmt = count_conn
+        .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+        .unwrap();
     let (count_stats, count_throughput) = measure_operation(WARMUP, ITERATIONS, || {
         let row = count_stmt.query_row().unwrap();
         assert_eq!(row.values()[0], SqliteValue::Integer(ROW_COUNT));
+    });
+    let (count_range_stats, count_range_throughput) = measure_operation(WARMUP, ITERATIONS, || {
+        let row = count_range_stmt
+            .query_row_with_params(&[
+                SqliteValue::Integer(COUNT_RANGE_START),
+                SqliteValue::Integer(COUNT_RANGE_END),
+            ])
+            .unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Integer(COUNT_RANGE_WIDTH));
+    });
+    let (count_sum_stats, count_sum_throughput) = measure_operation(WARMUP, ITERATIONS, || {
+        let row = count_sum_stmt.query_row().unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Integer(ROW_COUNT));
+        assert_eq!(
+            row.values()[1],
+            SqliteValue::Integer(expected_bench_score_sum(ROW_COUNT))
+        );
     });
 
     let category_count = (ROW_COUNT / 20).max(5);
@@ -959,6 +1060,14 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
         count_stats.p50_micros, count_stats.p95_micros,
     );
     eprintln!(
+        "manual_perf_probe.read_guard_shapes.count_range_50 p50_us={} p95_us={} throughput_ops_per_sec={count_range_throughput:.1}",
+        count_range_stats.p50_micros, count_range_stats.p95_micros,
+    );
+    eprintln!(
+        "manual_perf_probe.read_guard_shapes.count_sum_aggregate p50_us={} p95_us={} throughput_ops_per_sec={count_sum_throughput:.1}",
+        count_sum_stats.p50_micros, count_sum_stats.p95_micros,
+    );
+    eprintln!(
         "manual_perf_probe.read_guard_shapes.exists_subquery p50_us={} p95_us={} throughput_ops_per_sec={exists_throughput:.1}",
         exists_stats.p50_micros, exists_stats.p95_micros,
     );
@@ -972,6 +1081,8 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
     );
 
     assert!(count_throughput > 0.0);
+    assert!(count_range_throughput > 0.0);
+    assert!(count_sum_throughput > 0.0);
     assert!(exists_throughput > 0.0);
     assert!(in_throughput > 0.0);
     assert!(recursive_cte_throughput > 0.0);
@@ -982,6 +1093,9 @@ fn manual_perf_probe_read_guard_shapes_count_in_exists_recursive_cte() {
 fn manual_hot_path_profile_read_guard_shapes_count_in_exists_100k() {
     const ROW_COUNT: i64 = 100_000;
     const COUNT_EXPECTED: i64 = ROW_COUNT;
+    const COUNT_RANGE_START: i64 = 25_000;
+    const COUNT_RANGE_WIDTH: i64 = 50;
+    const COUNT_RANGE_END: i64 = COUNT_RANGE_START + COUNT_RANGE_WIDTH;
     const IN_SUBQUERY_EXPECTED_COUNT: i64 = 100;
     const EXISTS_SUBQUERY_EXPECTED_COUNT: i64 = ROW_COUNT / 2;
 
@@ -989,6 +1103,12 @@ fn manual_hot_path_profile_read_guard_shapes_count_in_exists_100k() {
 
     let count_conn = setup_query_guard_bench(ROW_COUNT);
     let count_stmt = count_conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+    let count_range_stmt = count_conn
+        .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+        .unwrap();
+    let count_sum_stmt = count_conn
+        .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+        .unwrap();
     let warm_count = count_stmt.query_row().unwrap();
     assert_eq!(warm_count.values()[0], SqliteValue::Integer(COUNT_EXPECTED));
     reset_hot_path_profile();
@@ -998,6 +1118,64 @@ fn manual_hot_path_profile_read_guard_shapes_count_in_exists_100k() {
     assert_eq!(count_row.values()[0], SqliteValue::Integer(COUNT_EXPECTED));
     let count_profile = hot_path_profile_snapshot();
     log_manual_hot_path_profile("count_star_100k", count_wall, &count_profile);
+
+    let warm_count_range = count_range_stmt
+        .query_row_with_params(&[
+            SqliteValue::Integer(COUNT_RANGE_START),
+            SqliteValue::Integer(COUNT_RANGE_END),
+        ])
+        .unwrap();
+    assert_eq!(
+        warm_count_range.values()[0],
+        SqliteValue::Integer(COUNT_RANGE_WIDTH)
+    );
+    reset_hot_path_profile();
+    let count_range_started = std::time::Instant::now();
+    let count_range_row = count_range_stmt
+        .query_row_with_params(&[
+            SqliteValue::Integer(COUNT_RANGE_START),
+            SqliteValue::Integer(COUNT_RANGE_END),
+        ])
+        .unwrap();
+    let count_range_wall = count_range_started.elapsed();
+    assert_eq!(
+        count_range_row.values()[0],
+        SqliteValue::Integer(COUNT_RANGE_WIDTH)
+    );
+    let count_range_profile = hot_path_profile_snapshot();
+    log_manual_hot_path_profile(
+        "count_range_50_100k",
+        count_range_wall,
+        &count_range_profile,
+    );
+
+    let warm_count_sum = count_sum_stmt.query_row().unwrap();
+    assert_eq!(
+        warm_count_sum.values()[0],
+        SqliteValue::Integer(COUNT_EXPECTED)
+    );
+    assert_eq!(
+        warm_count_sum.values()[1],
+        SqliteValue::Integer(expected_bench_score_sum(ROW_COUNT))
+    );
+    reset_hot_path_profile();
+    let count_sum_started = std::time::Instant::now();
+    let count_sum_row = count_sum_stmt.query_row().unwrap();
+    let count_sum_wall = count_sum_started.elapsed();
+    assert_eq!(
+        count_sum_row.values()[0],
+        SqliteValue::Integer(COUNT_EXPECTED)
+    );
+    assert_eq!(
+        count_sum_row.values()[1],
+        SqliteValue::Integer(expected_bench_score_sum(ROW_COUNT))
+    );
+    let count_sum_profile = hot_path_profile_snapshot();
+    log_manual_hot_path_profile(
+        "count_sum_aggregate_100k",
+        count_sum_wall,
+        &count_sum_profile,
+    );
 
     let category_count = (ROW_COUNT / 20).max(5);
     let subquery_conn = setup_subquery_guard_bench(ROW_COUNT);
@@ -1043,6 +1221,82 @@ fn manual_hot_path_profile_read_guard_shapes_count_in_exists_100k() {
     );
     let in_profile = hot_path_profile_snapshot();
     log_manual_hot_path_profile("in_subquery_100k", in_wall, &in_profile);
+}
+
+#[test]
+#[ignore = "manual perf probe; run via rch when investigating bd-wwqen.4 future query_row fast-path cuts"]
+fn manual_perf_probe_future_query_row_probe_shapes_100k() {
+    const ROW_COUNT: i64 = 100_000;
+    const WARMUP: u32 = 20;
+    const ITERATIONS: u32 = 200;
+    const UNIQUE_ID: i64 = 75_000;
+
+    let _profile_guard = ManualHotPathProfileGuard::new();
+    let conn = setup_query_guard_bench(ROW_COUNT);
+    conn.execute("CREATE UNIQUE INDEX idx_bench_name_probe ON bench(name)")
+        .unwrap();
+
+    let indexed_stmt = conn
+        .prepare("SELECT id, name, score FROM bench WHERE name = ?1")
+        .unwrap();
+    let indexed_params = [SqliteValue::Text(format!("name_{UNIQUE_ID}").into())];
+    let warm_indexed = indexed_stmt.query_row_with_params(&indexed_params).unwrap();
+    assert_eq!(warm_indexed.values()[0], SqliteValue::Integer(UNIQUE_ID));
+    reset_hot_path_profile();
+    let (indexed_stats, indexed_throughput) = measure_operation(WARMUP, ITERATIONS, || {
+        let row = indexed_stmt.query_row_with_params(&indexed_params).unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Integer(UNIQUE_ID));
+    });
+    let indexed_profile = hot_path_profile_snapshot();
+    eprintln!(
+        concat!(
+            "manual_perf_probe.future_query_row.indexed_equality_100k ",
+            "p50_us={} p95_us={} throughput_ops_per_sec={:.1} ",
+            "fast={} slow={} direct_indexed_hits={} result_rows={} result_values={}"
+        ),
+        indexed_stats.p50_micros,
+        indexed_stats.p95_micros,
+        indexed_throughput,
+        indexed_profile.parser.fast_path_executions,
+        indexed_profile.parser.slow_path_executions,
+        indexed_profile.direct_indexed_equality_query_hits,
+        indexed_profile.vdbe.result_rows_total,
+        indexed_profile.vdbe.result_values_total,
+    );
+
+    let range_stmt = conn
+        .prepare("SELECT id, name, score FROM bench WHERE id >= ?1 AND id < ?2")
+        .unwrap();
+    let range_params = [
+        SqliteValue::Integer(UNIQUE_ID),
+        SqliteValue::Integer(UNIQUE_ID + 1),
+    ];
+    let warm_range = range_stmt.query_row_with_params(&range_params).unwrap();
+    assert_eq!(warm_range.values()[0], SqliteValue::Integer(UNIQUE_ID));
+    reset_hot_path_profile();
+    let (range_stats, range_throughput) = measure_operation(WARMUP, ITERATIONS, || {
+        let row = range_stmt.query_row_with_params(&range_params).unwrap();
+        assert_eq!(row.values()[0], SqliteValue::Integer(UNIQUE_ID));
+    });
+    let range_profile = hot_path_profile_snapshot();
+    eprintln!(
+        concat!(
+            "manual_perf_probe.future_query_row.rowid_range_100k ",
+            "p50_us={} p95_us={} throughput_ops_per_sec={:.1} ",
+            "fast={} slow={} direct_rowid_range_hits={} result_rows={} result_values={}"
+        ),
+        range_stats.p50_micros,
+        range_stats.p95_micros,
+        range_throughput,
+        range_profile.parser.fast_path_executions,
+        range_profile.parser.slow_path_executions,
+        range_profile.direct_rowid_range_query_hits,
+        range_profile.vdbe.result_rows_total,
+        range_profile.vdbe.result_values_total,
+    );
+
+    assert!(indexed_throughput > 0.0);
+    assert!(range_throughput > 0.0);
 }
 
 #[test]

@@ -27,6 +27,10 @@ const SUBQUERY_ROWS: i64 = 10_000;
 const RECURSIVE_CTE_LIMIT: i64 = 1_000;
 const RECURSIVE_CTE_SUM: i64 = 500_500;
 
+fn expected_score_sum(row_count: i64) -> i64 {
+    7 * row_count * (row_count + 1) / 2
+}
+
 // ─── PRAGMA helpers ─────────────────────────────────────────────────────
 
 fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
@@ -318,6 +322,79 @@ fn bench_full_count_large(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_count_range(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_count_range_50");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(50));
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite();
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
+        b.iter(|| {
+            let count: i64 = stmt
+                .query_row(rusqlite::params![200, 250], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 50);
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite();
+        let stmt = conn
+            .prepare("SELECT COUNT(*) FROM bench WHERE id >= ?1 AND id < ?2")
+            .unwrap();
+        b.iter(|| {
+            let row = stmt
+                .query_row_with_params(&[SqliteValue::Integer(200), SqliteValue::Integer(250)])
+                .unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(50));
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_count_sum_aggregate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("read_count_sum_aggregate");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("csqlite", |b| {
+        let conn = setup_csqlite();
+        let mut stmt = conn
+            .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+            .unwrap();
+        b.iter(|| {
+            let (count, sum): (i64, i64) = stmt
+                .query_row([], |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())))
+                .unwrap();
+            assert_eq!(count, SEED_ROWS);
+            assert_eq!(sum, expected_score_sum(SEED_ROWS));
+        });
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        let conn = setup_fsqlite();
+        let stmt = conn
+            .prepare("SELECT COUNT(*), SUM(score) FROM bench")
+            .unwrap();
+        b.iter(|| {
+            let row = stmt.query_row().unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Integer(SEED_ROWS));
+            assert_eq!(
+                row.values()[1],
+                SqliteValue::Integer(expected_score_sum(SEED_ROWS))
+            );
+        });
+    });
+
+    group.finish();
+}
+
 // ─── 4. GROUP BY aggregate ──────────────────────────────────────────────
 
 fn bench_group_by(c: &mut Criterion) {
@@ -499,6 +576,8 @@ criterion_group!(
         bench_range_scan,
         bench_full_count,
         bench_full_count_large,
+        bench_count_range,
+        bench_count_sum_aggregate,
         bench_group_by,
         bench_order_limit,
         bench_exists_subquery,

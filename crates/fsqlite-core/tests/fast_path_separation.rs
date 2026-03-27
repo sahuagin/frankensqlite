@@ -892,3 +892,163 @@ fn test_entry_proof_within_explicit_transaction() {
         Some(&fsqlite_types::SqliteValue::Text("updated in txn".into()))
     );
 }
+
+/// T16: Future B4 coverage — unique secondary-index query_row should flip the
+/// direct indexed-equality counter once the direct query_row fast path lands.
+#[test]
+#[ignore = "enable when bd-wwqen.4 lands direct indexed-equality query_row fast path"]
+fn future_query_row_indexed_equality_uses_direct_counter() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, email TEXT NOT NULL, val TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX idx_t_email ON t(email)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES
+            (1, 'a@test.example', 'alpha'),
+            (2, 'b@test.example', 'beta'),
+            (3, 'c@test.example', 'gamma')",
+    )
+    .unwrap();
+
+    let stmt = conn
+        .prepare("SELECT id, email, val FROM t WHERE email = ?1")
+        .unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt
+        .query_row_with_params(&[fsqlite_types::SqliteValue::Text("b@test.example".into())])
+        .unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_eq!(
+        row.get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(2)),
+        "indexed equality query_row should return the matching id"
+    );
+    assert_eq!(
+        row.get(1),
+        Some(&fsqlite_types::SqliteValue::Text("b@test.example".into())),
+        "indexed equality query_row should return the matching email"
+    );
+    assert_eq!(
+        row.get(2),
+        Some(&fsqlite_types::SqliteValue::Text("beta".into())),
+        "indexed equality query_row should return the matching payload"
+    );
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "prepared indexed equality query_row should stay on the fast prepared path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "prepared indexed equality query_row should not need slow-path execution"
+    );
+
+    let direct_delta = after
+        .direct_indexed_equality_query_hits
+        .saturating_sub(before.direct_indexed_equality_query_hits);
+    assert!(
+        direct_delta > 0,
+        "future B4 cut should increment direct indexed equality hits for query_row: before={before:?} after={after:?}"
+    );
+
+    let miss = stmt
+        .query_row_with_params(&[fsqlite_types::SqliteValue::Text(
+            "missing@test.example".into(),
+        )])
+        .expect_err("missing indexed equality row should return no rows");
+    assert!(
+        matches!(miss, fsqlite_error::FrankenError::QueryReturnedNoRows),
+        "missing indexed equality row should surface QueryReturnedNoRows"
+    );
+}
+
+/// T17: Future B4 coverage — rowid-range query_row should short-circuit after
+/// first/second row detection and flip the direct rowid-range counter.
+#[test]
+#[ignore = "enable when bd-wwqen.4 lands direct rowid-range query_row fast path"]
+fn future_query_row_rowid_range_uses_direct_counter() {
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES
+            (1, 'alpha'),
+            (2, 'beta'),
+            (3, 'gamma'),
+            (4, 'delta')",
+    )
+    .unwrap();
+
+    let stmt = conn
+        .prepare("SELECT id, val FROM t WHERE id >= ?1 AND id < ?2")
+        .unwrap();
+
+    let before = hot_path_profile_snapshot();
+    let row = stmt
+        .query_row_with_params(&[
+            fsqlite_types::SqliteValue::Integer(2),
+            fsqlite_types::SqliteValue::Integer(3),
+        ])
+        .unwrap();
+    let after = hot_path_profile_snapshot();
+
+    assert_eq!(
+        row.get(0),
+        Some(&fsqlite_types::SqliteValue::Integer(2)),
+        "single-row rowid range should return the expected id"
+    );
+    assert_eq!(
+        row.get(1),
+        Some(&fsqlite_types::SqliteValue::Text("beta".into())),
+        "single-row rowid range should return the expected payload"
+    );
+
+    let (fast_delta, slow_delta) = fast_slow_delta(&before.parser, &after.parser);
+    assert!(
+        fast_delta > 0,
+        "prepared rowid-range query_row should stay on the fast prepared path"
+    );
+    assert_eq!(
+        slow_delta, 0,
+        "prepared rowid-range query_row should not need slow-path execution"
+    );
+
+    let direct_delta = after
+        .direct_rowid_range_query_hits
+        .saturating_sub(before.direct_rowid_range_query_hits);
+    assert!(
+        direct_delta > 0,
+        "future B4 cut should increment direct rowid-range hits for query_row: before={before:?} after={after:?}"
+    );
+
+    let no_rows = stmt
+        .query_row_with_params(&[
+            fsqlite_types::SqliteValue::Integer(5),
+            fsqlite_types::SqliteValue::Integer(5),
+        ])
+        .expect_err("empty rowid range should return no rows");
+    assert!(
+        matches!(no_rows, fsqlite_error::FrankenError::QueryReturnedNoRows),
+        "empty rowid range should surface QueryReturnedNoRows"
+    );
+
+    let multiple_rows = stmt
+        .query_row_with_params(&[
+            fsqlite_types::SqliteValue::Integer(2),
+            fsqlite_types::SqliteValue::Integer(5),
+        ])
+        .expect_err("multi-row range should return multiple rows error");
+    assert!(
+        matches!(
+            multiple_rows,
+            fsqlite_error::FrankenError::QueryReturnedMultipleRows
+        ),
+        "multi-row rowid range should surface QueryReturnedMultipleRows"
+    );
+}

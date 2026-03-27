@@ -611,6 +611,65 @@ impl<P: PageReader> BtCursor<P> {
         result
     }
 
+    /// Count all rows in this table B-tree without decoding cell payloads.
+    ///
+    /// Walks every leaf page summing `cell_count` values. This avoids key
+    /// parsing, overflow chain following, and register materialization — it
+    /// only reads page headers. Still O(pages) but with a much smaller
+    /// constant factor than the `first()/while next()` row-by-row scan.
+    ///
+    /// bd-wwqen.1 (B1.1): direct COUNT(*) fast path.
+    pub fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
+        // Save and restore cursor state so this doesn't disturb
+        // any in-progress iteration.
+        let saved_stack_len = self.stack.len();
+        let saved_eof = self.at_eof;
+        self.stack.clear();
+        self.at_eof = true;
+
+        let result = self.count_all_rows_inner(cx, self.root_page);
+
+        // Restore cursor state.
+        self.stack.clear();
+        self.at_eof = saved_eof;
+        // We can't perfectly restore the stack, but since Count is a
+        // terminal opcode (no further cursor ops expected), clearing
+        // is safe. If needed, the caller will re-seek.
+        let _ = saved_stack_len;
+
+        result
+    }
+
+    fn count_all_rows_inner(&mut self, cx: &Cx, page_no: PageNumber) -> Result<i64> {
+        let entry = self.load_page(cx, page_no)?;
+        if entry.header.page_type.is_leaf() {
+            return Ok(i64::from(entry.header.cell_count));
+        }
+
+        // Interior page: sum children.
+        let cell_count = entry.header.cell_count;
+        let right_child =
+            entry
+                .header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior page has no right child in count_all_rows".to_owned(),
+                })?;
+        let mut total: i64 = 0;
+        for i in 0..cell_count {
+            let cell = self.parse_cell_at(&entry, i)?;
+            let child = cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior cell has no left child in count_all_rows".to_owned(),
+                })?;
+            total = total.saturating_add(self.count_all_rows_inner(cx, child)?);
+        }
+        // Right child.
+        total = total.saturating_add(self.count_all_rows_inner(cx, right_child)?);
+        Ok(total)
+    }
+
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
         let depth = if self.stack.is_empty() {
             self.measure_tree_depth(cx)?
@@ -2473,6 +2532,78 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
+    fn try_table_append_on_hinted_leaf(
+        &mut self,
+        cx: &Cx,
+        hinted_leaf_page: PageNumber,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+        self.stack.clear();
+        self.at_eof = true;
+
+        let mut entry = match self.load_page(cx, hinted_leaf_page) {
+            Ok(entry) => entry,
+            Err(_) => return Ok(false),
+        };
+        if entry.header.page_type != cell::BtreePageType::LeafTable || entry.header.cell_count == 0
+        {
+            self.stack.clear();
+            self.at_eof = true;
+            return Ok(false);
+        }
+
+        entry.cell_idx = entry.header.cell_count - 1;
+        self.stack.push(entry);
+        self.at_eof = false;
+        self.record_range_page_witness(hinted_leaf_page);
+
+        let last_rowid = self.rowid(cx)?;
+        if rowid <= last_rowid {
+            self.stack.clear();
+            self.at_eof = true;
+            return Ok(false);
+        }
+
+        self.at_eof = true;
+        let insert_idx = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+            .header
+            .cell_count;
+
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+            Ok(true) => {
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                Ok(true)
+            }
+            Ok(false) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    self.free_overflow_chain(cx, first)?;
+                }
+                self.stack.clear();
+                self.at_eof = true;
+                Ok(false)
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                self.stack.clear();
+                self.at_eof = true;
+                Err(error)
+            }
+        }
+    }
+
     /// Fast insert path for callers that already positioned the cursor with
     /// `table_move_to(rowid)` and observed `SeekResult::NotFound`.
     ///
@@ -2496,6 +2627,41 @@ impl<P: PageWriter> BtCursor<P> {
     #[doc(hidden)]
     pub fn table_insert_rightmost_hint(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            let has_last = cursor.last(cx)?;
+            if has_last {
+                let last_rowid = cursor.rowid(cx)?;
+                if rowid <= last_rowid {
+                    let seek = cursor.table_seek_for_insert(cx, rowid)?;
+                    if seek.is_found() {
+                        return Err(FrankenError::PrimaryKeyViolation);
+                    }
+                    return cursor.table_insert_from_current_position(cx, rowid, data);
+                }
+                cursor.at_eof = true;
+            }
+            cursor.table_insert_from_current_position(cx, rowid, data)
+        })
+    }
+
+    /// Fast append path for repeated monotonic inserts when the caller has a
+    /// previously successful rightmost leaf hint from the same table.
+    ///
+    /// The hint is conservative: if the leaf is stale, full, or no longer
+    /// ordered before `rowid`, this falls back to the normal rightmost-hint
+    /// insert path.
+    #[doc(hidden)]
+    pub fn table_insert_rightmost_leaf_hint(
+        &mut self,
+        cx: &Cx,
+        hinted_leaf_page: PageNumber,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if cursor.try_table_append_on_hinted_leaf(cx, hinted_leaf_page, rowid, data)? {
+                return Ok(());
+            }
+
             let has_last = cursor.last(cx)?;
             if has_last {
                 let last_rowid = cursor.rowid(cx)?;
@@ -4757,6 +4923,40 @@ mod tests {
             cursor
                 .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
                 .unwrap();
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=256_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_insert_rightmost_leaf_hint_reuses_leaf_and_falls_back_after_split() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+
+        let mut hinted_leaf = cursor
+            .current_page()
+            .expect("first append should leave the cursor on a concrete leaf");
+        for rowid in 2..=256_i64 {
+            let payload = payload_for_rowid(rowid);
+            cursor
+                .table_insert_rightmost_leaf_hint(&cx, hinted_leaf, rowid, payload.as_slice())
+                .unwrap();
+            if let Some(current_leaf) = cursor.current_page() {
+                hinted_leaf = current_leaf;
+            }
         }
 
         assert!(cursor.first(&cx).unwrap());

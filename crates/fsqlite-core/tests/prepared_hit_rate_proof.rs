@@ -188,17 +188,19 @@ fn test_prepared_fast_lane_hit_rate_on_c1_workload() {
         "prepared stmts should not produce compiled cache hits"
     );
 
-    // 4. Table engine reuse should cover all ops with zero fresh allocs
-    // in the measurement window (allocs happen during warmup, before reset).
+    // 4. Either the direct-insert fast path OR the engine-reuse path should
+    // cover all ops. The direct-insert path bypasses the VDBE engine entirely
+    // (so engine_reuses stays 0) but is strictly faster. Accept either.
+    let direct_insert_executions = snap.prepared_direct_insert_executions;
+    let engine_reuses = snap.prepared_table_engine_reuses;
+    assert!(
+        direct_insert_executions >= 100 || engine_reuses >= 100,
+        "all ops should use either direct-insert ({direct_insert_executions}) or engine-reuse ({engine_reuses}) path",
+    );
     assert_eq!(
         snap.prepared_table_engine_fresh_allocs, 0,
         "no fresh table-engine allocs expected after warmup: got {}",
         snap.prepared_table_engine_fresh_allocs
-    );
-    assert!(
-        snap.prepared_table_engine_reuses >= 100,
-        "table engine should be reused for all ops: got {}",
-        snap.prepared_table_engine_reuses
     );
 }
 

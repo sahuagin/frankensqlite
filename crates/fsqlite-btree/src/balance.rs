@@ -1747,7 +1747,12 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 final_cells.len()
             )));
         }
-        let last_pgno = *new_pgnos.last().unwrap();
+        let last_pgno = *new_pgnos.last().ok_or_else(|| {
+            FrankenError::internal(format!(
+                "apply_child_replacement: new_pgnos empty despite guard for page {}",
+                parent_page_no
+            ))
+        })?;
         if final_cells[patch_idx].data.len() < 4 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(

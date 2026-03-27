@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fsqlite_e2e::benchmark::BenchmarkSummary;
+use fsqlite_e2e::benchmark::{BenchmarkSummary, IterationRecord, LatencyStats, ThroughputStats};
 use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BenchmarkArtifactCommand, BenchmarkArtifactManifest,
     BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
@@ -14,9 +14,18 @@ use fsqlite_e2e::fixture_select::{
     PLACEMENT_PROFILE_BASELINE_UNPINNED, build_benchmark_artifact_manifest,
     load_beads_benchmark_campaign,
 };
+use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+const MATRIX_REGRESSION_GATE_SCHEMA_V1: &str =
+    "fsqlite-e2e.complete_benchmark_matrix_regression_gate.v1";
+const DEFAULT_MAX_P95_RATIO: f64 = 1.25;
+const DEFAULT_MIN_THROUGHPUT_RATIO: f64 = 0.80;
+const MATRIX_BASELINE_JSONL_ENV: &str = "FSQLITE_MATRIX_BASELINE_JSONL";
+const MATRIX_MAX_P95_RATIO_ENV: &str = "FSQLITE_MATRIX_MAX_P95_RATIO";
+const MATRIX_MIN_THROUGHPUT_RATIO_ENV: &str = "FSQLITE_MATRIX_MIN_THROUGHPUT_RATIO";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -256,6 +265,219 @@ fn sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn resolve_repo_relative_env_path(repo_root: &Path, key: &str) -> Option<PathBuf> {
+    std::env::var_os(key).map(|raw| {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            repo_root.join(path)
+        }
+    })
+}
+
+fn parse_ratio_env(key: &str, default: f64) -> Result<f64, Box<dyn Error>> {
+    let Some(raw) = std::env::var_os(key) else {
+        return Ok(default);
+    };
+    let text = raw.to_string_lossy();
+    let value: f64 = text
+        .parse()
+        .map_err(|error| format!("invalid {key} `{text}`: {error}"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{key} must be finite and > 0, got `{text}`").into());
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct MatrixRegressionThresholds {
+    max_p95_ratio: f64,
+    min_throughput_ratio: f64,
+}
+
+impl Default for MatrixRegressionThresholds {
+    fn default() -> Self {
+        Self {
+            max_p95_ratio: DEFAULT_MAX_P95_RATIO,
+            min_throughput_ratio: DEFAULT_MIN_THROUGHPUT_RATIO,
+        }
+    }
+}
+
+impl MatrixRegressionThresholds {
+    fn from_env() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            max_p95_ratio: parse_ratio_env(MATRIX_MAX_P95_RATIO_ENV, DEFAULT_MAX_P95_RATIO)?,
+            min_throughput_ratio: parse_ratio_env(
+                MATRIX_MIN_THROUGHPUT_RATIO_ENV,
+                DEFAULT_MIN_THROUGHPUT_RATIO,
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MatrixRegressionCheck {
+    benchmark_id: String,
+    baseline_p95_ms: f64,
+    current_p95_ms: f64,
+    p95_ratio: f64,
+    baseline_throughput_ops_per_sec: f64,
+    current_throughput_ops_per_sec: f64,
+    throughput_ratio: f64,
+    passed: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MatrixRegressionGateReport {
+    schema_version: String,
+    baseline_jsonl: String,
+    current_jsonl: String,
+    thresholds: MatrixRegressionThresholds,
+    compared_cells: usize,
+    missing_baseline_cells: Vec<String>,
+    failing_cells: Vec<String>,
+    checks: Vec<MatrixRegressionCheck>,
+}
+
+impl MatrixRegressionGateReport {
+    fn failure_summary(&self) -> Option<String> {
+        if self.missing_baseline_cells.is_empty() && self.failing_cells.is_empty() {
+            return None;
+        }
+
+        let mut segments = Vec::new();
+        if !self.missing_baseline_cells.is_empty() {
+            segments.push(format!(
+                "missing baseline cells: {}",
+                self.missing_baseline_cells.join(", ")
+            ));
+        }
+        if !self.failing_cells.is_empty() {
+            segments.push(format!(
+                "regressed cells: {}",
+                self.failing_cells.join(", ")
+            ));
+        }
+        Some(segments.join(" | "))
+    }
+}
+
+fn load_benchmark_summary_map(
+    path: &Path,
+) -> Result<BTreeMap<String, BenchmarkSummary>, Box<dyn Error>> {
+    let mut summaries = BTreeMap::new();
+    let raw = fs::read_to_string(path)?;
+    for (line_idx, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let summary: BenchmarkSummary = serde_json::from_str(line).map_err(|error| {
+            format!(
+                "parse benchmark summary line {} from {}: {error}",
+                line_idx + 1,
+                path.display()
+            )
+        })?;
+        if summaries
+            .insert(summary.benchmark_id.clone(), summary)
+            .is_some()
+        {
+            return Err(format!(
+                "duplicate benchmark_id in {} on line {}",
+                path.display(),
+                line_idx + 1
+            )
+            .into());
+        }
+    }
+    Ok(summaries)
+}
+
+fn evaluate_matrix_regression_gate(
+    baseline_jsonl: &Path,
+    current_jsonl: &Path,
+    thresholds: MatrixRegressionThresholds,
+) -> Result<MatrixRegressionGateReport, Box<dyn Error>> {
+    let baseline = load_benchmark_summary_map(baseline_jsonl)?;
+    let current = load_benchmark_summary_map(current_jsonl)?;
+
+    let mut checks = Vec::new();
+    let mut missing_baseline_cells = Vec::new();
+    let mut failing_cells = Vec::new();
+
+    for (benchmark_id, current_summary) in &current {
+        let Some(baseline_summary) = baseline.get(benchmark_id) else {
+            missing_baseline_cells.push(benchmark_id.clone());
+            continue;
+        };
+
+        let mut reasons = Vec::new();
+
+        let p95_ratio = if baseline_summary.latency.p95_ms > 0.0 {
+            current_summary.latency.p95_ms / baseline_summary.latency.p95_ms
+        } else {
+            reasons.push(format!(
+                "baseline p95 must be > 0, got {:.4}",
+                baseline_summary.latency.p95_ms
+            ));
+            f64::INFINITY
+        };
+        if p95_ratio > thresholds.max_p95_ratio {
+            reasons.push(format!(
+                "p95 ratio {:.4} > allowed {:.4}",
+                p95_ratio, thresholds.max_p95_ratio
+            ));
+        }
+
+        let throughput_ratio = if baseline_summary.throughput.median_ops_per_sec > 0.0 {
+            current_summary.throughput.median_ops_per_sec
+                / baseline_summary.throughput.median_ops_per_sec
+        } else {
+            reasons.push(format!(
+                "baseline throughput must be > 0, got {:.4}",
+                baseline_summary.throughput.median_ops_per_sec
+            ));
+            0.0
+        };
+        if throughput_ratio < thresholds.min_throughput_ratio {
+            reasons.push(format!(
+                "throughput ratio {:.4} < allowed {:.4}",
+                throughput_ratio, thresholds.min_throughput_ratio
+            ));
+        }
+
+        let passed = reasons.is_empty();
+        if !passed {
+            failing_cells.push(benchmark_id.clone());
+        }
+        checks.push(MatrixRegressionCheck {
+            benchmark_id: benchmark_id.clone(),
+            baseline_p95_ms: baseline_summary.latency.p95_ms,
+            current_p95_ms: current_summary.latency.p95_ms,
+            p95_ratio,
+            baseline_throughput_ops_per_sec: baseline_summary.throughput.median_ops_per_sec,
+            current_throughput_ops_per_sec: current_summary.throughput.median_ops_per_sec,
+            throughput_ratio,
+            passed,
+            reasons,
+        });
+    }
+
+    Ok(MatrixRegressionGateReport {
+        schema_version: MATRIX_REGRESSION_GATE_SCHEMA_V1.to_owned(),
+        baseline_jsonl: baseline_jsonl.display().to_string(),
+        current_jsonl: current_jsonl.display().to_string(),
+        thresholds,
+        compared_cells: checks.len(),
+        missing_baseline_cells,
+        failing_cells,
+        checks,
+    })
+}
+
 fn benchmark_mode_from_engine(engine: &str) -> Result<BenchmarkMode, Box<dyn Error>> {
     match engine {
         "sqlite3" | "sqlite_reference" => Ok(BenchmarkMode::SqliteReference),
@@ -461,6 +683,192 @@ fn matrix_artifact_dir_relative_override_is_repo_relative() -> Result<(), Box<dy
     );
     assert_eq!(artifact_dir, repo_root.join("tmp/matrix-output"));
     Ok(())
+}
+
+fn sample_benchmark_summary(
+    benchmark_id: &str,
+    engine: &str,
+    workload: &str,
+    fixture_id: &str,
+    concurrency: u16,
+    p95_ms: f64,
+    throughput_ops_per_sec: f64,
+) -> BenchmarkSummary {
+    BenchmarkSummary {
+        benchmark_id: benchmark_id.to_owned(),
+        engine: engine.to_owned(),
+        workload: workload.to_owned(),
+        fixture_id: fixture_id.to_owned(),
+        concurrency,
+        methodology: MethodologyMeta::current(),
+        environment: EnvironmentMeta::capture("test"),
+        warmup_count: 0,
+        measurement_count: 3,
+        total_measurement_ms: 30,
+        latency: LatencyStats {
+            min_ms: p95_ms * 0.5,
+            max_ms: p95_ms * 1.1,
+            mean_ms: p95_ms * 0.8,
+            median_ms: p95_ms * 0.75,
+            p95_ms,
+            p99_ms: p95_ms * 1.05,
+            stddev_ms: p95_ms * 0.1,
+        },
+        throughput: ThroughputStats {
+            mean_ops_per_sec: throughput_ops_per_sec * 0.98,
+            median_ops_per_sec: throughput_ops_per_sec,
+            peak_ops_per_sec: throughput_ops_per_sec * 1.02,
+        },
+        iterations: vec![IterationRecord {
+            iteration: 0,
+            wall_time_ms: 10,
+            ops_per_sec: throughput_ops_per_sec,
+            ops_total: 100,
+            retries: 0,
+            aborts: 0,
+            error: None,
+        }],
+    }
+}
+
+#[test]
+fn matrix_regression_gate_loads_canonical_record_lines_via_benchmark_summary() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let path = tempdir.path().join("canonical.jsonl");
+    let payload = serde_json::json!({
+        "benchmark_id": "fsqlite:count_star:fixture:c1",
+        "engine": "fsqlite",
+        "workload": "count_star",
+        "fixture_id": "fixture",
+        "concurrency": 1,
+        "methodology": MethodologyMeta::current(),
+        "environment": EnvironmentMeta::capture("test"),
+        "warmup_count": 0,
+        "measurement_count": 1,
+        "total_measurement_ms": 10,
+        "latency": {
+            "min_ms": 1.0,
+            "max_ms": 2.0,
+            "mean_ms": 1.5,
+            "median_ms": 1.4,
+            "p95_ms": 1.9,
+            "p99_ms": 2.0,
+            "stddev_ms": 0.1
+        },
+        "throughput": {
+            "mean_ops_per_sec": 1000.0,
+            "median_ops_per_sec": 950.0,
+            "peak_ops_per_sec": 1100.0
+        },
+        "iterations": [],
+        "row_id": "row-1",
+        "mode_id": "fsqlite_mvcc"
+    });
+    fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&payload).expect("serialize payload")
+        ),
+    )
+    .expect("write canonical jsonl");
+
+    let summaries = load_benchmark_summary_map(&path).expect("load summaries");
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries.contains_key("fsqlite:count_star:fixture:c1"));
+}
+
+#[test]
+fn matrix_regression_gate_flags_ratio_failures_and_missing_baselines() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let baseline_path = tempdir.path().join("baseline.jsonl");
+    let current_path = tempdir.path().join("current.jsonl");
+
+    let baseline = [
+        sample_benchmark_summary(
+            "fsqlite:count_star:fixture:c1",
+            "fsqlite",
+            "count_star",
+            "fixture",
+            1,
+            10.0,
+            1_000.0,
+        ),
+        sample_benchmark_summary(
+            "fsqlite:exists_subquery:fixture:c1",
+            "fsqlite",
+            "exists_subquery",
+            "fixture",
+            1,
+            20.0,
+            800.0,
+        ),
+    ];
+    let current = [
+        sample_benchmark_summary(
+            "fsqlite:count_star:fixture:c1",
+            "fsqlite",
+            "count_star",
+            "fixture",
+            1,
+            13.0,
+            700.0,
+        ),
+        sample_benchmark_summary(
+            "fsqlite:missing_baseline:fixture:c1",
+            "fsqlite",
+            "missing_baseline",
+            "fixture",
+            1,
+            5.0,
+            500.0,
+        ),
+    ];
+
+    fs::write(
+        &baseline_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&baseline[0]).expect("serialize baseline[0]"),
+            serde_json::to_string(&baseline[1]).expect("serialize baseline[1]")
+        ),
+    )
+    .expect("write baseline");
+    fs::write(
+        &current_path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&current[0]).expect("serialize current[0]"),
+            serde_json::to_string(&current[1]).expect("serialize current[1]")
+        ),
+    )
+    .expect("write current");
+
+    let report = evaluate_matrix_regression_gate(
+        &baseline_path,
+        &current_path,
+        MatrixRegressionThresholds {
+            max_p95_ratio: 1.20,
+            min_throughput_ratio: 0.80,
+        },
+    )
+    .expect("evaluate regression gate");
+
+    assert_eq!(report.compared_cells, 1);
+    assert_eq!(
+        report.missing_baseline_cells,
+        vec!["fsqlite:missing_baseline:fixture:c1".to_owned()]
+    );
+    assert_eq!(
+        report.failing_cells,
+        vec!["fsqlite:count_star:fixture:c1".to_owned()]
+    );
+    assert!(
+        report
+            .failure_summary()
+            .expect("gate should fail")
+            .contains("regressed cells")
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -727,6 +1135,7 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     let single_md = artifact_dir.join(format!("{stem}_single_writer.md"));
     let full_jsonl = artifact_dir.join(format!("{stem}_full.jsonl"));
     let manifest_json = artifact_dir.join(format!("{stem}.manifest.json"));
+    let regression_summary_json = artifact_dir.join(format!("{stem}.regression_summary.json"));
 
     let mut ran_both = false;
     let mut ran_single = false;
@@ -844,6 +1253,29 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
     }
     fs::write(&full_jsonl, combined)?;
 
+    let baseline_jsonl = resolve_repo_relative_env_path(&repo_root, MATRIX_BASELINE_JSONL_ENV);
+    let regression_gate_report = if let Some(baseline_jsonl) = baseline_jsonl.as_ref() {
+        let report = evaluate_matrix_regression_gate(
+            baseline_jsonl,
+            &full_jsonl,
+            MatrixRegressionThresholds::from_env()?,
+        )?;
+        fs::write(
+            &regression_summary_json,
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        if let Some(summary) = report.failure_summary() {
+            return Err(format!(
+                "matrix regression gate failed against {}: {summary}",
+                baseline_jsonl.display()
+            )
+            .into());
+        }
+        Some(report)
+    } else {
+        None
+    };
+
     let manifest = serde_json::json!({
         "schema_version": "fsqlite-e2e.complete_benchmark_matrix_manifest.v2",
         "campaign_id": campaign.campaign_id,
@@ -861,6 +1293,12 @@ fn complete_benchmark_matrix() -> Result<(), Box<dyn Error>> {
         "matrix_single_writer_jsonl": ran_single.then_some(single_jsonl),
         "matrix_single_writer_md": ran_single.then_some(single_md),
         "matrix_full_jsonl": full_jsonl,
+        "matrix_baseline_jsonl": baseline_jsonl,
+        "matrix_regression_summary_json": regression_gate_report.as_ref().map(|_| regression_summary_json.clone()),
+        "matrix_regression_thresholds": regression_gate_report.as_ref().map(|report| report.thresholds),
+        "matrix_regression_compared_cells": regression_gate_report.as_ref().map(|report| report.compared_cells),
+        "matrix_regression_missing_baseline_cells": regression_gate_report.as_ref().map(|report| report.missing_baseline_cells.clone()),
+        "matrix_regression_failing_cells": regression_gate_report.as_ref().map(|report| report.failing_cells.clone()),
         "generated_bundle_count": generated_bundles.len(),
         "generated_bundles": generated_bundles,
     });
