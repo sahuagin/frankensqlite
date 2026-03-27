@@ -300,27 +300,27 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
 }
 
 /// B3.4 Probe: Measure commit_txn_roundtrip_time_ns for :memory: autocommit INSERTs.
+/// Uses AUTO-ROWID inserts to test the implicit_rowid_hint fast path.
 #[test]
 fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
     let _profile_guard = HotPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
+    // Use auto-rowid: INSERT INTO t(val) VALUES(?) - no explicit id
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)").unwrap();
-    let stmt = conn.prepare("INSERT INTO t VALUES(?1, ?2)").unwrap();
+    let stmt = conn.prepare("INSERT INTO t(val) VALUES(?1)").unwrap();
 
     // Warmup
     for i in 0..10 {
         stmt.execute_with_params(&[
-            SqliteValue::Integer(i),
             SqliteValue::Text(format!("w{i}").into()),
         ]).unwrap();
     }
     reset_hot_path_profile();
 
-    // Measurement: 1000 autocommit INSERTs
+    // Measurement: 1000 autocommit INSERTs with auto-rowid
     let n: i64 = 1000;
     for i in 0..n {
         stmt.execute_with_params(&[
-            SqliteValue::Integer(i + 100),
             SqliteValue::Text(format!("v{i}").into()),
         ]).unwrap();
     }
@@ -328,13 +328,18 @@ fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
     let snap = hot_path_profile_snapshot();
     let commit_us = snap.commit_txn_roundtrip_time_ns as f64 / 1000.0;
     let per_row_us = commit_us / n as f64;
+    let cursor_setup_us = snap.prepared_direct_insert_cursor_setup_time_ns as f64 / 1000.0;
+    let btree_insert_us = snap.prepared_direct_insert_btree_insert_time_ns as f64 / 1000.0;
 
-    eprintln!("=== B3.4 Probe ({n} :memory: INSERTs) ===");
-    eprintln!("commit_txn_roundtrip: {:.1} us total, {:.3} us/row", commit_us, per_row_us);
-    eprintln!("execute_body:         {:.1} us total, {:.3} us/row",
+    eprintln!("=== B3.4 Probe ({n} :memory: auto-rowid INSERTs) ===");
+    eprintln!("commit_txn_roundtrip:  {:.1} us total, {:.3} us/row", commit_us, per_row_us);
+    eprintln!("cursor_setup:          {:.1} us total, {:.3} us/row", cursor_setup_us, cursor_setup_us / n as f64);
+    eprintln!("btree_insert:          {:.1} us total, {:.3} us/row", btree_insert_us, btree_insert_us / n as f64);
+    eprintln!("execute_body:          {:.1} us total, {:.3} us/row",
               snap.execute_body_time_ns as f64 / 1000.0,
               snap.execute_body_time_ns as f64 / 1000.0 / n as f64);
     eprintln!("fast_lane_hits: {}", snap.prepared_insert_fast_lane_hits);
+    eprintln!("direct_insert_executions: {}", snap.prepared_direct_insert_executions);
 
     assert!(snap.prepared_insert_fast_lane_hits >= n as u64);
 }
