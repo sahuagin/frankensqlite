@@ -373,6 +373,12 @@ pub struct BtCursor<P> {
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
     /// engine to implement `sqlite3_last_insert_rowid()` on a per-cursor basis.
     pub last_insert_rowid: Option<i64>,
+    /// bd-wwqen.3: Cached (leaf_page, last_rowid) from the most recent
+    /// successful hinted-leaf append. On the next hinted-leaf insert, if the
+    /// hint matches this cached page AND rowid > cached_rowid, skip the
+    /// `self.rowid(cx)?` cell parse and use the cached value directly.
+    /// Cleared on any non-append cursor operation.
+    append_hint_cache: Option<(PageNumber, i64)>,
 }
 
 impl<P> BtCursor<P> {
@@ -383,6 +389,7 @@ impl<P> BtCursor<P> {
     pub fn invalidate(&mut self) {
         self.at_eof = true;
         self.stack.clear();
+        self.append_hint_cache = None;
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -469,6 +476,7 @@ impl<P: PageReader> BtCursor<P> {
             active_op_stats: None,
             cell_buf: Vec::new(),
             last_insert_rowid: None,
+            append_hint_cache: None,
         }
     }
 
@@ -622,52 +630,119 @@ impl<P: PageReader> BtCursor<P> {
     pub fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
         // Save and restore cursor state so this doesn't disturb
         // any in-progress iteration.
-        let saved_stack_len = self.stack.len();
         let saved_eof = self.at_eof;
         self.stack.clear();
         self.at_eof = true;
 
-        let result = self.count_all_rows_inner(cx, self.root_page);
+        // bd-wwqen.1: iterative B-tree walk — no recursion overhead.
+        let result = self.count_all_rows_iterative(cx);
 
         // Restore cursor state.
         self.stack.clear();
         self.at_eof = saved_eof;
-        // We can't perfectly restore the stack, but since Count is a
-        // terminal opcode (no further cursor ops expected), clearing
-        // is safe. If needed, the caller will re-seek.
-        let _ = saved_stack_len;
 
         result
     }
 
-    fn count_all_rows_inner(&mut self, cx: &Cx, page_no: PageNumber) -> Result<i64> {
-        let entry = self.load_page(cx, page_no)?;
-        if entry.header.page_type.is_leaf() {
-            return Ok(i64::from(entry.header.cell_count));
-        }
-
-        // Interior page: sum children.
-        let cell_count = entry.header.cell_count;
-        let right_child =
-            entry
-                .header
-                .right_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior page has no right child in count_all_rows".to_owned(),
-                })?;
+    /// bd-wwqen.1: Iterative B-tree count matching SQLite's sqlite3BtreeCount
+    /// pattern. Walks every page exactly once without recursion, extracting
+    /// child page numbers directly from raw cell bytes (4-byte BE at cell
+    /// offset) to avoid full parse_cell_at overhead.
+    fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
+        // Stack of (page_no, next_cell_idx_to_descend).
+        // When next_cell_idx == cell_count, descend into right_child.
+        // When next_cell_idx == cell_count + 1, this page is fully visited.
+        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>)> = Vec::new();
         let mut total: i64 = 0;
-        for i in 0..cell_count {
-            let cell = self.parse_cell_at(&entry, i)?;
-            let child = cell
-                .left_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior cell has no left child in count_all_rows".to_owned(),
-                })?;
-            total = total.saturating_add(self.count_all_rows_inner(cx, child)?);
+        let mut current_page = self.root_page;
+
+        loop {
+            let entry = self.load_page(cx, current_page)?;
+
+            if entry.header.page_type.is_leaf() {
+                // Leaf: count cells from the page header, no payload decode.
+                total = total.saturating_add(i64::from(entry.header.cell_count));
+
+                // Pop up until we find a parent with unvisited children.
+                loop {
+                    let Some((parent_page, cell_idx, cell_count, right_child)) =
+                        visit_stack.last_mut()
+                    else {
+                        // Stack empty — all pages visited.
+                        return Ok(total);
+                    };
+
+                    if *cell_idx < *cell_count {
+                        // Descend into the next left_child of this parent.
+                        let parent_entry = self.load_page(cx, *parent_page)?;
+                        let child = self.read_interior_cell_child(&parent_entry, *cell_idx)?;
+                        *cell_idx += 1;
+                        current_page = child;
+                        break;
+                    } else if let Some(rc) = right_child.take() {
+                        // Descend into right_child.
+                        current_page = rc;
+                        break;
+                    } else {
+                        // This parent is fully visited, pop it.
+                        visit_stack.pop();
+                    }
+                }
+            } else {
+                // Interior page: push onto stack, descend into first child.
+                let cell_count = entry.header.cell_count;
+                let right_child =
+                    entry
+                        .header
+                        .right_child
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: "interior page has no right child in count_all_rows".to_owned(),
+                        })?;
+
+                if cell_count == 0 {
+                    // Degenerate interior page with no cells — only right child.
+                    visit_stack.push((current_page, 0, 0, None));
+                    current_page = right_child;
+                } else {
+                    // Read first child, push parent with next_idx=1.
+                    let first_child = self.read_interior_cell_child(&entry, 0)?;
+                    visit_stack.push((current_page, 1, cell_count, Some(right_child)));
+                    current_page = first_child;
+                }
+            }
         }
-        // Right child.
-        total = total.saturating_add(self.count_all_rows_inner(cx, right_child)?);
-        Ok(total)
+    }
+
+    /// Extract the left_child page number from an interior cell at the given
+    /// index without full cell parsing. Interior cells store a 4-byte BE
+    /// page number at the start of the cell.
+    fn read_interior_cell_child(&self, entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
+        let cell_pointers = &entry.cell_pointers;
+        let idx = cell_idx as usize;
+        if idx >= cell_pointers.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {idx} out of range for page with {} cells",
+                    cell_pointers.len()
+                ),
+            });
+        }
+        let cell_offset = cell_pointers[idx] as usize;
+        let page = entry.page_data.as_bytes();
+        if cell_offset + 4 > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "interior cell extends past page in count_all_rows".to_owned(),
+            });
+        }
+        let pgno = u32::from_be_bytes([
+            page[cell_offset],
+            page[cell_offset + 1],
+            page[cell_offset + 2],
+            page[cell_offset + 3],
+        ]);
+        PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "interior cell has zero left-child pointer in count_all_rows".to_owned(),
+        })
     }
 
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
@@ -2596,7 +2671,17 @@ impl<P: PageWriter> BtCursor<P> {
         self.at_eof = false;
         self.record_range_page_witness(hinted_leaf_page);
 
-        let last_rowid = self.rowid(cx)?;
+        // bd-wwqen.3: use cached rowid if available for this leaf page,
+        // avoiding a cell parse just to read the last rowid.
+        let last_rowid = if let Some((cached_page, cached_rowid)) = self.append_hint_cache {
+            if cached_page == hinted_leaf_page {
+                cached_rowid
+            } else {
+                self.rowid(cx)?
+            }
+        } else {
+            self.rowid(cx)?
+        };
         if rowid <= last_rowid {
             self.stack.clear();
             self.at_eof = true;
@@ -2618,6 +2703,8 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
+                // bd-wwqen.3: cache the leaf page + rowid for next insert.
+                self.append_hint_cache = Some((hinted_leaf_page, rowid));
                 Ok(true)
             }
             Ok(false) => {
@@ -2627,6 +2714,7 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 self.stack.clear();
                 self.at_eof = true;
+                self.append_hint_cache = None; // leaf full or stale
                 Ok(false)
             }
             Err(error) => {
