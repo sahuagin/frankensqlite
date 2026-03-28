@@ -1887,6 +1887,7 @@ impl<P: PageWriter> BtCursor<P> {
     ///
     /// The buffer is cleared and reused across calls so repeated inserts
     /// reuse the same heap allocation.
+    #[inline]
     fn encode_table_leaf_cell_into(
         &mut self,
         cx: &Cx,

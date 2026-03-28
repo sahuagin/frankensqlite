@@ -2921,6 +2921,105 @@ struct CountStarPlusSumPlan {
     sum_is_rowid: bool,
 }
 
+struct GroupByRowidBucketSumPlan {
+    group_divisor: i64,
+    group_out_idx: usize,
+    sum_out_idx: usize,
+    sum_col_idx: usize,
+}
+
+fn rowid_bucket_divisor(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<i64> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOp::Divide,
+        right,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    if !matches!(
+        resolve_column_ref(left, table, table_alias),
+        Some(SortKeySource::Rowid)
+    ) {
+        return None;
+    }
+
+    match right.as_ref() {
+        Expr::Literal(Literal::Integer(divisor), _) if *divisor > 0 => Some(*divisor),
+        _ => None,
+    }
+}
+
+fn simple_group_by_rowid_bucket_sum_plan(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    group_by: &[Expr],
+) -> Option<GroupByRowidBucketSumPlan> {
+    if columns.len() != 2 || group_by.len() != 1 {
+        return None;
+    }
+
+    let group_expr = &group_by[0];
+    let group_divisor = rowid_bucket_divisor(group_expr, table, table_alias)?;
+    let mut group_out_idx = None;
+    let mut sum_out_idx = None;
+    let mut sum_col_idx = None;
+
+    for (out_idx, column) in columns.iter().enumerate() {
+        match column {
+            ResultColumn::Expr { expr, .. } if expr == group_expr => {
+                if group_out_idx.replace(out_idx).is_some() {
+                    return None;
+                }
+            }
+            ResultColumn::Expr {
+                expr:
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct: false,
+                        order_by,
+                        filter: None,
+                        over: None,
+                        ..
+                    },
+                ..
+            } if name.eq_ignore_ascii_case("sum") && order_by.is_empty() => {
+                let FunctionArgs::List(exprs) = args else {
+                    return None;
+                };
+                let [arg_expr] = exprs.as_slice() else {
+                    return None;
+                };
+                let Some(SortKeySource::Column(idx)) =
+                    resolve_column_ref(arg_expr, table, table_alias)
+                else {
+                    return None;
+                };
+                if sum_out_idx.replace(out_idx).is_some() {
+                    return None;
+                }
+                sum_col_idx = Some(idx);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(GroupByRowidBucketSumPlan {
+        group_divisor,
+        group_out_idx: group_out_idx?,
+        sum_out_idx: sum_out_idx?,
+        sum_col_idx: sum_col_idx?,
+    })
+}
+
 fn simple_count_star_plus_sum_plan(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -3261,6 +3360,156 @@ fn codegen_select_count_star_plus_sum(
     );
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 2, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::unnecessary_wraps)]
+fn codegen_select_group_by_rowid_bucket_sum(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    plan: &GroupByRowidBucketSumPlan,
+    out_regs: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let group_reg = out_regs + i32::try_from(plan.group_out_idx).unwrap_or_default();
+    let sum_out_reg = out_regs + i32::try_from(plan.sum_out_idx).unwrap_or_default();
+    let divisor_reg = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+    let cur_key_reg = b.alloc_reg();
+    let prev_key_reg = b.alloc_reg();
+    let sum_accum_reg = b.alloc_reg();
+    let sum_arg_reg = b.alloc_reg();
+    let have_group_reg = b.alloc_reg();
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::Int64,
+        0,
+        divisor_reg,
+        0,
+        P4::Int64(plan.group_divisor),
+        0,
+    );
+    b.emit_op(Opcode::Null, 0, prev_key_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, have_group_reg, 0, P4::None, 0);
+
+    let finalize_label = b.emit_label();
+    let compare_keys_label = b.emit_label();
+    let new_group_label = b.emit_label();
+    let first_row_label = b.emit_label();
+    let same_group_label = b.emit_label();
+    let scan_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
+    b.emit_op(Opcode::Rowid, cursor, rowid_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Divide,
+        divisor_reg,
+        rowid_reg,
+        cur_key_reg,
+        P4::None,
+        0,
+    );
+
+    b.emit_jump_to_label(
+        Opcode::IfPos,
+        have_group_reg,
+        0,
+        compare_keys_label,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, first_row_label, P4::None, 0);
+
+    b.resolve_label(compare_keys_label);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        cur_key_reg,
+        prev_key_reg,
+        new_group_label,
+        P4::None,
+        0x80,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, same_group_label, P4::None, 0);
+
+    b.resolve_label(new_group_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        sum_accum_reg,
+        1,
+        0,
+        P4::FuncName("SUM".to_owned()),
+        0,
+    );
+    b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, sum_accum_reg, sum_out_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_regs, 2, 0, P4::None, 0);
+    b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+
+    b.resolve_label(first_row_label);
+    b.emit_op(Opcode::Integer, 1, have_group_reg, 0, P4::None, 0);
+
+    b.resolve_label(same_group_label);
+    b.emit_op(Opcode::Copy, cur_key_reg, prev_key_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Column,
+        cursor,
+        i32::try_from(plan.sum_col_idx).unwrap_or_default(),
+        sum_arg_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::AggStep,
+        0,
+        sum_arg_reg,
+        sum_accum_reg,
+        P4::FuncName("SUM".to_owned()),
+        1,
+    );
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+
+    let output_final_label = b.emit_label();
+    b.resolve_label(finalize_label);
+    b.emit_jump_to_label(
+        Opcode::IfPos,
+        have_group_reg,
+        0,
+        output_final_label,
+        P4::None,
+        0,
+    );
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(output_final_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        sum_accum_reg,
+        1,
+        0,
+        P4::FuncName("SUM".to_owned()),
+        0,
+    );
+    b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, sum_accum_reg, sum_out_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::ResultRow, out_regs, 2, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     b.resolve_label(end_label);
@@ -8058,6 +8307,17 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
+    if where_clause.is_none()
+        && having.is_none()
+        && limit_clause.is_none()
+        && let Some(plan) =
+            simple_group_by_rowid_bucket_sum_plan(columns, table, table_alias, group_by)
+    {
+        return codegen_select_group_by_rowid_bucket_sum(
+            b, cursor, table, &plan, out_regs, done_label, end_label,
+        );
+    }
+
     let (mut output_cols, group_by_keys, mut agg_columns) =
         parse_group_by_output(columns, table, group_by)?;
 
@@ -16570,12 +16830,16 @@ pub fn emit_scan_filter(
 mod tests {
     use super::*;
     use crate::ProgramBuilder;
+    use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
         Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, LimitClause, Literal,
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
-        SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
+        SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery,
+        UpdateStatement,
     };
+    use fsqlite_func::{FunctionRegistry, register_builtins};
+    use fsqlite_parser::parse_first_statement_with_tail;
     use fsqlite_types::opcode::{Opcode, P4};
 
     fn test_schema() -> Vec<TableSchema> {
@@ -16619,6 +16883,67 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    fn test_small_bench_schema() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "bench".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("name", 'B', false),
+                ColumnInfo::basic("value", 'E', false),
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn seed_small_bench_db(row_count: usize) -> MemDatabase {
+        let mut db = MemDatabase::new();
+        db.create_table_at(2, 3);
+        let table = db.get_table_mut(2).expect("bench table should exist");
+        for id in 0..row_count {
+            let id = i64::try_from(id).expect("row ids should fit in i64");
+            table.insert_row(
+                id,
+                vec![
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(format!("name{id}").into()),
+                    SqliteValue::Float(((id * 3) + 1) as f64),
+                ],
+            );
+        }
+        db
+    }
+
+    fn execute_codegen_select_with_storage_cursor(
+        stmt: &SelectStatement,
+        schema: &[TableSchema],
+        db: MemDatabase,
+    ) -> Vec<Vec<SqliteValue>> {
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, stmt, schema, &ctx).expect("select should codegen");
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_read_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(std::sync::Arc::new(registry));
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect()
     }
 
     fn test_schema_with_nocase_text_column() -> Vec<TableSchema> {
@@ -23500,6 +23825,246 @@ mod tests {
         assert!(
             if_not_before_agg,
             "GROUP BY FILTER should emit IfNot before AggStep"
+        );
+    }
+
+    #[test]
+    fn test_codegen_group_by_rowid_bucket_sum_skips_sorter() {
+        let group_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Divide,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: group_expr.clone(),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "sum".to_owned(),
+                                args: FunctionArgs::List(vec![Expr::Column(
+                                    ColumnRef::bare("value"),
+                                    Span::ZERO,
+                                )]),
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("bench")),
+                    where_clause: None,
+                    group_by: vec![group_expr],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_small_bench_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "rowid-bucket SUM GROUP BY fast path should bypass the sorter"
+        );
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead,
+                Opcode::Int64,
+                Opcode::Rowid,
+                Opcode::Divide,
+                Opcode::AggStep,
+                Opcode::AggFinal,
+                Opcode::ResultRow,
+                Opcode::Halt,
+            ]
+        ));
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.p4, P4::Int64(value) if value == 10)),
+            "fast path should encode the bucket divisor literal"
+        );
+    }
+
+    #[test]
+    fn test_codegen_parsed_group_by_rowid_bucket_sum_skips_sorter() {
+        let sql = "SELECT (id / 3), SUM(value) FROM bench GROUP BY (id / 3)";
+        let Some((statement, tail)) = parse_first_statement_with_tail(sql).unwrap() else {
+            panic!("expected parsed statement");
+        };
+        assert_eq!(
+            tail,
+            sql.len(),
+            "parser should consume the whole SQL string"
+        );
+        let stmt = match statement {
+            Statement::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+
+        let schema = test_small_bench_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "parsed rowid-bucket SUM GROUP BY should also bypass the sorter"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.p4, P4::Int64(value) if value == 3)),
+            "parsed SQL fast path should encode the parsed divisor literal"
+        );
+    }
+
+    #[test]
+    fn test_execute_rowid_bucket_projection_keeps_integer_keys() {
+        let group_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Divide,
+            right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: group_expr,
+                        alias: None,
+                    }],
+                    from: Some(from_table("bench")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let rows = execute_codegen_select_with_storage_cursor(
+            &stmt,
+            &test_small_bench_schema(),
+            seed_small_bench_db(7),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_execute_group_by_rowid_bucket_sum_storage_cursor_rows() {
+        let group_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Divide,
+            right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: group_expr.clone(),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "sum".to_owned(),
+                                args: FunctionArgs::List(vec![Expr::Column(
+                                    ColumnRef::bare("value"),
+                                    Span::ZERO,
+                                )]),
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("bench")),
+                    where_clause: None,
+                    group_by: vec![group_expr],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let rows = execute_codegen_select_with_storage_cursor(
+            &stmt,
+            &test_small_bench_schema(),
+            seed_small_bench_db(7),
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0), SqliteValue::Float(12.0)],
+                vec![SqliteValue::Integer(1), SqliteValue::Float(39.0)],
+                vec![SqliteValue::Integer(2), SqliteValue::Float(19.0)],
+            ]
         );
     }
 
