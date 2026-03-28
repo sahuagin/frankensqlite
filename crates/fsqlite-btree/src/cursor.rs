@@ -2040,6 +2040,87 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
+    /// Try to append a cell onto the current leaf page already loaded at the
+    /// top of the cursor stack.
+    ///
+    /// This is used by the rightmost-leaf hint path, where the leaf was just
+    /// loaded and validated in the same function. That lets us reuse the
+    /// cached page/header directly and avoid a second pager read plus a full
+    /// cell-pointer-array decode/reload cycle on the hot append case.
+    fn try_append_on_current_leaf(&mut self, cx: &Cx, cell_data: &[u8]) -> Result<bool> {
+        let mut entry = self
+            .stack
+            .pop()
+            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+        let leaf_page_no = entry.page_no;
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let insert_idx = entry.header.cell_count;
+        let content_offset = entry.header.content_offset(self.usable_size);
+        let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+            self.stack.push(entry);
+            return Ok(false);
+        };
+
+        let ptr_array_end = header_offset
+            + usize::from(entry.header.page_type.header_size())
+            + (usize::from(insert_idx) + 1) * 2;
+        if ptr_array_end > new_content_offset {
+            self.stack.push(entry);
+            return Ok(false);
+        }
+
+        let new_cell_offset =
+            u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf cell offset {} exceeds u16 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        let new_cell_count =
+            insert_idx
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "leaf page {} cell count overflow while appending",
+                        leaf_page_no.get()
+                    ),
+                })?;
+        let ptr_offset = header_offset
+            + usize::from(entry.header.page_type.header_size())
+            + usize::from(insert_idx) * 2;
+
+        entry.header.cell_count = new_cell_count;
+        entry.header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        {
+            let page_bytes = entry.page_data.as_bytes_mut();
+            page_bytes[new_content_offset..new_content_offset + cell_data.len()]
+                .copy_from_slice(cell_data);
+            page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
+            entry.header.write(page_bytes, header_offset);
+        }
+
+        let staged_page = entry.page_data.clone();
+        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+
+        let mut updated_cell_pointers = Vec::with_capacity(entry.cell_pointers.len() + 1);
+        updated_cell_pointers.extend_from_slice(&entry.cell_pointers);
+        updated_cell_pointers.push(new_cell_offset);
+        entry.cell_pointers = Arc::<[u16]>::from(updated_cell_pointers);
+        entry.cell_idx = insert_idx;
+
+        self.stack.push(entry);
+        self.at_eof = false;
+        Ok(true)
+    }
+
     /// Balance the tree after an insert when the leaf page is full.
     ///
     /// `cell_data` is the cell that didn't fit. `insert_idx` is where within
@@ -2720,17 +2801,10 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         self.at_eof = true;
-        let insert_idx = self
-            .stack
-            .last()
-            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-            .header
-            .cell_count;
-
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
 
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+        match self.try_append_on_current_leaf(cx, &cell_data) {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
