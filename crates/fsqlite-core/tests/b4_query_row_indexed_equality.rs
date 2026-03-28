@@ -24,9 +24,7 @@ struct B4ProfileGuard {
 
 impl B4ProfileGuard {
     fn new() -> Self {
-        let lock = B4_PROFILE_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let lock = B4_PROFILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let previous_enabled = hot_path_profile_enabled();
         set_hot_path_profile_enabled(true);
         reset_hot_path_profile();
@@ -109,7 +107,10 @@ fn test_query_row_indexed_equality_no_match() {
         .direct_indexed_equality_query_hits
         .saturating_sub(before.direct_indexed_equality_query_hits);
     eprintln!("[B4.2] no-match: hits_delta={hits_delta}");
-    assert!(hits_delta >= 1, "fast path should fire for no-match: {hits_delta}");
+    assert!(
+        hits_delta >= 1,
+        "fast path should fire for no-match: {hits_delta}"
+    );
 }
 
 /// B4.3: NULL parameter via prepared query_row fires fast path, returns error.
@@ -135,7 +136,10 @@ fn test_query_row_indexed_equality_null_param() {
         .direct_indexed_equality_query_hits
         .saturating_sub(before.direct_indexed_equality_query_hits);
     eprintln!("[B4.3] null-param: hits_delta={hits_delta}");
-    assert!(hits_delta >= 1, "fast path should fire for NULL: {hits_delta}");
+    assert!(
+        hits_delta >= 1,
+        "fast path should fire for NULL: {hits_delta}"
+    );
 }
 
 /// B4.4: Read-after-write correctness.
@@ -170,23 +174,34 @@ fn test_query_row_indexed_equality_prepared_reuse() {
         .unwrap();
     conn.execute("CREATE UNIQUE INDEX idx_email ON users(email)")
         .unwrap();
-    conn.execute("INSERT INTO users VALUES (1, 'a@b.com', 'Alice')").unwrap();
-    conn.execute("INSERT INTO users VALUES (2, 'c@d.com', 'Bob')").unwrap();
-    conn.execute("INSERT INTO users VALUES (3, 'e@f.com', 'Carol')").unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'a@b.com', 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'c@d.com', 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (3, 'e@f.com', 'Carol')")
+        .unwrap();
 
-    let stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").unwrap();
+    let stmt = conn
+        .prepare("SELECT * FROM users WHERE email = ?1")
+        .unwrap();
     // Warm.
     let _ = stmt.query_row_with_params(&[SqliteValue::Text("a@b.com".into())]);
     reset_hot_path_profile();
 
     let before = hot_path_profile_snapshot();
-    let r1 = stmt.query_row_with_params(&[SqliteValue::Text("a@b.com".into())]).unwrap();
+    let r1 = stmt
+        .query_row_with_params(&[SqliteValue::Text("a@b.com".into())])
+        .unwrap();
     assert_eq!(r1.get(2), Some(&SqliteValue::Text("Alice".into())));
 
-    let r2 = stmt.query_row_with_params(&[SqliteValue::Text("c@d.com".into())]).unwrap();
+    let r2 = stmt
+        .query_row_with_params(&[SqliteValue::Text("c@d.com".into())])
+        .unwrap();
     assert_eq!(r2.get(2), Some(&SqliteValue::Text("Bob".into())));
 
-    let r3 = stmt.query_row_with_params(&[SqliteValue::Text("e@f.com".into())]).unwrap();
+    let r3 = stmt
+        .query_row_with_params(&[SqliteValue::Text("e@f.com".into())])
+        .unwrap();
     assert_eq!(r3.get(2), Some(&SqliteValue::Text("Carol".into())));
     let after = hot_path_profile_snapshot();
 
@@ -194,7 +209,10 @@ fn test_query_row_indexed_equality_prepared_reuse() {
         .direct_indexed_equality_query_hits
         .saturating_sub(before.direct_indexed_equality_query_hits);
     eprintln!("[B4.5] prepared reuse: hits_delta={hits_delta}");
-    assert!(hits_delta >= 3, "fast path should fire for all 3 lookups: {hits_delta}");
+    assert!(
+        hits_delta >= 3,
+        "fast path should fire for all 3 lookups: {hits_delta}"
+    );
 }
 
 /// B4.6: Unique index query_row returns exactly one row and fires fast path.
@@ -206,10 +224,14 @@ fn test_query_row_indexed_equality_unique_index() {
         .unwrap();
     conn.execute("CREATE UNIQUE INDEX idx_users_email ON users(email)")
         .unwrap();
-    conn.execute("INSERT INTO users VALUES (1, 'a@b.com', 'Alice')").unwrap();
-    conn.execute("INSERT INTO users VALUES (2, 'c@d.com', 'Bob')").unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'a@b.com', 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'c@d.com', 'Bob')")
+        .unwrap();
 
-    let stmt = conn.prepare("SELECT * FROM users WHERE email = ?1").unwrap();
+    let stmt = conn
+        .prepare("SELECT * FROM users WHERE email = ?1")
+        .unwrap();
     let _ = stmt.query_row_with_params(&[SqliteValue::Text("a@b.com".into())]);
     reset_hot_path_profile();
 
@@ -236,9 +258,12 @@ fn test_query_row_indexed_equality_integer_column() {
         .unwrap();
     conn.execute("CREATE INDEX idx_scores_player ON scores(player_id)")
         .unwrap();
-    conn.execute("INSERT INTO scores VALUES (1, 10, 100)").unwrap();
-    conn.execute("INSERT INTO scores VALUES (2, 20, 200)").unwrap();
-    conn.execute("INSERT INTO scores VALUES (3, 10, 150)").unwrap();
+    conn.execute("INSERT INTO scores VALUES (1, 10, 100)")
+        .unwrap();
+    conn.execute("INSERT INTO scores VALUES (2, 20, 200)")
+        .unwrap();
+    conn.execute("INSERT INTO scores VALUES (3, 10, 150)")
+        .unwrap();
 
     let rows = conn
         .query_with_params(

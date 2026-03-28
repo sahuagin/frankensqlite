@@ -12,8 +12,8 @@ use fsqlite_core::connection::{
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 use fsqlite_e2e::baseline::{
-    measure_operation, BaselineReport, LatencyStats, Operation, OperationBaseline,
-    RegressionResult, DEFAULT_REGRESSION_THRESHOLD,
+    BaselineReport, DEFAULT_REGRESSION_THRESHOLD, LatencyStats, Operation, OperationBaseline,
+    RegressionResult, measure_operation,
 };
 use fsqlite_types::SqliteValue;
 use std::sync::{Mutex, OnceLock};
@@ -1291,8 +1291,7 @@ fn manual_perf_probe_future_query_row_probe_shapes_100k() {
         indexed_profile.vdbe.result_values_total,
     );
     assert_eq!(
-        indexed_profile.direct_indexed_equality_query_hits,
-        EXPECTED_PROBE_EXECUTIONS,
+        indexed_profile.direct_indexed_equality_query_hits, EXPECTED_PROBE_EXECUTIONS,
         "corrected indexed-equality probe should hit the B4 direct query_row path on every warmup + measured execution"
     );
     assert_eq!(
@@ -1335,8 +1334,7 @@ fn manual_perf_probe_future_query_row_probe_shapes_100k() {
         range_profile.vdbe.result_values_total,
     );
     assert_eq!(
-        range_profile.direct_rowid_range_query_hits,
-        EXPECTED_PROBE_EXECUTIONS,
+        range_profile.direct_rowid_range_query_hits, EXPECTED_PROBE_EXECUTIONS,
         "corrected rowid-range probe should hit the B4 direct query_row path on every warmup + measured execution"
     );
     assert_eq!(

@@ -567,26 +567,29 @@ fn test_large_in_null_three_valued_above_threshold() {
     conn.execute("INSERT INTO big VALUES(NULL)").unwrap();
 
     // 5 is in the set → TRUE regardless of NULL
-    let rows = conn
-        .query("SELECT 5 IN (SELECT id FROM big)")
-        .unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1),
-        "5 IN (1..20, NULL) must be TRUE");
+    let rows = conn.query("SELECT 5 IN (SELECT id FROM big)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(1),
+        "5 IN (1..20, NULL) must be TRUE"
+    );
 
     // 99 is NOT in the set but NULL is present → NULL
-    let rows = conn
-        .query("SELECT 99 IN (SELECT id FROM big)")
-        .unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Null,
-        "99 IN (1..20, NULL) must be NULL, not FALSE");
+    let rows = conn.query("SELECT 99 IN (SELECT id FROM big)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Null,
+        "99 IN (1..20, NULL) must be NULL, not FALSE"
+    );
 
     // Remove NULL, now 99 NOT found with no NULL → FALSE
     conn.execute("DELETE FROM big WHERE id IS NULL").unwrap();
-    let rows = conn
-        .query("SELECT 99 IN (SELECT id FROM big)")
-        .unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(0),
-        "99 IN (1..20) without NULL must be FALSE");
+    let rows = conn.query("SELECT 99 IN (SELECT id FROM big)").unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "99 IN (1..20) without NULL must be FALSE"
+    );
 }
 
 /// Large IN with duplicates: duplicates must not change membership semantics.
@@ -595,17 +598,25 @@ fn test_large_in_duplicates_above_threshold() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE dup(id INTEGER)").unwrap();
     for i in 1..=10 {
-        conn.execute(&format!("INSERT INTO dup VALUES({i})")).unwrap();
-        conn.execute(&format!("INSERT INTO dup VALUES({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO dup VALUES({i})"))
+            .unwrap();
+        conn.execute(&format!("INSERT INTO dup VALUES({i})"))
+            .unwrap();
     }
 
     let rows = conn.query("SELECT 5 IN (SELECT id FROM dup)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1),
-        "5 IN duplicated set must be TRUE");
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(1),
+        "5 IN duplicated set must be TRUE"
+    );
 
     let rows = conn.query("SELECT 99 IN (SELECT id FROM dup)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(0),
-        "99 IN duplicated set must be FALSE");
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "99 IN duplicated set must be FALSE"
+    );
 }
 
 /// Large IN with mixed Integer/Float: 1 and 1.0 must be treated as equal.
@@ -614,18 +625,25 @@ fn test_large_in_mixed_int_float_above_threshold() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE mixed(val REAL)").unwrap();
     for i in 1..=20 {
-        conn.execute(&format!("INSERT INTO mixed VALUES({i}.0)")).unwrap();
+        conn.execute(&format!("INSERT INTO mixed VALUES({i}.0)"))
+            .unwrap();
     }
 
     // INTEGER 5 must match REAL 5.0
     let rows = conn.query("SELECT 5 IN (SELECT val FROM mixed)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1),
-        "INTEGER 5 IN (REAL 1.0..20.0) must be TRUE");
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(1),
+        "INTEGER 5 IN (REAL 1.0..20.0) must be TRUE"
+    );
 
     // REAL 5.5 must NOT match any integer-valued float
     let rows = conn.query("SELECT 5.5 IN (SELECT val FROM mixed)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(0),
-        "5.5 IN (1.0..20.0 integers) must be FALSE");
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "5.5 IN (1.0..20.0 integers) must be FALSE"
+    );
 }
 
 /// Large IN with text: case-sensitive by default (binary comparison).
@@ -634,16 +652,27 @@ fn test_large_in_text_case_sensitive_above_threshold() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE words(w TEXT)").unwrap();
     for i in 1..=20 {
-        conn.execute(&format!("INSERT INTO words VALUES('word{i}')")).unwrap();
+        conn.execute(&format!("INSERT INTO words VALUES('word{i}')"))
+            .unwrap();
     }
 
-    let rows = conn.query("SELECT 'word5' IN (SELECT w FROM words)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(1),
-        "'word5' IN text set must be TRUE");
+    let rows = conn
+        .query("SELECT 'word5' IN (SELECT w FROM words)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(1),
+        "'word5' IN text set must be TRUE"
+    );
 
-    let rows = conn.query("SELECT 'WORD5' IN (SELECT w FROM words)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(0),
-        "'WORD5' IN lowercase text set must be FALSE (binary comparison)");
+    let rows = conn
+        .query("SELECT 'WORD5' IN (SELECT w FROM words)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "'WORD5' IN lowercase text set must be FALSE (binary comparison)"
+    );
 }
 
 /// Large NOT IN with NULLs above threshold: mirror of positive IN test.
@@ -652,17 +681,28 @@ fn test_large_not_in_null_above_threshold() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE notbig(id INTEGER)").unwrap();
     for i in 1..=20 {
-        conn.execute(&format!("INSERT INTO notbig VALUES({i})")).unwrap();
+        conn.execute(&format!("INSERT INTO notbig VALUES({i})"))
+            .unwrap();
     }
     conn.execute("INSERT INTO notbig VALUES(NULL)").unwrap();
 
     // 5 NOT IN (1..20, NULL) → FALSE (found)
-    let rows = conn.query("SELECT 5 NOT IN (SELECT id FROM notbig)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Integer(0),
-        "5 NOT IN (1..20, NULL) must be FALSE");
+    let rows = conn
+        .query("SELECT 5 NOT IN (SELECT id FROM notbig)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "5 NOT IN (1..20, NULL) must be FALSE"
+    );
 
     // 99 NOT IN (1..20, NULL) → NULL (not found, NULL present)
-    let rows = conn.query("SELECT 99 NOT IN (SELECT id FROM notbig)").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Null,
-        "99 NOT IN (1..20, NULL) must be NULL");
+    let rows = conn
+        .query("SELECT 99 NOT IN (SELECT id FROM notbig)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Null,
+        "99 NOT IN (1..20, NULL) must be NULL"
+    );
 }

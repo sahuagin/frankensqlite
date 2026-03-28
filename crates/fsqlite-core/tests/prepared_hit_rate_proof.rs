@@ -13,8 +13,8 @@
 //!     --test prepared_hit_rate_proof -- --test-threads=1 --nocapture
 
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled, Connection,
+    Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled,
 };
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
