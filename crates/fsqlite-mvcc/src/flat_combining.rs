@@ -44,7 +44,7 @@
 //!   - `fsqlite_htm_aborts_other`
 
 use fsqlite_types::sync_primitives::Instant;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;
@@ -64,6 +64,275 @@ const RESULT_BIT: u64 = 1 << 63;
 
 /// Maximum spin iterations before yielding while waiting for result.
 const SPIN_BEFORE_YIELD: u32 = 1024;
+
+// ---------------------------------------------------------------------------
+// HTM Guard State Machine (bd-77l3t Phase 1)
+// ---------------------------------------------------------------------------
+
+/// HTM guard states (stored in AtomicU8).
+/// See HTM_GUARD_DESIGN.md for the full state machine diagram.
+const HTM_NOT_PROBED: u8 = 0;
+const HTM_AVAILABLE: u8 = 1;
+const HTM_UNAVAILABLE: u8 = 2;
+const HTM_BLACKLISTED: u8 = 3;
+const HTM_DISABLED: u8 = 4;
+const HTM_USER_DISABLED: u8 = 5;
+
+/// EWMA abort-rate threshold for dynamic disable (fixed-point: 5000 = 50%).
+const HTM_DISABLE_THRESHOLD: u32 = 5000;
+
+/// Initial cooldown before re-enabling after dynamic disable (milliseconds).
+const HTM_COOLDOWN_INITIAL_MS: u64 = 5000;
+
+/// Maximum cooldown with exponential backoff (milliseconds).
+const HTM_COOLDOWN_MAX_MS: u64 = 60_000;
+
+/// EWMA alpha numerator (out of 10000). alpha=0.3 → 3000.
+const HTM_EWMA_ALPHA: u32 = 3000;
+
+/// Window size: update EWMA every this many attempts.
+const HTM_EWMA_WINDOW_SIZE: u64 = 1000;
+
+/// Maximum HTM retries per apply() invocation before falling through to lock.
+const MAX_HTM_RETRIES: u32 = 3;
+
+/// HTM guard: state machine + abort-rate monitor for the flat combiner fast-path.
+///
+/// Phase 1: guard skeleton only. State always resolves to `HTM_UNAVAILABLE` because
+/// no actual HTM intrinsics are wired. The guard infrastructure (state machine,
+/// EWMA monitor, PRAGMA support, tracing hooks) is exercisable and testable.
+///
+/// Zero behavior change: all threads use the existing lock path.
+pub struct HtmGuard {
+    /// Current guard state (see HTM_* constants).
+    state: AtomicU8,
+    /// EWMA abort rate: fixed-point [0..10000] = [0.0000..1.0000].
+    ewma_abort_rate: AtomicU32,
+    /// Attempts in current EWMA window.
+    window_attempts: AtomicU64,
+    /// Aborts in current EWMA window.
+    window_aborts: AtomicU64,
+    /// Window start timestamp (nanoseconds since epoch, Relaxed).
+    window_start_ns: AtomicU64,
+    /// Number of times we have transitioned to DISABLED (for exponential backoff).
+    disable_count: AtomicU32,
+    /// Timestamp of last disable event (nanoseconds).
+    last_disable_ns: AtomicU64,
+}
+
+impl HtmGuard {
+    /// Create a new guard. State starts as NOT_PROBED.
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(HTM_NOT_PROBED),
+            ewma_abort_rate: AtomicU32::new(0),
+            window_attempts: AtomicU64::new(0),
+            window_aborts: AtomicU64::new(0),
+            window_start_ns: AtomicU64::new(0),
+            disable_count: AtomicU32::new(0),
+            last_disable_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Probe CPU for HTM support. Called lazily on first use.
+    /// Phase 1: always returns UNAVAILABLE (no intrinsics wired).
+    fn probe_cpu(&self) {
+        // Phase 1: no HTM intrinsics available in safe Rust.
+        // Always set UNAVAILABLE. Future phases will wire real detection.
+        let new_state = HTM_UNAVAILABLE;
+
+        // CAS from NOT_PROBED to the probed result. If another thread raced
+        // us, that's fine — both will compute the same result.
+        let _ = self.state.compare_exchange(
+            HTM_NOT_PROBED,
+            new_state,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+
+        tracing::info!(
+            target: "fsqlite::htm",
+            event = "cpu_probe",
+            tsx_available = false,
+            tme_available = false,
+            stepping = "unknown",
+            known_buggy = false,
+            phase = "phase1_stub",
+        );
+    }
+
+    /// Check if HTM fast-path should be attempted.
+    /// Returns true only if state == AVAILABLE.
+    #[inline]
+    fn should_attempt(&self) -> bool {
+        let state = self.state.load(Ordering::Relaxed);
+        if state == HTM_NOT_PROBED {
+            self.probe_cpu();
+            return self.state.load(Ordering::Relaxed) == HTM_AVAILABLE;
+        }
+        // Check for cooldown expiry if DISABLED.
+        if state == HTM_DISABLED {
+            self.maybe_reenable();
+        }
+        self.state.load(Ordering::Relaxed) == HTM_AVAILABLE
+    }
+
+    /// Record an HTM attempt (regardless of outcome).
+    fn record_attempt(&self) {
+        record_htm_attempt();
+        let attempts = self.window_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempts >= HTM_EWMA_WINDOW_SIZE {
+            self.update_ewma();
+        }
+    }
+
+    /// Record an HTM abort with status code.
+    fn record_abort(&self, status: u32) {
+        let classification = record_htm_abort_status(status);
+        self.window_aborts.fetch_add(1, Ordering::Relaxed);
+
+        tracing::debug!(
+            target: "fsqlite::htm",
+            event = "xabort",
+            abort_code = status,
+            reason = match classification.reason {
+                HtmAbortReason::Conflict => "conflict",
+                HtmAbortReason::Capacity => "capacity",
+                HtmAbortReason::Explicit => "explicit",
+                HtmAbortReason::Other => "other",
+            },
+            retryable = classification.retryable,
+        );
+    }
+
+    /// Update EWMA and check disable threshold. Called when window fills.
+    fn update_ewma(&self) {
+        let attempts = self.window_attempts.swap(0, Ordering::Relaxed);
+        let aborts = self.window_aborts.swap(0, Ordering::Relaxed);
+
+        if attempts == 0 {
+            return;
+        }
+
+        // Compute new_rate in fixed-point [0..10000].
+        #[allow(clippy::cast_possible_truncation)]
+        let new_rate_fp = ((aborts * 10000) / attempts) as u32;
+        let old_ewma = self.ewma_abort_rate.load(Ordering::Relaxed);
+
+        // EWMA: alpha * new + (1-alpha) * old, all in fixed-point.
+        let updated = (HTM_EWMA_ALPHA * new_rate_fp
+            + (10000 - HTM_EWMA_ALPHA) * old_ewma)
+            / 10000;
+        self.ewma_abort_rate.store(updated, Ordering::Relaxed);
+
+        // Check disable threshold.
+        if updated > HTM_DISABLE_THRESHOLD
+            && self.state.load(Ordering::Relaxed) == HTM_AVAILABLE
+        {
+            self.dynamic_disable(updated);
+        }
+    }
+
+    /// Transition to DISABLED state due to abort storm.
+    fn dynamic_disable(&self, abort_rate: u32) {
+        let prev = self.state.compare_exchange(
+            HTM_AVAILABLE,
+            HTM_DISABLED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        if prev.is_ok() {
+            self.disable_count.fetch_add(1, Ordering::Relaxed);
+            // Record disable timestamp for cooldown.
+            #[allow(clippy::cast_possible_truncation)]
+            let now_ns = Instant::now().elapsed().as_nanos() as u64;
+            self.last_disable_ns.store(now_ns, Ordering::Relaxed);
+
+            tracing::warn!(
+                target: "fsqlite::htm",
+                event = "dynamic_disable",
+                abort_rate_fp = abort_rate,
+                abort_rate_pct = abort_rate as f64 / 100.0,
+                threshold_pct = HTM_DISABLE_THRESHOLD as f64 / 100.0,
+                disable_count = self.disable_count.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    /// Check if cooldown has expired and re-enable if so.
+    fn maybe_reenable(&self) {
+        let dc = self.disable_count.load(Ordering::Relaxed);
+        let cooldown_ms = HTM_COOLDOWN_INITIAL_MS
+            .saturating_mul(1u64.checked_shl(dc).unwrap_or(u64::MAX))
+            .min(HTM_COOLDOWN_MAX_MS);
+
+        // Simple approach: compare timestamps.
+        // In Phase 1 this is never reached (state never becomes AVAILABLE → DISABLED).
+        #[allow(clippy::cast_possible_truncation)]
+        let now_ns = Instant::now().elapsed().as_nanos() as u64;
+        let disable_ns = self.last_disable_ns.load(Ordering::Relaxed);
+        let elapsed_ms = now_ns.saturating_sub(disable_ns) / 1_000_000;
+
+        if elapsed_ms >= cooldown_ms {
+            // Reset EWMA and window, then re-enable.
+            self.ewma_abort_rate.store(0, Ordering::Relaxed);
+            self.window_attempts.store(0, Ordering::Relaxed);
+            self.window_aborts.store(0, Ordering::Relaxed);
+            let _ = self.state.compare_exchange(
+                HTM_DISABLED,
+                HTM_AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            tracing::info!(
+                target: "fsqlite::htm",
+                event = "reenable",
+                cooldown_ms,
+                disable_count = dc,
+            );
+        }
+    }
+
+    /// Force-disable via PRAGMA. Returns previous state.
+    pub fn pragma_disable(&self) -> u8 {
+        self.state.swap(HTM_USER_DISABLED, Ordering::AcqRel)
+    }
+
+    /// Re-enable via PRAGMA (re-probes CPU).
+    pub fn pragma_enable(&self) {
+        let current = self.state.load(Ordering::Relaxed);
+        if current == HTM_USER_DISABLED {
+            self.state.store(HTM_NOT_PROBED, Ordering::Release);
+            // Next should_attempt() will re-probe.
+        }
+    }
+
+    /// Current state name (for diagnostics / virtual table).
+    #[must_use]
+    pub fn state_name(&self) -> &'static str {
+        match self.state.load(Ordering::Relaxed) {
+            HTM_NOT_PROBED => "not_probed",
+            HTM_AVAILABLE => "available",
+            HTM_UNAVAILABLE => "unavailable",
+            HTM_BLACKLISTED => "blacklisted",
+            HTM_DISABLED => "disabled",
+            HTM_USER_DISABLED => "user_disabled",
+            _ => "unknown",
+        }
+    }
+
+    /// Current EWMA abort rate as percentage (0.0..100.0).
+    #[must_use]
+    pub fn ewma_pct(&self) -> f64 {
+        f64::from(self.ewma_abort_rate.load(Ordering::Relaxed)) / 100.0
+    }
+
+    /// Number of times dynamic disable has triggered.
+    #[must_use]
+    pub fn disable_count(&self) -> u32 {
+        self.disable_count.load(Ordering::Relaxed)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Global metrics
@@ -107,7 +376,7 @@ struct HtmAbortClassification {
 }
 
 /// Snapshot of flat combining metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct FlatCombiningMetrics {
     pub fsqlite_flat_combining_batches_total: u64,
     pub fsqlite_flat_combining_ops_total: u64,
@@ -120,11 +389,36 @@ pub struct FlatCombiningMetrics {
     pub fsqlite_htm_aborts_capacity: u64,
     pub fsqlite_htm_aborts_explicit: u64,
     pub fsqlite_htm_aborts_other: u64,
+    /// HTM guard state name.
+    pub fsqlite_htm_state: &'static str,
+    /// EWMA abort rate as percentage (0.0..100.0).
+    pub fsqlite_htm_ewma_abort_rate_pct: f64,
+    /// Number of dynamic disable events.
+    pub fsqlite_htm_disable_count: u32,
 }
 
-/// Read current flat combining metrics.
+/// Read current flat combining metrics (global counters only).
+/// For HTM guard state, pass a `&FlatCombiner` to [`flat_combining_metrics_with_guard`].
 #[must_use]
 pub fn flat_combining_metrics() -> FlatCombiningMetrics {
+    flat_combining_metrics_with_htm("unavailable", 0.0, 0)
+}
+
+/// Read flat combining metrics with HTM guard state from a specific combiner.
+#[must_use]
+pub fn flat_combining_metrics_from(combiner: &FlatCombiner) -> FlatCombiningMetrics {
+    flat_combining_metrics_with_htm(
+        combiner.htm_guard.state_name(),
+        combiner.htm_guard.ewma_pct(),
+        combiner.htm_guard.disable_count(),
+    )
+}
+
+fn flat_combining_metrics_with_htm(
+    state: &'static str,
+    ewma_pct: f64,
+    disable_count: u32,
+) -> FlatCombiningMetrics {
     FlatCombiningMetrics {
         fsqlite_flat_combining_batches_total: FC_BATCHES_TOTAL.load(Ordering::Relaxed),
         fsqlite_flat_combining_ops_total: FC_OPS_TOTAL.load(Ordering::Relaxed),
@@ -137,6 +431,9 @@ pub fn flat_combining_metrics() -> FlatCombiningMetrics {
         fsqlite_htm_aborts_capacity: FC_HTM_ABORTS_CAPACITY.load(Ordering::Relaxed),
         fsqlite_htm_aborts_explicit: FC_HTM_ABORTS_EXPLICIT.load(Ordering::Relaxed),
         fsqlite_htm_aborts_other: FC_HTM_ABORTS_OTHER.load(Ordering::Relaxed),
+        fsqlite_htm_state: state,
+        fsqlite_htm_ewma_abort_rate_pct: ewma_pct,
+        fsqlite_htm_disable_count: disable_count,
     }
 }
 
@@ -268,6 +565,8 @@ pub struct FlatCombiner {
     owners: [AtomicU64; MAX_FC_THREADS],
     /// Combiner lock — only one thread processes a batch at a time.
     combiner_lock: Mutex<()>,
+    /// HTM fast-path guard (bd-77l3t). Phase 1: always UNAVAILABLE.
+    htm_guard: HtmGuard,
 }
 
 /// Operation tag: add argument to accumulator.
@@ -283,7 +582,14 @@ impl FlatCombiner {
             slots: std::array::from_fn(|_| FcSlot::new()),
             owners: std::array::from_fn(|_| AtomicU64::new(0)),
             combiner_lock: Mutex::new(()),
+            htm_guard: HtmGuard::new(),
         }
+    }
+
+    /// Access the HTM guard (for PRAGMA support and diagnostics).
+    #[must_use]
+    pub fn htm_guard(&self) -> &HtmGuard {
+        &self.htm_guard
     }
 
     /// Register a thread.  Returns an [`FcHandle`] with an assigned slot,
@@ -416,6 +722,21 @@ impl FcHandle<'_> {
         self.combiner.slots[self.slot]
             .state
             .store(op, Ordering::Release);
+
+        // ── HTM fast-path guard (bd-77l3t) ──────────────────────────────
+        // Phase 1: should_attempt() always returns false (UNAVAILABLE).
+        // When real HTM is wired (Phase 3), this block will:
+        //   1. XBEGIN
+        //   2. Check combiner_lock is not held (XABORT if held)
+        //   3. Execute combine_locked() speculatively
+        //   4. XEND → return result
+        //   5. On abort → record_abort(eax), fall through to lock path
+        // See HTM_GUARD_DESIGN.md §5 for the full call-site shape.
+        if self.combiner.htm_guard.should_attempt() {
+            // Phase 2+: HTM transaction would go here.
+            // For now, this branch is never taken.
+        }
+        // ── End HTM guard ────────────────────────────────────────────────
 
         // ALIEN ARTIFACT: True Flat Combining.
         // We attempt to become the combiner. If we fail, we MUST NOT block on an OS mutex
@@ -769,6 +1090,110 @@ mod tests {
         assert!(dbg.contains("FlatCombiner"));
         assert!(dbg.contains("42"));
     }
+
+    // ── HTM Guard tests (bd-77l3t Phase 1) ──────────────────────────
+
+    #[test]
+    fn htm_guard_defaults_to_unavailable() {
+        let guard = HtmGuard::new();
+        assert_eq!(guard.state.load(Ordering::Relaxed), HTM_NOT_PROBED);
+        assert!(!guard.should_attempt());
+        assert_eq!(guard.state_name(), "unavailable");
+    }
+
+    #[test]
+    fn htm_guard_probe_is_idempotent() {
+        let guard = HtmGuard::new();
+        guard.probe_cpu();
+        let state1 = guard.state.load(Ordering::Relaxed);
+        guard.probe_cpu();
+        let state2 = guard.state.load(Ordering::Relaxed);
+        assert_eq!(state1, state2);
+        assert_eq!(state1, HTM_UNAVAILABLE);
+    }
+
+    #[test]
+    fn htm_guard_pragma_disable_enable() {
+        let guard = HtmGuard::new();
+        guard.probe_cpu(); // Sets UNAVAILABLE in Phase 1
+
+        let prev = guard.pragma_disable();
+        assert_eq!(prev, HTM_UNAVAILABLE);
+        assert_eq!(guard.state_name(), "user_disabled");
+
+        guard.pragma_enable();
+        // After enable, state goes back to NOT_PROBED, then re-probes.
+        assert!(!guard.should_attempt()); // Re-probes → UNAVAILABLE
+        assert_eq!(guard.state_name(), "unavailable");
+    }
+
+    #[test]
+    fn htm_guard_ewma_computation() {
+        let guard = HtmGuard::new();
+        // Manually set to AVAILABLE to test EWMA logic.
+        guard.state.store(HTM_AVAILABLE, Ordering::Relaxed);
+
+        // Simulate 1000 attempts with 800 aborts (80% abort rate).
+        guard.window_attempts.store(1000, Ordering::Relaxed);
+        guard.window_aborts.store(800, Ordering::Relaxed);
+        guard.update_ewma();
+
+        // EWMA: 0.3 * 8000 + 0.7 * 0 = 2400 (fixed-point)
+        let ewma = guard.ewma_abort_rate.load(Ordering::Relaxed);
+        assert_eq!(ewma, 2400);
+
+        // Second window: another 80% abort rate.
+        guard.window_attempts.store(1000, Ordering::Relaxed);
+        guard.window_aborts.store(800, Ordering::Relaxed);
+        guard.update_ewma();
+
+        // EWMA: 0.3 * 8000 + 0.7 * 2400 = 2400 + 1680 = 4080
+        let ewma2 = guard.ewma_abort_rate.load(Ordering::Relaxed);
+        assert_eq!(ewma2, 4080);
+
+        // Third window: pushes over threshold.
+        guard.window_attempts.store(1000, Ordering::Relaxed);
+        guard.window_aborts.store(800, Ordering::Relaxed);
+        guard.update_ewma();
+
+        // EWMA: 0.3 * 8000 + 0.7 * 4080 = 2400 + 2856 = 5256 > 5000
+        let ewma3 = guard.ewma_abort_rate.load(Ordering::Relaxed);
+        assert_eq!(ewma3, 5256);
+        // Should have triggered dynamic disable.
+        assert_eq!(guard.state.load(Ordering::Relaxed), HTM_DISABLED);
+        assert_eq!(guard.disable_count(), 1);
+    }
+
+    #[test]
+    fn htm_guard_record_abort_updates_window() {
+        let guard = HtmGuard::new();
+        guard.record_abort(XABORT_CONFLICT | XABORT_RETRY);
+        assert_eq!(guard.window_aborts.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn htm_guard_metrics_in_flat_combiner() {
+        let fc = FlatCombiner::new(0);
+        assert_eq!(fc.htm_guard().state_name(), "not_probed");
+        let metrics = flat_combining_metrics_from(&fc);
+        assert_eq!(metrics.fsqlite_htm_state, "not_probed");
+        assert!((metrics.fsqlite_htm_ewma_abort_rate_pct - 0.0).abs() < f64::EPSILON);
+        assert_eq!(metrics.fsqlite_htm_disable_count, 0);
+    }
+
+    #[test]
+    fn htm_guard_in_apply_path() {
+        // Verify that apply() works correctly with the guard present.
+        // Phase 1: guard always returns false, so lock path is always used.
+        let fc = FlatCombiner::new(0);
+        let h = fc.register().unwrap();
+        let result = h.add(42);
+        assert_eq!(result, 42);
+        // Guard should have been probed lazily.
+        assert_eq!(fc.htm_guard().state_name(), "unavailable");
+    }
+
+    // ── Existing HTM classification tests ─────────────────────────────
 
     #[test]
     fn classify_htm_abort_status_prefers_conflict() {
