@@ -13,8 +13,8 @@
 //!     --test prepared_hit_rate_proof -- --test-threads=1 --nocapture
 
 use fsqlite_core::connection::{
-    Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled, Connection,
 };
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
@@ -357,6 +357,136 @@ fn test_b3_4_memory_autocommit_commit_roundtrip_probe() {
     );
 
     assert!(snap.prepared_insert_fast_lane_hits >= n as u64);
+}
+
+/// B3 follow-up proof: exact `small_3col` autocommit prepared INSERT shape.
+///
+/// This keeps a disjoint backstop on the comprehensive/write-throughput
+/// workload while exposing the direct-body split pane 5 is targeting next:
+/// row build, serialization, btree insert, and MemDB apply.
+#[test]
+fn test_b3_small_3col_autocommit_direct_insert_profile_breakdown() {
+    let _profile_guard = HotPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute(
+        "CREATE TABLE bench(\
+            id INTEGER PRIMARY KEY, \
+            name TEXT NOT NULL, \
+            value REAL NOT NULL\
+        )",
+    )
+    .unwrap();
+    let stmt = conn
+        .prepare("INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))")
+        .unwrap();
+
+    const ROWS: i64 = 512;
+    reset_hot_path_profile();
+    for id in 0..ROWS {
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Integer(id)])
+            .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    let profile = hot_path_profile_snapshot();
+    let direct_insert_total = profile
+        .prepared_direct_insert_row_build_time_ns
+        .saturating_add(profile.prepared_direct_insert_cursor_setup_time_ns)
+        .saturating_add(profile.prepared_direct_insert_serialize_time_ns)
+        .saturating_add(profile.prepared_direct_insert_btree_insert_time_ns)
+        .saturating_add(profile.prepared_direct_insert_memdb_apply_time_ns);
+    let autocommit_wrapper_total = profile
+        .prepared_direct_insert_schema_validation_time_ns
+        .saturating_add(profile.prepared_direct_insert_autocommit_begin_time_ns)
+        .saturating_add(profile.prepared_direct_insert_change_tracking_time_ns)
+        .saturating_add(profile.prepared_direct_insert_autocommit_resolve_time_ns);
+    let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROWS));
+
+    eprintln!("=== B3 small_3col autocommit profile ({ROWS} rows) ===");
+    eprintln!(
+        "row_build:            {:.1} us total, {:.3} us/row",
+        profile.prepared_direct_insert_row_build_time_ns as f64 / 1000.0,
+        profile.prepared_direct_insert_row_build_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "cursor_setup:         {:.1} us total, {:.3} us/row",
+        profile.prepared_direct_insert_cursor_setup_time_ns as f64 / 1000.0,
+        profile.prepared_direct_insert_cursor_setup_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "serialize:            {:.1} us total, {:.3} us/row",
+        profile.prepared_direct_insert_serialize_time_ns as f64 / 1000.0,
+        profile.prepared_direct_insert_serialize_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "btree_insert:         {:.1} us total, {:.3} us/row",
+        profile.prepared_direct_insert_btree_insert_time_ns as f64 / 1000.0,
+        profile.prepared_direct_insert_btree_insert_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "memdb_apply:          {:.1} us total, {:.3} us/row",
+        profile.prepared_direct_insert_memdb_apply_time_ns as f64 / 1000.0,
+        profile.prepared_direct_insert_memdb_apply_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "direct_body_total:    {:.1} us total, {:.3} us/row",
+        direct_insert_total as f64 / 1000.0,
+        direct_insert_total as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "autocommit_wrapper:   {:.1} us total, {:.3} us/row",
+        autocommit_wrapper_total as f64 / 1000.0,
+        autocommit_wrapper_total as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "commit_roundtrip:     {:.1} us total, {:.3} us/row",
+        profile.commit_txn_roundtrip_time_ns as f64 / 1000.0,
+        profile.commit_txn_roundtrip_time_ns as f64 / 1000.0 / ROWS as f64
+    );
+    eprintln!(
+        "cached_write_txn:     reuses={} parks={} memory_fast_begins={}",
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.memory_autocommit_fast_path_begins,
+    );
+    eprintln!(
+        "direct_execs:         fast_hits={} direct_execs={} autocommit_execs={}",
+        profile.prepared_insert_fast_lane_hits,
+        profile.prepared_direct_insert_executions,
+        profile.prepared_direct_insert_autocommit_executions,
+    );
+
+    assert_eq!(
+        profile.prepared_insert_fast_lane_hits, ROWS as u64,
+        "small_3col autocommit INSERT should stay on the prepared fast lane: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_insert_executions, ROWS as u64,
+        "small_3col autocommit INSERT should stay on the direct insert path: {profile:?}"
+    );
+    assert_eq!(
+        profile.prepared_direct_insert_autocommit_executions, ROWS as u64,
+        "small_3col autocommit INSERT should count every autocommit direct execution: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_insert_serialize_time_ns > 0,
+        "the direct insert profile must expose serialization cost for the small_3col shape: {profile:?}"
+    );
+    assert!(
+        profile.prepared_direct_insert_btree_insert_time_ns > 0,
+        "the direct insert profile must expose btree insert cost for the small_3col shape: {profile:?}"
+    );
+    assert_eq!(
+        profile.cached_write_txn_parks, ROWS as u64,
+        "every autocommit INSERT should still park the cached write txn for the next statement: {profile:?}"
+    );
+    assert!(
+        profile.cached_write_txn_reuses >= ROWS as u64 - 1
+            || profile.memory_autocommit_fast_path_begins >= 1,
+        "the small_3col autocommit probe should stay on the retained write-txn path after the first statement: {profile:?}"
+    );
 }
 
 /// bd-wwqen.3: Proof test for column-list INSERT direct path eligibility.

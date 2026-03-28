@@ -87,6 +87,80 @@ fn assert_count_star_sum_row(
     }
 }
 
+fn stringify_fsqlite_value(value: &fsqlite_types::SqliteValue) -> String {
+    match value {
+        fsqlite_types::SqliteValue::Null => "NULL".to_owned(),
+        fsqlite_types::SqliteValue::Integer(n) => n.to_string(),
+        fsqlite_types::SqliteValue::Float(f) => format!("{f}"),
+        fsqlite_types::SqliteValue::Text(s) => format!("'{s}'"),
+        fsqlite_types::SqliteValue::Blob(b) => {
+            format!(
+                "X'{}'",
+                b.iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        }
+    }
+}
+
+fn stringify_rusqlite_value(value: rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Null => "NULL".to_owned(),
+        rusqlite::types::Value::Integer(n) => n.to_string(),
+        rusqlite::types::Value::Real(f) => format!("{f}"),
+        rusqlite::types::Value::Text(s) => format!("'{s}'"),
+        rusqlite::types::Value::Blob(b) => {
+            format!(
+                "X'{}'",
+                b.iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        }
+    }
+}
+
+fn sorted_frank_rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+    let stmt = conn.prepare(sql).unwrap();
+    let mut rows = stmt
+        .query()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.values().iter().map(stringify_fsqlite_value).collect())
+        .collect::<Vec<Vec<String>>>();
+    rows.sort();
+    rows
+}
+
+fn sorted_rusqlite_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let col_count = stmt.column_count();
+    let mut rows = stmt
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for idx in 0..col_count {
+                let value: rusqlite::types::Value = row.get(idx)?;
+                values.push(stringify_rusqlite_value(value));
+            }
+            Ok(values)
+        })
+        .unwrap()
+        .collect::<Result<Vec<Vec<String>>, _>>()
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+fn seed_grouped_sum_bench(fconn: &Connection, rconn: &rusqlite::Connection, row_count: usize) {
+    for id in 0..row_count {
+        let value = (id * 3) + 1;
+        let sql = format!("INSERT INTO bench VALUES ({id}, 'name{id}', {value}.0)");
+        fconn.execute(&sql).unwrap();
+        rconn.execute(&sql, []).unwrap();
+    }
+}
+
 /// T1: Prepared INSERT uses fast path.
 #[test]
 fn test_fast_path_simple_insert() {
@@ -1225,4 +1299,28 @@ fn test_fast_path_count_star_sum_sees_post_delete_visibility() {
         slow_delta, 0,
         "post-delete COUNT(*)+SUM() should not fall back to the slow path"
     );
+}
+
+#[test]
+fn test_fast_path_group_by_rowid_bucket_sum_matches_sqlite_reference_rows() {
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench(id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
+
+    for (row_count, divisor) in [(0_usize, 1_i64), (7, 3), (25, 10)] {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+        fconn.execute(CREATE_TABLE).unwrap();
+        rconn.execute(CREATE_TABLE, []).unwrap();
+        seed_grouped_sum_bench(&fconn, &rconn, row_count);
+
+        let sql =
+            format!("SELECT (id / {divisor}), SUM(value) FROM bench GROUP BY (id / {divisor})");
+        let frank_rows = sorted_frank_rows(&fconn, &sql);
+        let sqlite_rows = sorted_rusqlite_rows(&rconn, &sql);
+
+        assert_eq!(
+            frank_rows, sqlite_rows,
+            "grouped-SUM rows should match rusqlite for row_count={row_count}, divisor={divisor}"
+        );
+    }
 }

@@ -634,6 +634,11 @@ fn log_manual_insert_hot_path_profile(
             "manual_insert_hot_path_profile.{label} ",
             "wall_us={wall_us} bg_status_us={bg_status_us} prepared_schema_refresh_us={prepared_schema_refresh_us} ",
             "begin_setup_us={begin_setup_us} execute_body_us={execute_body_us} ",
+            "row_build_us={row_build_us} cursor_setup_us={cursor_setup_us} serialize_us={serialize_us} ",
+            "btree_insert_us={btree_insert_us} memdb_apply_us={memdb_apply_us} direct_body_us={direct_body_us} ",
+            "schema_validation_us={schema_validation_us} autocommit_begin_us={autocommit_begin_us} ",
+            "change_tracking_us={change_tracking_us} autocommit_resolve_us={autocommit_resolve_us} ",
+            "autocommit_wrapper_us={autocommit_wrapper_us} direct_autocommit_execs={direct_autocommit_execs} ",
             "commit_pre_txn_us={commit_pre_txn_us} commit_txn_roundtrip_us={commit_txn_roundtrip_us} ",
             "commit_finalize_seq_us={commit_finalize_seq_us} commit_handle_finalize_us={commit_handle_finalize_us} ",
             "commit_post_write_maintenance_us={commit_post_write_maintenance_us} finalize_post_publish_us={finalize_post_publish_us} ",
@@ -647,6 +652,29 @@ fn log_manual_insert_hot_path_profile(
         prepared_schema_refresh_us = profile.prepared_schema_refresh_time_ns / 1_000,
         begin_setup_us = profile.begin_setup_time_ns / 1_000,
         execute_body_us = profile.execute_body_time_ns / 1_000,
+        row_build_us = profile.prepared_direct_insert_row_build_time_ns / 1_000,
+        cursor_setup_us = profile.prepared_direct_insert_cursor_setup_time_ns / 1_000,
+        serialize_us = profile.prepared_direct_insert_serialize_time_ns / 1_000,
+        btree_insert_us = profile.prepared_direct_insert_btree_insert_time_ns / 1_000,
+        memdb_apply_us = profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
+        direct_body_us = profile
+            .prepared_direct_insert_row_build_time_ns
+            .saturating_add(profile.prepared_direct_insert_cursor_setup_time_ns)
+            .saturating_add(profile.prepared_direct_insert_serialize_time_ns)
+            .saturating_add(profile.prepared_direct_insert_btree_insert_time_ns)
+            .saturating_add(profile.prepared_direct_insert_memdb_apply_time_ns)
+            / 1_000,
+        schema_validation_us = profile.prepared_direct_insert_schema_validation_time_ns / 1_000,
+        autocommit_begin_us = profile.prepared_direct_insert_autocommit_begin_time_ns / 1_000,
+        change_tracking_us = profile.prepared_direct_insert_change_tracking_time_ns / 1_000,
+        autocommit_resolve_us = profile.prepared_direct_insert_autocommit_resolve_time_ns / 1_000,
+        autocommit_wrapper_us = profile
+            .prepared_direct_insert_schema_validation_time_ns
+            .saturating_add(profile.prepared_direct_insert_autocommit_begin_time_ns)
+            .saturating_add(profile.prepared_direct_insert_change_tracking_time_ns)
+            .saturating_add(profile.prepared_direct_insert_autocommit_resolve_time_ns)
+            / 1_000,
+        direct_autocommit_execs = profile.prepared_direct_insert_autocommit_executions,
         commit_pre_txn_us = profile.commit_pre_txn_time_ns / 1_000,
         commit_txn_roundtrip_us = profile.commit_txn_roundtrip_time_ns / 1_000,
         commit_finalize_seq_us = profile.commit_finalize_seq_time_ns / 1_000,
@@ -1415,6 +1443,35 @@ fn manual_hot_path_profile_large_prepared_insert_single_transaction_10k() {
 
     let profile = hot_path_profile_snapshot();
     log_manual_insert_hot_path_profile("large_prepared_insert_single_txn_10k", wall, &profile);
+}
+
+#[test]
+#[ignore = "manual hot path profile; run via rch when validating small_3col autocommit insert micro-cuts"]
+fn manual_hot_path_profile_small_prepared_insert_autocommit_10k() {
+    const ROW_COUNT: i64 = 10_000;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL);";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
+
+    let _profile_guard = ManualHotPathProfileGuard::new();
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_manual_probe_pragmas_fsqlite(&conn);
+    conn.execute(CREATE_TABLE).unwrap();
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+
+    reset_hot_path_profile();
+    let started = std::time::Instant::now();
+    for i in 0..ROW_COUNT {
+        conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
+            .unwrap();
+    }
+    let wall = started.elapsed();
+
+    let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(ROW_COUNT));
+
+    let profile = hot_path_profile_snapshot();
+    log_manual_insert_hot_path_profile("small_prepared_insert_autocommit_10k", wall, &profile);
 }
 
 #[test]
