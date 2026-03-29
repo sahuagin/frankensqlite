@@ -155,7 +155,9 @@ pub fn persist_to_sqlite(
 
     // Track (type, name, tbl_name, root_page, create_sql) for sqlite_master entries.
     // Extended from just tables to also include indexes, views, and triggers.
-    let mut master_entries: Vec<(&str, String, String, u32, String)> = Vec::new();
+    // The sql column is Option<String> because autoindex entries (sqlite_autoindex_*)
+    // must have NULL sql, matching stock SQLite behavior.
+    let mut master_entries: Vec<(&str, String, String, u32, Option<String>)> = Vec::new();
 
     // Write each table's data into its own B-tree.
     for table in schema {
@@ -191,7 +193,7 @@ pub fn persist_to_sqlite(
             table_name.clone(),
             table_name.clone(),
             root_page.get(),
-            create_sql,
+            Some(create_sql),
         ));
 
         // Write index B-trees for all indexes including autoindexes.
@@ -239,31 +241,37 @@ pub fn persist_to_sqlite(
                 }
             }
 
-            // Build CREATE INDEX SQL.
-            let terms: Vec<CreateIndexSqlTerm<'_>> = index
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| CreateIndexSqlTerm {
-                    column_name: col.as_str(),
-                    collation: index.key_collations.get(i).and_then(|c| c.as_deref()),
-                    direction: index.key_sort_directions.get(i).copied(),
-                })
-                .collect();
-            // Parse WHERE clause from string if present.
-            let idx_sql = build_create_index_sql(
-                &index.name,
-                &table_name,
-                index.is_unique,
-                &terms,
-                None, // WHERE clause from string is already in index.where_clause
-            );
-            // Append WHERE clause text if present (the build function takes an
-            // Expr, but we have a String — append directly).
-            let idx_sql = if let Some(ref wc) = index.where_clause {
-                format!("{idx_sql} WHERE {wc}")
+            // Build CREATE INDEX SQL — but autoindexes (sqlite_autoindex_*)
+            // must have NULL sql in sqlite_master, matching stock SQLite.
+            // Stock SQLite rejects CREATE INDEX with reserved sqlite_ prefix,
+            // so a non-NULL sql here would be an invalid schema entry.
+            let idx_sql = if index.name.starts_with("sqlite_autoindex_") {
+                None
             } else {
-                idx_sql
+                let terms: Vec<CreateIndexSqlTerm<'_>> = index
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| CreateIndexSqlTerm {
+                        column_name: col.as_str(),
+                        collation: index.key_collations.get(i).and_then(|c| c.as_deref()),
+                        direction: index.key_sort_directions.get(i).copied(),
+                    })
+                    .collect();
+                let sql = build_create_index_sql(
+                    &index.name,
+                    &table_name,
+                    index.is_unique,
+                    &terms,
+                    None, // WHERE clause from string is already in index.where_clause
+                );
+                // Append WHERE clause text if present (the build function takes an
+                // Expr, but we have a String — append directly).
+                Some(if let Some(ref wc) = index.where_clause {
+                    format!("{sql} WHERE {wc}")
+                } else {
+                    sql
+                })
             };
             master_entries.push((
                 "index",
@@ -289,12 +297,16 @@ pub fn persist_to_sqlite(
         for (rowid, (entry_type, name, tbl_name, root_page_num, create_sql)) in
             master_entries.iter().enumerate()
         {
+            let sql_value = match create_sql {
+                Some(sql) => SqliteValue::Text(sql.clone().into()),
+                None => SqliteValue::Null,
+            };
             let record = serialize_record(&[
                 SqliteValue::Text((*entry_type).into()),
                 SqliteValue::Text(name.clone().into()),
                 SqliteValue::Text(tbl_name.clone().into()),
                 SqliteValue::Integer(i64::from(*root_page_num)),
-                SqliteValue::Text(create_sql.clone().into()),
+                sql_value,
             ]);
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
