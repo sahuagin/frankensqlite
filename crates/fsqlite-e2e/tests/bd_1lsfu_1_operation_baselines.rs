@@ -1591,6 +1591,76 @@ fn manual_perf_probe_write_10k_autocommit_prepared_and_ad_hoc() {
 }
 
 #[test]
+#[ignore = "manual perf probe; run via rch when measuring UNIQUE secondary-index insert maintenance"]
+fn manual_perf_probe_write_10k_autocommit_prepared_unique_email_index() {
+    const ROW_COUNT: i64 = 10_000;
+    const MEASURED_RUNS: usize = 3;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score INTEGER, created TEXT);";
+    const CREATE_INDEX: &str = "CREATE UNIQUE INDEX idx_bench_email_unique ON bench(email);";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), ('2026-01-' || ((?1 % 28) + 1)))";
+
+    fn run_csqlite_prepared_once() -> f64 {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_manual_probe_pragmas_csqlite(&conn);
+        conn.execute_batch(CREATE_TABLE).unwrap();
+        conn.execute_batch(CREATE_INDEX).unwrap();
+        let start = std::time::Instant::now();
+        let mut stmt = conn.prepare(INSERT_SQL).unwrap();
+        for i in 0..ROW_COUNT {
+            stmt.execute(rusqlite::params![i]).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bench", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, ROW_COUNT);
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    fn run_fsqlite_prepared_once() -> f64 {
+        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        apply_manual_probe_pragmas_fsqlite(&conn);
+        conn.execute(CREATE_TABLE).unwrap();
+        conn.execute(CREATE_INDEX).unwrap();
+        let stmt = conn.prepare(INSERT_SQL).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..ROW_COUNT {
+            stmt.execute_with_params(&[fsqlite_types::value::SqliteValue::Integer(i)])
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(ROW_COUNT)
+        );
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    let csqlite_prepared: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_csqlite_prepared_once())
+        .collect();
+    let fsqlite_prepared: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_fsqlite_prepared_once())
+        .collect();
+
+    let csqlite_prepared_median = median_f64(csqlite_prepared.clone());
+    let fsqlite_prepared_median = median_f64(fsqlite_prepared.clone());
+
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit_prepared_unique_email_index.csqlite_prepared.samples={csqlite_prepared:?} median_rows_per_sec={csqlite_prepared_median:.1}"
+    );
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit_prepared_unique_email_index.frankensqlite_prepared.samples={fsqlite_prepared:?} median_rows_per_sec={fsqlite_prepared_median:.1} ratio_vs_csqlite={:.4}",
+        fsqlite_prepared_median / csqlite_prepared_median
+    );
+
+    assert!(csqlite_prepared_median > 0.0);
+    assert!(fsqlite_prepared_median > 0.0);
+}
+
+#[test]
 #[ignore = "manual perf probe; run via rch when investigating repeated prepare reuse"]
 fn manual_perf_probe_prepare_cache_reuse_vs_unique_sql_variants() {
     const ROW_COUNT: i64 = 10_000;
