@@ -1595,8 +1595,7 @@ fn manual_perf_probe_write_10k_autocommit_prepared_and_ad_hoc() {
 fn manual_perf_probe_write_10k_autocommit_prepared_unique_email_index() {
     const ROW_COUNT: i64 = 10_000;
     const MEASURED_RUNS: usize = 3;
-    const CREATE_TABLE: &str =
-        "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score INTEGER, created TEXT);";
+    const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, email TEXT, score INTEGER, created TEXT);";
     const CREATE_INDEX: &str = "CREATE UNIQUE INDEX idx_bench_email_unique ON bench(email);";
     const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), ('2026-01-' || ((?1 % 28) + 1)))";
 

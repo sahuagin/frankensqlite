@@ -220,15 +220,11 @@ impl HtmGuard {
         let old_ewma = self.ewma_abort_rate.load(Ordering::Relaxed);
 
         // EWMA: alpha * new + (1-alpha) * old, all in fixed-point.
-        let updated = (HTM_EWMA_ALPHA * new_rate_fp
-            + (10000 - HTM_EWMA_ALPHA) * old_ewma)
-            / 10000;
+        let updated = (HTM_EWMA_ALPHA * new_rate_fp + (10000 - HTM_EWMA_ALPHA) * old_ewma) / 10000;
         self.ewma_abort_rate.store(updated, Ordering::Relaxed);
 
         // Check disable threshold.
-        if updated > HTM_DISABLE_THRESHOLD
-            && self.state.load(Ordering::Relaxed) == HTM_AVAILABLE
-        {
+        if updated > HTM_DISABLE_THRESHOLD && self.state.load(Ordering::Relaxed) == HTM_AVAILABLE {
             self.dynamic_disable(updated);
         }
     }
