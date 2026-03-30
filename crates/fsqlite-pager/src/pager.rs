@@ -1944,6 +1944,32 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start);
     }
 
+    /// Publish commit: retain pages up to db_size, then bulk insert prebuilt page images.
+    fn publish_commit_prebuilt_pages(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        pages: &[(PageNumber, PageData)],
+    ) {
+        let _publish_guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let start = Instant::now();
+        let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
+        self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
+
+        // Retain pages within db_size
+        self.pages.retain(|page_no| page_no.get() <= update.db_size);
+
+        // Bulk insert committed pages
+        self.pages.insert_batch(pages.iter().cloned());
+
+        let page_set_size = self.pages.len();
+        self.finalize_publish(cx, update, page_set_size, start);
+    }
+
     /// Insert a single page (for testing and internal use).
     #[cfg(test)]
     fn publish_insert_single(
@@ -4060,6 +4086,16 @@ impl<V: Vfs> SimpleTransaction<V> {
         self.published.publish_commit(cx, update, &self.write_set);
     }
 
+    fn publish_committed_state_prebuilt_pages(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        pages: &[(PageNumber, PageData)],
+    ) {
+        self.published
+            .publish_commit_prebuilt_pages(cx, update, pages);
+    }
+
     /// Publish a new committed-state snapshot while the pager inner lock is still held.
     ///
     /// The write lock is held only long enough to swap the immutable snapshot Arc.
@@ -5453,6 +5489,7 @@ where
         // pending_freed so inner.freelist remains untouched until Phase C
         // (after successful commit).
         let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
+        let mut retained_publish_pages: Option<Vec<(PageNumber, PageData)>> = None;
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
             if freelist_dirty {
@@ -5552,10 +5589,18 @@ where
                 // bd-wwqen.3: :memory: retained-commit fast path.
                 // Skip journal creation, pre-image backup, sync, and deletion.
                 // Just flush dirty pages directly to the MemoryFile.
-                for (&page_no, staged) in &self.write_set {
-                    inner.flush_page(cx, page_no, staged.as_page_bytes())?;
+                let pages: Vec<(PageNumber, PageData)> = self
+                    .write_set
+                    .iter()
+                    .map(|(&page_no, staged)| {
+                        (page_no, PageData::from_vec(staged.as_page_bytes().to_vec()))
+                    })
+                    .collect();
+                for (page_no, page_data) in &pages {
+                    inner.flush_page(cx, *page_no, page_data.as_bytes())?;
                     inner.db_size = inner.db_size.max(page_no.get());
                 }
+                retained_publish_pages = Some(pages);
                 Ok(())
             } else {
                 Self::commit_journal(
@@ -5600,7 +5645,11 @@ where
             // before the seqlock commit_seq advances.
             self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
-            self.publish_committed_state(cx, publish_update);
+            if let Some(ref pages) = retained_publish_pages {
+                self.publish_committed_state_prebuilt_pages(cx, publish_update, pages);
+            } else {
+                self.publish_committed_state(cx, publish_update);
+            }
 
             // Clear write set for reuse (no allocation — just clears existing maps).
             self.write_set.clear();
