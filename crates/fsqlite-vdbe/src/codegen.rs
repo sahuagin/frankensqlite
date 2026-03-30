@@ -3778,6 +3778,12 @@ fn codegen_select_count_star_indexed_in_scan(
     );
     b.emit_op(Opcode::OpenAutoindex, probe_cursor, 1, 0, P4::None, 0);
 
+    let use_materialized_semijoin_merge = matches!(
+        &in_target,
+        CountIndexedInTarget::MaterializedProbeSource(probe_source)
+            if count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source)
+    );
+
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
     match in_target {
@@ -3794,7 +3800,8 @@ fn codegen_select_count_star_indexed_in_scan(
                 b.resolve_label(next_value);
             }
         }
-        CountIndexedInTarget::ProbeSource(probe_source) => {
+        CountIndexedInTarget::ProbeSource(probe_source)
+        | CountIndexedInTarget::MaterializedProbeSource(probe_source) => {
             b.emit_op(
                 Opcode::OpenRead,
                 source_cursor,
@@ -3924,53 +3931,106 @@ fn codegen_select_count_star_indexed_in_scan(
     b.free_temp(r_key);
     b.free_temp(r_value);
 
-    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+    if use_materialized_semijoin_merge {
+        b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
 
-    let r_probe_value = b.alloc_reg();
-    let r_min_rowid = b.alloc_reg();
-    let r_probe_record = b.alloc_reg();
-    let r_current_key = b.alloc_reg();
+        let r_probe_value = b.alloc_reg();
+        let r_current_key = b.alloc_reg();
+        let probe_loop_top = b.current_addr();
+        b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
 
-    let probe_loop_top = b.current_addr();
-    b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
-    b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
-    b.emit_op(
-        Opcode::MakeRecord,
-        r_probe_value,
-        2,
-        r_probe_record,
-        P4::None,
-        0,
-    );
-    let next_probe = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::SeekGE,
-        idx_cursor,
-        r_probe_record,
-        next_probe,
-        P4::None,
-        0,
-    );
+        let next_probe = b.emit_label();
+        let advance_outer = b.emit_label();
+        let align_outer = b.emit_label();
 
-    let idx_loop_top = b.current_addr();
-    b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
-    b.emit_jump_to_label(
-        Opcode::Ne,
-        r_probe_value,
-        r_current_key,
-        next_probe,
-        P4::None,
-        0,
-    );
-    b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let idx_loop_body = idx_loop_top as i32;
-    b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+        b.resolve_label(align_outer);
+        b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Lt,
+            r_current_key,
+            r_probe_value,
+            advance_outer,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::Gt,
+            r_current_key,
+            r_probe_value,
+            next_probe,
+            P4::None,
+            0,
+        );
 
-    b.resolve_label(next_probe);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let probe_loop_body = probe_loop_top as i32;
-    b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::CountIndexEqRun,
+            idx_cursor,
+            out_regs,
+            r_probe_value,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::IfNullRow, idx_cursor, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, next_probe, P4::None, 0);
+
+        b.resolve_label(advance_outer);
+        b.emit_jump_to_label(Opcode::Next, idx_cursor, 0, align_outer, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+        b.resolve_label(next_probe);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let probe_loop_body = probe_loop_top as i32;
+        b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+
+        let r_probe_value = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_probe_record = b.alloc_reg();
+        let r_current_key = b.alloc_reg();
+
+        let probe_loop_top = b.current_addr();
+        b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(
+            Opcode::MakeRecord,
+            r_probe_value,
+            2,
+            r_probe_record,
+            P4::None,
+            0,
+        );
+        let next_probe = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            r_probe_record,
+            next_probe,
+            P4::None,
+            0,
+        );
+
+        let idx_loop_top = b.current_addr();
+        b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            r_probe_value,
+            r_current_key,
+            next_probe,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::AddImm, out_regs, 1, 0, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let idx_loop_body = idx_loop_top as i32;
+        b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+
+        b.resolve_label(next_probe);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let probe_loop_body = probe_loop_top as i32;
+        b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
+    }
 
     b.resolve_label(done_label);
     b.emit_op(Opcode::ResultRow, out_regs, 1, 0, P4::None, 0);
@@ -13216,6 +13276,7 @@ fn extract_column_eq_target<'a>(
 enum CountIndexedInTarget<'a> {
     List(&'a [Expr]),
     ProbeSource(InProbeSource<'a>),
+    MaterializedProbeSource(InProbeSource<'a>),
 }
 
 fn extract_count_indexed_in_target<'a>(
@@ -13250,8 +13311,10 @@ fn extract_count_indexed_in_target<'a>(
         }
         InSet::Subquery(_) | InSet::Table(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
-            can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
-                .then_some((idx_schema, CountIndexedInTarget::ProbeSource(probe_source)))
+            can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx).then_some((
+                idx_schema,
+                CountIndexedInTarget::MaterializedProbeSource(probe_source),
+            ))
         }
         InSet::List(_) => None,
     }
@@ -22293,8 +22356,21 @@ mod tests {
             "count(*) with indexed IN-subquery should still read the inner probe source once"
         );
         assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "count(*) with indexed IN-subquery should materialize a deduplicated RHS probe set once"
+        );
+        assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
             "count(*) with indexed IN-subquery should seek into the outer index per probe value"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "non-rowid IN-subquery should stay on per-probe indexed seeks"
         );
         assert!(
             !prog.ops().iter().any(|op| matches!(&op.p4, P4::Table(name) if op.opcode == Opcode::OpenRead && name == "t")),
@@ -22370,8 +22446,16 @@ mod tests {
         let prog = b.finish().unwrap();
 
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
-            "rowid-driven IN-subquery should still seek into the outer index per probe value"
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenAutoindex),
+            "rowid-driven IN-subquery should still materialize the RHS probe set once"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::CountIndexEqRun),
+            "rowid-driven IN-subquery should consume the materialized RHS via duplicate-run counting"
         );
         assert!(
             prog.ops()
@@ -22525,8 +22609,11 @@ mod tests {
 
         assert_eq!(extracted.0.name, "idx_t_b");
         match extracted.1 {
-            CountIndexedInTarget::ProbeSource(probe_source) => {
+            CountIndexedInTarget::MaterializedProbeSource(probe_source) => {
                 assert!(matches!(probe_source.value, InProbeValue::Rowid));
+            }
+            CountIndexedInTarget::ProbeSource(_) => {
+                panic!("IPK-projected IN target should lower to a materialized rowid probe source");
             }
             CountIndexedInTarget::List(_) => {
                 panic!("IPK-projected IN target should lower to a rowid probe source");
@@ -22983,6 +23070,9 @@ mod tests {
         match extracted.1 {
             CountIndexedInTarget::ProbeSource(probe_source) => {
                 assert!(matches!(probe_source.value, InProbeValue::Rowid));
+            }
+            CountIndexedInTarget::MaterializedProbeSource(_) => {
+                panic!("EXISTS target should lower to a direct probe source");
             }
             CountIndexedInTarget::List(_) => {
                 panic!("EXISTS target should lower to a probe source");
