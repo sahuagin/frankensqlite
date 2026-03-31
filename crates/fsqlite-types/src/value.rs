@@ -244,7 +244,7 @@ impl<'de> serde::Deserialize<'de> for SmallText {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(SmallText::from_string(s))
+        Ok(Self::from_string(s))
     }
 }
 
