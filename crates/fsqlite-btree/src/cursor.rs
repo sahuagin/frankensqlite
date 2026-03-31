@@ -707,7 +707,8 @@ impl<P: PageReader> BtCursor<P> {
             };
 
             match scan_outcome {
-                LocalRunScanOutcome::MatchedAll(matched) | LocalRunScanOutcome::MatchedCurrent(matched) => {
+                LocalRunScanOutcome::MatchedAll(matched)
+                | LocalRunScanOutcome::MatchedCurrent(matched) => {
                     matched_total = matched_total.wrapping_add(matched);
                     if !self.advance_next(cx)? {
                         return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));

@@ -49,7 +49,9 @@ use fsqlite_types::record::{
     ColumnOffset, RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
 use fsqlite_types::serial_type::{read_varint, serial_type_len};
-use fsqlite_types::value::{SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches};
+use fsqlite_types::value::{
+    SmallText, SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches,
+};
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
     StrictColumnType, WitnessKey,
@@ -106,6 +108,87 @@ impl StatementColdState {
 #[inline]
 fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+const MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES: usize = 9;
+const MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MIN: usize = 64;
+const MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MAX: usize = 512;
+
+#[inline]
+fn compute_record_header_size_hint(content_size: usize) -> usize {
+    let mut header_size = content_size + 1;
+    loop {
+        let needed = fsqlite_types::serial_type::varint_len(header_size as u64) + content_size;
+        if needed <= header_size {
+            return header_size;
+        }
+        header_size = needed;
+    }
+}
+
+#[inline]
+fn make_record_variable_width_reserve(page_size: PageSize) -> usize {
+    usize::try_from(page_size.get())
+        .unwrap_or(fsqlite_types::limits::DEFAULT_PAGE_SIZE as usize)
+        .div_ceil(16)
+        .clamp(
+            MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MIN,
+            MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MAX,
+        )
+}
+
+fn estimate_make_record_capacity_for_affinity(
+    affinity: Option<&str>,
+    n_cols: usize,
+    variable_width_hint: usize,
+) -> usize {
+    let chars = affinity.map_or_else(
+        || smallvec::SmallVec::<[char; 16]>::from_elem('C', n_cols),
+        |aff| aff.chars().collect(),
+    );
+    let column_count = chars.len().max(n_cols);
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+
+    for idx in 0..column_count {
+        match chars.get(idx).copied().unwrap_or('C') {
+            'X' => {
+                header_content_size += 1;
+            }
+            'C' | 'D' | 'E' => {
+                header_content_size += 1;
+                body_size += MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES;
+            }
+            'A' | 'B' => {
+                header_content_size += 2;
+                body_size += variable_width_hint;
+            }
+            _ => {
+                header_content_size += 2;
+                body_size += variable_width_hint;
+            }
+        }
+    }
+
+    compute_record_header_size_hint(header_content_size) + body_size
+}
+
+fn estimate_make_record_buffer_capacity(program: &VdbeProgram, page_size: PageSize) -> usize {
+    let variable_width_hint = make_record_variable_width_reserve(page_size);
+    program
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == Opcode::MakeRecord)
+        .map(|op| {
+            let n_cols = usize::try_from(op.p2.max(0)).unwrap_or(0);
+            let affinity = match &op.p4 {
+                P4::Affinity(aff) => Some(aff.as_str()),
+                _ => None,
+            };
+            estimate_make_record_capacity_for_affinity(affinity, n_cols, variable_width_hint)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 #[inline]
@@ -2830,6 +2913,10 @@ struct StorageCursor {
     /// which is O(1) when already positioned at the rightmost leaf.
     /// This matches C SQLite's `BTREE_APPEND` fast-path.
     last_successful_insert_rowid: Option<i64>,
+    /// Cached rowid for the current cursor position (avoids repeated B-tree lookups).
+    cached_rowid: Option<i64>,
+    /// Cached result of payload_includes_rowid_alias check for the current row.
+    payload_includes_rowid_alias: Option<bool>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -4965,7 +5052,7 @@ impl VdbeEngine {
         self.time_travel_gc_horizon = None;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
-        self.make_record_buf.clear();
+        self.make_record_buf.truncate(0);
         self.collect_result_rows = true;
         self.max_collected_result_rows = None;
         self.statement_state_clean = true;
@@ -5616,6 +5703,13 @@ impl VdbeEngine {
         borrowed_bindings: Option<&[SqliteValue]>,
     ) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+        let estimated_make_record_capacity =
+            estimate_make_record_buffer_capacity(program, self.page_size);
+        if estimated_make_record_capacity > self.make_record_buf.capacity() {
+            self.make_record_buf
+                .reserve(estimated_make_record_capacity - self.make_record_buf.capacity());
+        }
+        self.make_record_buf.truncate(0);
         if !self.statement_state_clean {
             self.clear_statement_cold_state();
             self.results.clear();
@@ -5816,6 +5910,9 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
+            if self.try_execute_hot_opcode(op, &mut pc, collect_vdbe_metrics)? {
+                continue;
+            }
             #[allow(unreachable_patterns)]
             match op.opcode {
                 // ── Control Flow ────────────────────────────────────────
@@ -5855,150 +5952,7 @@ impl VdbeEngine {
                 }
 
                 Opcode::SetSnapshot => {
-                    // Attach a time-travel snapshot to cursor P1.
-                    //
-                    // 1. Record the marker for read-only enforcement.
-                    // 2. If a VersionStore is available, replace the cursor's
-                    //    page I/O backend with `TimeTravelPageIo` so that
-                    //    subsequent reads resolve historical page versions
-                    //    from the MVCC version store.
-                    let cursor_id = op.p1;
-                    let target = match &op.p4 {
-                        P4::TimeTravelCommitSeq(seq) => TimeTravelMarker::CommitSeq(*seq),
-                        P4::TimeTravelTimestamp(ts) => TimeTravelMarker::Timestamp(ts.clone()),
-                        _ => {
-                            return Err(FrankenError::Internal(
-                                "SetSnapshot: invalid P4 (expected time-travel target)".to_owned(),
-                            ));
-                        }
-                    };
-                    self.time_travel_cursors.insert(cursor_id, target.clone());
-
-                    let version_store = self.version_store.as_ref().ok_or_else(|| {
-                        FrankenError::Internal(
-                            "SetSnapshot: VersionStore not available for time-travel".to_owned(),
-                        )
-                    })?;
-                    let commit_log = self.time_travel_commit_log.as_ref().ok_or_else(|| {
-                        FrankenError::Internal(
-                            "SetSnapshot: CommitLog not available for time-travel".to_owned(),
-                        )
-                    })?;
-                    let gc_horizon = self.time_travel_gc_horizon.ok_or_else(|| {
-                        FrankenError::Internal(
-                            "SetSnapshot: GC horizon not available for time-travel".to_owned(),
-                        )
-                    })?;
-
-                    let has_txn_cursor = self
-                        .storage_cursors
-                        .get(&cursor_id)
-                        .is_some_and(|sc| matches!(&sc.cursor, CursorBackend::Txn(_)));
-                    if !has_txn_cursor {
-                        return Err(FrankenError::Internal(format!(
-                            "SetSnapshot: cursor {cursor_id} is not a transactional cursor"
-                        )));
-                    }
-
-                    let time_travel_target = match &target {
-                        TimeTravelMarker::CommitSeq(seq) => {
-                            TimeTravelTarget::CommitSequence(CommitSeq::new(*seq))
-                        }
-                        TimeTravelMarker::Timestamp(ts) => {
-                            // Timestamp-based time-travel requires parsing
-                            // an ISO-8601 / SQLite datetime string to unix
-                            // nanoseconds. The datetime parser integration
-                            // is not yet available; return an explicit error.
-                            return Err(FrankenError::Internal(format!(
-                                "SetSnapshot: timestamp-based time-travel \
-                                 not yet supported (datetime parser not \
-                                 wired); timestamp='{ts}'"
-                            )));
-                        }
-                    };
-
-                    let schema_epoch = SchemaEpoch::new(u64::from(self.schema_cookie));
-                    let commit_log = commit_log
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let tt_snapshot = create_time_travel_snapshot(
-                        time_travel_target,
-                        &commit_log,
-                        gc_horizon,
-                        schema_epoch,
-                    )
-                    .map_err(|err| {
-                        FrankenError::Internal(format!("time-travel snapshot error: {err}"))
-                    })?;
-
-                    // Re-create cursor with TimeTravelPageIo.
-                    // Remove the old cursor to get its metadata.
-                    let old_sc = self.storage_cursors.remove(&cursor_id).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "SetSnapshot: cursor {} not found",
-                            cursor_id
-                        ))
-                    })?;
-                    let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
-                    let root_pgno = PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
-
-                    // Extract the SharedTxnPageIo from the old cursor.
-                    // Since we verified it's Txn above, this is safe.
-                    let inner_page_io = if let Some(ref page_io) = self.txn_page_io {
-                        page_io.clone()
-                    } else {
-                        return Err(FrankenError::Internal(
-                            "SetSnapshot: no transaction page I/O available".to_owned(),
-                        ));
-                    };
-
-                    let commit_seq = tt_snapshot.target_commit_seq().get();
-                    let tt_page_io = TimeTravelPageIo {
-                        inner: inner_page_io,
-                        version_store: Arc::clone(version_store),
-                        snapshot: tt_snapshot,
-                    };
-
-                    // Preserve the cursor's table-vs-index type from
-                    // the original cursor so index cursors remain correct.
-                    let is_table_btree = old_sc.cursor.is_table_btree();
-                    let index_desc_flags = if is_table_btree {
-                        Vec::new()
-                    } else {
-                        self.index_desc_flags_for_root(root_page)
-                    };
-                    let page_layout = BtreeCursorPageLayout {
-                        usable_size: old_sc.cursor.usable_size(),
-                        page_size: old_sc.cursor.page_size(),
-                    };
-                    let mut new_cursor = BtCursor::new_with_index_desc(
-                        tt_page_io,
-                        root_pgno,
-                        page_layout.usable_size,
-                        is_table_btree,
-                        index_desc_flags,
-                    );
-                    configure_btree_cursor_page_size(&mut new_cursor, page_layout);
-                    self.storage_cursors.insert(
-                        cursor_id,
-                        StorageCursor {
-                            cursor: CursorBackend::TimeTravel(new_cursor),
-                            cx: old_sc.cx,
-                            writable: false, // Time-travel is always read-only
-                            last_alloc_rowid: 0,
-                            payload_buf: Vec::new(),
-                            target_vals_buf: Vec::new(),
-                            cur_vals_buf: Vec::new(),
-                            row_decode: RowDecodeScratch::default(),
-                            last_position_stamp: None,
-                            last_successful_insert_rowid: None,
-                        },
-                    );
-                    tracing::info!(
-                        cursor_id,
-                        commit_seq,
-                        "SetSnapshot: upgraded cursor to time-travel backend"
-                    );
+                    self.execute_set_snapshot_cold(op)?;
                     pc += 1;
                 }
 
@@ -6032,7 +5986,7 @@ impl VdbeEngine {
                     // register's existing String buffer when possible.
                     match &op.p4 {
                         P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(Arc::from(""))),
+                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
                     }
                     pc += 1;
                 }
@@ -6041,7 +5995,7 @@ impl VdbeEngine {
                     // p1 = length, p4 = string data. Same as String8 for us.
                     match &op.p4 {
                         P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(Arc::from(""))),
+                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
                     }
                     pc += 1;
                 }
@@ -6747,6 +6701,8 @@ impl VdbeEngine {
                                 row_decode: RowDecodeScratch::default(),
                                 last_position_stamp: None,
                                 last_successful_insert_rowid: None,
+                                cached_rowid: None,
+                                payload_includes_rowid_alias: None,
                             },
                         );
                     }
@@ -8245,45 +8201,7 @@ impl VdbeEngine {
 
                 // ── Record building (SQLite record format) ──────────────
                 Opcode::MakeRecord => {
-                    // Build a record from registers p1..p1+p2-1 into register p3.
-                    let target = op.p3;
-                    let n_cols = usize::try_from(op.p2).unwrap_or(0);
-                    // Reuse make_record_buf to avoid per-row Vec<u8> allocation.
-                    let mut rec_buf = std::mem::take(&mut self.make_record_buf);
-                    {
-                        let this = &*self;
-                        if let P4::Affinity(aff) = &op.p4 {
-                            let null_placeholder = SqliteValue::Null;
-                            let iter = aff.chars().enumerate().map(|(i, ch)| {
-                                if ch == 'X' {
-                                    &null_placeholder
-                                } else {
-                                    #[allow(clippy::cast_possible_wrap)]
-                                    let reg = op.p1 + i as i32;
-                                    this.get_reg(reg)
-                                }
-                            });
-                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-                        } else {
-                            let iter = (0..n_cols).map(move |i| {
-                                #[allow(clippy::cast_possible_wrap)]
-                                let reg = op.p1 + i as i32;
-                                this.get_reg(reg)
-                            });
-                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-                        }
-                    }
-                    if collect_vdbe_metrics {
-                        FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-                        FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.fetch_add(
-                            u64::try_from(rec_buf.len()).unwrap_or(u64::MAX),
-                            AtomicOrdering::Relaxed,
-                        );
-                    }
-                    // Take serialized bytes, return empty buffer for reuse.
-                    let blob = std::mem::take(&mut rec_buf);
-                    self.make_record_buf = rec_buf;
-                    self.set_reg(target, SqliteValue::Blob(blob.into()));
+                    self.execute_make_record_hot(op, collect_vdbe_metrics);
                     pc += 1;
                 }
 
@@ -9499,7 +9417,7 @@ impl VdbeEngine {
                 Opcode::JournalMode => {
                     // Return current journal mode as text in register P2.
                     // FrankenSQLite defaults to WAL mode.
-                    self.set_reg(op.p2, SqliteValue::Text(Arc::from("wal")));
+                    self.set_reg(op.p2, SqliteValue::Text(SmallText::new("wal")));
                     pc += 1;
                 }
 
@@ -9519,7 +9437,7 @@ impl VdbeEngine {
                     // Run integrity check. For now, always report OK.
                     // P1 = root page register, P2 = output register,
                     // P3 = number of tables to check.
-                    self.set_reg(op.p2, SqliteValue::Text(Arc::from("ok")));
+                    self.set_reg(op.p2, SqliteValue::Text(SmallText::new("ok")));
                     pc += 1;
                 }
 
@@ -9978,6 +9896,378 @@ impl VdbeEngine {
             .and_then(|delta| start.checked_add(delta))
     }
 
+    /// Explicit hot-opcode fast lane for the main interpreter loop.
+    ///
+    /// We keep direct enum dispatch instead of switching to indexed
+    /// function-pointer dispatch because indirect branches inhibit inlining
+    /// and usually lose to the compiler's jump-table lowering for a dense
+    /// opcode enum.
+    #[inline(always)]
+    fn try_execute_hot_opcode(
+        &mut self,
+        op: &VdbeOp,
+        pc: &mut usize,
+        collect_vdbe_metrics: bool,
+    ) -> Result<bool> {
+        match op.opcode {
+            Opcode::Column => {
+                self.execute_column_hot(op)?;
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::ResultRow => {
+                self.execute_result_row_hot(op, collect_vdbe_metrics);
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
+                self.execute_comparison_jump_hot(op, pc)?;
+                Ok(true)
+            }
+            Opcode::Compare => {
+                self.execute_compare_hot(op)?;
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::MakeRecord => {
+                self.execute_make_record_hot(op, collect_vdbe_metrics);
+                *pc += 1;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    #[inline(always)]
+    fn execute_column_hot(&mut self, op: &VdbeOp) -> Result<()> {
+        let cursor_id = op.p1;
+        let col_idx = op.p2 as usize;
+        let target = op.p3;
+        if !self.column_to_reg_direct(cursor_id, col_idx, target)? {
+            let val = self.cursor_column(cursor_id, col_idx)?;
+            self.set_reg_fast(target, val);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn execute_result_row_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
+        let count = usize::try_from(op.p2).unwrap_or(0);
+        let should_retain_row = self.collect_result_rows
+            && match self.max_collected_result_rows {
+                Some(limit) => self.results.len() < limit,
+                None => true,
+            };
+        if should_retain_row {
+            let materialize_start = collect_vdbe_metrics.then(Instant::now);
+            let row = self.take_reg_range(op.p1, count);
+            if collect_vdbe_metrics {
+                if let Some(materialize_start) = materialize_start {
+                    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                        u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                record_result_row_metrics(&row);
+            }
+            self.results.push(row);
+        } else {
+            self.discard_reg_range(op.p1, count);
+        }
+    }
+
+    #[inline(always)]
+    fn execute_comparison_jump_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
+        let lhs = self.get_reg(op.p3);
+        let rhs = self.get_reg(op.p1);
+        let store_p2 = (op.p5 & 0x20) != 0; // SQLITE_STOREP2
+
+        if lhs.is_null() || rhs.is_null() {
+            let null_eq = (op.p5 & 0x80) != 0;
+            if null_eq {
+                let both_null = lhs.is_null() && rhs.is_null();
+                let should_jump = match op.opcode {
+                    Opcode::Eq => both_null,
+                    Opcode::Ne => !both_null,
+                    _ => false,
+                };
+                if store_p2 {
+                    self.set_reg_int(op.p2, i64::from(should_jump));
+                    *pc += 1;
+                } else if should_jump {
+                    *pc = op.p2 as usize;
+                } else {
+                    *pc += 1;
+                }
+            } else if store_p2 {
+                self.set_reg_fast(op.p2, SqliteValue::Null);
+                *pc += 1;
+            } else if (op.p5 & 0x10) != 0 {
+                *pc = op.p2 as usize;
+            } else {
+                *pc += 1;
+            }
+            return Ok(());
+        }
+
+        let cmp = if let Some(cmp) = fast_compare_same_storage_class(lhs, rhs, &op.p4) {
+            cmp
+        } else {
+            let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
+            if let P4::Collation(ref coll_name) = op.p4 {
+                let coll = self.lock_collation();
+                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
+            } else {
+                cmp_lhs.partial_cmp(&cmp_rhs)
+            }
+        };
+
+        let should_jump = matches!(
+            (op.opcode, cmp),
+            (Opcode::Eq, Some(Ordering::Equal))
+                | (Opcode::Lt, Some(Ordering::Less))
+                | (Opcode::Le, Some(Ordering::Less | Ordering::Equal))
+                | (Opcode::Gt, Some(Ordering::Greater))
+                | (Opcode::Ge, Some(Ordering::Greater | Ordering::Equal))
+        ) || matches!((op.opcode, cmp), (Opcode::Ne, Some(ord)) if ord != Ordering::Equal);
+
+        if store_p2 {
+            if cmp.is_none() {
+                self.set_reg_fast(op.p2, SqliteValue::Null);
+            } else {
+                self.set_reg_int(op.p2, i64::from(should_jump));
+            }
+            *pc += 1;
+        } else if should_jump {
+            *pc = op.p2 as usize;
+        } else {
+            *pc += 1;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn execute_compare_hot(&mut self, op: &VdbeOp) -> Result<()> {
+        let start_a = op.p1;
+        let start_b = op.p2;
+        let count = op.p3;
+        let compare_collations = parse_compare_collations(&op.p4);
+        let coll_arc = Arc::clone(&self.collation_registry);
+        let mut coll_guard = None;
+        let mut result = Ordering::Equal;
+
+        for i in 0..count {
+            let val_a = self.get_reg(start_a + i);
+            let val_b = self.get_reg(start_b + i);
+            let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
+                compare_collation_for_field(compare_collations.as_deref(), field_idx)
+            });
+
+            let ord = if let Some(coll_name) = coll_name {
+                if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (val_a, val_b) {
+                    if let Some(fast) = builtin_collation_compare_text(left, right, coll_name) {
+                        Some(fast)
+                    } else {
+                        let coll = coll_guard.get_or_insert_with(|| {
+                            coll_arc.lock().unwrap_or_else(|e| e.into_inner())
+                        });
+                        collate_compare(val_a, val_b, coll_name, coll)
+                    }
+                } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &op.p4) {
+                    fast
+                } else {
+                    let coll = coll_guard
+                        .get_or_insert_with(|| coll_arc.lock().unwrap_or_else(|e| e.into_inner()));
+                    collate_compare(val_a, val_b, coll_name, coll)
+                }
+            } else if let Some(fast) = fast_compare_same_storage_class(val_a, val_b, &P4::None) {
+                fast
+            } else {
+                val_a.partial_cmp(val_b)
+            };
+
+            let ordering = match ord {
+                Some(ordering) => ordering,
+                None => match (val_a.is_null(), val_b.is_null()) {
+                    (true, true) => Ordering::Equal,
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => Ordering::Equal,
+                },
+            };
+            if ordering != Ordering::Equal {
+                result = ordering;
+                break;
+            }
+        }
+
+        self.last_compare_result = Some(result);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
+        let target = op.p3;
+        let n_cols = usize::try_from(op.p2).unwrap_or(0);
+        let mut rec_buf = std::mem::take(&mut self.make_record_buf);
+        {
+            let this = &*self;
+            if let P4::Affinity(aff) = &op.p4 {
+                let null_placeholder = SqliteValue::Null;
+                let iter = aff.chars().enumerate().map(|(i, ch)| {
+                    if ch == 'X' {
+                        &null_placeholder
+                    } else {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let reg = op.p1 + i as i32;
+                        this.get_reg(reg)
+                    }
+                });
+                fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+            } else {
+                let iter = (0..n_cols).map(move |i| {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let reg = op.p1 + i as i32;
+                    this.get_reg(reg)
+                });
+                fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+            }
+        }
+        if collect_vdbe_metrics {
+            FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.fetch_add(
+                u64::try_from(rec_buf.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        let blob = std::mem::take(&mut rec_buf);
+        self.make_record_buf = rec_buf;
+        self.set_reg(target, SqliteValue::Blob(blob.into()));
+    }
+
+    #[cold]
+    fn execute_set_snapshot_cold(&mut self, op: &VdbeOp) -> Result<()> {
+        let cursor_id = op.p1;
+        let target = match &op.p4 {
+            P4::TimeTravelCommitSeq(seq) => TimeTravelMarker::CommitSeq(*seq),
+            P4::TimeTravelTimestamp(ts) => TimeTravelMarker::Timestamp(ts.clone()),
+            _ => {
+                return Err(FrankenError::Internal(
+                    "SetSnapshot: invalid P4 (expected time-travel target)".to_owned(),
+                ));
+            }
+        };
+        self.time_travel_cursors.insert(cursor_id, target.clone());
+
+        let version_store = self.version_store.as_ref().ok_or_else(|| {
+            FrankenError::Internal(
+                "SetSnapshot: VersionStore not available for time-travel".to_owned(),
+            )
+        })?;
+        let commit_log = self.time_travel_commit_log.as_ref().ok_or_else(|| {
+            FrankenError::Internal(
+                "SetSnapshot: CommitLog not available for time-travel".to_owned(),
+            )
+        })?;
+        let gc_horizon = self.time_travel_gc_horizon.ok_or_else(|| {
+            FrankenError::Internal(
+                "SetSnapshot: GC horizon not available for time-travel".to_owned(),
+            )
+        })?;
+
+        let has_txn_cursor = self
+            .storage_cursors
+            .get(&cursor_id)
+            .is_some_and(|sc| matches!(&sc.cursor, CursorBackend::Txn(_)));
+        if !has_txn_cursor {
+            return Err(FrankenError::Internal(format!(
+                "SetSnapshot: cursor {cursor_id} is not a transactional cursor"
+            )));
+        }
+
+        let time_travel_target = match &target {
+            TimeTravelMarker::CommitSeq(seq) => {
+                TimeTravelTarget::CommitSequence(CommitSeq::new(*seq))
+            }
+            TimeTravelMarker::Timestamp(ts) => {
+                return Err(FrankenError::Internal(format!(
+                    "SetSnapshot: timestamp-based time-travel not yet supported (datetime parser not wired); timestamp='{ts}'"
+                )));
+            }
+        };
+
+        let schema_epoch = SchemaEpoch::new(u64::from(self.schema_cookie));
+        let commit_log = commit_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tt_snapshot =
+            create_time_travel_snapshot(time_travel_target, &commit_log, gc_horizon, schema_epoch)
+                .map_err(|err| {
+                    FrankenError::Internal(format!("time-travel snapshot error: {err}"))
+                })?;
+
+        let old_sc = self.storage_cursors.remove(&cursor_id).ok_or_else(|| {
+            FrankenError::Internal(format!("SetSnapshot: cursor {} not found", cursor_id))
+        })?;
+        let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
+        let root_pgno = PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
+        let inner_page_io = if let Some(ref page_io) = self.txn_page_io {
+            page_io.clone()
+        } else {
+            return Err(FrankenError::Internal(
+                "SetSnapshot: no transaction page I/O available".to_owned(),
+            ));
+        };
+
+        let commit_seq = tt_snapshot.target_commit_seq().get();
+        let tt_page_io = TimeTravelPageIo {
+            inner: inner_page_io,
+            version_store: Arc::clone(version_store),
+            snapshot: tt_snapshot,
+        };
+        let is_table_btree = old_sc.cursor.is_table_btree();
+        let index_desc_flags = if is_table_btree {
+            Vec::new()
+        } else {
+            self.index_desc_flags_for_root(root_page)
+        };
+        let page_layout = BtreeCursorPageLayout {
+            usable_size: old_sc.cursor.usable_size(),
+            page_size: old_sc.cursor.page_size(),
+        };
+        let mut new_cursor = BtCursor::new_with_index_desc(
+            tt_page_io,
+            root_pgno,
+            page_layout.usable_size,
+            is_table_btree,
+            index_desc_flags,
+        );
+        configure_btree_cursor_page_size(&mut new_cursor, page_layout);
+        self.storage_cursors.insert(
+            cursor_id,
+            StorageCursor {
+                cursor: CursorBackend::TimeTravel(new_cursor),
+                cx: old_sc.cx,
+                writable: false,
+                last_alloc_rowid: 0,
+                payload_buf: Vec::new(),
+                target_vals_buf: Vec::new(),
+                cur_vals_buf: Vec::new(),
+                row_decode: RowDecodeScratch::default(),
+                last_position_stamp: None,
+                cached_rowid: None,
+                payload_includes_rowid_alias: None,
+                last_successful_insert_rowid: None,
+            },
+        );
+        tracing::info!(
+            cursor_id,
+            commit_seq,
+            "SetSnapshot: upgraded cursor to time-travel backend"
+        );
+        Ok(())
+    }
+
     fn collect_reg_range(&self, start: i32, count: usize) -> smallvec::SmallVec<[SqliteValue; 16]> {
         let mut row = smallvec::SmallVec::with_capacity(count);
         for offset in 0..count {
@@ -10128,7 +10418,7 @@ impl VdbeEngine {
         if !self.register_subtypes.is_empty() {
             self.register_subtypes.remove(&r);
         }
-        self.registers[idx] = SqliteValue::Text(Arc::from(text));
+        self.registers[idx] = SqliteValue::Text(SmallText::new(text));
     }
 
     /// Write a blob to a register.
@@ -10181,7 +10471,7 @@ impl VdbeEngine {
 
         // ── Resolve IPK alias and payload column index ────────────
         let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-        let rowid = cursor.cursor.rowid(&cursor.cx)?;
+        let rowid = storage_cursor_cached_rowid(cursor)?;
         let ipk_col_idx = root_page
             .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
             .copied();
@@ -10193,15 +10483,21 @@ impl VdbeEngine {
                 ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
             refresh_state.refreshed |= ipk_refresh.refreshed;
         }
-        let payload_includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
-            payload_includes_rowid_alias_lazy(
-                &mut cursor.row_decode,
-                &cursor.payload_buf,
-                rowid,
-                ipk,
-                self.table_column_count_by_root_page.get(&rp).copied(),
-            )
-        });
+        let payload_includes = if let Some(cached) = cursor.payload_includes_rowid_alias {
+            cached
+        } else {
+            let includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
+                payload_includes_rowid_alias_lazy(
+                    &mut cursor.row_decode,
+                    &cursor.payload_buf,
+                    rowid,
+                    ipk,
+                    self.table_column_count_by_root_page.get(&rp).copied(),
+                )
+            });
+            cursor.payload_includes_rowid_alias = Some(includes);
+            includes
+        };
 
         let payload_idx = if let Some(ipk) = ipk_col_idx {
             if col_idx == ipk {
@@ -10337,7 +10633,7 @@ impl VdbeEngine {
                 ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics)?;
 
             let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-            let rowid = cursor.cursor.rowid(&cursor.cx)?;
+            let rowid = storage_cursor_cached_rowid(cursor)?;
             let ipk_col_idx = root_page
                 .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
                 .copied();
@@ -10350,19 +10646,26 @@ impl VdbeEngine {
                 refresh_state.refreshed |= ipk_refresh.refreshed;
             }
             let payload_includes_rowid_alias =
-                root_page
-                    .zip(ipk_col_idx)
-                    .is_some_and(|(root_page, ipk_col_idx)| {
-                        payload_includes_rowid_alias_lazy(
-                            &mut cursor.row_decode,
-                            &cursor.payload_buf,
-                            rowid,
-                            ipk_col_idx,
-                            self.table_column_count_by_root_page
-                                .get(&root_page)
-                                .copied(),
-                        )
-                    });
+                if let Some(cached) = cursor.payload_includes_rowid_alias {
+                    cached
+                } else {
+                    let includes =
+                        root_page
+                            .zip(ipk_col_idx)
+                            .is_some_and(|(root_page, ipk_col_idx)| {
+                                payload_includes_rowid_alias_lazy(
+                                    &mut cursor.row_decode,
+                                    &cursor.payload_buf,
+                                    rowid,
+                                    ipk_col_idx,
+                                    self.table_column_count_by_root_page
+                                        .get(&root_page)
+                                        .copied(),
+                                )
+                            });
+                    cursor.payload_includes_rowid_alias = Some(includes);
+                    includes
+                };
             let payload_idx = if let Some(ipk) = ipk_col_idx {
                 if col_idx == ipk {
                     return Ok(SqliteValue::Integer(rowid));
@@ -10763,6 +11066,8 @@ impl VdbeEngine {
                             cur_vals_buf: Vec::new(),
                             row_decode: RowDecodeScratch::default(),
                             last_position_stamp: None,
+                            cached_rowid: None,
+                            payload_includes_rowid_alias: None,
                         },
                     );
                     tracing::debug!(
@@ -10863,6 +11168,8 @@ impl VdbeEngine {
                             cur_vals_buf: Vec::new(),
                             row_decode: RowDecodeScratch::default(),
                             last_position_stamp: None,
+                            cached_rowid: None,
+                            payload_includes_rowid_alias: None,
                         },
                     );
                     tracing::debug!(
@@ -10985,6 +11292,8 @@ impl VdbeEngine {
                 cur_vals_buf: Vec::new(),
                 row_decode: RowDecodeScratch::default(),
                 last_position_stamp: None,
+                cached_rowid: None,
+                payload_includes_rowid_alias: None,
             },
         );
         tracing::debug!(
@@ -11175,6 +11484,57 @@ fn compare_text_with_collation(
         .unwrap_or_else(|| left.cmp(right))
 }
 
+fn builtin_collation_compare_text(left: &str, right: &str, coll_name: &str) -> Option<Ordering> {
+    if coll_name.eq_ignore_ascii_case("BINARY") {
+        return Some(left.as_bytes().cmp(right.as_bytes()));
+    }
+    if coll_name.eq_ignore_ascii_case("NOCASE") {
+        return Some(compare_ascii_nocase_bytes(
+            left.as_bytes(),
+            right.as_bytes(),
+        ));
+    }
+    if coll_name.eq_ignore_ascii_case("RTRIM") {
+        return Some(
+            trim_rtrim_collation_text(left.as_bytes())
+                .cmp(trim_rtrim_collation_text(right.as_bytes())),
+        );
+    }
+    None
+}
+
+fn compare_ascii_nocase_bytes(left: &[u8], right: &[u8]) -> Ordering {
+    let shared_len = left.len().min(right.len());
+    for idx in 0..shared_len {
+        let l = left[idx].to_ascii_lowercase();
+        let r = right[idx].to_ascii_lowercase();
+        match l.cmp(&r) {
+            Ordering::Equal => {}
+            non_equal => return non_equal,
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn fast_compare_same_storage_class(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    p4: &P4,
+) -> Option<Option<Ordering>> {
+    match (lhs, rhs) {
+        (SqliteValue::Integer(a), SqliteValue::Integer(b)) => Some(Some(a.cmp(b))),
+        (SqliteValue::Float(a), SqliteValue::Float(b)) => Some(a.partial_cmp(b)),
+        (SqliteValue::Text(a), SqliteValue::Text(b)) => match p4 {
+            P4::Collation(coll_name) => builtin_collation_compare_text(a, b, coll_name).map(Some),
+            _ => Some(Some(a.as_bytes().cmp(b.as_bytes()))),
+        },
+        (SqliteValue::Blob(a), SqliteValue::Blob(b)) if !matches!(p4, P4::Collation(_)) => {
+            Some(Some(a.as_ref().cmp(b.as_ref())))
+        }
+        _ => None,
+    }
+}
+
 fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
     match p4 {
         P4::Collation(name) => Some(vec![name.clone()]),
@@ -11357,6 +11717,17 @@ fn refresh_storage_cursor_first_key_state(cursor: &mut StorageCursor, collect_vd
     cursor.row_decode.invalidate();
     cursor.payload_buf.clear();
     cursor.last_position_stamp = position_stamp;
+    cursor.cached_rowid = None;
+    cursor.payload_includes_rowid_alias = None;
+}
+
+fn storage_cursor_cached_rowid(cursor: &mut StorageCursor) -> Result<i64> {
+    if let Some(rowid) = cursor.cached_rowid {
+        return Ok(rowid);
+    }
+    let rowid = cursor.cursor.rowid(&cursor.cx)?;
+    cursor.cached_rowid = Some(rowid);
+    Ok(rowid)
 }
 
 fn storage_cursor_first_index_key_column_offset(
@@ -11941,6 +12312,8 @@ fn ensure_storage_cursor_row_layout(
         cursor.row_decode.invalidate();
         cursor.payload_buf.clear();
         cursor.last_position_stamp = position_stamp;
+        cursor.cached_rowid = None;
+        cursor.payload_includes_rowid_alias = None;
         refreshed = true;
     }
 
@@ -12035,6 +12408,8 @@ fn invalidate_storage_cursor_row_cache_with_reason(
     }
     cursor.row_decode.invalidate();
     cursor.last_position_stamp = None;
+    cursor.cached_rowid = None;
+    cursor.payload_includes_rowid_alias = None;
 }
 
 fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
@@ -16740,6 +17115,59 @@ mod tests {
 
         let decoded = decode_record(&rows[0][0]).expect("record should decode");
         assert_eq!(decoded, vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_make_record_retains_statement_scratch_capacity() {
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_value = builder.alloc_reg();
+        let r_record = builder.alloc_reg();
+        builder.emit_op(Opcode::String8, 0, r_value, 0, P4::Str("x".repeat(256)), 0);
+        builder.emit_op(
+            Opcode::MakeRecord,
+            r_value,
+            1,
+            r_record,
+            P4::Affinity("B".to_owned()),
+            0,
+        );
+        builder.emit_op(
+            Opcode::String8,
+            0,
+            r_value,
+            0,
+            P4::Str("tiny".to_owned()),
+            0,
+        );
+        builder.emit_op(
+            Opcode::MakeRecord,
+            r_value,
+            1,
+            r_record,
+            P4::Affinity("B".to_owned()),
+            0,
+        );
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+
+        let program = builder.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&program, PageSize::DEFAULT);
+        let mut engine = VdbeEngine::new(program.register_count());
+
+        let outcome = engine.execute(&program).expect("program should execute");
+        assert!(matches!(outcome, ExecOutcome::Done));
+        assert!(
+            engine.make_record_buf.capacity() >= expected_capacity,
+            "MakeRecord scratch should retain its pre-sized capacity across the statement"
+        );
+        assert!(
+            engine.make_record_buf.is_empty(),
+            "statement scratch should be length-reset after the final MakeRecord"
+        );
+        let decoded = decode_record(engine.get_reg(r_record)).expect("record should decode");
+        assert_eq!(decoded, vec![SqliteValue::Text("tiny".into())]);
     }
 
     #[test]
