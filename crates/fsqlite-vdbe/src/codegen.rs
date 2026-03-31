@@ -13309,7 +13309,25 @@ fn extract_count_indexed_in_target<'a>(
         {
             Some((idx_schema, CountIndexedInTarget::List(values)))
         }
-        InSet::Subquery(_) | InSet::Table(_) => {
+        InSet::Subquery(_) => {
+            let probe_source = resolve_in_probe_source(set, schema)?;
+            if can_use_direct_count_indexed_in_subquery_probe_source(
+                table,
+                idx_schema,
+                &probe_source,
+                operand,
+                scan_ctx,
+            ) {
+                Some((idx_schema, CountIndexedInTarget::ProbeSource(probe_source)))
+            } else {
+                can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx)
+                    .then_some((
+                        idx_schema,
+                        CountIndexedInTarget::MaterializedProbeSource(probe_source),
+                    ))
+            }
+        }
+        InSet::Table(_) => {
             let probe_source = resolve_in_probe_source(set, schema)?;
             can_use_once_materialized_in_probe_source(&probe_source, operand, scan_ctx).then_some((
                 idx_schema,
@@ -13762,6 +13780,20 @@ fn probe_source_value_is_unique(probe_source: &InProbeSource<'_>) -> bool {
 
 fn count_probe_source_can_skip_materialization(probe_source: &InProbeSource<'_>) -> bool {
     probe_source_value_is_unique(probe_source)
+}
+
+fn can_use_direct_count_indexed_in_subquery_probe_source(
+    table: &TableSchema,
+    idx_schema: &IndexSchema,
+    probe_source: &InProbeSource<'_>,
+    operand: &Expr,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    matches!(probe_source.value, InProbeValue::Rowid)
+        && can_use_once_materialized_in_probe_source(probe_source, operand, scan_ctx)
+        && count_probe_source_can_skip_materialization(probe_source)
+        && extract_safe_probe_source_rowid_range(probe_source).is_some()
+        && count_exists_semijoin_merge_is_safe(table, idx_schema, probe_source)
 }
 
 fn resolve_in_probe_source<'a>(
@@ -22470,7 +22502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_count_indexed_in_target_treats_ipk_projection_as_rowid_probe() {
+    fn test_extract_count_indexed_in_target_uses_direct_probe_source_for_bounded_ipk_subquery() {
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
@@ -22609,11 +22641,13 @@ mod tests {
 
         assert_eq!(extracted.0.name, "idx_t_b");
         match extracted.1 {
-            CountIndexedInTarget::MaterializedProbeSource(probe_source) => {
+            CountIndexedInTarget::ProbeSource(probe_source) => {
                 assert!(matches!(probe_source.value, InProbeValue::Rowid));
             }
-            CountIndexedInTarget::ProbeSource(_) => {
-                panic!("IPK-projected IN target should lower to a materialized rowid probe source");
+            CountIndexedInTarget::MaterializedProbeSource(_) => {
+                panic!(
+                    "bounded IPK-projected IN target should lower to a direct rowid probe source"
+                );
             }
             CountIndexedInTarget::List(_) => {
                 panic!("IPK-projected IN target should lower to a rowid probe source");

@@ -22,6 +22,7 @@ use fsqlite_types::{
     PageSize,
 };
 use fsqlite_vfs::{Vfs, VfsFile};
+use smallvec::SmallVec;
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
@@ -1930,8 +1931,19 @@ impl PublishedPagerState {
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
-        // Retain pages within db_size
-        self.pages.retain(|page_no| page_no.get() <= update.db_size);
+        // Only sweep published pages when this publication actually shrinks
+        // the visible database size and is not stale relative to the current
+        // published commit horizon. The common retained autocommit path does
+        // not shrink; sweeping there is pure O(n) overhead inside the commit
+        // roundtrip. It is also unsafe for an older smaller publication to
+        // evict pages from a newer larger published snapshot.
+        let previous_db_size = self.db_size.load(AtomicOrdering::Acquire);
+        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
+        if update.db_size < previous_db_size
+            && update.visible_commit_seq.get() >= previous_visible_commit_seq
+        {
+            self.pages.retain(|page_no| page_no.get() <= update.db_size);
+        }
 
         // Bulk insert committed pages
         self.pages.insert_batch(
@@ -1944,13 +1956,10 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start);
     }
 
-    /// Publish commit: retain pages up to db_size, then bulk insert prebuilt page images.
-    fn publish_commit_prebuilt_pages(
-        &self,
-        cx: &Cx,
-        update: PublishedPagerUpdate,
-        pages: &[(PageNumber, PageData)],
-    ) {
+    fn publish_commit_consuming_pages<I>(&self, cx: &Cx, update: PublishedPagerUpdate, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, StagedPage)>,
+    {
         let _publish_guard = self
             .publish_lock
             .lock()
@@ -1960,14 +1969,43 @@ impl PublishedPagerState {
         let publish_start_sequence = self.sequence.fetch_add(1, AtomicOrdering::AcqRel);
         self.signal_sequence_waiters(publish_start_sequence, "publish_begin");
 
-        // Retain pages within db_size
-        self.pages.retain(|page_no| page_no.get() <= update.db_size);
+        let previous_db_size = self.db_size.load(AtomicOrdering::Acquire);
+        let previous_visible_commit_seq = self.visible_commit_seq.load(AtomicOrdering::Acquire);
+        if update.db_size < previous_db_size
+            && update.visible_commit_seq.get() >= previous_visible_commit_seq
+        {
+            self.pages.retain(|page_no| page_no.get() <= update.db_size);
+        }
 
-        // Bulk insert committed pages
-        self.pages.insert_batch(pages.iter().cloned());
+        self.pages.insert_batch(
+            pages
+                .into_iter()
+                .map(|(page_no, staged)| (page_no, staged.into_published_page())),
+        );
 
         let page_set_size = self.pages.len();
         self.finalize_publish(cx, update, page_set_size, start);
+    }
+
+    /// Publish commit by draining staged pages when the caller no longer needs
+    /// the write set after publication.
+    fn publish_commit_draining_write_set(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        write_set: &mut HashMap<PageNumber, StagedPage>,
+    ) {
+        self.publish_commit_consuming_pages(cx, update, write_set.drain());
+    }
+
+    #[cfg(test)]
+    fn publish_commit_staged_pages(
+        &self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        staged_pages: Vec<(PageNumber, StagedPage)>,
+    ) {
+        self.publish_commit_consuming_pages(cx, update, staged_pages);
     }
 
     /// Insert a single page (for testing and internal use).
@@ -3725,6 +3763,18 @@ impl StagedPage {
             .clone()
     }
 
+    fn into_published_page(self) -> PageData {
+        let Self { backing, published } = self;
+        if let Some(page) = published.into_inner() {
+            return page;
+        }
+
+        match backing {
+            StagedPageBacking::Buffered(buf) => PageData::from_vec(buf.as_slice().to_vec()),
+            StagedPageBacking::Owned(data) => data,
+        }
+    }
+
     fn into_buf(self, pool: &PageBufPool) -> PageBuf {
         match self.backing {
             StagedPageBacking::Buffered(buf) => buf,
@@ -4086,14 +4136,13 @@ impl<V: Vfs> SimpleTransaction<V> {
         self.published.publish_commit(cx, update, &self.write_set);
     }
 
-    fn publish_committed_state_prebuilt_pages(
-        &self,
+    fn publish_committed_state_draining_write_set(
+        &mut self,
         cx: &Cx,
         update: PublishedPagerUpdate,
-        pages: &[(PageNumber, PageData)],
     ) {
         self.published
-            .publish_commit_prebuilt_pages(cx, update, pages);
+            .publish_commit_draining_write_set(cx, update, &mut self.write_set);
     }
 
     /// Publish a new committed-state snapshot while the pager inner lock is still held.
@@ -5489,7 +5538,6 @@ where
         // pending_freed so inner.freelist remains untouched until Phase C
         // (after successful commit).
         let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
-        let mut retained_publish_pages: Option<Vec<(PageNumber, PageData)>> = None;
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
             if freelist_dirty {
@@ -5588,19 +5636,31 @@ where
             } else if self.vfs.is_memory() {
                 // bd-wwqen.3: :memory: retained-commit fast path.
                 // Skip journal creation, pre-image backup, sync, and deletion.
-                // Just flush dirty pages directly to the MemoryFile.
-                let pages: Vec<(PageNumber, PageData)> = self
-                    .write_set
-                    .iter()
-                    .map(|(&page_no, staged)| {
-                        (page_no, PageData::from_vec(staged.as_page_bytes().to_vec()))
-                    })
-                    .collect();
-                for (page_no, page_data) in &pages {
-                    inner.flush_page(cx, *page_no, page_data.as_bytes())?;
-                    inner.db_size = inner.db_size.max(page_no.get());
+                // Batch dirty-page flushes through the VFS so MemoryFile can
+                // hold its backing-storage lock once for the whole retained
+                // commit. Keep the staged pages in the write set for the later
+                // publish step so the flush path avoids an eager drain/move of
+                // the whole staging map on every autocommit write.
+                let page_size_bytes = u64::from(inner.page_size.get());
+
+                let mut flushed_db_size = inner.db_size;
+                let write_result = {
+                    let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+                        SmallVec::with_capacity(self.write_set.len());
+                    for (&page_no, staged) in &self.write_set {
+                        let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+                        batched_writes.push((offset, staged.as_page_bytes()));
+                        flushed_db_size = flushed_db_size.max(page_no.get());
+                    }
+                    inner
+                        .db_file
+                        .write_page_batch(cx, batched_writes.as_slice())
+                };
+                if let Err(e) = write_result {
+                    self.freed_pages.extend(pending_freed);
+                    return Err(e);
                 }
-                retained_publish_pages = Some(pages);
+                inner.db_size = flushed_db_size;
                 Ok(())
             } else {
                 Self::commit_journal(
@@ -5645,14 +5705,9 @@ where
             // before the seqlock commit_seq advances.
             self.publish_committed_snapshot_from_inner(&inner);
             drop(inner);
-            if let Some(ref pages) = retained_publish_pages {
-                self.publish_committed_state_prebuilt_pages(cx, publish_update, pages);
-            } else {
-                self.publish_committed_state(cx, publish_update);
-            }
+            self.publish_committed_state_draining_write_set(cx, publish_update);
 
-            // Clear write set for reuse (no allocation — just clears existing maps).
-            self.write_set.clear();
+            // Clear retained transaction state for reuse.
             self.write_pages_sorted.clear();
             self.freed_pages.clear();
             self.allocated_from_freelist.clear();
@@ -15395,6 +15450,211 @@ mod tests {
             published.snapshot().page_set_size,
             0,
             "bead_id=bd-qrss1 case=publication_plane_page_count_after_clear"
+        );
+    }
+
+    #[test]
+    fn test_publish_commit_skips_sweep_for_stale_smaller_db_size_update() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_seven = PageNumber::new(7).unwrap();
+        let original_page_two = PageData::from_vec(sample_page(0x22));
+        let original_page_seven = PageData::from_vec(sample_page(0x77));
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_two,
+            original_page_two,
+        );
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_seven,
+            original_page_seven.clone(),
+        );
+
+        let refreshed_page_two = PageData::from_vec(sample_page(0x99));
+        let write_set = HashMap::from([(
+            page_two,
+            StagedPage::from_page_data(refreshed_page_two.clone()),
+        )]);
+        published.publish_commit(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(7),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &write_set,
+        );
+
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(refreshed_page_two),
+            "bead_id=bd-wwqen.3 case=stale_smaller_commit_still_refreshes_written_pages"
+        );
+        assert_eq!(
+            published.try_get_page(page_seven),
+            Some(original_page_seven),
+            "bead_id=bd-wwqen.3 case=stale_smaller_commit_must_not_evict_newer_larger_pages"
+        );
+        assert_eq!(
+            published.snapshot().db_size,
+            8,
+            "bead_id=bd-wwqen.3 case=stale_smaller_commit_preserves_published_db_size"
+        );
+    }
+
+    #[test]
+    fn test_publish_commit_sweeps_pages_when_db_size_shrinks() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_seven = PageNumber::new(7).unwrap();
+
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_seven,
+            PageData::from_vec(sample_page(0x77)),
+        );
+
+        let refreshed_page_two = PageData::from_vec(sample_page(0x22));
+        let write_set = HashMap::from([(
+            page_two,
+            StagedPage::from_page_data(refreshed_page_two.clone()),
+        )]);
+        published.publish_commit(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(9),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &write_set,
+        );
+
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(refreshed_page_two),
+            "bead_id=bd-wwqen.3 case=shrink_commit_keeps_written_page_inside_new_db_size"
+        );
+        assert!(
+            published.try_get_page(page_seven).is_none(),
+            "bead_id=bd-wwqen.3 case=shrink_commit_evicts_pages_above_new_db_size"
+        );
+    }
+
+    #[test]
+    fn test_publish_commit_draining_write_set_publishes_and_empties_staging() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(4), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+        let page_two_data = PageData::from_vec(sample_page(0x22));
+        let page_three_data = PageData::from_vec(sample_page(0x33));
+        let mut write_set = HashMap::from([
+            (page_two, StagedPage::from_page_data(page_two_data.clone())),
+            (
+                page_three,
+                StagedPage::from_page_data(page_three_data.clone()),
+            ),
+        ]);
+
+        published.publish_commit_draining_write_set(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(5),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &mut write_set,
+        );
+
+        assert!(
+            write_set.is_empty(),
+            "bead_id=bd-autocommit-publish-drain case=publish_drain_consumes_write_set"
+        );
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(page_two_data),
+            "bead_id=bd-autocommit-publish-drain case=publish_drain_keeps_page_two_visible"
+        );
+        assert_eq!(
+            published.try_get_page(page_three),
+            Some(page_three_data),
+            "bead_id=bd-autocommit-publish-drain case=publish_drain_keeps_page_three_visible"
+        );
+    }
+
+    #[test]
+    fn test_publish_commit_staged_pages_publishes_drained_pages() {
+        init_publication_test_tracing();
+        let published = PublishedPagerState::new(4, CommitSeq::new(4), JournalMode::Wal, 0);
+        let cx = Cx::new();
+        let page_two = PageNumber::new(2).unwrap();
+        let page_three = PageNumber::new(3).unwrap();
+        let staged_pages = vec![
+            (
+                page_two,
+                StagedPage::from_page_data(PageData::from_vec(sample_page(0x42))),
+            ),
+            (
+                page_three,
+                StagedPage::from_page_data(PageData::from_vec(sample_page(0x53))),
+            ),
+        ];
+
+        published.publish_commit_staged_pages(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(5),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            staged_pages,
+        );
+
+        assert_eq!(
+            published.try_get_page(page_two),
+            Some(PageData::from_vec(sample_page(0x42))),
+            "bead_id=bd-autocommit-publish-drain case=publish_staged_pages_keeps_page_two_visible"
+        );
+        assert_eq!(
+            published.try_get_page(page_three),
+            Some(PageData::from_vec(sample_page(0x53))),
+            "bead_id=bd-autocommit-publish-drain case=publish_staged_pages_keeps_page_three_visible"
         );
     }
 

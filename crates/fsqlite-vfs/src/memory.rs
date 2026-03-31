@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::{LockLevel, PageData};
 
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
@@ -225,6 +225,26 @@ pub struct MemoryFile {
 }
 
 impl MemoryFile {
+    fn write_into_storage(storage: &mut FileStorage, buf: &[u8], offset: u64) -> Result<()> {
+        let offset = u64_to_usize(offset, "write offset")?;
+        let end = offset.checked_add(buf.len()).ok_or_else(|| {
+            FrankenError::Io(std::io::Error::other("write offset + length overflow"))
+        })?;
+
+        if offset == storage.data.len() {
+            // Fast path: appending exactly at the end. Skips zero-initialization.
+            storage.data.extend_from_slice(buf);
+            return Ok(());
+        }
+
+        if end > storage.data.len() {
+            storage.data.resize(end, 0);
+        }
+
+        storage.data[offset..end].copy_from_slice(buf);
+        Ok(())
+    }
+
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<MemoryShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));
@@ -463,23 +483,16 @@ impl VfsFile for MemoryFile {
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        Self::write_into_storage(&mut storage, buf, offset)
+    }
 
-        let offset = u64_to_usize(offset, "write offset")?;
-        let end = offset.checked_add(buf.len()).ok_or_else(|| {
-            FrankenError::Io(std::io::Error::other("write offset + length overflow"))
-        })?;
-
-        if offset == storage.data.len() {
-            // Fast path: appending exactly at the end. Skips zero-initialization.
-            storage.data.extend_from_slice(buf);
-            return Ok(());
+    #[allow(clippy::significant_drop_tightening)]
+    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        for (offset, data) in writes {
+            Self::write_into_storage(&mut storage, data, *offset)?;
         }
-
-        if end > storage.data.len() {
-            storage.data.resize(end, 0);
-        }
-
-        storage.data[offset..end].copy_from_slice(buf);
         Ok(())
     }
 
@@ -659,6 +672,7 @@ impl VfsFile for MemoryFile {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use fsqlite_types::PageData;
 
     fn make_vfs() -> MemoryVfs {
         MemoryVfs::new()
@@ -1554,6 +1568,24 @@ mod tests {
         file.sync(&cx, SyncFlags::NORMAL).unwrap();
         file.sync(&cx, SyncFlags::FULL).unwrap();
         file.sync(&cx, SyncFlags::DATAONLY).unwrap();
+    }
+
+    #[test]
+    fn write_page_batch_applies_multiple_writes() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("batch_write.db")), flags)
+            .unwrap();
+
+        file.write(&cx, b"01234567", 0).unwrap();
+        file.write_page_batch(&cx, &[(2, &b"AB"[..]), (8, &b"XYZ"[..])])
+            .unwrap();
+
+        let mut buf = [0_u8; 11];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"01AB4567XYZ");
     }
 
     #[test]

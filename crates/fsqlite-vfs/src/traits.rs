@@ -110,6 +110,18 @@ pub trait VfsFile: Send + Sync {
     /// Write `buf` starting at byte offset `offset`.
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()>;
 
+    /// Write multiple page-sized buffers in one logical operation.
+    ///
+    /// The default implementation preserves existing semantics by issuing the
+    /// writes sequentially through [`Self::write`]. VFS backends may override
+    /// this to amortize locking or syscall overhead for hot pager commit paths.
+    fn write_page_batch(&mut self, cx: &Cx, writes: &[(u64, &[u8])]) -> Result<()> {
+        for (offset, data) in writes {
+            self.write(cx, data, *offset)?;
+        }
+        Ok(())
+    }
+
     /// Truncate the file to `size` bytes.
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()>;
 

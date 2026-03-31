@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use fsqlite_btree::cursor::FirstIndexKeyIntegerLocalRunSegment;
 use fsqlite_btree::{
     BtCursor, BtreeCursorOps, BtreePageHeader, BtreePageType, MemPageStore, PageReader, PageWriter,
     SeekResult, header_offset_for_page,
@@ -47,6 +48,7 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     ColumnOffset, RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
+use fsqlite_types::serial_type::{read_varint, serial_type_len};
 use fsqlite_types::value::{SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches};
 use fsqlite_types::{
     CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
@@ -2660,6 +2662,35 @@ impl CursorBackend {
             Self::Mem(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
             Self::Txn(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
             Self::TimeTravel(c) => c.payload_prefix_into(cx, max_prefix_bytes, buf),
+        }
+    }
+
+    fn try_probe_current_first_index_key_integer_local(
+        &self,
+        probe_value: i64,
+    ) -> Result<Option<(bool, i64)>> {
+        match self {
+            Self::Mem(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
+            Self::Txn(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
+            Self::TimeTravel(c) => c.try_probe_current_first_index_key_integer_local(probe_value),
+        }
+    }
+
+    fn count_equal_first_index_key_run_integer_local_segment(
+        &mut self,
+        cx: &Cx,
+        probe_value: i64,
+    ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
+        match self {
+            Self::Mem(c) => {
+                c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
+            }
+            Self::Txn(c) => {
+                c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
+            }
+            Self::TimeTravel(c) => {
+                c.count_equal_first_index_key_run_integer_local_segment(cx, probe_value)
+            }
         }
     }
 
@@ -8312,25 +8343,11 @@ impl VdbeEngine {
                             0
                         }
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        let memdb_count = (!sc.writable
-                            && self.memdb_rows_loaded
-                            && self.storage_cursor_memdb_count_shortcuts_safe
-                            && !sc.cursor.is_time_travel())
-                        .then(|| self.cursor_root_pages.get(&cursor_id).copied())
-                        .flatten()
-                        .and_then(|root_page| {
-                            self.db
-                                .as_ref()
-                                .and_then(|db| db.get_table(root_page))
-                                .and_then(|table| i64::try_from(table.rows.len()).ok())
-                        });
-                        if let Some(count) = memdb_count {
-                            count
-                        } else {
-                            // bd-wwqen.1: Use count_all_rows which walks
-                            // leaf page headers without decoding payloads.
-                            sc.cursor.count_all_rows(&sc.cx)?
-                        }
+                        // bd-wwqen.3: storage-cursor COUNT must report the
+                        // cursor's own storage view, not a connection-local
+                        // MemDatabase mirror that may lag retained same-connection
+                        // writes.
+                        sc.cursor.count_all_rows(&sc.cx)?
                     } else {
                         0
                     };
@@ -8353,7 +8370,11 @@ impl VdbeEngine {
                                 "CountIndexEqRun requires an index cursor",
                             ));
                         }
-                        storage_cursor_count_equal_first_key_run(op.p1, cursor, &probe_value)?
+                        storage_cursor_count_equal_first_key_run(
+                            cursor,
+                            &probe_value,
+                            self.collect_vdbe_metrics,
+                        )?
                     };
                     let next_count = self.get_reg(op.p2).to_integer().wrapping_add(matched);
                     self.set_reg_int(op.p2, next_count);
@@ -10771,12 +10792,9 @@ impl VdbeEngine {
                     // for both), so using it alone would misclassify autoindex
                     // pages as tables — causing "wrong # of entries" corruption
                     // when stock SQLite reads the file (issue #55).
-                    let is_known_index = self
-                        .index_desc_flags_by_root_page
-                        .contains_key(&root_page)
-                        || self
-                            .index_collations_by_root_page
-                            .contains_key(&root_page);
+                    let is_known_index =
+                        self.index_desc_flags_by_root_page.contains_key(&root_page)
+                            || self.index_collations_by_root_page.contains_key(&root_page);
                     let is_table_btree = if is_known_index {
                         false
                     } else {
@@ -11259,51 +11277,455 @@ fn storage_cursor_no_conflict_prefix_match(
         && cursor.cur_vals_buf[..prefix_len] == cursor.target_vals_buf[..])
 }
 
-fn storage_cursor_current_first_index_key(
+fn storage_cursor_current_first_index_key_equals(
     cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
     malformed_detail: &'static str,
-) -> Result<SqliteValue> {
-    ensure_storage_cursor_row_cache(cursor, false)?;
-    let Some(col) = cursor.row_decode.column_offset(0).copied() else {
-        return Err(FrankenError::internal(
-            "CountIndexEqRun: index entry missing first key column",
-        ));
-    };
+) -> Result<bool> {
+    refresh_storage_cursor_first_key_state(cursor, collect_vdbe_metrics);
+    storage_cursor_current_first_index_key_equals_at_current_row(
+        cursor,
+        probe_value,
+        collect_vdbe_metrics,
+        malformed_detail,
+    )
+}
 
+fn storage_cursor_current_first_index_key_equals_at_current_row(
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
+    malformed_detail: &'static str,
+) -> Result<bool> {
     if cursor.row_decode.cached_value_ready(0) {
-        return cursor
+        note_decode_cache_hit(collect_vdbe_metrics);
+        let cached = cursor
             .row_decode
             .cached_value(0)
-            .cloned()
-            .ok_or_else(|| FrankenError::internal(malformed_detail));
+            .ok_or_else(|| FrankenError::internal(malformed_detail))?;
+        if collect_vdbe_metrics {
+            record_decoded_value_metrics(cached);
+        }
+        return Ok(values_equal_without_collation(cached, probe_value));
     }
 
+    note_decode_cache_miss(collect_vdbe_metrics);
+    if let SqliteValue::Integer(probe_int) = probe_value {
+        match storage_cursor_probe_first_index_key_integer(cursor, *probe_int, malformed_detail)? {
+            FirstIndexKeyIntegerProbe::Match => return Ok(true),
+            FirstIndexKeyIntegerProbe::Mismatch(current_value) => {
+                cursor
+                    .row_decode
+                    .cache_decoded(0, SqliteValue::Integer(current_value));
+                return Ok(false);
+            }
+            FirstIndexKeyIntegerProbe::NeedsGenericCompare(fallback_col) => {
+                return storage_cursor_current_first_index_key_equals_generic_fallback(
+                    cursor,
+                    probe_value,
+                    collect_vdbe_metrics,
+                    malformed_detail,
+                    fallback_col,
+                );
+            }
+        }
+    }
+
+    let col = storage_cursor_first_index_key_column_offset(cursor, malformed_detail)?;
+    storage_cursor_current_first_index_key_equals_generic_fallback(
+        cursor,
+        probe_value,
+        collect_vdbe_metrics,
+        malformed_detail,
+        col,
+    )
+}
+
+fn refresh_storage_cursor_first_key_state(cursor: &mut StorageCursor, collect_vdbe_metrics: bool) {
+    let position_stamp = cursor.cursor.position_stamp();
+    if cursor.last_position_stamp == position_stamp {
+        return;
+    }
+
+    if cursor.last_position_stamp.is_some() {
+        note_decode_cache_invalidation(
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::PositionChange,
+        );
+    }
+    cursor.row_decode.invalidate();
+    cursor.payload_buf.clear();
+    cursor.last_position_stamp = position_stamp;
+}
+
+fn storage_cursor_first_index_key_column_offset(
+    cursor: &mut StorageCursor,
+    malformed_detail: &'static str,
+) -> Result<ColumnOffset> {
+    const INITIAL_PREFIX_BYTES: usize = 16;
+
+    let mut requested_bytes = INITIAL_PREFIX_BYTES;
+    loop {
+        ensure_storage_cursor_payload_prefix(cursor, requested_bytes)?;
+        let loaded = cursor.payload_buf.len();
+
+        let (header_size_u64, hdr_varint_len) =
+            read_varint(&cursor.payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        let header_size =
+            usize::try_from(header_size_u64).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        if header_size < hdr_varint_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            });
+        }
+        if header_size > loaded {
+            if loaded < requested_bytes {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                });
+            }
+            requested_bytes = header_size.max(loaded.saturating_mul(2));
+            continue;
+        }
+
+        let (serial_type, _) = read_varint(&cursor.payload_buf[hdr_varint_len..header_size])
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        let value_len = usize::try_from(serial_type_len(serial_type).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            }
+        })?)
+        .map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: malformed_detail.to_owned(),
+        })?;
+        let body_offset = header_size;
+        let col_end =
+            body_offset
+                .checked_add(value_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                })?;
+        if col_end > loaded {
+            if loaded < requested_bytes {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                });
+            }
+            requested_bytes = col_end.max(loaded.saturating_mul(2));
+            continue;
+        }
+
+        return Ok(ColumnOffset {
+            serial_type,
+            body_offset: u32::try_from(body_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?,
+            value_len: u32::try_from(value_len).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?,
+        });
+    }
+}
+
+fn storage_cursor_current_first_index_key_equals_generic_fallback(
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
+    malformed_detail: &'static str,
+    col: ColumnOffset,
+) -> Result<bool> {
     let hint = cursor.row_decode.cached_value(0);
     let value = fsqlite_types::record::decode_column_from_offset_reuse(
         &cursor.payload_buf,
         &col,
         hint,
-        false,
+        collect_vdbe_metrics,
     )
     .ok_or_else(|| FrankenError::internal(malformed_detail))?;
-    cursor.row_decode.cache_decoded(0, value.clone());
-    Ok(value)
+    if collect_vdbe_metrics {
+        record_decoded_value_metrics(&value);
+    }
+    let matches = values_equal_without_collation(&value, probe_value);
+    cursor.row_decode.cache_decoded(0, value);
+    Ok(matches)
+}
+
+enum FirstIndexKeyIntegerProbe {
+    Match,
+    Mismatch(i64),
+    NeedsGenericCompare(ColumnOffset),
+}
+
+fn storage_cursor_probe_first_index_key_integer(
+    cursor: &mut StorageCursor,
+    probe_value: i64,
+    malformed_detail: &'static str,
+) -> Result<FirstIndexKeyIntegerProbe> {
+    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+
+    if let Some((matches, current_value)) = cursor
+        .cursor
+        .try_probe_current_first_index_key_integer_local(probe_value)?
+    {
+        return Ok(if matches {
+            FirstIndexKeyIntegerProbe::Match
+        } else {
+            FirstIndexKeyIntegerProbe::Mismatch(current_value)
+        });
+    }
+
+    const INITIAL_PREFIX_BYTES: usize = 16;
+
+    let mut requested_bytes = INITIAL_PREFIX_BYTES;
+    loop {
+        ensure_storage_cursor_payload_prefix(cursor, requested_bytes)?;
+        let loaded = cursor.payload_buf.len();
+
+        let (header_size_u64, hdr_varint_len) =
+            read_varint(&cursor.payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        let header_size =
+            usize::try_from(header_size_u64).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        if header_size < hdr_varint_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            });
+        }
+        if header_size > loaded {
+            if loaded < requested_bytes {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                });
+            }
+            requested_bytes = header_size.max(loaded.saturating_mul(2));
+            continue;
+        }
+
+        let (serial_type, _) = read_varint(&cursor.payload_buf[hdr_varint_len..header_size])
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            })?;
+        let value_len = usize::try_from(serial_type_len(serial_type).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: malformed_detail.to_owned(),
+            }
+        })?)
+        .map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: malformed_detail.to_owned(),
+        })?;
+        let body_offset = header_size;
+        let col_end =
+            body_offset
+                .checked_add(value_len)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                })?;
+        if col_end > loaded {
+            if loaded < requested_bytes {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                });
+            }
+            requested_bytes = col_end.max(loaded.saturating_mul(2));
+            continue;
+        }
+
+        let mismatch = |current_value| FirstIndexKeyIntegerProbe::Mismatch(current_value);
+        return Ok(match classify_serial_type(serial_type) {
+            SerialTypeClass::Zero => {
+                if probe_value == 0 {
+                    FirstIndexKeyIntegerProbe::Match
+                } else {
+                    mismatch(0)
+                }
+            }
+            SerialTypeClass::One => {
+                if probe_value == 1 {
+                    FirstIndexKeyIntegerProbe::Match
+                } else {
+                    mismatch(1)
+                }
+            }
+            SerialTypeClass::Integer => {
+                let bytes = cursor
+                    .payload_buf
+                    .get(body_offset..col_end)
+                    .ok_or_else(|| FrankenError::internal(malformed_detail))?;
+                let current_value = decode_big_endian_signed_fast(bytes);
+                if current_value == probe_value {
+                    FirstIndexKeyIntegerProbe::Match
+                } else {
+                    mismatch(current_value)
+                }
+            }
+            _ => FirstIndexKeyIntegerProbe::NeedsGenericCompare(ColumnOffset {
+                serial_type,
+                body_offset: u32::try_from(body_offset).map_err(|_| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: malformed_detail.to_owned(),
+                    }
+                })?,
+                value_len: u32::try_from(value_len).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: malformed_detail.to_owned(),
+                })?,
+            }),
+        });
+    }
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn decode_big_endian_signed_fast(bytes: &[u8]) -> i64 {
+    match bytes.len() {
+        0 => 0,
+        1 => bytes[0] as i8 as i64,
+        2 => {
+            let mut buf = [0_u8; 2];
+            buf.copy_from_slice(bytes);
+            i16::from_be_bytes(buf) as i64
+        }
+        3 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 4];
+            buf[1..4].copy_from_slice(bytes);
+            i32::from_be_bytes(buf) as i64
+        }
+        4 => {
+            let mut buf = [0_u8; 4];
+            buf.copy_from_slice(bytes);
+            i32::from_be_bytes(buf) as i64
+        }
+        6 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 8];
+            buf[2..8].copy_from_slice(bytes);
+            i64::from_be_bytes(buf)
+        }
+        8 => {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(bytes);
+            i64::from_be_bytes(buf)
+        }
+        _ => {
+            let negative = bytes.first().is_some_and(|&b| b & 0x80 != 0);
+            let mut value: u64 = if negative { u64::MAX } else { 0 };
+            for &b in bytes {
+                value = (value << 8) | u64::from(b);
+            }
+            value as i64
+        }
+    }
 }
 
 fn storage_cursor_count_equal_first_key_run(
-    _cursor_id: i32,
     cursor: &mut StorageCursor,
     probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
 ) -> Result<i64> {
+    if let SqliteValue::Integer(probe_int) = probe_value {
+        return storage_cursor_count_equal_first_key_run_integer_probe(
+            cursor,
+            *probe_int,
+            collect_vdbe_metrics,
+        );
+    }
+
     let mut matched = 0_i64;
     while !cursor.cursor.eof() {
-        let current_key = storage_cursor_current_first_index_key(
+        if !storage_cursor_current_first_index_key_equals(
             cursor,
+            probe_value,
+            collect_vdbe_metrics,
             "CountIndexEqRun: malformed index entry record",
-        )?;
-        if !values_equal_without_collation(&current_key, probe_value) {
+        )? {
             break;
         }
+        matched = matched.wrapping_add(1);
+        if !cursor.cursor.next(&cursor.cx)? {
+            break;
+        }
+    }
+    Ok(matched)
+}
+
+fn storage_cursor_count_equal_first_key_run_integer_probe(
+    cursor: &mut StorageCursor,
+    probe_int: i64,
+    collect_vdbe_metrics: bool,
+) -> Result<i64> {
+    let mut matched = 0_i64;
+    let probe_value = SqliteValue::Integer(probe_int);
+    let mut payload_position_stamp = None;
+    while !cursor.cursor.eof() {
+        match cursor
+            .cursor
+            .count_equal_first_index_key_run_integer_local_segment(&cursor.cx, probe_int)?
+        {
+            FirstIndexKeyIntegerLocalRunSegment::Matched(local_matched) => {
+                matched = matched.wrapping_add(local_matched);
+                continue;
+            }
+            FirstIndexKeyIntegerLocalRunSegment::Mismatch {
+                matched: local_matched,
+                current_value,
+            } => {
+                matched = matched.wrapping_add(local_matched);
+                cursor.row_decode.invalidate();
+                cursor
+                    .row_decode
+                    .cache_decoded(0, SqliteValue::Integer(current_value));
+                break;
+            }
+            FirstIndexKeyIntegerLocalRunSegment::NeedsFallback {
+                matched: local_matched,
+            } => {
+                matched = matched.wrapping_add(local_matched);
+            }
+        }
+
+        if cursor.cursor.eof() {
+            break;
+        }
+
+        let position_stamp = cursor.cursor.position_stamp();
+        if payload_position_stamp != position_stamp {
+            cursor.payload_buf.clear();
+            payload_position_stamp = position_stamp;
+        }
+        match storage_cursor_probe_first_index_key_integer(
+            cursor,
+            probe_int,
+            "CountIndexEqRun: malformed index entry record",
+        )? {
+            FirstIndexKeyIntegerProbe::Match => {}
+            FirstIndexKeyIntegerProbe::Mismatch(current_value) => {
+                cursor.row_decode.invalidate();
+                cursor
+                    .row_decode
+                    .cache_decoded(0, SqliteValue::Integer(current_value));
+                break;
+            }
+            FirstIndexKeyIntegerProbe::NeedsGenericCompare(col) => {
+                cursor.row_decode.invalidate();
+                if !storage_cursor_current_first_index_key_equals_generic_fallback(
+                    cursor,
+                    &probe_value,
+                    collect_vdbe_metrics,
+                    "CountIndexEqRun: malformed index entry record",
+                    col,
+                )? {
+                    break;
+                }
+            }
+        }
+
         matched = matched.wrapping_add(1);
         if !cursor.cursor.next(&cursor.cx)? {
             break;
@@ -11565,36 +11987,6 @@ fn ensure_storage_cursor_row_layout(
             eager_values_ready: false,
         });
     }
-}
-
-fn ensure_storage_cursor_row_cache(
-    cursor: &mut StorageCursor,
-    collect_vdbe_metrics: bool,
-) -> Result<DecodeCacheRefreshState> {
-    let position_stamp = cursor.cursor.position_stamp();
-    if cursor.last_position_stamp == position_stamp {
-        return Ok(DecodeCacheRefreshState::default());
-    }
-    if cursor.last_position_stamp.is_some() {
-        note_decode_cache_invalidation(
-            collect_vdbe_metrics,
-            DecodeCacheInvalidationReason::PositionChange,
-        );
-    }
-    cursor
-        .cursor
-        .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
-    let eager_values_ready = cursor
-        .row_decode
-        .prepare_for_record(&cursor.payload_buf)
-        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "malformed record header or payload in cursor payload".to_owned(),
-        })?;
-    cursor.last_position_stamp = position_stamp;
-    Ok(DecodeCacheRefreshState {
-        refreshed: true,
-        eager_values_ready,
-    })
 }
 
 fn ensure_sorter_row_cache(
@@ -16646,6 +17038,84 @@ mod tests {
         assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
     }
 
+    #[test]
+    fn test_count_on_mem_cursor_uses_memdb_rows() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Count, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_memdb_rows_loaded(true);
+        engine.cursors.insert(0, MemCursor::new(root, false));
+
+        let rows = execute_program_with_engine(&mut engine, &prog);
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+    }
+
+    #[test]
+    fn test_count_on_readonly_storage_cursor_ignores_stale_memdb_shortcut() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Count, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_memdb_rows_loaded(true);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(engine.open_storage_cursor(0, root, true));
+        engine.cursor_root_pages.insert(0, root);
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            sc.cursor
+                .table_insert(&sc.cx, 1, &encode_record(&[SqliteValue::Integer(10)]))
+                .unwrap();
+            sc.cursor
+                .table_insert(&sc.cx, 2, &encode_record(&[SqliteValue::Integer(20)]))
+                .unwrap();
+            sc.writable = false;
+        }
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 0, "attached MemDatabase stays stale here");
+    }
+
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────
 
     /// Build and execute a write program with storage cursors enabled.
@@ -18351,6 +18821,186 @@ mod tests {
         assert!(
             cursor.row_decode.cached_value_ready(0),
             "CountIndexEqRun should leave the first index key cached in row-decode scratch"
+        );
+    }
+
+    #[test]
+    fn test_count_index_eq_run_integer_fast_lane_falls_back_for_float_keys() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        let key = encode_record(&[SqliteValue::Float(7.0), SqliteValue::Integer(1)]);
+        cursor
+            .cursor
+            .index_insert(&cursor.cx, &key)
+            .expect("float-key index entry should insert");
+        assert!(
+            cursor
+                .cursor
+                .first(&cursor.cx)
+                .expect("cursor first should succeed")
+        );
+
+        let matches = storage_cursor_current_first_index_key_equals(
+            cursor,
+            &SqliteValue::Integer(7),
+            false,
+            "CountIndexEqRun: malformed index entry record",
+        )
+        .expect("float-key comparison should succeed");
+
+        assert!(
+            matches,
+            "integer probe should still match a numerically equal float key via generic fallback"
+        );
+        assert!(
+            cursor.row_decode.cached_value_ready(0),
+            "generic fallback should still decode and cache the float key"
+        );
+    }
+
+    #[test]
+    fn test_count_index_eq_run_integer_probe_preserves_float_fallback_through_run_loop() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        for key in [
+            encode_record(&[SqliteValue::Float(7.0), SqliteValue::Integer(1)]),
+            encode_record(&[SqliteValue::Float(7.0), SqliteValue::Integer(2)]),
+            encode_record(&[SqliteValue::Integer(8), SqliteValue::Integer(3)]),
+        ] {
+            cursor
+                .cursor
+                .index_insert(&cursor.cx, &key)
+                .expect("index entry should insert");
+        }
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_count = b.alloc_reg();
+        let r_next_key = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_probe, 0, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+        b.emit_op(Opcode::CountIndexEqRun, 0, r_count, r_probe, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNullRow, 0, 0, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_next_key, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_count, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(2), SqliteValue::Integer(8)]],
+            "integer-probe CountIndexEqRun should still count numerically equal float keys before stopping on the next distinct key"
+        );
+    }
+
+    #[test]
+    fn test_count_index_eq_run_local_integer_segment_preserves_float_fallback() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        for key in [
+            encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(1)]),
+            encode_record(&[SqliteValue::Integer(7), SqliteValue::Integer(2)]),
+            encode_record(&[SqliteValue::Float(7.0), SqliteValue::Integer(3)]),
+            encode_record(&[SqliteValue::Integer(8), SqliteValue::Integer(4)]),
+        ] {
+            cursor
+                .cursor
+                .index_insert(&cursor.cx, &key)
+                .expect("index entry should insert");
+        }
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_min_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_count = b.alloc_reg();
+        let r_next_key = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_probe, 0, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+        b.emit_op(Opcode::CountIndexEqRun, 0, r_count, r_probe, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNullRow, 0, 0, done, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, r_next_key, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_count, 2, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(3), SqliteValue::Integer(8)]],
+            "CountIndexEqRun should preserve the float generic fallback after consuming a local integer segment"
         );
     }
 

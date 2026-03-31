@@ -29,7 +29,9 @@ use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record};
-use fsqlite_types::serial_type::{read_varint, write_varint};
+use fsqlite_types::serial_type::{
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
+};
 use fsqlite_types::{PageData, PageNumber, WitnessKey};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -381,6 +383,14 @@ pub struct BtCursor<P> {
     append_hint_cache: Option<(PageNumber, i64)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum FirstIndexKeyIntegerLocalRunSegment {
+    Matched(i64),
+    Mismatch { matched: i64, current_value: i64 },
+    NeedsFallback { matched: i64 },
+}
+
 impl<P> BtCursor<P> {
     /// Force the cursor into EOF state (not positioned on any row).
     ///
@@ -448,6 +458,292 @@ impl<P> BtCursor<P> {
 }
 
 impl<P: PageReader> BtCursor<P> {
+    fn first_index_key_integer_from_local_payload(local: &[u8]) -> Result<Option<i64>> {
+        if local.is_empty() {
+            return Ok(None);
+        }
+
+        let (header_size_u64, hdr_varint_len) = match read_varint(local) {
+            Some(parsed) => parsed,
+            None => return Ok(None),
+        };
+        let header_size = match usize::try_from(header_size_u64) {
+            Ok(size) => size,
+            Err(_) => return Ok(None),
+        };
+        if header_size < hdr_varint_len || header_size > local.len() {
+            return Ok(None);
+        }
+
+        let (serial_type, _) = match read_varint(&local[hdr_varint_len..header_size]) {
+            Some(parsed) => parsed,
+            None => return Ok(None),
+        };
+        let value_len = match serial_type_len(serial_type).and_then(|len| usize::try_from(len).ok())
+        {
+            Some(len) => len,
+            None => return Ok(None),
+        };
+        let body_offset = header_size;
+        let col_end = match body_offset.checked_add(value_len) {
+            Some(end) => end,
+            None => return Ok(None),
+        };
+        if col_end > local.len() {
+            return Ok(None);
+        }
+
+        Ok(Some(match classify_serial_type(serial_type) {
+            SerialTypeClass::Zero => 0,
+            SerialTypeClass::One => 1,
+            SerialTypeClass::Integer => decode_big_endian_signed_fast(&local[body_offset..col_end]),
+            _ => return Ok(None),
+        }))
+    }
+
+    fn first_index_key_integer_local_value_from_cell_offset(
+        &self,
+        page: &[u8],
+        page_type: cell::BtreePageType,
+        cell_offset: usize,
+    ) -> Result<Option<i64>> {
+        if page_type.is_table() {
+            return Ok(None);
+        }
+
+        let mut pos = cell_offset;
+        if page_type.is_interior() {
+            if pos + 4 > page.len() {
+                return Ok(None);
+            }
+            pos += 4;
+        }
+
+        let (payload_size_raw, payload_varint_len) = match page.get(pos..) {
+            Some(rest) => match read_varint(rest) {
+                Some(parsed) => parsed,
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        let payload_size = match u32::try_from(payload_size_raw) {
+            Ok(size) => size,
+            Err(_) => return Ok(None),
+        };
+        pos = match pos.checked_add(payload_varint_len) {
+            Some(next) => next,
+            None => return Ok(None),
+        };
+
+        let local_size =
+            cell::local_payload_size(payload_size, self.usable_size, page_type) as usize;
+        let local_end = match pos.checked_add(local_size) {
+            Some(end) => end,
+            None => return Ok(None),
+        };
+        if local_end > page.len() || local_end > self.usable_size as usize {
+            return Ok(None);
+        }
+
+        Self::first_index_key_integer_from_local_payload(&page[pos..local_end])
+    }
+
+    fn index_cell_first_key_integer_local_value_at(
+        &self,
+        entry: &StackEntry,
+        cell_idx: u16,
+    ) -> Result<Option<i64>> {
+        let idx_usize = cell_idx as usize;
+        if idx_usize >= entry.cell_pointers.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    cell_idx,
+                    entry.cell_pointers.len()
+                ),
+            });
+        }
+
+        let cell_offset = entry.cell_pointers[idx_usize] as usize;
+        self.first_index_key_integer_local_value_from_cell_offset(
+            entry.page_data.as_bytes(),
+            entry.header.page_type,
+            cell_offset,
+        )
+    }
+
+    fn current_first_index_key_integer_local_value(&self) -> Result<Option<i64>> {
+        if self.at_eof || self.stack.is_empty() {
+            return Err(FrankenError::internal("cursor at EOF"));
+        }
+        let top = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        self.index_cell_first_key_integer_local_value_at(top, top.cell_idx)
+    }
+
+    /// Probe the current index cell's first key column as an integer using
+    /// only the local payload bytes already resident on the leaf page.
+    ///
+    /// Returns `Ok(Some(...))` when the first column is fully available from
+    /// the local payload and is integer-class (`0`, `1`, or integer serial
+    /// types). Returns `Ok(None)` when the caller must fall back to the slower
+    /// prefix-buffer path (for example because the first field spans overflow
+    /// or is non-integer-class).
+    pub fn try_probe_current_first_index_key_integer_local(
+        &self,
+        probe_value: i64,
+    ) -> Result<Option<(bool, i64)>> {
+        Ok(self
+            .current_first_index_key_integer_local_value()?
+            .map(|current_value| (current_value == probe_value, current_value)))
+    }
+
+    /// Count a matched segment of integer first-key entries while the cursor
+    /// stays on a leaf page and the first column is fully available from local
+    /// payload bytes. The cursor is left on the first unconsumed row
+    /// (mismatch/fallback) or advanced once to the next logical row/eof after
+    /// the matched local segment.
+    pub fn count_equal_first_index_key_run_integer_local_segment(
+        &mut self,
+        cx: &Cx,
+        probe_value: i64,
+    ) -> Result<FirstIndexKeyIntegerLocalRunSegment> {
+        enum LocalRunScanOutcome {
+            MatchedAll(i64),
+            MatchedCurrent(i64),
+            Mismatch {
+                matched: i64,
+                cell_idx: Option<u16>,
+                current_value: i64,
+            },
+            NeedsFallback {
+                matched: i64,
+                cell_idx: Option<u16>,
+            },
+        }
+
+        let mut matched_total = 0_i64;
+        loop {
+            if self.at_eof || self.stack.is_empty() {
+                return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
+            }
+
+            let scan_outcome = {
+                let top = self
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+                let page_type = top.header.page_type;
+                if page_type.is_leaf() && !page_type.is_table() {
+                    let start_idx = top.cell_idx;
+                    let cell_count = top.header.cell_count;
+                    let page = top.page_data.as_bytes();
+                    let cell_pointers = &top.cell_pointers;
+                    let mut matched = 0_i64;
+                    let mut outcome = None;
+
+                    for idx in start_idx..cell_count {
+                        let cell_offset =
+                            cell_pointers.get(idx as usize).copied().ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "cell index {} out of bounds ({})",
+                                        idx,
+                                        cell_pointers.len()
+                                    ),
+                                }
+                            })? as usize;
+
+                        match self.first_index_key_integer_local_value_from_cell_offset(
+                            page,
+                            page_type,
+                            cell_offset,
+                        )? {
+                            Some(value) if value == probe_value => {
+                                matched = matched.wrapping_add(1);
+                            }
+                            Some(current_value) => {
+                                outcome = Some(LocalRunScanOutcome::Mismatch {
+                                    matched,
+                                    cell_idx: Some(idx),
+                                    current_value,
+                                });
+                                break;
+                            }
+                            None => {
+                                outcome = Some(LocalRunScanOutcome::NeedsFallback {
+                                    matched,
+                                    cell_idx: Some(idx),
+                                });
+                                break;
+                            }
+                        }
+                    }
+
+                    outcome.unwrap_or(LocalRunScanOutcome::MatchedAll(matched))
+                } else if page_type.is_table() {
+                    LocalRunScanOutcome::NeedsFallback {
+                        matched: 0,
+                        cell_idx: Some(top.cell_idx),
+                    }
+                } else {
+                    match self.current_first_index_key_integer_local_value()? {
+                        Some(current_value) if current_value == probe_value => {
+                            LocalRunScanOutcome::MatchedCurrent(1)
+                        }
+                        Some(current_value) => LocalRunScanOutcome::Mismatch {
+                            matched: 0,
+                            cell_idx: None,
+                            current_value,
+                        },
+                        None => LocalRunScanOutcome::NeedsFallback {
+                            matched: 0,
+                            cell_idx: None,
+                        },
+                    }
+                }
+            };
+
+            match scan_outcome {
+                LocalRunScanOutcome::MatchedAll(matched) | LocalRunScanOutcome::MatchedCurrent(matched) => {
+                    matched_total = matched_total.wrapping_add(matched);
+                    if !self.advance_next(cx)? {
+                        return Ok(FirstIndexKeyIntegerLocalRunSegment::Matched(matched_total));
+                    }
+                }
+                LocalRunScanOutcome::Mismatch {
+                    matched,
+                    cell_idx,
+                    current_value,
+                } => {
+                    if let Some(cell_idx) = cell_idx {
+                        self.stack
+                            .last_mut()
+                            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                            .cell_idx = cell_idx;
+                    }
+                    return Ok(FirstIndexKeyIntegerLocalRunSegment::Mismatch {
+                        matched: matched_total.wrapping_add(matched),
+                        current_value,
+                    });
+                }
+                LocalRunScanOutcome::NeedsFallback { matched, cell_idx } => {
+                    if let Some(cell_idx) = cell_idx {
+                        self.stack
+                            .last_mut()
+                            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                            .cell_idx = cell_idx;
+                    }
+                    return Ok(FirstIndexKeyIntegerLocalRunSegment::NeedsFallback {
+                        matched: matched_total.wrapping_add(matched),
+                    });
+                }
+            }
+        }
+    }
+
     /// Create a new cursor positioned before the first entry (at EOF).
     #[must_use]
     pub fn new(pager: P, root_page: PageNumber, usable_size: u32, is_table: bool) -> Self {
@@ -703,6 +999,13 @@ impl<P: PageReader> BtCursor<P> {
                         .ok_or_else(|| FrankenError::DatabaseCorrupt {
                             detail: "interior page has no right child in count_all_rows".to_owned(),
                         })?;
+
+                // Index interior separator cells are logical entries in this
+                // implementation, and cursor next/prev traversal already visits
+                // them directly. COUNT on an index root must include them too.
+                if !self.is_table {
+                    total = total.saturating_add(i64::from(cell_count));
+                }
 
                 if cell_count == 0 {
                     visit_stack.push((current_page, 0, 0, None, hdr_size));
@@ -1056,6 +1359,40 @@ impl<P: PageReader> BtCursor<P> {
                     detail: "interior cell has no left child".to_owned(),
                 })
         }
+    }
+
+    /// Recompute which child slot in an ancestor page points at `child_page_no`.
+    ///
+    /// Upward split propagation cannot trust the stale cursor-stack `cell_idx`
+    /// after a lower-level balance rewrites the tree shape underneath it.
+    fn find_child_slot_by_page_no(
+        &mut self,
+        cx: &Cx,
+        parent_page_no: PageNumber,
+        child_page_no: PageNumber,
+    ) -> Result<u16> {
+        let entry = self.reload_page_fresh(cx, parent_page_no)?;
+        if !entry.header.page_type.is_interior() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cannot locate child slot in non-interior page {}",
+                    parent_page_no
+                ),
+            });
+        }
+
+        for child_idx in 0..=entry.header.cell_count {
+            if self.child_page_at(&entry, child_idx)? == child_page_no {
+                return Ok(child_idx);
+            }
+        }
+
+        Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "ancestor page {} has no child pointer to page {}",
+                parent_page_no, child_page_no
+            ),
+        })
     }
 
     /// Seek to a rowid in a table B-tree. Returns the seek result.
@@ -1752,6 +2089,47 @@ impl<P: PageReader> BtCursor<P> {
     }
 }
 
+#[allow(clippy::cast_possible_wrap)]
+fn decode_big_endian_signed_fast(bytes: &[u8]) -> i64 {
+    match bytes.len() {
+        0 => 0,
+        1 => bytes[0] as i8 as i64,
+        2 => {
+            let mut buf = [0_u8; 2];
+            buf.copy_from_slice(bytes);
+            i16::from_be_bytes(buf) as i64
+        }
+        3 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 4];
+            buf[1..4].copy_from_slice(bytes);
+            i32::from_be_bytes(buf) as i64
+        }
+        4 => {
+            let mut buf = [0_u8; 4];
+            buf.copy_from_slice(bytes);
+            i32::from_be_bytes(buf) as i64
+        }
+        6 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 8];
+            buf[2..8].copy_from_slice(bytes);
+            i64::from_be_bytes(buf)
+        }
+        8 => {
+            let mut buf = [0_u8; 8];
+            buf.copy_from_slice(bytes);
+            i64::from_be_bytes(buf)
+        }
+        _ => {
+            let negative = bytes.first().is_some_and(|&b| b & 0x80 != 0);
+            let mut value: u64 = if negative { u64::MAX } else { 0 };
+            for &b in bytes {
+                value = (value << 8) | u64::from(b);
+            }
+            value as i64
+        }
+    }
+}
+
 /// Result of a binary search within a page.
 enum BinarySearchResult {
     /// Exact match found at this cell index.
@@ -2246,6 +2624,7 @@ impl<P: PageWriter> BtCursor<P> {
             // If balancing split the parent page, propagate the split up the
             // cursor stack by updating each ancestor in turn.
             let mut parent_level = depth - 2; // stack index of the split page
+            let mut split_page_no = parent_page_no;
             while let balance::BalanceResult::Split {
                 new_pgnos,
                 new_dividers,
@@ -2261,7 +2640,11 @@ impl<P: PageWriter> BtCursor<P> {
                 }
 
                 let ancestor_page_no = self.stack[parent_level - 1].page_no;
-                let ancestor_child_idx = self.stack[parent_level - 1].cell_idx as usize;
+                let ancestor_child_idx = usize::from(self.find_child_slot_by_page_no(
+                    cx,
+                    ancestor_page_no,
+                    split_page_no,
+                )?);
                 let ancestor_is_root = ancestor_page_no == self.root_page;
 
                 outcome = balance::apply_child_replacement(
@@ -2277,6 +2660,7 @@ impl<P: PageWriter> BtCursor<P> {
                     ancestor_is_root,
                 )?;
 
+                split_page_no = ancestor_page_no;
                 parent_level -= 1;
             }
         }
@@ -2331,6 +2715,7 @@ impl<P: PageWriter> BtCursor<P> {
             // If balancing split the parent page, propagate the split up the
             // cursor stack by updating each ancestor in turn.
             let mut split_level = level;
+            let mut split_page_no = parent_page_no;
             while let balance::BalanceResult::Split {
                 new_pgnos,
                 new_dividers,
@@ -2346,7 +2731,11 @@ impl<P: PageWriter> BtCursor<P> {
                 }
 
                 let ancestor_page_no = self.stack[split_level - 1].page_no;
-                let ancestor_child_idx = self.stack[split_level - 1].cell_idx as usize;
+                let ancestor_child_idx = usize::from(self.find_child_slot_by_page_no(
+                    cx,
+                    ancestor_page_no,
+                    split_page_no,
+                )?);
                 let ancestor_is_root = ancestor_page_no == self.root_page;
 
                 outcome = balance::apply_child_replacement(
@@ -2362,6 +2751,7 @@ impl<P: PageWriter> BtCursor<P> {
                     ancestor_is_root,
                 )?;
 
+                split_page_no = ancestor_page_no;
                 split_level -= 1;
             }
 
@@ -3158,15 +3548,12 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             Ok(())
         })?;
 
-        let can_reuse_insert_position = self.stack.last().is_some_and(|top| {
-            top.header.page_type.is_leaf() && (self.at_eof || top.cell_idx < top.header.cell_count)
-        });
-
-        if can_reuse_insert_position {
-            self.index_insert_prechecked_absent(cx, key)
-        } else {
-            self.index_insert(cx, key)
-        }
+        // bd-wwqen.3: the post-probe successor/EOF state from index_insert_unique()
+        // is not reliable enough for deep monotonic unique-key streams. Reuse here
+        // undercounts the index on the exact 10k unique-email workload, so route
+        // unique inserts back through the canonical full insert path until a
+        // stronger reuse contract is proven.
+        self.index_insert(cx, key)
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
@@ -3810,6 +4197,41 @@ mod tests {
 
         assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn test_table_insert_prechecked_absent_deep_tree_rightmost_10k() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let row_count = 10_000_i64;
+
+        for rowid in 0..row_count {
+            let payload = format!("row-{rowid}");
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert_eq!(
+                seek,
+                SeekResult::NotFound,
+                "monotonic prechecked insert should not find existing rowid {rowid}"
+            );
+            cursor
+                .table_insert_prechecked_absent(&cx, rowid, payload.as_bytes())
+                .unwrap();
+        }
+
+        let counted = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            counted, row_count,
+            "deep/rightmost prechecked-absent table with {row_count} rows must count exactly"
+        );
+
+        let seek = cursor.table_move_to(&cx, row_count - 1).unwrap();
+        assert_eq!(seek, SeekResult::Found);
+        assert_eq!(
+            cursor.payload(&cx).unwrap(),
+            format!("row-{}", row_count - 1).as_bytes()
+        );
     }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
@@ -4483,6 +4905,164 @@ mod tests {
     }
 
     #[test]
+    fn test_index_insert_monotonic_unique_email_keys_10k_counts_and_reaches_last_key() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, false);
+        let row_count = 10_000_i64;
+
+        for rowid in 1..=row_count {
+            let key = serialize_record(&[
+                SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
+        assert!(
+            depth >= 2,
+            "test requires at least one interior index level, got depth {depth}"
+        );
+
+        let last_key = serialize_record(&[
+            SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+            SqliteValue::Integer(row_count),
+        ]);
+        let last_found = cursor.index_move_to(&cx, &last_key).unwrap().is_found();
+        let last_payload = last_found.then(|| parse_record(&cursor.payload(&cx).unwrap()).unwrap());
+        let count = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            count, row_count,
+            "plain monotonic index_insert should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
+        );
+
+        assert!(
+            last_found,
+            "plain monotonic index_insert should keep the last key reachable"
+        );
+        assert_eq!(
+            last_payload.unwrap(),
+            vec![
+                SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+                SqliteValue::Integer(row_count),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_index_insert_unique_monotonic_unique_email_keys_10k_counts_and_reaches_last_key() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, false);
+        let row_count = 10_000_i64;
+
+        for rowid in 1..=row_count {
+            let key = serialize_record(&[
+                SqliteValue::Text(format!("user_{:05}@test.com", rowid - 1).into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            cursor
+                .index_insert_unique(&cx, &key, 1, "bench.email")
+                .unwrap();
+        }
+
+        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
+        assert!(
+            depth >= 2,
+            "test requires at least one interior index level, got depth {depth}"
+        );
+
+        let last_key = serialize_record(&[
+            SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+            SqliteValue::Integer(row_count),
+        ]);
+        let last_found = cursor.index_move_to(&cx, &last_key).unwrap().is_found();
+        let last_payload = last_found.then(|| parse_record(&cursor.payload(&cx).unwrap()).unwrap());
+        let count = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            count, row_count,
+            "monotonic unique index_insert_unique should preserve all {row_count} index entries; last_found={last_found} last_payload={last_payload:?}"
+        );
+
+        assert!(
+            last_found,
+            "monotonic unique index_insert_unique should keep the last key reachable"
+        );
+        assert_eq!(
+            last_payload.unwrap(),
+            vec![
+                SqliteValue::Text(format!("user_{:05}@test.com", row_count - 1).into()),
+                SqliteValue::Integer(row_count),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_index_insert_unique_deep_tree_monotonic_10k_counts_all_rows() {
+        let store = MemPageStore::with_empty_index(pn(2), USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let row_count = 10_000_i64;
+
+        for rowid in 0..row_count {
+            let key = serialize_record(&[
+                SqliteValue::Text(format!("user_{rowid}@test.com").into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            cursor
+                .index_insert_unique(&cx, &key, 1, "bench.email")
+                .unwrap();
+        }
+
+        let counted = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            counted, row_count,
+            "deep monotonic unique index should contain every inserted entry"
+        );
+
+        let last_key = serialize_record(&[
+            SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
+            SqliteValue::Integer(row_count - 1),
+        ]);
+        let seek = cursor.index_move_to(&cx, &last_key).unwrap();
+        assert_eq!(seek, SeekResult::Found);
+        assert_eq!(cursor.payload(&cx).unwrap(), last_key);
+    }
+
+    #[test]
+    fn test_index_insert_deep_tree_monotonic_10k_counts_all_rows() {
+        let store = MemPageStore::with_empty_index(pn(2), USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let row_count = 10_000_i64;
+
+        for rowid in 0..row_count {
+            let key = serialize_record(&[
+                SqliteValue::Text(format!("user_{rowid}@test.com").into()),
+                SqliteValue::Integer(rowid),
+            ]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        let counted = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            counted, row_count,
+            "deep monotonic plain index should contain every inserted entry"
+        );
+
+        let last_key = serialize_record(&[
+            SqliteValue::Text(format!("user_{}@test.com", row_count - 1).into()),
+            SqliteValue::Integer(row_count - 1),
+        ]);
+        let seek = cursor.index_move_to(&cx, &last_key).unwrap();
+        assert_eq!(seek, SeekResult::Found);
+        assert_eq!(cursor.payload(&cx).unwrap(), last_key);
+    }
+
+    #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
@@ -4543,6 +5123,22 @@ mod tests {
                 b"a".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn test_count_all_rows_on_interior_index_includes_separator_cells() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
+        store.pages.insert(3, build_leaf_index(&[b"a"]));
+        store.pages.insert(4, build_leaf_index(&[b"c"]));
+        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 6);
     }
 
     #[test]
@@ -6428,5 +7024,80 @@ mod tests {
                 .is_found(),
             "bd-wwqen.1: cursor must remain usable after count_all_rows"
         );
+    }
+
+    #[test]
+    fn test_count_all_rows_deep_tree_rightmost_10k() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let row_count = 10_000_i64;
+        let payload = vec![b'R'; 200];
+
+        for rowid in 1..=row_count {
+            cursor
+                .table_insert(&cx, rowid, &payload)
+                .expect("insert should succeed");
+        }
+
+        let depth = measure_tree_depth(&cursor.pager, root, USABLE);
+        assert!(
+            depth >= 3,
+            "test requires a deeper interior tree, got depth {depth}"
+        );
+
+        let count = cursor.count_all_rows(&cx).unwrap();
+        assert_eq!(
+            count, row_count,
+            "deep/rightmost table with {row_count} rows must count exactly"
+        );
+
+        assert!(
+            cursor
+                .table_move_to(&cx, row_count)
+                .expect("seek after deep count should succeed")
+                .is_found(),
+            "rightmost row must remain reachable after count_all_rows"
+        );
+    }
+
+    #[test]
+    fn test_find_child_slot_by_page_no_matches_actual_root_children() {
+        const USABLE: u32 = 4096;
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let payload = vec![b'S'; 200];
+
+        for rowid in 1..=10_000_i64 {
+            cursor
+                .table_insert(&cx, rowid, &payload)
+                .expect("insert should succeed");
+        }
+
+        let root_entry = cursor
+            .reload_page_fresh(&cx, root)
+            .expect("reload root after inserts");
+        assert!(
+            root_entry.header.page_type.is_interior(),
+            "expected interior root after enough inserts"
+        );
+
+        for child_idx in 0..=root_entry.header.cell_count {
+            let child_page = cursor
+                .child_page_at(&root_entry, child_idx)
+                .expect("read child pointer");
+            let found = cursor
+                .find_child_slot_by_page_no(&cx, root, child_page)
+                .expect("find child slot");
+            assert_eq!(
+                found, child_idx,
+                "slot lookup must round-trip for child {} on root page {}",
+                child_page, root
+            );
+        }
     }
 }

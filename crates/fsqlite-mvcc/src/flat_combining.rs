@@ -79,6 +79,7 @@ const HTM_DISABLED: u8 = 4;
 const HTM_USER_DISABLED: u8 = 5;
 
 /// EWMA abort-rate threshold for dynamic disable (fixed-point: 5000 = 50%).
+#[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
 const HTM_DISABLE_THRESHOLD: u32 = 5000;
 
 /// Initial cooldown before re-enabling after dynamic disable (milliseconds).
@@ -88,12 +89,15 @@ const HTM_COOLDOWN_INITIAL_MS: u64 = 5000;
 const HTM_COOLDOWN_MAX_MS: u64 = 60_000;
 
 /// EWMA alpha numerator (out of 10000). alpha=0.3 → 3000.
+#[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
 const HTM_EWMA_ALPHA: u32 = 3000;
 
 /// Window size: update EWMA every this many attempts.
+#[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
 const HTM_EWMA_WINDOW_SIZE: u64 = 1000;
 
 /// Maximum HTM retries per apply() invocation before falling through to lock.
+#[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
 const MAX_HTM_RETRIES: u32 = 3;
 
 /// HTM guard: state machine + abort-rate monitor for the flat combiner fast-path.
@@ -113,6 +117,7 @@ pub struct HtmGuard {
     /// Aborts in current EWMA window.
     window_aborts: AtomicU64,
     /// Window start timestamp (nanoseconds since epoch, Relaxed).
+    #[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
     window_start_ns: AtomicU64,
     /// Number of times we have transitioned to DISABLED (for exponential backoff).
     disable_count: AtomicU32,
@@ -178,6 +183,7 @@ impl HtmGuard {
     }
 
     /// Record an HTM attempt (regardless of outcome).
+    #[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
     fn record_attempt(&self) {
         record_htm_attempt();
         let attempts = self.window_attempts.fetch_add(1, Ordering::Relaxed) + 1;
@@ -187,6 +193,7 @@ impl HtmGuard {
     }
 
     /// Record an HTM abort with status code.
+    #[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
     fn record_abort(&self, status: u32) {
         let classification = record_htm_abort_status(status);
         self.window_aborts.fetch_add(1, Ordering::Relaxed);
@@ -206,6 +213,7 @@ impl HtmGuard {
     }
 
     /// Update EWMA and check disable threshold. Called when window fills.
+    #[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
     fn update_ewma(&self) {
         let attempts = self.window_attempts.swap(0, Ordering::Relaxed);
         let aborts = self.window_aborts.swap(0, Ordering::Relaxed);
@@ -230,6 +238,7 @@ impl HtmGuard {
     }
 
     /// Transition to DISABLED state due to abort storm.
+    #[allow(dead_code)] // Phase 1 HTM guard scaffolding; wired in later phases.
     fn dynamic_disable(&self, abort_rate: u32) {
         let prev = self.state.compare_exchange(
             HTM_AVAILABLE,
