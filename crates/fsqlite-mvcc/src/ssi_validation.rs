@@ -27,6 +27,7 @@ use crate::witness_objects::{
     AbortPolicy, AbortReason, AbortWitness, DependencyEdgeKind, EcsCommitProof, EcsDependencyEdge,
     EdgeKeyBasis, KeySummary,
 };
+use crate::witness_plane::witness_keys_overlap;
 
 // ---------------------------------------------------------------------------
 // SSI Error
@@ -377,6 +378,61 @@ pub struct CommittedWriterInfo {
     pub had_out_rw: bool,
     /// Keys the writer modified.
     pub keys: Vec<WitnessKey>,
+}
+
+// ---------------------------------------------------------------------------
+// E4 Fast Path Helper (bd-wwqen Track E)
+// ---------------------------------------------------------------------------
+
+/// Quick check: does ANY concurrent reader have a read that overlaps with
+/// any of the given write_keys?
+///
+/// This is the fast-path check for disjoint inserts. If no reader has read
+/// any of our write_keys, there can be no incoming rw-antidependency edges.
+///
+/// Returns `true` if there's potential overlap (need full edge discovery),
+/// `false` if definitely no overlap (can skip edge discovery).
+fn has_any_read_overlap(
+    write_keys: &[WitnessKey],
+    active_readers: &[&dyn ActiveTxnView],
+    committed_readers: &[CommittedReaderInfo],
+) -> bool {
+    // Fast path: no readers at all → no overlap possible.
+    if active_readers.is_empty() && committed_readers.is_empty() {
+        return false;
+    }
+
+    // Fast path: no write keys → no overlap possible.
+    if write_keys.is_empty() {
+        return false;
+    }
+
+    // Check active readers for any overlap.
+    for reader in active_readers {
+        if !reader.is_active() {
+            continue;
+        }
+        for write_key in write_keys {
+            if reader.check_read_overlap(write_key) {
+                return true;
+            }
+        }
+    }
+
+    // Check committed readers for any overlap.
+    for reader in committed_readers {
+        for write_key in write_keys {
+            if reader
+                .keys
+                .iter()
+                .any(|rk| witness_keys_overlap(rk, write_key))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +795,48 @@ pub fn ssi_validate_and_publish(
             reason: SsiAbortReason::MarkedForAbort,
             witness,
         });
+    }
+
+    // E4 (bd-wwqen Track E): Disjoint insert fast path.
+    // If this transaction has no reads (read_keys is empty), it cannot have
+    // outgoing rw-antidependency edges. If additionally no concurrent reader
+    // has read any of our write_keys, there are no incoming edges either.
+    // In this case, we can skip the expensive edge discovery entirely.
+    if read_keys.is_empty() {
+        // No reads → no outgoing edges from this transaction.
+        // Check if any concurrent reader could have read our write_keys.
+        let has_potential_incoming =
+            has_any_read_overlap(write_keys, active_readers, committed_readers);
+
+        if !has_potential_incoming {
+            // Disjoint insert: no reads, no reader overlap → skip SSI entirely.
+            record_evidence_decision(
+                SsiDecisionType::CommitAllowed,
+                txn,
+                begin_seq,
+                Some(commit_seq),
+                read_keys,
+                write_keys,
+                &[],
+                "disjoint_insert_fast_path",
+            );
+            span.record("conflict_detected", false);
+            span.record("decision_reason", "disjoint_insert_fast_path");
+            debug!(
+                bead_id = "bd-wwqen",
+                txn = ?txn,
+                write_keys = write_keys.len(),
+                "ssi_validate: disjoint insert fast path, skipping edge discovery"
+            );
+            let proof = build_commit_proof(txn, begin_seq, commit_seq, &state, &[], &[]);
+            observability::record_ssi_commit();
+            return Ok(SsiValidationOk {
+                edges: Vec::new(),
+                edge_ids: Vec::new(),
+                commit_proof: proof,
+                ssi_state: state,
+            });
+        }
     }
 
     // Step 3: Discover incoming and outgoing rw-antidependency edges.

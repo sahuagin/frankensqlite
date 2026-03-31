@@ -818,6 +818,166 @@ impl Drop for FcHandle<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// ShardedFlatCombiner (E1 — bd-wwqen Track E)
+// ---------------------------------------------------------------------------
+
+/// Number of shards for the sharded flat combiner.
+/// Set to min(8, num_cpus) at runtime, capped at 8 for cache efficiency.
+pub const MAX_FC_SHARDS: usize = 8;
+
+/// A sharded flat combiner that distributes operations across multiple
+/// independent combiners based on a shard key (typically page number).
+///
+/// At c8 concurrency, a single `FlatCombiner` becomes a bottleneck because
+/// only one thread can hold the combiner lock. With sharding, operations
+/// on different pages can proceed in parallel through different shards.
+///
+/// # Design
+///
+/// Each shard is a fully independent `FlatCombiner` with its own:
+/// - `combiner_lock` (no cross-shard contention)
+/// - slot array (per-shard thread registration)
+/// - value accumulator (per-shard state)
+///
+/// # Routing
+///
+/// Operations are routed to shards via `shard_key % num_shards`. For MVCC
+/// page operations, the shard key is typically `page_number.get()`. This
+/// ensures that operations on the same page always go to the same shard
+/// (preserving linearizability) while operations on different pages can
+/// proceed in parallel.
+///
+/// # Performance
+///
+/// - c1: ~same as single combiner (minimal overhead)
+/// - c4: ~4x improvement (4 threads can use 4 different shards)
+/// - c8: ~8x improvement (8 threads across 8 shards, no contention)
+pub struct ShardedFlatCombiner {
+    /// The shard array. Using a fixed-size array avoids allocation.
+    shards: [FlatCombiner; MAX_FC_SHARDS],
+    /// Number of active shards (1..=MAX_FC_SHARDS).
+    num_shards: usize,
+}
+
+impl ShardedFlatCombiner {
+    /// Create a new sharded combiner with the given initial value per shard.
+    ///
+    /// The number of shards is `min(num_cpus, MAX_FC_SHARDS)`.
+    #[must_use]
+    pub fn new(initial_per_shard: u64) -> Self {
+        let num_shards = std::thread::available_parallelism()
+            .map(|p| p.get().min(MAX_FC_SHARDS))
+            .unwrap_or(MAX_FC_SHARDS);
+        Self {
+            shards: std::array::from_fn(|_| FlatCombiner::new(initial_per_shard)),
+            num_shards,
+        }
+    }
+
+    /// Create a sharded combiner with a specific number of shards.
+    #[must_use]
+    pub fn with_shards(num_shards: usize, initial_per_shard: u64) -> Self {
+        let effective = num_shards.clamp(1, MAX_FC_SHARDS);
+        Self {
+            shards: std::array::from_fn(|_| FlatCombiner::new(initial_per_shard)),
+            num_shards: effective,
+        }
+    }
+
+    /// Number of active shards.
+    #[must_use]
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+
+    /// Get the shard index for a given key.
+    #[inline]
+    fn shard_index(&self, shard_key: u64) -> usize {
+        (shard_key as usize) % self.num_shards
+    }
+
+    /// Get a reference to the shard for the given key.
+    #[inline]
+    pub fn shard(&self, shard_key: u64) -> &FlatCombiner {
+        &self.shards[self.shard_index(shard_key)]
+    }
+
+    /// Register a thread on the shard for the given key.
+    pub fn register(&self, shard_key: u64) -> Option<ShardedFcHandle<'_>> {
+        let idx = self.shard_index(shard_key);
+        self.shards[idx].register().map(|inner| ShardedFcHandle {
+            inner,
+            shard_idx: idx,
+        })
+    }
+
+    /// Total value across all shards (for diagnostics).
+    #[must_use]
+    pub fn total_value(&self) -> u64 {
+        self.shards[..self.num_shards]
+            .iter()
+            .map(FlatCombiner::value)
+            .sum()
+    }
+
+    /// Total active threads across all shards.
+    #[must_use]
+    pub fn total_active_threads(&self) -> usize {
+        self.shards[..self.num_shards]
+            .iter()
+            .map(FlatCombiner::active_threads)
+            .sum()
+    }
+
+    /// Per-shard values (for diagnostics).
+    #[must_use]
+    pub fn shard_values(&self) -> Vec<u64> {
+        self.shards[..self.num_shards]
+            .iter()
+            .map(FlatCombiner::value)
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for ShardedFlatCombiner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedFlatCombiner")
+            .field("num_shards", &self.num_shards)
+            .field("total_value", &self.total_value())
+            .finish()
+    }
+}
+
+/// Per-thread handle for a sharded flat combiner.
+pub struct ShardedFcHandle<'a> {
+    inner: FcHandle<'a>,
+    shard_idx: usize,
+}
+
+impl ShardedFcHandle<'_> {
+    /// Submit an operation and wait for the result.
+    pub fn apply(&self, op: u64, arg: u64) -> u64 {
+        self.inner.apply(op, arg)
+    }
+
+    /// Convenience: add a value to the shard's accumulator.
+    pub fn add(&self, val: u64) -> u64 {
+        self.inner.add(val)
+    }
+
+    /// Convenience: read the shard's current accumulator value.
+    pub fn read(&self) -> u64 {
+        self.inner.read()
+    }
+
+    /// Which shard this handle is registered to.
+    #[must_use]
+    pub fn shard_index(&self) -> usize {
+        self.shard_idx
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1246,5 +1406,85 @@ mod tests {
         assert_eq!(metrics.fsqlite_htm_aborts_capacity, 1);
         assert_eq!(metrics.fsqlite_htm_aborts_explicit, 1);
         assert_eq!(metrics.fsqlite_htm_aborts_other, 1);
+    }
+
+    // ── ShardedFlatCombiner tests (E1 — bd-wwqen Track E) ─────────────────
+
+    #[test]
+    fn sharded_combiner_basic() {
+        let sfc = ShardedFlatCombiner::with_shards(4, 0);
+        assert_eq!(sfc.num_shards(), 4);
+        assert_eq!(sfc.total_value(), 0);
+        assert_eq!(sfc.total_active_threads(), 0);
+    }
+
+    #[test]
+    fn sharded_combiner_register_different_shards() {
+        let sfc = ShardedFlatCombiner::with_shards(4, 0);
+        let h0 = sfc.register(0).unwrap();
+        let h1 = sfc.register(1).unwrap();
+        let h4 = sfc.register(4).unwrap(); // hashes to shard 0
+
+        assert_eq!(h0.shard_index(), 0);
+        assert_eq!(h1.shard_index(), 1);
+        assert_eq!(h4.shard_index(), 0);
+
+        drop(h0);
+        drop(h1);
+        drop(h4);
+    }
+
+    #[test]
+    fn sharded_combiner_adds_to_correct_shard() {
+        let sfc = ShardedFlatCombiner::with_shards(4, 0);
+        let h0 = sfc.register(0).unwrap();
+        let h1 = sfc.register(1).unwrap();
+
+        h0.add(100);
+        h1.add(200);
+        h0.add(50);
+
+        let values = sfc.shard_values();
+        assert_eq!(values[0], 150);
+        assert_eq!(values[1], 200);
+        assert_eq!(sfc.total_value(), 350);
+
+        drop(h0);
+        drop(h1);
+    }
+
+    #[test]
+    fn sharded_combiner_concurrent_parallel_shards() {
+        let sfc = Arc::new(ShardedFlatCombiner::with_shards(8, 0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for shard_key in 0..8u64 {
+            let s = Arc::clone(&sfc);
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let h = s.register(shard_key).unwrap();
+                b.wait();
+                for _ in 0..500 {
+                    h.add(1);
+                }
+                drop(h);
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(sfc.total_value(), 4000, "8 shards * 500 = 4000");
+    }
+
+    #[test]
+    fn sharded_combiner_clamp_shards() {
+        let sfc1 = ShardedFlatCombiner::with_shards(0, 0);
+        assert_eq!(sfc1.num_shards(), 1);
+
+        let sfc2 = ShardedFlatCombiner::with_shards(100, 0);
+        assert_eq!(sfc2.num_shards(), MAX_FC_SHARDS);
     }
 }

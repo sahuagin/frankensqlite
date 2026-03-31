@@ -63,10 +63,11 @@ pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentPageState, ConcurrentRegistry, ConcurrentSavepoint, FcwResult,
     MAX_CONCURRENT_WRITERS, PreparedConcurrentCommit, SharedConcurrentHandle, SsiResult,
     concurrent_abort, concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
-    concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
-    concurrent_prepare_write_page, concurrent_read_page, concurrent_restore_page_state,
-    concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_stage_prepared_write_page,
-    concurrent_track_write_conflict_page, concurrent_write_page,
+    concurrent_free_page, concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt,
+    concurrent_page_is_freed, concurrent_page_state, concurrent_prepare_write_page,
+    concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
+    concurrent_savepoint, concurrent_stage_prepared_write_page,
+    concurrent_track_write_conflict_page, concurrent_write_metadata_page, concurrent_write_page,
     finalize_prepared_concurrent_commit_with_ssi, is_concurrent_mode,
     prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
 };
@@ -132,8 +133,8 @@ pub use ebr::{
     StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
 };
 pub use flat_combining::{
-    FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_THREADS, OP_ADD, OP_READ,
-    flat_combining_metrics, reset_flat_combining_metrics,
+    FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_SHARDS, MAX_FC_THREADS, OP_ADD, OP_READ,
+    ShardedFcHandle, ShardedFlatCombiner, flat_combining_metrics, reset_flat_combining_metrics,
 };
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,

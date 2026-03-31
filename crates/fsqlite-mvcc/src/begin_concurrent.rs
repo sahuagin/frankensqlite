@@ -102,11 +102,20 @@ struct PageTxnState {
     is_freed: bool,
     is_conflict_only: bool,
     held_lock: bool,
+    /// E3 (bd-wwqen Track E): Metadata pages (e.g., page 1 freelist) can be
+    /// marked exempt from conflict checking. These pages are still written,
+    /// but don't trigger FCW conflicts. This eliminates false conflicts when
+    /// disjoint inserts both update freelist metadata on page 1.
+    metadata_exempt: bool,
 }
 
 impl PageTxnState {
     #[must_use]
     fn tracks_write_conflict(&self) -> bool {
+        // E3: Skip conflict tracking for metadata-exempt pages.
+        if self.metadata_exempt {
+            return false;
+        }
         self.staged_data.is_some() || self.is_freed || self.is_conflict_only
     }
 
@@ -197,6 +206,7 @@ struct SavepointPageState {
     staged_data: Option<PageData>,
     is_freed: bool,
     is_conflict_only: bool,
+    metadata_exempt: bool,
 }
 
 impl ConcurrentHandle {
@@ -603,12 +613,20 @@ pub struct ConcurrentRegistry {
     committed_readers: Vec<CommittedReaderInfo>,
     /// Page-local index into committed reader history.
     committed_readers_by_page: HashMap<PageNumber, Vec<usize>>,
+    /// Page witness-local index into committed reader history.
+    committed_readers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    /// Exact cell-local index into committed reader history.
+    committed_readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
     /// Committed reader entries that include at least one global witness.
     committed_readers_with_global_keys: Vec<usize>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
     committed_writers: Vec<CommittedWriterInfo>,
     /// Page-local index into committed writer history.
     committed_writers_by_page: HashMap<PageNumber, Vec<usize>>,
+    /// Page witness-local index into committed writer history.
+    committed_writers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    /// Exact cell-local index into committed writer history.
+    committed_writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
     /// Committed writer entries that include at least one global witness.
     committed_writers_with_global_keys: Vec<usize>,
     /// Detached handles kept for reuse so hot autocommit loops do not hit the
@@ -630,9 +648,13 @@ impl ConcurrentRegistry {
             gc_horizon_counts: BTreeMap::new(),
             committed_readers: Vec::new(),
             committed_readers_by_page: HashMap::new(),
+            committed_readers_by_page_witness: HashMap::new(),
+            committed_readers_by_exact_cell: HashMap::new(),
             committed_readers_with_global_keys: Vec::new(),
             committed_writers: Vec::new(),
             committed_writers_by_page: HashMap::new(),
+            committed_writers_by_page_witness: HashMap::new(),
+            committed_writers_by_exact_cell: HashMap::new(),
             committed_writers_with_global_keys: Vec::new(),
             recycled_handles: Vec::new(),
             next_session_id: 1,
@@ -766,9 +788,13 @@ impl ConcurrentRegistry {
         let Some(min_active_begin) = self.history_retention_horizon() else {
             self.committed_readers.clear();
             self.committed_readers_by_page.clear();
+            self.committed_readers_by_page_witness.clear();
+            self.committed_readers_by_exact_cell.clear();
             self.committed_readers_with_global_keys.clear();
             self.committed_writers.clear();
             self.committed_writers_by_page.clear();
+            self.committed_writers_by_page_witness.clear();
+            self.committed_writers_by_exact_cell.clear();
             self.committed_writers_with_global_keys.clear();
             return;
         };
@@ -822,9 +848,13 @@ impl ConcurrentRegistry {
                 tracing::warn!("prune_committed_conflict_history: forced to clear SSI history");
                 self.committed_readers.clear();
                 self.committed_readers_by_page.clear();
+                self.committed_readers_by_page_witness.clear();
+                self.committed_readers_by_exact_cell.clear();
                 self.committed_readers_with_global_keys.clear();
                 self.committed_writers.clear();
                 self.committed_writers_by_page.clear();
+                self.committed_writers_by_page_witness.clear();
+                self.committed_writers_by_exact_cell.clear();
                 self.committed_writers_with_global_keys.clear();
                 break;
             }
@@ -848,6 +878,8 @@ impl ConcurrentRegistry {
 
     fn rebuild_committed_history_indexes(&mut self) {
         self.committed_readers_by_page.clear();
+        self.committed_readers_by_page_witness.clear();
+        self.committed_readers_by_exact_cell.clear();
         self.committed_readers_with_global_keys.clear();
         for (idx, reader) in self.committed_readers.iter().enumerate() {
             let summary = summarize_witness_keys(&reader.keys);
@@ -860,9 +892,23 @@ impl ConcurrentRegistry {
                     .or_default()
                     .push(idx);
             }
+            for page in summary.page_witness_pages {
+                self.committed_readers_by_page_witness
+                    .entry(page)
+                    .or_default()
+                    .push(idx);
+            }
+            for cell in summary.cell_witnesses {
+                self.committed_readers_by_exact_cell
+                    .entry(cell.exact_key())
+                    .or_default()
+                    .push(idx);
+            }
         }
 
         self.committed_writers_by_page.clear();
+        self.committed_writers_by_page_witness.clear();
+        self.committed_writers_by_exact_cell.clear();
         self.committed_writers_with_global_keys.clear();
         for (idx, writer) in self.committed_writers.iter().enumerate() {
             let summary = summarize_witness_keys(&writer.keys);
@@ -872,6 +918,18 @@ impl ConcurrentRegistry {
             for page in summary.pages {
                 self.committed_writers_by_page
                     .entry(page)
+                    .or_default()
+                    .push(idx);
+            }
+            for page in summary.page_witness_pages {
+                self.committed_writers_by_page_witness
+                    .entry(page)
+                    .or_default()
+                    .push(idx);
+            }
+            for cell in summary.cell_witnesses {
+                self.committed_writers_by_exact_cell
+                    .entry(cell.exact_key())
                     .or_default()
                     .push(idx);
             }
@@ -916,6 +974,18 @@ impl ConcurrentRegistry {
                 .or_default()
                 .push(entry_idx);
         }
+        for page in summary.page_witness_pages {
+            self.committed_readers_by_page_witness
+                .entry(page)
+                .or_default()
+                .push(entry_idx);
+        }
+        for cell in summary.cell_witnesses {
+            self.committed_readers_by_exact_cell
+                .entry(cell.exact_key())
+                .or_default()
+                .push(entry_idx);
+        }
     }
 
     fn index_committed_writer(&mut self, entry_idx: usize) {
@@ -929,6 +999,18 @@ impl ConcurrentRegistry {
         for page in summary.pages {
             self.committed_writers_by_page
                 .entry(page)
+                .or_default()
+                .push(entry_idx);
+        }
+        for page in summary.page_witness_pages {
+            self.committed_writers_by_page_witness
+                .entry(page)
+                .or_default()
+                .push(entry_idx);
+        }
+        for cell in summary.cell_witnesses {
+            self.committed_writers_by_exact_cell
+                .entry(cell.exact_key())
                 .or_default()
                 .push(entry_idx);
         }
@@ -947,10 +1029,12 @@ impl ConcurrentRegistry {
         let candidate_indexes = if write_key_summary.has_global_keys {
             (0..self.committed_readers.len()).collect::<Vec<_>>()
         } else {
-            collect_indexed_candidates(
+            collect_precise_candidates(
                 &self.committed_readers_with_global_keys,
                 &self.committed_readers_by_page,
-                &write_key_summary.pages,
+                &self.committed_readers_by_page_witness,
+                &self.committed_readers_by_exact_cell,
+                write_key_summary,
             )
         };
         let committing_begin = committing_begin_seq.get();
@@ -980,10 +1064,12 @@ impl ConcurrentRegistry {
         let candidate_indexes = if read_key_summary.has_global_keys {
             (0..self.committed_writers.len()).collect::<Vec<_>>()
         } else {
-            collect_indexed_candidates(
+            collect_precise_candidates(
                 &self.committed_writers_with_global_keys,
                 &self.committed_writers_by_page,
-                &read_key_summary.pages,
+                &self.committed_writers_by_page_witness,
+                &self.committed_writers_by_exact_cell,
+                read_key_summary,
             )
         };
         let committing_begin = committing_begin_seq.get();
@@ -1329,6 +1415,55 @@ pub fn concurrent_page_is_freed(handle: &ConcurrentHandle, page: PageNumber) -> 
     handle.is_page_freed(page)
 }
 
+/// Mark a page as metadata-exempt for MVCC conflict tracking (E3 — bd-wwqen Track E).
+///
+/// Metadata pages (e.g., page 1 with freelist metadata) are still written but
+/// don't participate in first-committer-wins conflict detection. This eliminates
+/// false conflicts when disjoint inserts both update structural metadata on the
+/// same page (e.g., both bump the freelist pointer on page 1).
+///
+/// # Safety Guarantee
+///
+/// The page is still locked and written — only conflict *detection* is skipped.
+/// The caller must ensure that concurrent modifications to metadata pages are
+/// semantically safe (e.g., freelist operations are commutative).
+///
+/// # Use Cases
+///
+/// - Page 1 freelist metadata updates during INSERT
+/// - Private page allocation counters that reconcile at commit
+/// - Structural B-tree metadata that can be merged safely
+pub fn concurrent_mark_metadata_exempt(handle: &mut ConcurrentHandle, page: PageNumber) {
+    if let Some(state) = handle.page_states.get_mut(&page) {
+        state.metadata_exempt = true;
+    }
+}
+
+/// Check if a page is marked as metadata-exempt.
+#[must_use]
+pub fn concurrent_is_metadata_exempt(handle: &ConcurrentHandle, page: PageNumber) -> bool {
+    handle
+        .page_state(page)
+        .is_some_and(|state| state.metadata_exempt)
+}
+
+/// Write a page and mark it as metadata-exempt for MVCC conflict tracking.
+///
+/// This is a convenience function combining `concurrent_write_page` with
+/// `concurrent_mark_metadata_exempt`. Use this for freelist/structural metadata
+/// pages that should not trigger FCW conflicts with disjoint operations.
+pub fn concurrent_write_metadata_page(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+    data: PageData,
+) -> Result<(), MvccError> {
+    concurrent_write_page(handle, lock_table, session_id, page, data)?;
+    concurrent_mark_metadata_exempt(handle, page);
+    Ok(())
+}
+
 /// Validate the write set against the commit index using first-committer-wins.
 ///
 /// For each page in the write set, checks whether any other transaction
@@ -1443,6 +1578,7 @@ pub struct PreparedConcurrentCommit {
     outgoing_edges: Vec<DiscoveredEdge>,
     dro_t3_decision: Option<crate::ssi_abort_policy::DroHotPathDecision>,
     used_uncontended_prepare_fast_path: bool,
+    used_candidate_free_prepare_fast_path: bool,
 }
 
 impl PreparedConcurrentCommit {
@@ -1479,6 +1615,11 @@ impl PreparedConcurrentCommit {
     #[must_use]
     pub const fn used_uncontended_prepare_fast_path(&self) -> bool {
         self.used_uncontended_prepare_fast_path
+    }
+
+    #[must_use]
+    pub const fn used_candidate_free_prepare_fast_path(&self) -> bool {
+        self.used_candidate_free_prepare_fast_path
     }
 
     #[must_use]
@@ -1586,27 +1727,66 @@ impl HandleViewFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ExactCellWitness {
+    btree_root: PageNumber,
+    leaf_page: PageNumber,
+    tag: u64,
+}
+
+impl ExactCellWitness {
+    const fn new(btree_root: PageNumber, leaf_page: PageNumber, tag: u64) -> Self {
+        Self {
+            btree_root,
+            leaf_page,
+            tag,
+        }
+    }
+
+    const fn exact_key(self) -> (PageNumber, u64) {
+        (self.btree_root, self.tag)
+    }
+}
+
 struct HandleView {
     token: TxnToken,
     begin_seq: CommitSeq,
     flags: HandleViewFlags,
     read_pages: HashSet<PageNumber>,
+    read_page_witness_pages: HashSet<PageNumber>,
+    read_exact_cells: HashSet<(PageNumber, u64)>,
     write_pages: HashSet<PageNumber>,
+    write_page_witness_pages: HashSet<PageNumber>,
+    write_exact_cells: HashSet<(PageNumber, u64)>,
     has_in_rw: Cell<bool>,
     has_out_rw: Cell<bool>,
 }
 
 impl HandleView {
     fn new(handle: &ConcurrentHandle) -> Self {
+        let read_summary = summarize_witness_keys(&handle.read_witness_keys());
+        let write_summary = summarize_witness_keys(&handle.write_witness_keys());
         let mut write_pages: HashSet<PageNumber> =
             handle.tracked_write_conflict_pages_iter().collect();
-        write_pages.extend(handle.write_index.keys().copied());
+        write_pages.extend(write_summary.pages.iter().copied());
         Self {
             token: handle.token(),
             begin_seq: handle.begin_seq(),
             flags: HandleViewFlags::from_handle(handle),
-            read_pages: handle.read_set().clone(),
+            read_pages: read_summary.pages.iter().copied().collect(),
+            read_page_witness_pages: read_summary.page_witness_pages.iter().copied().collect(),
+            read_exact_cells: read_summary
+                .cell_witnesses
+                .iter()
+                .map(|cell| cell.exact_key())
+                .collect(),
             write_pages,
+            write_page_witness_pages: write_summary.page_witness_pages.iter().copied().collect(),
+            write_exact_cells: write_summary
+                .cell_witnesses
+                .iter()
+                .map(|cell| cell.exact_key())
+                .collect(),
             has_in_rw: Cell::new(handle.has_in_rw()),
             has_out_rw: Cell::new(handle.has_out_rw()),
         }
@@ -1636,23 +1816,50 @@ impl HandleView {
 #[derive(Debug, Clone, Default)]
 struct WitnessKeySummary {
     pages: Vec<PageNumber>,
+    page_witness_pages: Vec<PageNumber>,
+    cell_witnesses: Vec<ExactCellWitness>,
     has_global_keys: bool,
 }
 
 fn summarize_witness_keys(keys: &[WitnessKey]) -> WitnessKeySummary {
     let mut pages = Vec::new();
+    let mut page_witness_pages = Vec::new();
+    let mut cell_witnesses = Vec::new();
     let mut has_global_keys = false;
     for key in keys {
-        if let Some(page) = witness_key_page(key) {
-            pages.push(page);
-        } else {
-            has_global_keys = true;
+        match key {
+            WitnessKey::Page(page) | WitnessKey::ByteRange { page, .. } => {
+                pages.push(*page);
+                page_witness_pages.push(*page);
+            }
+            WitnessKey::KeyRange { btree_root, .. } => {
+                pages.push(*btree_root);
+                page_witness_pages.push(*btree_root);
+            }
+            WitnessKey::Cell {
+                btree_root,
+                leaf_page,
+                tag,
+            } => {
+                pages.push(*btree_root);
+                pages.push(*leaf_page);
+                cell_witnesses.push(ExactCellWitness::new(*btree_root, *leaf_page, *tag));
+            }
+            WitnessKey::Custom { .. } => {
+                has_global_keys = true;
+            }
         }
     }
     pages.sort_unstable();
     pages.dedup();
+    page_witness_pages.sort_unstable();
+    page_witness_pages.dedup();
+    cell_witnesses.sort_unstable();
+    cell_witnesses.dedup();
     WitnessKeySummary {
         pages,
+        page_witness_pages,
+        cell_witnesses,
         has_global_keys,
     }
 }
@@ -1682,14 +1889,26 @@ fn hydrate_finalize_witness_state(
     Some((read_keys, read_key_summary, write_keys, write_key_summary))
 }
 
-fn collect_indexed_candidates(
+fn collect_precise_candidates(
     global_indexes: &[usize],
     indexes_by_page: &HashMap<PageNumber, Vec<usize>>,
-    pages: &[PageNumber],
+    indexes_by_page_witness: &HashMap<PageNumber, Vec<usize>>,
+    indexes_by_exact_cell: &HashMap<(PageNumber, u64), Vec<usize>>,
+    summary: &WitnessKeySummary,
 ) -> Vec<usize> {
     let mut candidate_indexes = global_indexes.to_vec();
-    for &page in pages {
+    for &page in &summary.page_witness_pages {
         if let Some(indexes) = indexes_by_page.get(&page) {
+            candidate_indexes.extend(indexes.iter().copied());
+        }
+    }
+    for cell in &summary.cell_witnesses {
+        for page in [cell.btree_root, cell.leaf_page] {
+            if let Some(indexes) = indexes_by_page_witness.get(&page) {
+                candidate_indexes.extend(indexes.iter().copied());
+            }
+        }
+        if let Some(indexes) = indexes_by_exact_cell.get(&cell.exact_key()) {
             candidate_indexes.extend(indexes.iter().copied());
         }
     }
@@ -1706,6 +1925,10 @@ struct ActiveEdgeDiscoveryIndex {
     writers_with_global_keys: Vec<usize>,
     readers_by_page: HashMap<PageNumber, Vec<usize>>,
     writers_by_page: HashMap<PageNumber, Vec<usize>>,
+    readers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    writers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
+    writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
 }
 
 impl ActiveEdgeDiscoveryIndex {
@@ -1720,6 +1943,20 @@ impl ActiveEdgeDiscoveryIndex {
                 for &page in &view.read_pages {
                     index.readers_by_page.entry(page).or_default().push(idx);
                 }
+                for &page in &view.read_page_witness_pages {
+                    index
+                        .readers_by_page_witness
+                        .entry(page)
+                        .or_default()
+                        .push(idx);
+                }
+                for &cell in &view.read_exact_cells {
+                    index
+                        .readers_by_exact_cell
+                        .entry(cell)
+                        .or_default()
+                        .push(idx);
+                }
             }
             if view.has_write_witnesses() {
                 index.all_writers.push(idx);
@@ -1728,6 +1965,20 @@ impl ActiveEdgeDiscoveryIndex {
                 }
                 for &page in &view.write_pages {
                     index.writers_by_page.entry(page).or_default().push(idx);
+                }
+                for &page in &view.write_page_witness_pages {
+                    index
+                        .writers_by_page_witness
+                        .entry(page)
+                        .or_default()
+                        .push(idx);
+                }
+                for &cell in &view.write_exact_cells {
+                    index
+                        .writers_by_exact_cell
+                        .entry(cell)
+                        .or_default()
+                        .push(idx);
                 }
             }
         }
@@ -1742,15 +1993,28 @@ impl ActiveEdgeDiscoveryIndex {
         committing_commit_seq: CommitSeq,
         write_key_summary: &WitnessKeySummary,
     ) -> Vec<&'a dyn ActiveTxnView> {
-        let candidate_indexes = if write_key_summary.has_global_keys {
+        let mut candidate_indexes = if write_key_summary.has_global_keys {
             self.all_readers.clone()
         } else {
-            collect_indexed_candidates(
-                &self.readers_with_global_keys,
-                &self.readers_by_page,
-                &write_key_summary.pages,
-            )
+            self.readers_with_global_keys.clone()
         };
+        for &page in &write_key_summary.page_witness_pages {
+            if let Some(indexes) = self.readers_by_page.get(&page) {
+                candidate_indexes.extend(indexes.iter().copied());
+            }
+        }
+        for cell in &write_key_summary.cell_witnesses {
+            for page in [cell.btree_root, cell.leaf_page] {
+                if let Some(indexes) = self.readers_by_page_witness.get(&page) {
+                    candidate_indexes.extend(indexes.iter().copied());
+                }
+            }
+            if let Some(indexes) = self.readers_by_exact_cell.get(&cell.exact_key()) {
+                candidate_indexes.extend(indexes.iter().copied());
+            }
+        }
+        candidate_indexes.sort_unstable();
+        candidate_indexes.dedup();
         let committing_end = committing_commit_seq.get();
         candidate_indexes
             .into_iter()
@@ -1772,15 +2036,28 @@ impl ActiveEdgeDiscoveryIndex {
         committing_commit_seq: CommitSeq,
         read_key_summary: &WitnessKeySummary,
     ) -> Vec<&'a dyn ActiveTxnView> {
-        let candidate_indexes = if read_key_summary.has_global_keys {
+        let mut candidate_indexes = if read_key_summary.has_global_keys {
             self.all_writers.clone()
         } else {
-            collect_indexed_candidates(
-                &self.writers_with_global_keys,
-                &self.writers_by_page,
-                &read_key_summary.pages,
-            )
+            self.writers_with_global_keys.clone()
         };
+        for &page in &read_key_summary.page_witness_pages {
+            if let Some(indexes) = self.writers_by_page.get(&page) {
+                candidate_indexes.extend(indexes.iter().copied());
+            }
+        }
+        for cell in &read_key_summary.cell_witnesses {
+            for page in [cell.btree_root, cell.leaf_page] {
+                if let Some(indexes) = self.writers_by_page_witness.get(&page) {
+                    candidate_indexes.extend(indexes.iter().copied());
+                }
+            }
+            if let Some(indexes) = self.writers_by_exact_cell.get(&cell.exact_key()) {
+                candidate_indexes.extend(indexes.iter().copied());
+            }
+        }
+        candidate_indexes.sort_unstable();
+        candidate_indexes.dedup();
         let committing_end = committing_commit_seq.get();
         candidate_indexes
             .into_iter()
@@ -1818,10 +2095,19 @@ impl ActiveTxnView for HandleView {
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
         match key {
-            WitnessKey::Page(p)
-            | WitnessKey::Cell { btree_root: p, .. }
-            | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.read_pages.contains(p),
+            WitnessKey::Page(p) | WitnessKey::ByteRange { page: p, .. } => {
+                self.read_pages.contains(p)
+            }
+            WitnessKey::Cell {
+                btree_root,
+                leaf_page,
+                tag,
+            } => {
+                self.read_page_witness_pages.contains(btree_root)
+                    || self.read_page_witness_pages.contains(leaf_page)
+                    || self.read_exact_cells.contains(&(*btree_root, *tag))
+            }
+            WitnessKey::KeyRange { btree_root, .. } => self.read_pages.contains(btree_root),
             WitnessKey::Custom { .. } => {
                 !self.read_pages.is_empty() || self.has_global_read_witnesses()
             }
@@ -1830,10 +2116,19 @@ impl ActiveTxnView for HandleView {
 
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
         match key {
-            WitnessKey::Page(p)
-            | WitnessKey::Cell { btree_root: p, .. }
-            | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.write_pages.contains(p),
+            WitnessKey::Page(p) | WitnessKey::ByteRange { page: p, .. } => {
+                self.write_pages.contains(p)
+            }
+            WitnessKey::Cell {
+                btree_root,
+                leaf_page,
+                tag,
+            } => {
+                self.write_page_witness_pages.contains(btree_root)
+                    || self.write_page_witness_pages.contains(leaf_page)
+                    || self.write_exact_cells.contains(&(*btree_root, *tag))
+            }
+            WitnessKey::KeyRange { btree_root, .. } => self.write_pages.contains(btree_root),
             WitnessKey::Custom { .. } => {
                 !self.write_pages.is_empty() || self.has_global_write_witnesses()
             }
@@ -2047,6 +2342,7 @@ pub fn prepare_concurrent_commit_with_ssi(
                 outgoing_edges: Vec::new(),
                 dro_t3_decision: None,
                 used_uncontended_prepare_fast_path: true,
+                used_candidate_free_prepare_fast_path: false,
             });
         }
         return Ok(PreparedConcurrentCommit {
@@ -2066,6 +2362,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             outgoing_edges: Vec::new(),
             dro_t3_decision: None,
             used_uncontended_prepare_fast_path: true,
+            used_candidate_free_prepare_fast_path: false,
         });
     }
 
@@ -2099,12 +2396,6 @@ pub fn prepare_concurrent_commit_with_ssi(
         planned_commit_seq,
         &write_key_summary,
     );
-    let committed_reader_candidates = registry.committed_reader_candidates(
-        txn,
-        begin_seq,
-        planned_commit_seq,
-        &write_key_summary,
-    );
     let active_writer_candidates = active_index.outgoing_candidate_refs(
         &views,
         txn,
@@ -2112,8 +2403,39 @@ pub fn prepare_concurrent_commit_with_ssi(
         planned_commit_seq,
         &read_key_summary,
     );
+    let committed_reader_candidates = registry.committed_reader_candidates(
+        txn,
+        begin_seq,
+        planned_commit_seq,
+        &write_key_summary,
+    );
     let committed_writer_candidates =
         registry.committed_writer_candidates(txn, begin_seq, planned_commit_seq, &read_key_summary);
+    if active_reader_candidates.is_empty()
+        && active_writer_candidates.is_empty()
+        && committed_reader_candidates.is_empty()
+        && committed_writer_candidates.is_empty()
+    {
+        return Ok(PreparedConcurrentCommit {
+            session_id,
+            planned_commit_seq,
+            txn_token: txn,
+            begin_seq,
+            read_keys: sorted_read_keys,
+            read_key_summary,
+            write_keys: sorted_write_keys,
+            write_key_summary,
+            write_set_pages,
+            held_lock_pages,
+            has_in_rw: false,
+            has_out_rw: false,
+            incoming_edges: Vec::new(),
+            outgoing_edges: Vec::new(),
+            dro_t3_decision: None,
+            used_uncontended_prepare_fast_path: false,
+            used_candidate_free_prepare_fast_path: true,
+        });
+    }
 
     let incoming_edges = discover_incoming_edges(
         txn,
@@ -2183,6 +2505,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         outgoing_edges,
         dro_t3_decision,
         used_uncontended_prepare_fast_path: false,
+        used_candidate_free_prepare_fast_path: false,
     })
 }
 
@@ -2292,12 +2615,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         committed_seq,
         write_key_summary,
     );
-    let committed_reader_candidates = registry.committed_reader_candidates(
-        prepared.txn_token,
-        prepared.begin_seq,
-        committed_seq,
-        write_key_summary,
-    );
     let active_writer_candidates = active_index.outgoing_candidate_refs(
         &active_views,
         prepared.txn_token,
@@ -2305,12 +2622,56 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         committed_seq,
         read_key_summary,
     );
+    let committed_reader_candidates = registry.committed_reader_candidates(
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        write_key_summary,
+    );
     let committed_writer_candidates = registry.committed_writer_candidates(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
         read_key_summary,
     );
+    if prepared.incoming_edges.is_empty()
+        && prepared.outgoing_edges.is_empty()
+        && active_reader_candidates.is_empty()
+        && active_writer_candidates.is_empty()
+        && committed_reader_candidates.is_empty()
+        && committed_writer_candidates.is_empty()
+    {
+        commit_index.batch_update(&prepared.write_set_pages, committed_seq);
+        lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
+        if let Some(mut handle) = registry.get_mut(prepared.session_id)
+            && handle.is_active()
+        {
+            handle.has_in_rw.set(false);
+            handle.has_out_rw.set(false);
+            handle.mark_committed();
+        }
+        if !read_keys.is_empty() {
+            registry.committed_readers.push(CommittedReaderInfo {
+                token: prepared.txn_token,
+                begin_seq: prepared.begin_seq,
+                commit_seq: committed_seq,
+                had_in_rw: false,
+                keys: read_keys.to_vec(),
+            });
+            registry.index_committed_reader(registry.committed_readers.len() - 1);
+        }
+        if !write_keys.is_empty() {
+            registry.committed_writers.push(CommittedWriterInfo {
+                token: prepared.txn_token,
+                commit_seq: committed_seq,
+                had_out_rw: false,
+                keys: write_keys.to_vec(),
+            });
+            registry.index_committed_writer(registry.committed_writers.len() - 1);
+        }
+        registry.prune_committed_conflict_history();
+        return;
+    }
 
     let mut incoming_edges = prepared.incoming_edges.clone();
     let mut incoming_sources = incoming_edges.iter().map(|edge| edge.from).collect();
@@ -2542,6 +2903,7 @@ pub fn concurrent_savepoint(
                     staged_data: state.staged_data.clone(),
                     is_freed: state.is_freed,
                     is_conflict_only: state.is_conflict_only,
+                    metadata_exempt: state.metadata_exempt,
                 },
             ))
         })
@@ -2596,6 +2958,7 @@ pub fn concurrent_rollback_to_savepoint(
                 is_freed: snapshot_state.is_freed,
                 is_conflict_only: snapshot_state.is_conflict_only,
                 held_lock: true,
+                metadata_exempt: snapshot_state.metadata_exempt,
             },
         );
     }
@@ -2636,11 +2999,12 @@ mod tests {
         ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
         ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
         concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
-        concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
-        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
-        concurrent_savepoint, concurrent_track_write_conflict_page, concurrent_write_page,
-        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-        summarize_witness_keys, validate_first_committer_wins,
+        concurrent_free_page, concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt,
+        concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
+        concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
+        concurrent_track_write_conflict_page, concurrent_write_metadata_page,
+        concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
+        prepare_concurrent_commit_with_ssi, summarize_witness_keys, validate_first_committer_wins,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -4105,6 +4469,93 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_reader_candidates_skip_disjoint_point_keys_on_same_root() {
+        let mut registry = ConcurrentRegistry::new();
+        let global = test_token(212);
+
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: test_token(211),
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(12),
+            had_in_rw: false,
+            keys: vec![WitnessKey::for_cell_read(
+                test_page(70),
+                test_page(701),
+                b"key-b",
+            )],
+        });
+        registry.index_committed_reader(0);
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: global,
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(12),
+            had_in_rw: false,
+            keys: vec![WitnessKey::Custom {
+                namespace: 70,
+                bytes: b"global-reader".to_vec(),
+            }],
+        });
+        registry.index_committed_reader(1);
+
+        let (write_cell, write_page) =
+            WitnessKey::for_point_write(test_page(70), b"key-a", test_page(700));
+        let mut candidates = registry
+            .committed_reader_candidates(
+                test_token(999),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &summarize_witness_keys(&[write_cell, write_page]),
+            )
+            .into_iter()
+            .map(|reader| reader.token)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidates, vec![global]);
+    }
+
+    #[test]
+    fn test_committed_writer_candidates_skip_disjoint_point_keys_on_same_root() {
+        let mut registry = ConcurrentRegistry::new();
+        let global = test_token(222);
+        let (writer_cell, writer_page) =
+            WitnessKey::for_point_write(test_page(71), b"key-b", test_page(711));
+
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: test_token(221),
+            commit_seq: CommitSeq::new(12),
+            had_out_rw: false,
+            keys: vec![writer_cell, writer_page],
+        });
+        registry.index_committed_writer(0);
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: global,
+            commit_seq: CommitSeq::new(12),
+            had_out_rw: false,
+            keys: vec![WitnessKey::Custom {
+                namespace: 71,
+                bytes: b"global-writer".to_vec(),
+            }],
+        });
+        registry.index_committed_writer(1);
+
+        let read_cell = WitnessKey::for_cell_read(test_page(71), test_page(710), b"key-a");
+        let mut candidates = registry
+            .committed_writer_candidates(
+                test_token(999),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &summarize_witness_keys(&[read_cell]),
+            )
+            .into_iter()
+            .map(|writer| writer.token)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidates, vec![global]);
+    }
+
+    #[test]
     fn test_handle_view_custom_overlap_respects_global_witnesses() {
         let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(301));
         handle.record_read_witness(WitnessKey::Custom {
@@ -4125,6 +4576,23 @@ mod tests {
             namespace: 6,
             bytes: b"candidate".to_vec(),
         }));
+    }
+
+    #[test]
+    fn test_handle_view_disjoint_cell_witnesses_do_not_overlap_on_same_root() {
+        let root = test_page(41);
+        let leaf_a = test_page(410);
+        let leaf_b = test_page(411);
+
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(3011));
+        handle.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
+        let view = HandleView::new(&handle);
+
+        assert!(view.check_read_overlap(&WitnessKey::for_cell_read(root, leaf_a, b"key-a")));
+        assert!(
+            !view.check_read_overlap(&WitnessKey::for_cell_read(root, leaf_b, b"key-b")),
+            "same-root point witnesses must not overlap when the key tag differs"
+        );
     }
 
     #[test]
@@ -4212,6 +4680,53 @@ mod tests {
     }
 
     #[test]
+    fn test_active_edge_discovery_index_skips_disjoint_point_keys_on_same_root() {
+        let root = test_page(51);
+        let leaf_a = test_page(510);
+        let leaf_b = test_page(511);
+
+        let mut reader = ConcurrentHandle::new(test_snapshot(10), test_token(307));
+        reader.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
+
+        let mut writer = ConcurrentHandle::new(test_snapshot(10), test_token(308));
+        let (write_cell, write_page) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
+        writer.record_write_witness(write_cell.clone());
+        writer.record_write_witness(write_page.clone());
+
+        let views = vec![HandleView::new(&reader), HandleView::new(&writer)];
+        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let write_summary = summarize_witness_keys(&[write_cell.clone(), write_page.clone()]);
+        let read_summary =
+            summarize_witness_keys(&[WitnessKey::for_cell_read(root, leaf_a, b"key-a")]);
+
+        let incoming = index
+            .incoming_candidate_refs(
+                &views,
+                test_token(399),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &write_summary,
+            )
+            .into_iter()
+            .map(|candidate| candidate.token())
+            .collect::<Vec<_>>();
+        let outgoing = index
+            .outgoing_candidate_refs(
+                &views,
+                test_token(399),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &read_summary,
+            )
+            .into_iter()
+            .map(|candidate| candidate.token())
+            .collect::<Vec<_>>();
+
+        assert!(incoming.is_empty());
+        assert!(outgoing.is_empty());
+    }
+
+    #[test]
     fn test_active_edge_discovery_index_uses_presence_flags_without_materialized_keys() {
         let mut page_reader = ConcurrentHandle::new(test_snapshot(10), test_token(311));
         page_reader.record_read(test_page(7));
@@ -4284,6 +4799,100 @@ mod tests {
         assert_eq!(decision.active_readers, 1);
         assert_eq!(decision.active_writers, 1);
         assert!(decision.threshold >= 0.0);
+    }
+
+    #[test]
+    fn test_prepare_uses_candidate_free_fast_path_for_disjoint_point_inserts() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let root = test_page(61);
+        let leaf_a = test_page(610);
+        let leaf_b = test_page(611);
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
+            let (write_cell, _) = WitnessKey::for_point_write(root, b"key-a", leaf_a);
+            h1.record_write_witness(write_cell);
+            concurrent_write_page(&mut h1, &lock_table, s1, leaf_a, test_data()).unwrap();
+        }
+
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read_witness(WitnessKey::for_cell_read(root, leaf_b, b"key-b"));
+            let (write_cell, _) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
+            h2.record_write_witness(write_cell);
+            concurrent_write_page(&mut h2, &lock_table, s2, leaf_b, test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("disjoint point inserts should prepare cleanly");
+
+        assert!(prepared.used_candidate_free_prepare_fast_path());
+        assert!(!prepared.has_in_rw());
+        assert!(!prepared.has_out_rw());
+        assert!(prepared.conflicting_txns().is_empty());
+    }
+
+    #[test]
+    fn test_prepare_uses_candidate_free_fast_path_with_disjoint_committed_history() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+        let root = test_page(62);
+        let leaf_a = test_page(620);
+        let leaf_b = test_page(621);
+
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: test_token(631),
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(11),
+            had_in_rw: false,
+            keys: vec![WitnessKey::for_cell_read(root, leaf_b, b"key-b")],
+        });
+        registry.index_committed_reader(0);
+        let (writer_cell, writer_page) = WitnessKey::for_point_write(root, b"key-b", leaf_b);
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: test_token(632),
+            commit_seq: CommitSeq::new(11),
+            had_out_rw: false,
+            keys: vec![writer_cell, writer_page],
+        });
+        registry.index_committed_writer(0);
+
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            handle.record_read_witness(WitnessKey::for_cell_read(root, leaf_a, b"key-a"));
+            let (write_cell, _) = WitnessKey::for_point_write(root, b"key-a", leaf_a);
+            handle.record_write_witness(write_cell);
+            concurrent_write_page(&mut handle, &lock_table, session_id, leaf_a, test_data())
+                .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(12),
+        )
+        .expect("disjoint committed history should not force validation");
+
+        assert!(prepared.used_candidate_free_prepare_fast_path());
+        assert!(!prepared.has_in_rw());
+        assert!(!prepared.has_out_rw());
+        assert!(prepared.conflicting_txns().is_empty());
     }
 
     #[test]
@@ -5325,5 +5934,82 @@ mod tests {
         );
         let (err3, _) = result3.unwrap_err();
         assert_eq!(err3, MvccError::BusySnapshot);
+    }
+
+    // -----------------------------------------------------------------------
+    // E3 (bd-wwqen Track E): Metadata-exempt pages skip conflict detection.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metadata_exempt_skips_conflict_detection() {
+        // Two sessions both write to page 1 (metadata) and different data pages.
+        // Without metadata exemption, s2 would conflict on page 1.
+        // With exemption, only the data pages are conflict-checked.
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // s1 writes page 1 (metadata, exempt) and page 5 (data).
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_metadata_page(&mut h1, &lock_table, s1, test_page(1), test_data())
+                .unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+            assert!(concurrent_is_metadata_exempt(&h1, test_page(1)));
+            assert!(!concurrent_is_metadata_exempt(&h1, test_page(5)));
+        }
+
+        // s1 commits.
+        {
+            let mut h1 = registry.get_mut(s1).expect("handle s1");
+            concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+                .expect("s1 commits");
+        }
+
+        // s2 also writes page 1 (metadata, exempt) and page 10 (different data page).
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            concurrent_write_metadata_page(&mut h2, &lock_table, s2, test_page(1), test_data())
+                .unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+        }
+
+        // s2 should NOT conflict on page 1 (exempt), only page 10 is checked.
+        // Since page 10 wasn't written by s1, s2 should commit successfully.
+        {
+            let mut h2 = registry.get_mut(s2).expect("handle s2");
+            let result =
+                concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+            assert!(
+                result.is_ok(),
+                "s2 should commit: page 1 is metadata-exempt"
+            );
+        }
+    }
+
+    #[test]
+    fn test_metadata_exempt_manual_marking() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            // Write normally first.
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(1), test_data()).unwrap();
+            assert!(!concurrent_is_metadata_exempt(&h1, test_page(1)));
+
+            // Mark as metadata-exempt.
+            concurrent_mark_metadata_exempt(&mut h1, test_page(1));
+            assert!(concurrent_is_metadata_exempt(&h1, test_page(1)));
+
+            // Verify it no longer tracks write conflict.
+            assert!(
+                !h1.tracks_write_conflict_page(test_page(1)),
+                "metadata-exempt pages should not track write conflicts"
+            );
+        }
     }
 }

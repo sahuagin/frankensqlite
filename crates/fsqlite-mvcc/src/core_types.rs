@@ -342,7 +342,7 @@ impl std::fmt::Debug for VersionArena {
 // ---------------------------------------------------------------------------
 
 /// Number of shards in the lock table (power of 2 for fast modular indexing).
-pub const LOCK_TABLE_SHARDS: usize = 64;
+pub const LOCK_TABLE_SHARDS: usize = 256;
 
 /// Size of the flat atomic lock array covering page numbers 1..=FAST_LOCK_ARRAY_SIZE.
 /// 65536 entries × 8 bytes = 512 KiB, same footprint as the CommitIndex fast array.
@@ -2874,10 +2874,11 @@ mod tests {
     fn test_in_process_lock_table_shard_distribution() {
         let table = InProcessPageLockTable::new();
         let txn = TxnId::new(1).unwrap();
+        let page_count = u32::try_from(LOCK_TABLE_SHARDS * 2).unwrap();
 
         // Acquire locks on sharded pages only. Fast-array pages 1..=65536 do
         // not contribute to shard_distribution().
-        for i in 1..=128_u32 {
+        for i in 1..=page_count {
             let page = sharded_rebuild_page(i);
             table.try_acquire(page, txn).unwrap();
         }
@@ -2885,7 +2886,8 @@ mod tests {
         let dist = table.shard_distribution();
         assert_eq!(dist.len(), LOCK_TABLE_SHARDS);
 
-        // With 128 pages across 64 shards, each shard should have exactly 2.
+        // We insert exactly two sharded pages per shard, so distribution
+        // should stay uniform even as the shard fan-out changes.
         for &count in &dist {
             assert_eq!(count, 2, "uniform distribution expected");
         }
