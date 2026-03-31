@@ -1897,6 +1897,27 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start);
     }
 
+    fn store_metadata_single_connection(&self, update: PublishedPagerUpdate, clear_pages: bool) {
+        if clear_pages {
+            self.pages.clear();
+            self.page_set_size.store(0, AtomicOrdering::Release);
+        } else {
+            self.page_set_size
+                .store(self.pages.len(), AtomicOrdering::Release);
+        }
+        self.visible_commit_seq
+            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
+        self.db_size.store(update.db_size, AtomicOrdering::Release);
+        self.journal_mode.store(
+            encode_journal_mode(update.journal_mode),
+            AtomicOrdering::Release,
+        );
+        self.freelist_count
+            .store(update.freelist_count, AtomicOrdering::Release);
+        self.checkpoint_active
+            .store(update.checkpoint_active, AtomicOrdering::Release);
+    }
+
     /// Publish truncate during checkpoint: retain pages up to max_page, then remove page one.
     fn publish_truncate_checkpoint(&self, cx: &Cx, update: PublishedPagerUpdate, max_page: u32) {
         let _publish_guard = self
@@ -2196,6 +2217,9 @@ pub struct SimplePager<V: Vfs> {
     /// Readers clone the Arc via a brief RwLock-read to inspect committed state
     /// without taking the PagerInner Mutex.  Published on every commit.
     committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+    /// Same-path connection counter injected by the SQL connection layer.
+    /// Unset pagers keep the legacy publication path.
+    shared_connection_count: OnceLock<Arc<AtomicUsize>>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -2503,6 +2527,8 @@ where
             let published_snapshot = self.published.snapshot();
             let pool = self.pool.clone();
             let cleanup_cx = cx.clone();
+            let memory_db_bump_alloc =
+                self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
             return Ok(SimpleTransaction {
                 vfs: Arc::clone(&self.vfs),
                 journal_path: Self::journal_path(&self.db_path),
@@ -2515,6 +2541,7 @@ where
                 published: Arc::clone(&self.published),
                 wal_backend: Arc::clone(&self.wal_backend),
                 committed_snapshot: Arc::clone(&self.committed_snapshot),
+                shared_connection_count: self.shared_connection_count.get().cloned(),
                 published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
                 published_db_size: Cell::new(published_snapshot.db_size),
                 write_set: HashMap::new(),
@@ -2532,6 +2559,7 @@ where
                 pool,
                 cleanup_cx,
                 page_lease: Vec::new(),
+                memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(HashMap::new()),
             });
@@ -2665,6 +2693,7 @@ where
         let pool = self.pool.clone();
         let published_snapshot = self.published.snapshot();
         let cleanup_cx = cleanup_child_cx(cx);
+        let memory_db_bump_alloc = self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -2676,6 +2705,7 @@ where
             published: Arc::clone(&self.published),
             wal_backend: Arc::clone(&self.wal_backend),
             committed_snapshot: Arc::clone(&self.committed_snapshot),
+            shared_connection_count: self.shared_connection_count.get().cloned(),
             published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
             published_db_size: Cell::new(published_snapshot.db_size),
             write_set: HashMap::new(),
@@ -2693,6 +2723,7 @@ where
             pool,
             cleanup_cx,
             page_lease: Vec::new(),
+            memory_db_bump_alloc,
             rolled_back_pages: HashSet::new(),
             txn_read_cache: RefCell::new(HashMap::new()),
         })
@@ -3120,12 +3151,37 @@ where
     /// fast-path gating instead of locking `PagerInner`.
     #[must_use]
     pub fn committed_snapshot(&self) -> Arc<PagerCommittedSnapshot> {
+        if self
+            .shared_connection_count
+            .get()
+            .is_some_and(|counter| counter.load(AtomicOrdering::Acquire) == 1)
+        {
+            let published = self.published.snapshot();
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Arc::new(PagerCommittedSnapshot {
+                commit_seq: published.visible_commit_seq,
+                db_size: published.db_size,
+                journal_mode: published.journal_mode,
+                freelist_count: published.freelist_count,
+                checkpoint_active: published.checkpoint_active,
+                writer_active: inner.writer_active,
+                db_file_size_bytes: inner.committed_db_file_size_bytes,
+            });
+        }
         Arc::clone(
             &self
                 .committed_snapshot
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Bind a same-path connection counter owned by the SQL connection layer.
+    pub fn bind_shared_connection_count(&self, counter: Arc<AtomicUsize>) {
+        let _ = self.shared_connection_count.set(counter);
     }
 
     /// Number of page reads satisfied directly from the publication plane.
@@ -3421,6 +3477,7 @@ where
                 writer_active: false,
                 db_file_size_bytes: file_size,
             }))),
+            shared_connection_count: OnceLock::new(),
         })
     }
 
@@ -3565,6 +3622,7 @@ where
                 writer_active: false,
                 db_file_size_bytes: file_size,
             }))),
+            shared_connection_count: OnceLock::new(),
         })
     }
 
@@ -3814,6 +3872,8 @@ pub struct SimpleTransaction<V: Vfs> {
     wal_backend: SharedWalBackend,
     /// Shared committed-state snapshot (bd-db300.5.3.3.1 / M6).
     committed_snapshot: Arc<RwLock<Arc<PagerCommittedSnapshot>>>,
+    /// Shared connection counter for single-connection fast path.
+    shared_connection_count: Option<Arc<AtomicUsize>>,
     /// Visible commit sequence at snapshot capture. Uses `Cell` for interior
     /// mutability so `get_page` (which takes `&self`) can refresh the snapshot
     /// when encountering pages beyond the current db_size boundary.
@@ -3847,6 +3907,11 @@ pub struct SimpleTransaction<V: Vfs> {
     /// splits. Unused pages are returned to the global next_page on
     /// commit/rollback.
     page_lease: Vec<PageNumber>,
+    /// True only for real `:memory:` databases. Those databases never need
+    /// durable freelist reuse mid-transaction, so allocation can stay on a
+    /// simple bump-only fast path without pulling page 1 into the conflict
+    /// surface.
+    memory_db_bump_alloc: bool,
     /// Pages that were allocated after a savepoint but then rolled back.
     /// These pages should return zeros when read, not BusySnapshot error.
     rolled_back_pages: HashSet<PageNumber>,
@@ -3899,6 +3964,13 @@ impl<V: Vfs> SimpleTransaction<V> {
     #[must_use]
     pub fn is_writer(&self) -> bool {
         self.is_writer
+    }
+
+    /// Check if single-connection fast path is enabled.
+    fn single_connection_fast_path_enabled(&self) -> bool {
+        self.shared_connection_count
+            .as_ref()
+            .is_some_and(|counter| counter.load(AtomicOrdering::Acquire) == 1)
     }
 
     #[must_use]
@@ -3998,6 +4070,10 @@ impl<V: Vfs> SimpleTransaction<V> {
         &self,
         inner: &PagerInner<V::File>,
     ) -> bool {
+        if self.memory_db_bump_alloc {
+            return false;
+        }
+
         if self.mode == TransactionMode::Concurrent {
             // Concurrent-mode allocator/header/page-count reconciliation is a
             // commit-planning concern. Ordinary page growth stays on the local
@@ -4457,8 +4533,13 @@ where
                 }
                 let frame_count = frame_refs.len();
 
-                let _prepared_batch =
-                    with_wal_backend(wal_backend, |wal| wal.prepare_append_frames(&frame_refs))?;
+                let mut prepared_batch = with_wal_backend(wal_backend, |wal| {
+                    let mut prepared_batch = wal.prepare_append_frames(&frame_refs)?;
+                    if let Some(prepared) = prepared_batch.as_mut() {
+                        wal.finalize_prepared_frames(cx, prepared)?;
+                    }
+                    Ok(prepared_batch)
+                })?;
                 GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
                     u64::try_from(batch_count).unwrap_or(u64::MAX),
                     AtomicOrdering::Relaxed,
@@ -4489,7 +4570,11 @@ where
                         let t_append_start = Instant::now();
                         let flush_io_result = (|| -> Result<()> {
                             with_wal_backend(wal_backend, |wal| {
-                                wal.append_frames(cx, &frame_refs)
+                                if let Some(prepared) = prepared_batch.as_mut() {
+                                    wal.append_prepared_frames(cx, prepared)
+                                } else {
+                                    wal.append_frames(cx, &frame_refs)
+                                }
                             })?;
                             wal_append_us =
                                 Instant::now().duration_since(t_append_start).as_micros() as u64;
@@ -5094,32 +5179,34 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        let committed_freelist_is_snapshot_pinned =
-            self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+        if !self.memory_db_bump_alloc {
+            let committed_freelist_is_snapshot_pinned =
+                self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
 
-        if committed_freelist_is_snapshot_pinned {
-            // Concurrent writers always read against a fixed snapshot. So do
-            // immediate/deferred writers when another local transaction is
-            // still active, because that older reader snapshot can still
-            // observe the committed image being replaced. In both cases, pages
-            // at or below db_size are part of some still-visible committed
-            // state and cannot be safely reused from the live global freelist
-            // without versioned freelist metadata. Pages above db_size are
-            // different: they only exist because an earlier transaction
-            // allocated EOF pages and then rolled back, so reusing them cannot
-            // violate snapshot visibility and avoids page-count holes.
-            if let Some(idx) = inner
-                .freelist
-                .iter()
-                .rposition(|page| page.get() > inner.db_size)
-            {
-                let page = inner.freelist.remove(idx);
+            if committed_freelist_is_snapshot_pinned {
+                // Concurrent writers always read against a fixed snapshot. So do
+                // immediate/deferred writers when another local transaction is
+                // still active, because that older reader snapshot can still
+                // observe the committed image being replaced. In both cases, pages
+                // at or below db_size are part of some still-visible committed
+                // state and cannot be safely reused from the live global freelist
+                // without versioned freelist metadata. Pages above db_size are
+                // different: they only exist because an earlier transaction
+                // allocated EOF pages and then rolled back, so reusing them cannot
+                // violate snapshot visibility and avoids page-count holes.
+                if let Some(idx) = inner
+                    .freelist
+                    .iter()
+                    .rposition(|page| page.get() > inner.db_size)
+                {
+                    let page = inner.freelist.remove(idx);
+                    self.allocated_from_freelist.push(page);
+                    return Ok(page);
+                }
+            } else if let Some(page) = inner.freelist.pop() {
                 self.allocated_from_freelist.push(page);
                 return Ok(page);
             }
-        } else if let Some(page) = inner.freelist.pop() {
-            self.allocated_from_freelist.push(page);
-            return Ok(page);
         }
 
         // ── EOF allocation ──────────────────────────────────────────────
@@ -5431,25 +5518,31 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
-            self.publish_committed_snapshot_from_inner(&inner);
+            let single_connection_fast_path = self.single_connection_fast_path_enabled();
+            if !single_connection_fast_path {
+                // bd-db300.5.3.3.1: publish immutable snapshot while inner is still held.
+                self.publish_committed_snapshot_from_inner(&inner);
+            }
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
 
+            let t_phase_c1_done = Instant::now();
+
             // H4 fault hook: crash during Phase C, after commit_seq update
             // but before snapshot publish. WAL frames are durable, commit_seq
             // incremented in-memory, but snapshot plane not yet updated.
             #[cfg(any(test, feature = "fault-injection"))]
-            crate::fault_hooks::maybe_inject_during_phase_c(
-                publish_update.visible_commit_seq.get(),
-                publish_update.db_size,
-            )?;
-
-            let t_phase_c1_done = Instant::now();
+            if !single_connection_fast_path {
+                crate::fault_hooks::maybe_inject_during_phase_c(
+                    publish_update.visible_commit_seq.get(),
+                    publish_update.db_size,
+                )?;
+            }
 
             // Phase C2 (outside inner.lock): Publish to snapshot plane.
+            // Even for single_connection_fast_path, we must publish write_set pages.
             self.publish_committed_state(cx, publish_update);
 
             let t_phase_c2_done = Instant::now();
@@ -5699,12 +5792,16 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
+            let single_connection_fast_path = self.single_connection_fast_path_enabled();
             // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
             // held — MUST happen before publish_committed_state (same order as
             // `commit()`), so concurrent readers see the immutable snapshot
             // before the seqlock commit_seq advances.
-            self.publish_committed_snapshot_from_inner(&inner);
+            if !single_connection_fast_path {
+                self.publish_committed_snapshot_from_inner(&inner);
+            }
             drop(inner);
+            // Always publish write_set pages, even for single connection fast path.
             self.publish_committed_state_draining_write_set(cx, publish_update);
 
             // Clear retained transaction state for reuse.
@@ -13757,6 +13854,84 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_db_allocator_skips_committed_freelist_and_page_one_conflicts() {
+        let vfs = MemoryVfs::new();
+        let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let (page_two, page_three) = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = seed.allocate_page(&cx).unwrap();
+            let page_three = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            seed.write_page(&cx, page_three, &vec![0x22; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (page_two, page_three)
+        };
+
+        {
+            let mut free_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            free_txn.free_page(&cx, page_two).unwrap();
+            free_txn.commit(&cx).unwrap();
+        }
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        assert!(
+            !txn.allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id={BEAD_ID} case=memory_db_allocate_skips_page_one_conflict_tracking"
+        );
+        let allocated = txn.allocate_page(&cx).unwrap();
+        let expected = PageNumber::new(page_three.get() + 1).unwrap();
+        assert_eq!(
+            allocated,
+            expected,
+            "bead_id={BEAD_ID} case=memory_db_allocator_uses_bump_path allocated={} expected={}",
+            allocated.get(),
+            expected.get()
+        );
+    }
+
+    #[test]
+    fn test_memory_db_allocator_stays_bump_only_after_rollback() {
+        let vfs = MemoryVfs::new();
+        let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let abandoned_pages = {
+            let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let page_one = abandoned.allocate_page(&cx).unwrap();
+            let page_two = abandoned.allocate_page(&cx).unwrap();
+            abandoned.rollback(&cx).unwrap();
+            [page_one, page_two]
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        assert!(
+            !txn.allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id={BEAD_ID} case=memory_db_post_rollback_allocate_skips_page_one_conflict_tracking"
+        );
+        let allocated = txn.allocate_page(&cx).unwrap();
+        let expected = PageNumber::new(abandoned_pages[1].get() + 1).unwrap();
+        assert!(
+            !abandoned_pages.contains(&allocated),
+            "bead_id={BEAD_ID} case=memory_db_allocator_skips_freelist_after_rollback allocated={} abandoned=({}, {})",
+            allocated.get(),
+            abandoned_pages[0].get(),
+            abandoned_pages[1].get()
+        );
+        assert_eq!(
+            allocated,
+            expected,
+            "bead_id={BEAD_ID} case=memory_db_allocator_keeps_bump_sequence allocated={} expected={}",
+            allocated.get(),
+            expected.get()
+        );
+    }
+
+    #[test]
     fn test_free_page_requires_page_one_conflict_tracking_defers_concurrent_freelist_reconciliation()
      {
         let (pager, _) = test_pager();
@@ -15234,6 +15409,51 @@ mod tests {
             pager.publication_write_count(),
             publication_writes_before_commit + 1,
             "bead_id={BEAD_ID} case=commit_batches_publication_writes"
+        );
+    }
+
+    #[test]
+    fn test_single_connection_commit_elides_publication_writes() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(1));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let before = pager.published_snapshot();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let publication_writes_before_commit = pager.publication_write_count();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x6B; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let after = pager.published_snapshot();
+        assert_eq!(
+            pager.publication_write_count(),
+            publication_writes_before_commit,
+            "bead_id={BEAD_ID} case=single_connection_commit_skips_publication_write"
+        );
+        assert!(
+            after.visible_commit_seq > before.visible_commit_seq,
+            "bead_id={BEAD_ID} case=single_connection_commit_still_advances_visible_commit_seq"
+        );
+        assert_eq!(
+            after.db_size,
+            p.get(),
+            "bead_id={BEAD_ID} case=single_connection_commit_updates_published_db_size"
+        );
+
+        shared_connection_count.store(2, AtomicOrdering::Release);
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let publication_writes_before_multi_connection_commit = pager.publication_write_count();
+        txn.write_page(&cx, p, &vec![0x7C; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert_eq!(
+            pager.publication_write_count(),
+            publication_writes_before_multi_connection_commit + 1,
+            "bead_id={BEAD_ID} case=multi_connection_commit_restores_publication_write"
         );
     }
 

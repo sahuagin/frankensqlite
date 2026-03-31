@@ -761,18 +761,58 @@ impl<F: VfsFile> WalFile<F> {
     /// serialized append window while preserving the requirement that checksum
     /// chaining still uses the live on-disk seed at append time.
     pub fn prepare_frame_bytes(&self, frames: &[WalAppendFrameRef<'_>]) -> Result<Vec<u8>> {
-        if frames.is_empty() {
-            return Ok(Vec::new());
+        let mut frame_buf = Vec::new();
+        let mut checksum_transforms = Vec::new();
+        let _ = self.prepare_frame_bytes_with_transforms_into(
+            frames.len(),
+            frames.iter().copied(),
+            &mut frame_buf,
+            &mut checksum_transforms,
+        )?;
+        Ok(frame_buf)
+    }
+
+    /// Serialize a batch of frames into caller-owned storage and precompute the
+    /// per-frame checksum transforms in the same pass.
+    ///
+    /// This lets higher layers reserve the buffer up front and avoid both an
+    /// intermediate `Vec<WalAppendFrameRef>` and a later whole-batch checksum
+    /// transform walk over the serialized bytes.
+    pub fn prepare_frame_bytes_with_transforms_into<'a, I>(
+        &self,
+        frame_count: usize,
+        frames: I,
+        frame_buf: &mut Vec<u8>,
+        checksum_transforms: &mut Vec<WalChecksumTransform>,
+    ) -> Result<Option<usize>>
+    where
+        I: IntoIterator<Item = WalAppendFrameRef<'a>>,
+    {
+        frame_buf.clear();
+        checksum_transforms.clear();
+        if frame_count == 0 {
+            return Ok(None);
         }
 
         let frame_size = self.frame_size();
-        let total_bytes = frames
-            .len()
+        let total_bytes = frame_count
             .checked_mul(frame_size)
             .ok_or(FrankenError::DatabaseFull)?;
-        let mut frame_buf = vec![0u8; total_bytes];
+        frame_buf.resize(total_bytes, 0);
+        if checksum_transforms.capacity() < frame_count {
+            checksum_transforms.reserve(frame_count - checksum_transforms.capacity());
+        }
 
-        for (idx, frame) in frames.iter().enumerate() {
+        let mut observed_frame_count = 0usize;
+        let mut last_commit_offset = None;
+        for (idx, frame) in frames.into_iter().enumerate() {
+            if idx >= frame_count {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "prepared batch frame count mismatch: expected {frame_count}, got more than declared"
+                    ),
+                });
+            }
             if frame.page_data.len() != self.page_size {
                 return Err(FrankenError::WalCorrupt {
                     detail: format!(
@@ -792,9 +832,26 @@ impl<F: VfsFile> WalFile<F> {
             frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
             write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], self.header.salts)?;
             frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+            checksum_transforms.push(WalChecksumTransform::for_wal_frame(
+                frame_slice,
+                self.page_size,
+                self.big_endian_checksum,
+            )?);
+            if frame.db_size_if_commit != 0 {
+                last_commit_offset = Some(idx);
+            }
+            observed_frame_count = idx.saturating_add(1);
         }
 
-        Ok(frame_buf)
+        if observed_frame_count != frame_count {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "prepared batch frame count mismatch: expected {frame_count}, got {observed_frame_count}"
+                ),
+            });
+        }
+
+        Ok(last_commit_offset)
     }
 
     /// Check whether the on-disk WAL still matches a previously observed

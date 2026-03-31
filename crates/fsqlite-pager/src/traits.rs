@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber, PageSize};
+use fsqlite_wal::checksum::WalChecksumTransform;
 
 // ---------------------------------------------------------------------------
 // Sealed trait discipline
@@ -290,24 +291,9 @@ pub struct PreparedWalFrameMeta {
 
 /// Affine checksum transform for one prepared WAL frame.
 ///
-/// The SQLite WAL rolling checksum is linear in the incoming `(s1, s2)` seed.
-/// Preparing a frame can therefore precompute the transform coefficients and
-/// defer only the final seed rebind to publish time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PreparedWalChecksumTransform {
-    /// Contribution of the incoming `s1` to the outgoing `s1`.
-    pub a11: u32,
-    /// Contribution of the incoming `s2` to the outgoing `s1`.
-    pub a12: u32,
-    /// Contribution of the incoming `s1` to the outgoing `s2`.
-    pub a21: u32,
-    /// Contribution of the incoming `s2` to the outgoing `s2`.
-    pub a22: u32,
-    /// Constant bias added to the outgoing `s1`.
-    pub c1: u32,
-    /// Constant bias added to the outgoing `s2`.
-    pub c2: u32,
-}
+/// Alias the canonical WAL transform type so prepared batches can flow through
+/// finalize/append paths without a per-frame transform copy.
+pub type PreparedWalChecksumTransform = WalChecksumTransform;
 
 /// Rolling-checksum seed/result captured for a prepared WAL batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
