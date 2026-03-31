@@ -1464,6 +1464,7 @@ impl BTreePageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::SmallText;
     use std::sync::Arc;
 
     #[test]
@@ -2370,7 +2371,7 @@ mod tests {
     #[test]
     fn test_affinity_applied_to_needing_operand_only() {
         let left = SqliteValue::Integer(42);
-        let right = SqliteValue::Text(Arc::from("123"));
+        let right = SqliteValue::Text(SmallText::new("123"));
         let affinity = TypeAffinity::comparison_affinity(left.affinity(), right.affinity())
             .expect("numeric-vs-text comparison must request numeric coercion");
 
