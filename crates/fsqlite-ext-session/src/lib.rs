@@ -1,5 +1,5 @@
 use fsqlite_types::serial_type::{read_varint, varint_len, write_varint};
-use fsqlite_types::value::SqliteValue;
+use fsqlite_types::value::{SmallText, SqliteValue};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -141,7 +141,7 @@ impl ChangesetValue {
             Self::Undefined | Self::Null => SqliteValue::Null,
             Self::Integer(i) => SqliteValue::Integer(*i),
             Self::Real(f) => SqliteValue::Float(*f),
-            Self::Text(s) => SqliteValue::Text(Arc::from(s.as_str())),
+            Self::Text(s) => SqliteValue::Text(SmallText::new(s.as_str())),
             Self::Blob(b) => SqliteValue::Blob(Arc::from(b.as_slice())),
         }
     }

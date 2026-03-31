@@ -1,10 +1,252 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use memchr::{memchr, memchr2};
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
+
+/// Maximum inline string length for `SmallText`.
+///
+/// Strings up to this length are stored inline (on the stack/in the struct)
+/// without heap allocation. Longer strings fall back to `Arc<str>`.
+///
+/// 23 bytes inline + 1 byte for length/tag = 24 bytes total, which aligns
+/// with common cache line fractions and matches Arc<str>'s pointer size.
+const SMALL_TEXT_INLINE_CAP: usize = 23;
+
+/// A small-string-optimized text value.
+///
+/// Stores strings ≤ 23 bytes inline without heap allocation. Longer strings
+/// use `Arc<str>` for O(1) cloning. This eliminates malloc for the vast
+/// majority of database text values (column names, short strings, numbers).
+///
+/// Layout:
+/// - Inline: 1 byte length (0..=23), followed by up to 23 UTF-8 bytes
+/// - Heap: tag byte 0xFF, followed by Arc<str> pointer
+#[derive(Clone)]
+pub struct SmallText {
+    /// Representation: either inline bytes or a heap pointer.
+    ///
+    /// Inline layout: buf[0] = length (0..=23), buf[1..1+len] = UTF-8 data
+    /// Heap layout: buf[0] = 0xFF (tag), buf[8..16] = Arc<str> pointer
+    repr: SmallTextRepr,
+}
+
+/// Internal representation for SmallText.
+#[derive(Clone)]
+enum SmallTextRepr {
+    /// Inline storage: length followed by up to 23 UTF-8 bytes.
+    Inline {
+        len: u8,
+        buf: [u8; SMALL_TEXT_INLINE_CAP],
+    },
+    /// Heap storage for strings > 23 bytes.
+    Heap(Arc<str>),
+}
+
+impl SmallText {
+    /// Create a new SmallText from a string slice.
+    #[inline]
+    pub fn new(s: &str) -> Self {
+        if s.len() <= SMALL_TEXT_INLINE_CAP {
+            let mut buf = [0u8; SMALL_TEXT_INLINE_CAP];
+            buf[..s.len()].copy_from_slice(s.as_bytes());
+            Self {
+                repr: SmallTextRepr::Inline {
+                    len: s.len() as u8,
+                    buf,
+                },
+            }
+        } else {
+            Self {
+                repr: SmallTextRepr::Heap(Arc::from(s)),
+            }
+        }
+    }
+
+    /// Create from an owned String, potentially reusing its allocation.
+    #[inline]
+    pub fn from_string(s: String) -> Self {
+        if s.len() <= SMALL_TEXT_INLINE_CAP {
+            Self::new(&s)
+        } else {
+            Self {
+                repr: SmallTextRepr::Heap(Arc::from(s)),
+            }
+        }
+    }
+
+    /// Create from an Arc<str>, avoiding re-allocation if already heap.
+    #[inline]
+    pub fn from_arc(arc: Arc<str>) -> Self {
+        if arc.len() <= SMALL_TEXT_INLINE_CAP {
+            Self::new(&arc)
+        } else {
+            Self {
+                repr: SmallTextRepr::Heap(arc),
+            }
+        }
+    }
+
+    /// Get the string as a slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match &self.repr {
+            SmallTextRepr::Inline { len, buf } => std::str::from_utf8(&buf[..*len as usize])
+                .expect("SmallText inline representation must always contain valid UTF-8"),
+            SmallTextRepr::Heap(arc) => arc,
+        }
+    }
+
+    /// Get the length in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.repr {
+            SmallTextRepr::Inline { len, .. } => *len as usize,
+            SmallTextRepr::Heap(arc) => arc.len(),
+        }
+    }
+
+    /// Check if empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Check if stored inline (no heap allocation).
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        matches!(self.repr, SmallTextRepr::Inline { .. })
+    }
+
+    /// Convert to Arc<str>, potentially allocating if currently inline.
+    #[inline]
+    pub fn into_arc(self) -> Arc<str> {
+        match self.repr {
+            SmallTextRepr::Inline { len, buf } => {
+                let s = std::str::from_utf8(&buf[..len as usize])
+                    .expect("SmallText inline representation must always contain valid UTF-8");
+                Arc::from(s)
+            }
+            SmallTextRepr::Heap(arc) => arc,
+        }
+    }
+}
+
+impl Default for SmallText {
+    #[inline]
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
+impl fmt::Debug for SmallText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for SmallText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq for SmallText {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SmallText {}
+
+impl PartialOrd for SmallText {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SmallText {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl Hash for SmallText {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl From<&str> for SmallText {
+    #[inline]
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for SmallText {
+    #[inline]
+    fn from(s: String) -> Self {
+        Self::from_string(s)
+    }
+}
+
+impl From<Arc<str>> for SmallText {
+    #[inline]
+    fn from(arc: Arc<str>) -> Self {
+        Self::from_arc(arc)
+    }
+}
+
+impl AsRef<str> for SmallText {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::ops::Deref for SmallText {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl std::borrow::Borrow<str> for SmallText {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+// Serde implementations for SmallText
+impl serde::Serialize for SmallText {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SmallText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(SmallText::from_string(s))
+    }
+}
 
 /// Scan the longest SQLite numeric prefix from a byte slice.
 ///
@@ -159,9 +401,10 @@ pub enum SqliteValue {
     Float(f64),
     /// A UTF-8 text string.
     ///
-    /// Uses `Arc<str>` so that register copies (SCopy, Copy, ResultRow) are
-    /// O(1) atomic refcount increments instead of O(n) heap copies.
-    Text(Arc<str>),
+    /// Uses `SmallText` for small-string optimization: strings ≤ 23 bytes
+    /// are stored inline without heap allocation. Longer strings use
+    /// `Arc<str>` internally for O(1) cloning.
+    Text(SmallText),
     /// A binary large object.
     ///
     /// Uses `Arc<[u8]>` for the same O(1)-clone benefit as `Text`.
@@ -214,15 +457,15 @@ impl SqliteValue {
                 Self::Null | Self::Text(_) | Self::Blob(_) => self,
                 Self::Integer(_) | Self::Float(_) => {
                     let t = self.to_text();
-                    Self::Text(Arc::from(t))
+                    Self::Text(SmallText::from_string(t))
                 }
             },
             TypeAffinity::Numeric => match &self {
-                Self::Text(s) => try_coerce_text_to_numeric(s).unwrap_or(self),
+                Self::Text(s) => try_coerce_text_to_numeric(s.as_str()).unwrap_or(self),
                 _ => self,
             },
             TypeAffinity::Integer => match &self {
-                Self::Text(s) => try_coerce_text_to_numeric(s).unwrap_or(self),
+                Self::Text(s) => try_coerce_text_to_numeric(s.as_str()).unwrap_or(self),
                 Self::Float(f) => {
                     if *f >= -9_223_372_036_854_775_808.0 && *f < 9_223_372_036_854_775_808.0 {
                         let i = *f as i64;
@@ -235,7 +478,7 @@ impl SqliteValue {
                 _ => self,
             },
             TypeAffinity::Real => match &self {
-                Self::Text(s) => try_coerce_text_to_numeric(s)
+                Self::Text(s) => try_coerce_text_to_numeric(s.as_str())
                     .map(|v| match v {
                         Self::Integer(i) => Self::Float(i as f64),
                         other => other,
@@ -1084,21 +1327,21 @@ impl From<f64> for SqliteValue {
 
 impl From<String> for SqliteValue {
     fn from(s: String) -> Self {
-        // Arc::from(String) reuses the String's heap buffer via
-        // String → Box<str> → Arc<str>, avoiding a redundant copy.
-        Self::Text(Arc::from(s))
+        // SmallText stores strings ≤ 23 bytes inline without heap allocation.
+        // Longer strings use Arc<str> internally.
+        Self::Text(SmallText::from_string(s))
     }
 }
 
 impl From<&str> for SqliteValue {
     fn from(s: &str) -> Self {
-        Self::Text(Arc::from(s))
+        Self::Text(SmallText::new(s))
     }
 }
 
 impl From<Arc<str>> for SqliteValue {
     fn from(s: Arc<str>) -> Self {
-        Self::Text(s)
+        Self::Text(SmallText::from_arc(s))
     }
 }
 
@@ -1320,7 +1563,7 @@ mod tests {
 
     #[test]
     fn text_properties() {
-        let v = SqliteValue::Text(Arc::from("hello"));
+        let v = SqliteValue::Text(SmallText::new("hello"));
         assert_eq!(v.as_text(), Some("hello"));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
@@ -1328,18 +1571,18 @@ mod tests {
 
     #[test]
     fn text_numeric_coercion() {
-        let v = SqliteValue::Text(Arc::from("123"));
+        let v = SqliteValue::Text(SmallText::new("123"));
         assert_eq!(v.to_integer(), 123);
         assert_eq!(v.to_float(), 123.0);
 
-        let v = SqliteValue::Text(Arc::from("3.14"));
+        let v = SqliteValue::Text(SmallText::new("3.14"));
         assert_eq!(v.to_integer(), 3);
         assert_eq!(v.to_float(), 3.14);
     }
 
     #[test]
     fn text_numeric_coercion_ignores_hex_text_prefixes() {
-        let v = SqliteValue::Text(Arc::from("0x10"));
+        let v = SqliteValue::Text(SmallText::new("0x10"));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
 
@@ -1350,10 +1593,10 @@ mod tests {
 
     #[test]
     fn test_integer_numeric_type_uses_sqlite_prefix_rules() {
-        assert!(SqliteValue::Text(Arc::from("123abc")).is_integer_numeric_type());
+        assert!(SqliteValue::Text(SmallText::new("123abc")).is_integer_numeric_type());
         assert!(SqliteValue::Blob(Arc::from(b"123a".as_slice())).is_integer_numeric_type());
-        assert!(!SqliteValue::Text(Arc::from("1.5e2abc")).is_integer_numeric_type());
-        assert!(!SqliteValue::Text(Arc::from("abc")).is_integer_numeric_type());
+        assert!(!SqliteValue::Text(SmallText::new("1.5e2abc")).is_integer_numeric_type());
+        assert!(!SqliteValue::Text(SmallText::new("abc")).is_integer_numeric_type());
     }
 
     #[test]
@@ -1366,7 +1609,7 @@ mod tests {
 
     #[test]
     fn test_sqlite_value_text_to_integer_coercion() {
-        let text_value = SqliteValue::Text(Arc::from("123"));
+        let text_value = SqliteValue::Text(SmallText::new("123"));
         let coerced = text_value.apply_affinity(TypeAffinity::Integer);
         assert_eq!(coerced, SqliteValue::Integer(123));
     }
@@ -1388,7 +1631,7 @@ mod tests {
         assert_eq!(SqliteValue::Integer(42).to_string(), "42");
         assert_eq!(SqliteValue::Integer(-1).to_string(), "-1");
         assert_eq!(SqliteValue::Float(1.5).to_string(), "1.5");
-        assert_eq!(SqliteValue::Text(Arc::from("hi")).to_string(), "'hi'");
+        assert_eq!(SqliteValue::Text(SmallText::new("hi")).to_string(), "'hi'");
         assert_eq!(
             SqliteValue::Blob(Arc::from([0xCA, 0xFE].as_slice())).to_string(),
             "X'CAFE'"
@@ -1399,7 +1642,7 @@ mod tests {
     fn sort_order_null_first() {
         let null = SqliteValue::Null;
         let int = SqliteValue::Integer(0);
-        let text = SqliteValue::Text(Arc::from(""));
+        let text = SqliteValue::Text(SmallText::new(""));
         let blob = SqliteValue::Blob(Arc::from(&[] as &[u8]));
 
         assert!(null < int);
@@ -1493,7 +1736,7 @@ mod tests {
         assert_eq!(SqliteValue::Integer(0).affinity(), TypeAffinity::Integer);
         assert_eq!(SqliteValue::Float(0.0).affinity(), TypeAffinity::Real);
         assert_eq!(
-            SqliteValue::Text(Arc::from("")).affinity(),
+            SqliteValue::Text(SmallText::new("")).affinity(),
             TypeAffinity::Text
         );
         assert_eq!(
@@ -1599,15 +1842,15 @@ mod tests {
     #[test]
     fn test_cast_to_numeric_uses_sqlite_cast_rules() {
         assert_eq!(
-            SqliteValue::Text(Arc::from("123abc")).cast_to_numeric(),
+            SqliteValue::Text(SmallText::new("123abc")).cast_to_numeric(),
             SqliteValue::Integer(123)
         );
         assert_eq!(
-            SqliteValue::Text(Arc::from("1.5e2abc")).cast_to_numeric(),
+            SqliteValue::Text(SmallText::new("1.5e2abc")).cast_to_numeric(),
             SqliteValue::Integer(150)
         );
         assert_eq!(
-            SqliteValue::Text(Arc::from("abc")).cast_to_numeric(),
+            SqliteValue::Text(SmallText::new("abc")).cast_to_numeric(),
             SqliteValue::Integer(0)
         );
         assert_eq!(
@@ -1615,7 +1858,7 @@ mod tests {
             SqliteValue::Integer(123)
         );
 
-        match SqliteValue::Text(Arc::from("1e999")).cast_to_numeric() {
+        match SqliteValue::Text(SmallText::new("1e999")).cast_to_numeric() {
             SqliteValue::Float(value) => assert!(value.is_infinite() && value.is_sign_positive()),
             other => panic!("expected +inf REAL from NUMERIC cast, got {other:?}"),
         }
@@ -1981,7 +2224,7 @@ mod tests {
 
     #[test]
     fn test_empty_string_is_not_null() {
-        let empty = SqliteValue::Text(Arc::from(""));
+        let empty = SqliteValue::Text(SmallText::new(""));
         // '' IS NULL → false.
         assert!(!empty.is_null());
         // '' IS NOT NULL → true (expressed as !is_null).
@@ -1992,13 +2235,13 @@ mod tests {
 
     #[test]
     fn test_length_empty_string_zero() {
-        let empty = SqliteValue::Text(Arc::from(""));
+        let empty = SqliteValue::Text(SmallText::new(""));
         assert_eq!(empty.sql_length(), Some(0));
     }
 
     #[test]
     fn test_typeof_empty_string_text() {
-        let empty = SqliteValue::Text(Arc::from(""));
+        let empty = SqliteValue::Text(SmallText::new(""));
         assert_eq!(empty.typeof_str(), "text");
         // NULL has typeof "null".
         assert_eq!(SqliteValue::Null.typeof_str(), "null");
@@ -2006,8 +2249,8 @@ mod tests {
 
     #[test]
     fn test_empty_string_comparisons() {
-        let empty1 = SqliteValue::Text(Arc::from(""));
-        let empty2 = SqliteValue::Text(Arc::from(""));
+        let empty1 = SqliteValue::Text(SmallText::new(""));
+        let empty2 = SqliteValue::Text(SmallText::new(""));
         // '' = '' → true.
         assert_eq!(empty1.partial_cmp(&empty2), Some(std::cmp::Ordering::Equal));
 
@@ -2036,7 +2279,7 @@ mod tests {
         assert_eq!(SqliteValue::Null.sql_length(), None);
         // TEXT → character count.
         assert_eq!(SqliteValue::Text("hello".into()).sql_length(), Some(5));
-        assert_eq!(SqliteValue::Text(Arc::from("")).sql_length(), Some(0));
+        assert_eq!(SqliteValue::Text(SmallText::new("")).sql_length(), Some(0));
         // BLOB → byte count.
         assert_eq!(
             SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())).sql_length(),

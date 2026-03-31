@@ -25,7 +25,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
     ColumnContext, FunctionRegistry, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
 };
-use fsqlite_types::{SqliteValue, cx::Cx};
+use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
 
 const JSON_VALID_DEFAULT_FLAGS: u8 = 0x01;
@@ -172,7 +172,7 @@ fn json_extract_value(root: &Value, paths: &[&str]) -> Result<SqliteValue> {
     }
 
     let encoded = encode_json_text("json_extract array encode failed", &Value::Array(out))?;
-    Ok(SqliteValue::Text(Arc::from(encoded)))
+    Ok(SqliteValue::Text(encoded.into()))
 }
 
 fn jsonb_extract_value(root: &Value, paths: &[&str]) -> Result<Vec<u8>> {
@@ -207,7 +207,7 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
         return Ok(SqliteValue::Null);
     };
     let encoded = encode_json_text("json_arrow encode failed", value)?;
-    Ok(SqliteValue::Text(Arc::from(encoded)))
+    Ok(SqliteValue::Text(encoded.into()))
 }
 
 fn json_array_length_value(root: &Value, path: Option<&str>) -> Result<Option<usize>> {
@@ -593,7 +593,7 @@ fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>
             for (key, item) in object {
                 let fullkey = append_object_path(base_path, key);
                 rows.push(JsonTableRow {
-                    key: SqliteValue::Text(Arc::from(key.as_str())),
+                    key: SqliteValue::Text(key.as_str().into()),
                     value: json_value_column(item)?,
                     type_name: json_type_name(item),
                     atom: json_atom_column(item),
@@ -1268,7 +1268,7 @@ fn append_array_path(base: &str, index: usize) -> String {
 fn json_value_column(value: &Value) -> Result<SqliteValue> {
     match value {
         Value::Array(_) | Value::Object(_) => serde_json::to_string(value)
-            .map(|s| SqliteValue::Text(Arc::from(s)))
+            .map(|s| SqliteValue::Text(s.into()))
             .map_err(|error| {
                 FrankenError::function_error(format!("json table value encode failed: {error}"))
             }),
@@ -1330,7 +1330,7 @@ fn append_tree_rows(
                 append_tree_rows(
                     rows,
                     item,
-                    SqliteValue::Text(Arc::from(child_key.as_str())),
+                    SqliteValue::Text(child_key.as_str().into()),
                     Some(current_id),
                     &child_fullkey,
                     fullkey,
@@ -1377,12 +1377,12 @@ fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32
     let value = match col {
         0 => row.key.clone(),
         1 => row.value.clone(),
-        2 => SqliteValue::Text(Arc::from(row.type_name)),
+        2 => SqliteValue::Text(row.type_name.into()),
         3 => row.atom.clone(),
         4 => SqliteValue::Integer(row.id),
         5 => row.parent.clone(),
-        6 => SqliteValue::Text(Arc::from(row.fullkey.as_str())),
-        7 => SqliteValue::Text(Arc::from(row.path.as_str())),
+        6 => SqliteValue::Text(row.fullkey.as_str().into()),
+        7 => SqliteValue::Text(row.path.as_str().into()),
         _ => {
             return Err(FrankenError::function_error(format!(
                 "json table-valued invalid column index {col}"
@@ -1429,10 +1429,10 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
                 SqliteValue::Float(number.as_f64().unwrap_or(0.0))
             }
         }
-        Value::String(text) => SqliteValue::Text(Arc::from(text.as_str())),
+        Value::String(text) => SqliteValue::Text(text.as_str().into()),
         Value::Array(_) | Value::Object(_) => {
             let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-            SqliteValue::Text(Arc::from(encoded))
+            SqliteValue::Text(encoded.into())
         }
     }
 }
@@ -1966,7 +1966,7 @@ impl ScalarFunction for JsonFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let encoded = encode_json_text("json serialize failed", &input)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2048,7 +2048,7 @@ impl ScalarFunction for JsonTypeFunc {
             None
         };
         Ok(match json_type_value(&input, path)? {
-            Some(kind) => SqliteValue::Text(Arc::from(kind)),
+            Some(kind) => SqliteValue::Text(SmallText::new(kind)),
             None => SqliteValue::Null,
         })
     }
@@ -2169,7 +2169,7 @@ pub struct JsonArrayFunc;
 impl ScalarFunction for JsonArrayFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let s = json_array(args)?;
-        Ok(SqliteValue::Text(Arc::from(s)))
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2203,7 +2203,7 @@ pub struct JsonObjectFunc;
 impl ScalarFunction for JsonObjectFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let s = json_object(args)?;
-        Ok(SqliteValue::Text(Arc::from(s)))
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2240,7 +2240,7 @@ impl ScalarFunction for JsonQuoteFunc {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
         let s = json_quote(&args[0])?;
-        Ok(SqliteValue::Text(Arc::from(s)))
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2282,7 +2282,7 @@ impl ScalarFunction for JsonSetFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2365,7 +2365,7 @@ impl ScalarFunction for JsonInsertFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2448,7 +2448,7 @@ impl ScalarFunction for JsonReplaceFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2519,7 +2519,7 @@ impl ScalarFunction for JsonRemoveFunc {
         if args.len() == 1 {
             // With just the JSON argument, validate and return minified.
             let encoded = encode_json_text("json serialize failed", &input)?;
-            return Ok(SqliteValue::Text(Arc::from(encoded)));
+            return Ok(SqliteValue::Text(SmallText::from_string(encoded)));
         }
         // SQLite returns NULL when any path argument is NULL.
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
@@ -2528,7 +2528,7 @@ impl ScalarFunction for JsonRemoveFunc {
         let paths = collect_path_args(self.name(), args, 1)?;
         let edited = json_remove_value(&input, &paths)?;
         let encoded = encode_json_text("json_remove encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2595,7 +2595,7 @@ impl ScalarFunction for JsonPatchFunc {
         let patch = json_arg_value(self.name(), args, 1)?;
         let merged = json_patch_value(&input, &patch);
         let encoded = encode_json_text("json_patch encode failed", &merged)?;
-        Ok(SqliteValue::Text(Arc::from(encoded)))
+        Ok(SqliteValue::Text(encoded.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -2725,7 +2725,7 @@ impl ScalarFunction for JsonPrettyFunc {
             None
         };
         let s = json_pretty_value(&input, indent)?;
-        Ok(SqliteValue::Text(Arc::from(s)))
+        Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2814,8 +2814,8 @@ mod tests {
             .expect("json_extract should be registered");
         let out = func
             .invoke(&[
-                SqliteValue::Text(Arc::from(r#"{"a":1,"b":[2,3]}"#)),
-                SqliteValue::Text(Arc::from("$.b[1]")),
+                SqliteValue::Text(SmallText::from_string(r#"{"a":1,"b":[2,3]}"#)),
+                SqliteValue::Text(SmallText::from_string("$.b[1]")),
             ])
             .unwrap();
         assert_eq!(out, SqliteValue::Integer(3));
@@ -2830,11 +2830,11 @@ mod tests {
             .expect("json_arrow should be registered");
         let out = func
             .invoke(&[
-                SqliteValue::Text(Arc::from(r#"{"a.b":1,"a":{"b":2}}"#)),
-                SqliteValue::Text(Arc::from("a.b")),
+                SqliteValue::Text(SmallText::from_string(r#"{"a.b":1,"a":{"b":2}}"#)),
+                SqliteValue::Text(SmallText::from_string("a.b")),
             ])
             .expect("json_arrow should normalize bare labels");
-        assert_eq!(out, SqliteValue::Text(Arc::from("1")));
+        assert_eq!(out, SqliteValue::Text(SmallText::from_string("1")));
     }
 
     #[test]
@@ -2846,7 +2846,7 @@ mod tests {
             .expect("json_double_arrow should be registered");
         let out = func
             .invoke(&[
-                SqliteValue::Text(Arc::from("[10,20,30]")),
+                SqliteValue::Text(SmallText::from_string("[10,20,30]")),
                 SqliteValue::Integer(1),
             ])
             .expect("json_double_arrow should normalize integer indexes");
@@ -2862,12 +2862,15 @@ mod tests {
             .expect("json_set should be registered");
         let out = func
             .invoke(&[
-                SqliteValue::Text(Arc::from(r#"{"a":1}"#)),
-                SqliteValue::Text(Arc::from("$.b")),
+                SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                SqliteValue::Text(SmallText::from_string("$.b")),
                 SqliteValue::Integer(2),
             ])
             .unwrap();
-        assert_eq!(out, SqliteValue::Text(Arc::from(r#"{"a":1,"b":2}"#)));
+        assert_eq!(
+            out,
+            SqliteValue::Text(SmallText::from_string(r#"{"a":1,"b":2}"#))
+        );
     }
 
     #[test]
@@ -2878,7 +2881,7 @@ mod tests {
             .find_scalar("jsonb", 1)
             .expect("jsonb should be registered");
         let out = func
-            .invoke(&[SqliteValue::Text(Arc::from(r#"{"a":[1,2]}"#))])
+            .invoke(&[SqliteValue::Text(SmallText::from_string(r#"{"a":[1,2]}"#))])
             .expect("jsonb should encode to JSONB");
         let SqliteValue::Blob(blob) = out else {
             panic!("jsonb should return BLOB");
@@ -2897,7 +2900,7 @@ mod tests {
         let out = func
             .invoke(&[
                 SqliteValue::Blob(Arc::from(input)),
-                SqliteValue::Text(Arc::from("$.a.b")),
+                SqliteValue::Text(SmallText::from_string("$.a.b")),
             ])
             .expect("json_extract should accept JSONB blob input");
         assert_eq!(out, SqliteValue::Integer(7));
@@ -2914,7 +2917,7 @@ mod tests {
         let out = func
             .invoke(&[
                 SqliteValue::Blob(Arc::from(input)),
-                SqliteValue::Text(Arc::from("$.b")),
+                SqliteValue::Text(SmallText::from_string("$.b")),
                 SqliteValue::Integer(9),
             ])
             .expect("jsonb_set should accept JSONB blob input");
@@ -3053,25 +3056,28 @@ mod tests {
     #[test]
     fn test_json_extract_multiple() {
         let result = json_extract(r#"{"a":1,"b":2}"#, &["$.a", "$.b"]).unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("[1,2]")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("[1,2]")));
     }
 
     #[test]
     fn test_json_extract_string_unwrap() {
         let result = json_extract(r#"{"a":"hello"}"#, &["$.a"]).unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("hello")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("hello")));
     }
 
     #[test]
     fn test_arrow_preserves_json() {
         let result = json_arrow(r#"{"a":"hello"}"#, "$.a").unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from(r#""hello""#)));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string(r#""hello""#))
+        );
     }
 
     #[test]
     fn test_double_arrow_unwraps() {
         let result = json_double_arrow(r#"{"a":"hello"}"#, "$.a").unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("hello")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("hello")));
     }
 
     #[test]
@@ -3102,7 +3108,7 @@ mod tests {
     #[test]
     fn test_json_quote_text() {
         assert_eq!(
-            json_quote(&SqliteValue::Text(Arc::from("hello"))).unwrap(),
+            json_quote(&SqliteValue::Text(SmallText::from_string("hello"))).unwrap(),
             r#""hello""#
         );
     }
@@ -3116,7 +3122,7 @@ mod tests {
     fn test_json_array_basic() {
         let out = json_array(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("two")),
+            SqliteValue::Text(SmallText::from_string("two")),
             SqliteValue::Null,
         ])
         .unwrap();
@@ -3126,10 +3132,10 @@ mod tests {
     #[test]
     fn test_json_object_basic() {
         let out = json_object(&[
-            SqliteValue::Text(Arc::from("a")),
+            SqliteValue::Text(SmallText::from_string("a")),
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("b")),
-            SqliteValue::Text(Arc::from("two")),
+            SqliteValue::Text(SmallText::from_string("b")),
+            SqliteValue::Text(SmallText::from_string("two")),
         ])
         .unwrap();
         assert_eq!(out, r#"{"a":1,"b":"two"}"#);
@@ -3146,7 +3152,7 @@ mod tests {
     fn test_jsonb_array_variant() {
         let blob = jsonb_array(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("two")),
+            SqliteValue::Text(SmallText::from_string("two")),
             SqliteValue::Null,
         ])
         .unwrap();
@@ -3156,10 +3162,10 @@ mod tests {
     #[test]
     fn test_jsonb_object_variant() {
         let blob = jsonb_object(&[
-            SqliteValue::Text(Arc::from("a")),
+            SqliteValue::Text(SmallText::from_string("a")),
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("b")),
-            SqliteValue::Text(Arc::from("two")),
+            SqliteValue::Text(SmallText::from_string("b")),
+            SqliteValue::Text(SmallText::from_string("two")),
         ])
         .unwrap();
         assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":"two"}"#);
@@ -3389,8 +3395,14 @@ mod tests {
     #[test]
     fn test_json_group_object_basic() {
         let out = json_group_object(&[
-            (SqliteValue::Text(Arc::from("a")), SqliteValue::Integer(1)),
-            (SqliteValue::Text(Arc::from("b")), SqliteValue::Integer(2)),
+            (
+                SqliteValue::Text(SmallText::from_string("a")),
+                SqliteValue::Integer(1),
+            ),
+            (
+                SqliteValue::Text(SmallText::from_string("b")),
+                SqliteValue::Integer(2),
+            ),
         ])
         .unwrap();
         assert_eq!(out, r#"{"a":1,"b":2}"#);
@@ -3399,8 +3411,14 @@ mod tests {
     #[test]
     fn test_json_group_object_duplicate_keys_last_wins() {
         let out = json_group_object(&[
-            (SqliteValue::Text(Arc::from("k")), SqliteValue::Integer(1)),
-            (SqliteValue::Text(Arc::from("k")), SqliteValue::Integer(2)),
+            (
+                SqliteValue::Text(SmallText::from_string("k")),
+                SqliteValue::Integer(1),
+            ),
+            (
+                SqliteValue::Text(SmallText::from_string("k")),
+                SqliteValue::Integer(2),
+            ),
         ])
         .unwrap();
         assert_eq!(out, r#"{"k":2}"#);
@@ -3411,9 +3429,11 @@ mod tests {
         let array_blob = jsonb_group_array(&[SqliteValue::Integer(1), SqliteValue::Null]).unwrap();
         assert_eq!(json_from_jsonb(&array_blob).unwrap(), "[1,null]");
 
-        let object_blob =
-            jsonb_group_object(&[(SqliteValue::Text(Arc::from("a")), SqliteValue::Integer(7))])
-                .unwrap();
+        let object_blob = jsonb_group_object(&[(
+            SqliteValue::Text(SmallText::from_string("a")),
+            SqliteValue::Integer(7),
+        )])
+        .unwrap();
         assert_eq!(json_from_jsonb(&object_blob).unwrap(), r#"{"a":7}"#);
     }
 
@@ -3431,8 +3451,8 @@ mod tests {
     fn test_json_each_object() {
         let rows = json_each(r#"{"a":1,"b":2}"#, None).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].key, SqliteValue::Text(Arc::from("a")));
-        assert_eq!(rows[1].key, SqliteValue::Text(Arc::from("b")));
+        assert_eq!(rows[0].key, SqliteValue::Text(SmallText::from_string("a")));
+        assert_eq!(rows[1].key, SqliteValue::Text(SmallText::from_string("b")));
         assert_eq!(rows[0].value, SqliteValue::Integer(1));
         assert_eq!(rows[1].value, SqliteValue::Integer(2));
     }
@@ -3448,7 +3468,10 @@ mod tests {
     #[test]
     fn test_json_each_nested_value_is_json_text() {
         let rows = json_each(r#"{"a":[1,2]}"#, None).unwrap();
-        assert_eq!(rows[0].value, SqliteValue::Text(Arc::from("[1,2]")));
+        assert_eq!(
+            rows[0].value,
+            SqliteValue::Text(SmallText::from_string("[1,2]"))
+        );
         assert_eq!(rows[0].atom, SqliteValue::Null); // arrays have null atom
     }
 
@@ -3466,7 +3489,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.fullkey == "$.a.b")
             .expect("nested row should exist");
-        assert_eq!(row.key, SqliteValue::Text(Arc::from("b")));
+        assert_eq!(row.key, SqliteValue::Text(SmallText::from_string("b")));
         assert_eq!(row.value, SqliteValue::Integer(1));
         assert_eq!(row.type_name, "integer");
         assert_eq!(row.atom, SqliteValue::Integer(1));
@@ -3484,8 +3507,8 @@ mod tests {
                 0,
                 None,
                 &[
-                    SqliteValue::Text(Arc::from(r#"{"a":{"b":1}}"#)),
-                    SqliteValue::Text(Arc::from("$.a")),
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":{"b":1}}"#)),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
                 ],
             )
             .unwrap();
@@ -3517,7 +3540,7 @@ mod tests {
                 None,
                 &[
                     SqliteValue::Blob(Arc::from(input)),
-                    SqliteValue::Text(Arc::from("$.a")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
                 ],
             )
             .expect("json_each cursor should accept JSONB blob input");
@@ -3549,7 +3572,7 @@ mod tests {
                 None,
                 &[
                     SqliteValue::Blob(Arc::from(input)),
-                    SqliteValue::Text(Arc::from("$.a")),
+                    SqliteValue::Text(SmallText::from_string("$.a")),
                 ],
             )
             .expect("json_tree cursor should accept JSONB blob input");
@@ -3687,7 +3710,7 @@ mod tests {
         assert!(json_extract(r#"{"a":1}"#, empty).is_err());
 
         let func = JsonExtractFunc;
-        let args = vec![SqliteValue::Text(Arc::from(r#"{"a":1}"#))];
+        let args = vec![SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#))];
         assert_eq!(func.invoke(&args).unwrap(), SqliteValue::Null);
     }
 
@@ -3714,7 +3737,10 @@ mod tests {
     #[test]
     fn test_json_extract_multiple_with_missing() {
         let result = json_extract(r#"{"a":1}"#, &["$.a", "$.b"]).unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("[1,null]")));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("[1,null]"))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3730,13 +3756,13 @@ mod tests {
     #[test]
     fn test_json_arrow_number() {
         let result = json_arrow(r#"{"a":42}"#, "$.a").unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("42")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("42")));
     }
 
     #[test]
     fn test_json_arrow_null() {
         let result = json_arrow(r#"{"a":null}"#, "$.a").unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("null")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("null")));
     }
 
     // -----------------------------------------------------------------------
@@ -3840,7 +3866,7 @@ mod tests {
         );
 
         let blob3 = jsonb_object(&[
-            SqliteValue::Text(Arc::from("key")),
+            SqliteValue::Text(SmallText::from_string("key")),
             SqliteValue::Integer(42),
         ])
         .unwrap();
@@ -3894,7 +3920,7 @@ mod tests {
 
     #[test]
     fn test_json_quote_text_special_chars() {
-        let result = json_quote(&SqliteValue::Text(Arc::from("a\"b\\c"))).unwrap();
+        let result = json_quote(&SqliteValue::Text(SmallText::from_string("a\"b\\c"))).unwrap();
         assert!(result.contains("\\\""));
         assert!(result.contains("\\\\"));
     }
@@ -3906,9 +3932,9 @@ mod tests {
     #[test]
     fn test_json_object_odd_args_error() {
         let err = json_object(&[
-            SqliteValue::Text(Arc::from("a")),
+            SqliteValue::Text(SmallText::from_string("a")),
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("b")),
+            SqliteValue::Text(SmallText::from_string("b")),
         ]);
         assert!(err.is_err());
     }
@@ -3927,9 +3953,9 @@ mod tests {
     #[test]
     fn test_json_object_duplicate_keys() {
         let out = json_object(&[
-            SqliteValue::Text(Arc::from("k")),
+            SqliteValue::Text(SmallText::from_string("k")),
             SqliteValue::Integer(1),
-            SqliteValue::Text(Arc::from("k")),
+            SqliteValue::Text(SmallText::from_string("k")),
             SqliteValue::Integer(2),
         ])
         .unwrap();

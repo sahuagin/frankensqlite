@@ -19,8 +19,8 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_func::scalar::ScalarFunction;
 use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
-use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;
+use fsqlite_types::value::{SmallText, SqliteValue};
 use rand::RngCore;
 use tracing::{debug, info};
 
@@ -517,10 +517,8 @@ impl ScalarFunction for DecimalFunc {
             return Ok(SqliteValue::Null);
         }
         let text = args[0].to_text();
-        Ok(SqliteValue::Text(Arc::from(
-            decimal_normalize(&text)
-                .unwrap_or_else(|| text.clone())
-                .as_str(),
+        Ok(SqliteValue::Text(SmallText::from_string(
+            decimal_normalize(&text).unwrap_or_else(|| text.clone()),
         )))
     }
 
@@ -550,7 +548,7 @@ impl ScalarFunction for DecimalAddFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_add invoked");
         Ok(match decimal_add_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result)),
+            Some(result) => SqliteValue::Text(SmallText::from_string(result)),
             None => SqliteValue::Null,
         })
     }
@@ -581,7 +579,7 @@ impl ScalarFunction for DecimalSubFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_sub invoked");
         Ok(match decimal_sub_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result)),
+            Some(result) => SqliteValue::Text(SmallText::from_string(result)),
             None => SqliteValue::Null,
         })
     }
@@ -612,7 +610,7 @@ impl ScalarFunction for DecimalMulFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_mul invoked");
         Ok(match decimal_mul_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result)),
+            Some(result) => SqliteValue::Text(SmallText::from_string(result)),
             None => SqliteValue::Null,
         })
     }
@@ -786,7 +784,7 @@ impl ScalarFunction for UuidFunc {
         }
         let uuid = generate_uuid_v4();
         debug!(uuid = %uuid, "uuid() generated");
-        Ok(SqliteValue::Text(Arc::from(uuid)))
+        Ok(SqliteValue::Text(SmallText::from_string(uuid)))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -818,13 +816,13 @@ impl ScalarFunction for UuidStrFunc {
         match &args[0] {
             SqliteValue::Blob(b) => {
                 let s = blob_to_uuid_str(b)?;
-                Ok(SqliteValue::Text(Arc::from(s)))
+                Ok(SqliteValue::Text(SmallText::from_string(s)))
             }
             SqliteValue::Text(s) => {
                 // If already a string, normalize it
                 let blob = uuid_str_to_blob(s)?;
                 let normalized = blob_to_uuid_str(&blob)?;
-                Ok(SqliteValue::Text(Arc::from(normalized)))
+                Ok(SqliteValue::Text(SmallText::from_string(normalized)))
             }
             _ => Err(FrankenError::internal(
                 "uuid_str: argument must be a blob or text",
@@ -1241,7 +1239,9 @@ mod tests {
     #[test]
     fn test_uuid_blob_length() {
         let result = UuidBlobFunc
-            .invoke(&[SqliteValue::Text(Arc::from(generate_uuid_v4().as_str()))])
+            .invoke(&[SqliteValue::Text(SmallText::from_string(
+                generate_uuid_v4().as_str(),
+            ))])
             .unwrap();
         if let SqliteValue::Blob(b) = result {
             assert_eq!(b.len(), 16, "uuid_blob should return 16-byte blob");
@@ -1257,7 +1257,10 @@ mod tests {
         let result = UuidStrFunc
             .invoke(&[SqliteValue::Blob(Arc::from(blob.as_slice()))])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from(uuid.as_str())));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string(uuid.as_str()))
+        );
     }
 
     // ── registration ─────────────────────────────────────────────────
@@ -1520,7 +1523,10 @@ mod tests {
     #[test]
     fn test_decimal_add_func_null_propagation() {
         let result = DecimalAddFunc
-            .invoke(&[SqliteValue::Null, SqliteValue::Text(Arc::from("1"))])
+            .invoke(&[
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::from_string("1")),
+            ])
             .unwrap();
         assert_eq!(result, SqliteValue::Null);
     }
@@ -1528,7 +1534,10 @@ mod tests {
     #[test]
     fn test_decimal_sub_func_null_propagation() {
         let result = DecimalSubFunc
-            .invoke(&[SqliteValue::Text(Arc::from("1")), SqliteValue::Null])
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("1")),
+                SqliteValue::Null,
+            ])
             .unwrap();
         assert_eq!(result, SqliteValue::Null);
     }
@@ -1544,7 +1553,10 @@ mod tests {
     #[test]
     fn test_decimal_cmp_func_null_propagation() {
         let result = DecimalCmpFunc
-            .invoke(&[SqliteValue::Null, SqliteValue::Text(Arc::from("1"))])
+            .invoke(&[
+                SqliteValue::Null,
+                SqliteValue::Text(SmallText::from_string("1")),
+            ])
             .unwrap();
         assert_eq!(result, SqliteValue::Null);
     }
@@ -1617,9 +1629,12 @@ mod tests {
         // uuid_str with text input should normalize via blob roundtrip
         let uuid = generate_uuid_v4();
         let result = UuidStrFunc
-            .invoke(&[SqliteValue::Text(Arc::from(uuid.as_str()))])
+            .invoke(&[SqliteValue::Text(SmallText::from_string(uuid.as_str()))])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from(uuid.as_str())));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string(uuid.as_str()))
+        );
     }
 
     #[test]

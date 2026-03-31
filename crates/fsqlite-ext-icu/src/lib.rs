@@ -21,7 +21,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_func::collation::{CollationFunction, CollationRegistry};
 use fsqlite_func::scalar::ScalarFunction;
-use fsqlite_types::SqliteValue;
+use fsqlite_types::{SmallText, SqliteValue};
 use tracing::{debug, info};
 
 #[must_use]
@@ -197,7 +197,7 @@ impl ScalarFunction for IcuUpperFunc {
             "icu_upper invoked"
         );
         let upper = icu_to_upper(&text, &locale);
-        Ok(SqliteValue::Text(Arc::from(upper)))
+        Ok(SqliteValue::Text(SmallText::from_string(upper)))
     }
 
     fn num_args(&self) -> i32 {
@@ -241,7 +241,7 @@ impl ScalarFunction for IcuLowerFunc {
             "icu_lower invoked"
         );
         let lower = icu_to_lower(&text, &locale);
-        Ok(SqliteValue::Text(Arc::from(lower)))
+        Ok(SqliteValue::Text(SmallText::from_string(lower)))
     }
 
     fn num_args(&self) -> i32 {

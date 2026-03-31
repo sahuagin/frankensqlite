@@ -19,7 +19,7 @@ use fsqlite_ast::{
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 use fsqlite_types::value::classify_sql_like_fast_path;
-use fsqlite_types::{SqliteValue, StrictColumnType, TypeAffinity};
+use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 
 // ---------------------------------------------------------------------------
 // Thread-local extra aggregate function names for UDF support (bd-2wt.3)
@@ -9947,7 +9947,7 @@ fn compile_time_insert_value(expr: &Expr) -> Option<SqliteValue> {
     Some(match literal {
         Literal::Integer(value) => SqliteValue::Integer(*value),
         Literal::Float(value) => SqliteValue::Float(*value),
-        Literal::String(value) => SqliteValue::Text(Arc::from(value.as_str())),
+        Literal::String(value) => SqliteValue::Text(SmallText::new(value.as_str())),
         Literal::Blob(value) => SqliteValue::Blob(Arc::from(value.as_slice())),
         Literal::Null => SqliteValue::Null,
         Literal::True => SqliteValue::Integer(1),

@@ -641,7 +641,7 @@ pub fn decode_column_from_offset_reuse(
                 if profile_enabled {
                     note_decoded_value(hint);
                 }
-                return Some(SqliteValue::Text(Arc::clone(arc)));
+                return Some(SqliteValue::Text(arc.clone()));
             }
             (SerialTypeClass::Blob, SqliteValue::Blob(arc)) if arc.as_ref() == bytes => {
                 if profile_enabled {
@@ -938,8 +938,11 @@ where
     // ── Phase 2: single-pass write header + body ─────────────────────
     let header_size = compute_header_size(header_content_size);
     let total_size = header_size + body_size;
-    buf.clear();
-    buf.resize(total_size, 0);
+    if buf.len() < total_size {
+        buf.resize(total_size, 0);
+    } else {
+        buf.truncate(total_size);
+    }
 
     let mut offset = write_varint(buf, header_size as u64);
     for &st in serial_types {
@@ -1015,7 +1018,7 @@ pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Op
         }
         SerialTypeClass::Text => std::str::from_utf8(bytes)
             .ok()
-            .map(|text| SqliteValue::Text(Arc::from(text))),
+            .map(|text| SqliteValue::Text(text.into())),
         SerialTypeClass::Blob => Some(SqliteValue::Blob(Arc::from(bytes))),
         SerialTypeClass::Reserved => None,
     };
@@ -1070,7 +1073,7 @@ fn decode_value_into(
                     return Some(());
                 }
             }
-            *slot = SqliteValue::Text(Arc::from(text));
+            *slot = SqliteValue::Text(text.into());
         }
         SerialTypeClass::Blob => {
             // bd-db300.4.4.2 K1: same reuse optimization for blobs.

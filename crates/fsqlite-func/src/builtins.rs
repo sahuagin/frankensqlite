@@ -28,8 +28,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::SqliteValue;
 use fsqlite_types::value::{format_sqlite_float, sql_like};
+use fsqlite_types::{SmallText, SqliteValue};
 
 use crate::agg_builtins::register_aggregate_builtins;
 use crate::datetime::register_datetime_builtins;
@@ -163,7 +163,7 @@ impl ScalarFunction for CharFunc {
                 result.push(c);
             }
         }
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -218,7 +218,7 @@ impl ScalarFunction for ConcatFunc {
                 result.push_str(&arg.to_text());
             }
         }
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -237,7 +237,7 @@ pub struct ConcatWsFunc;
 impl ScalarFunction for ConcatWsFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args.is_empty() {
-            return Ok(SqliteValue::Text(Arc::from("")));
+            return Ok(SqliteValue::Text(SmallText::new("")));
         }
         // C SQLite: concat_ws(NULL, ...) returns NULL when separator is NULL.
         if args[0].is_null() {
@@ -251,7 +251,7 @@ impl ScalarFunction for ConcatWsFunc {
                 parts.push(arg.to_text());
             }
         }
-        Ok(SqliteValue::Text(Arc::from(parts.join(&sep))))
+        Ok(SqliteValue::Text(SmallText::from_string(parts.join(&sep))))
     }
 
     fn num_args(&self) -> i32 {
@@ -273,7 +273,7 @@ impl ScalarFunction for HexFunc {
         // For NULL: blob returns NULL ptr, bytes returns 0, producing "" (empty string).
         // This has been consistent across all SQLite versions including 3.52.0.
         if args[0].is_null() {
-            return Ok(SqliteValue::Text(Arc::from("")));
+            return Ok(SqliteValue::Text(SmallText::new("")));
         }
         let bytes = match &args[0] {
             SqliteValue::Blob(b) => b.to_vec(),
@@ -284,7 +284,7 @@ impl ScalarFunction for HexFunc {
         for b in &bytes {
             let _ = write!(hex, "{b:02X}");
         }
-        Ok(SqliteValue::Text(Arc::from(hex)))
+        Ok(SqliteValue::Text(SmallText::from_string(hex)))
     }
 
     fn num_args(&self) -> i32 {
@@ -473,7 +473,7 @@ impl ScalarFunction for LowerFunc {
             return Ok(SqliteValue::Null);
         }
         let lowered = text_arg(&args[0]).as_ref().to_ascii_lowercase();
-        Ok(SqliteValue::Text(Arc::from(lowered)))
+        Ok(SqliteValue::Text(SmallText::from_string(lowered)))
     }
 
     fn num_args(&self) -> i32 {
@@ -493,7 +493,7 @@ impl ScalarFunction for UpperFunc {
             return Ok(SqliteValue::Null);
         }
         let upper = text_arg(&args[0]).as_ref().to_ascii_uppercase();
-        Ok(SqliteValue::Text(Arc::from(upper)))
+        Ok(SqliteValue::Text(SmallText::from_string(upper)))
     }
 
     fn num_args(&self) -> i32 {
@@ -539,7 +539,7 @@ impl ScalarFunction for TrimFunc {
         } else {
             " ".to_owned()
         };
-        Ok(SqliteValue::Text(Arc::from(
+        Ok(SqliteValue::Text(SmallText::new(
             trim_chars(&s, &chars).as_str(),
         )))
     }
@@ -564,7 +564,7 @@ impl ScalarFunction for LtrimFunc {
         } else {
             " ".to_owned()
         };
-        Ok(SqliteValue::Text(Arc::from(
+        Ok(SqliteValue::Text(SmallText::new(
             ltrim_chars(&s, &chars).as_str(),
         )))
     }
@@ -589,7 +589,7 @@ impl ScalarFunction for RtrimFunc {
         } else {
             " ".to_owned()
         };
-        Ok(SqliteValue::Text(Arc::from(
+        Ok(SqliteValue::Text(SmallText::new(
             rtrim_chars(&s, &chars).as_str(),
         )))
     }
@@ -638,7 +638,7 @@ impl ScalarFunction for TypeofFunc {
             SqliteValue::Text(_) => "text",
             SqliteValue::Blob(_) => "blob",
         };
-        Ok(SqliteValue::Text(Arc::from(type_name)))
+        Ok(SqliteValue::Text(SmallText::new(type_name)))
     }
 
     fn num_args(&self) -> i32 {
@@ -683,7 +683,7 @@ impl ScalarFunction for ReplaceFunc {
         let y = args[1].to_text();
         let z = args[2].to_text();
         if y.is_empty() {
-            return Ok(SqliteValue::Text(Arc::from(x)));
+            return Ok(SqliteValue::Text(SmallText::from_string(x)));
         }
 
         // Prevent OOM from massive string expansion
@@ -695,7 +695,7 @@ impl ScalarFunction for ReplaceFunc {
             }
         }
 
-        Ok(SqliteValue::Text(Arc::from(x.replace(&y, &z))))
+        Ok(SqliteValue::Text(SmallText::from_string(x.replace(&y, &z))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1012,7 +1012,7 @@ impl ScalarFunction for QuoteFunc {
                 hex
             }
         };
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1178,18 +1178,18 @@ impl ScalarFunction for SubstrFunc {
             p2 = len.saturating_sub(p1);
         }
         if p2 <= 0 {
-            return Ok(SqliteValue::Text(Arc::from("")));
+            return Ok(SqliteValue::Text(SmallText::new("")));
         }
 
         if ascii_fast_path {
             let start = p1 as usize;
             let end = (p1 + p2) as usize;
-            return Ok(SqliteValue::Text(Arc::from(&s[start..end])));
+            return Ok(SqliteValue::Text(SmallText::new(&s[start..end])));
         }
 
         let chars: Vec<char> = s.chars().collect();
         let result: String = chars[p1 as usize..(p1 + p2) as usize].iter().collect();
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1268,10 +1268,10 @@ impl ScalarFunction for SoundexFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
             // SQLite returns "?000" for SOUNDEX(NULL), not NULL.
-            return Ok(SqliteValue::Text(Arc::from("?000")));
+            return Ok(SqliteValue::Text(SmallText::new("?000")));
         }
         let s = args[0].to_text();
-        Ok(SqliteValue::Text(Arc::from(soundex(&s))))
+        Ok(SqliteValue::Text(SmallText::from_string(soundex(&s))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1438,7 +1438,7 @@ pub struct SqliteVersionFunc;
 
 impl ScalarFunction for SqliteVersionFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(Arc::from(
+        Ok(SqliteValue::Text(SmallText::new(
             fsqlite_types::FRANKENSQLITE_SQLITE_VERSION,
         )))
     }
@@ -1458,7 +1458,7 @@ pub struct SqliteSourceIdFunc;
 
 impl ScalarFunction for SqliteSourceIdFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(Arc::from(
+        Ok(SqliteValue::Text(SmallText::new(
             fsqlite_types::FRANKENSQLITE_SOURCE_ID,
         )))
     }
@@ -1517,7 +1517,7 @@ impl ScalarFunction for SqliteCompileoptionGetFunc {
         ];
         #[allow(clippy::cast_sign_loss)]
         match options.get(n as usize) {
-            Some(opt) => Ok(SqliteValue::Text(Arc::from(*opt))),
+            Some(opt) => Ok(SqliteValue::Text(SmallText::new(*opt))),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -1729,7 +1729,7 @@ impl ScalarFunction for UnistrFunc {
             result.push(chars[i]);
             i += 1;
         }
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1949,7 +1949,7 @@ impl ScalarFunction for FormatFunc {
         let fmt_str = args[0].to_text();
         let params = &args[1..];
         let result = sqlite_format(&fmt_str, params)?;
-        Ok(SqliteValue::Text(Arc::from(result)))
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2382,7 +2382,7 @@ mod tests {
     #[test]
     fn test_abs_string_coercion() {
         assert_eq!(
-            invoke1(&AbsFunc, SqliteValue::Text(Arc::from("-7.5"))).unwrap(),
+            invoke1(&AbsFunc, SqliteValue::Text(SmallText::from_string("-7.5"))).unwrap(),
             SqliteValue::Float(7.5)
         );
     }
@@ -2391,15 +2391,23 @@ mod tests {
     fn test_abs_whitespace_padded_text() {
         // SQLite's abs() casts non-integers to REAL, even if they parse cleanly as integers
         assert_eq!(
-            invoke1(&AbsFunc, SqliteValue::Text(Arc::from("  42  "))).unwrap(),
+            invoke1(
+                &AbsFunc,
+                SqliteValue::Text(SmallText::from_string("  42  "))
+            )
+            .unwrap(),
             SqliteValue::Float(42.0)
         );
         assert_eq!(
-            invoke1(&AbsFunc, SqliteValue::Text(Arc::from("  -7.5  "))).unwrap(),
+            invoke1(
+                &AbsFunc,
+                SqliteValue::Text(SmallText::from_string("  -7.5  "))
+            )
+            .unwrap(),
             SqliteValue::Float(7.5)
         );
         assert_eq!(
-            invoke1(&AbsFunc, SqliteValue::Text(Arc::from("abc"))).unwrap(),
+            invoke1(&AbsFunc, SqliteValue::Text(SmallText::from_string("abc"))).unwrap(),
             SqliteValue::Float(0.0)
         );
     }
@@ -2427,7 +2435,7 @@ mod tests {
                 SqliteValue::Integer(111),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("Hello")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("Hello")));
     }
 
     #[test]
@@ -2441,7 +2449,7 @@ mod tests {
                 SqliteValue::Integer(66),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("A\0B")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("A\0B")));
     }
 
     // ── coalesce ─────────────────────────────────────────────────────────
@@ -2468,11 +2476,11 @@ mod tests {
         let result = f
             .invoke(&[
                 SqliteValue::Null,
-                SqliteValue::Text(Arc::from("hello")),
+                SqliteValue::Text(SmallText::from_string("hello")),
                 SqliteValue::Null,
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("hello")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("hello")));
     }
 
     // ── concat_ws ────────────────────────────────────────────────────────
@@ -2482,13 +2490,13 @@ mod tests {
         let f = ConcatWsFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from(",")),
-                SqliteValue::Text(Arc::from("a")),
+                SqliteValue::Text(SmallText::from_string(",")),
+                SqliteValue::Text(SmallText::from_string("a")),
                 SqliteValue::Null,
-                SqliteValue::Text(Arc::from("b")),
+                SqliteValue::Text(SmallText::from_string("b")),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("a,b")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("a,b")));
     }
 
     // ── hex ──────────────────────────────────────────────────────────────
@@ -2500,14 +2508,17 @@ mod tests {
             SqliteValue::Blob(Arc::from([0xDE, 0xAD, 0xBE, 0xEF].as_slice())),
         )
         .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("DEADBEEF")));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("DEADBEEF"))
+        );
     }
 
     #[test]
     fn test_hex_number_via_text() {
         // hex(42) encodes '42' as UTF-8 hex, not raw bits
         let result = invoke1(&HexFunc, SqliteValue::Integer(42)).unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("3432")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("3432")));
     }
 
     // ── iif ──────────────────────────────────────────────────────────────
@@ -2518,11 +2529,11 @@ mod tests {
         let result = f
             .invoke(&[
                 SqliteValue::Integer(1),
-                SqliteValue::Text(Arc::from("yes")),
-                SqliteValue::Text(Arc::from("no")),
+                SqliteValue::Text(SmallText::from_string("yes")),
+                SqliteValue::Text(SmallText::from_string("no")),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("yes")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("yes")));
     }
 
     #[test]
@@ -2531,11 +2542,11 @@ mod tests {
         let result = f
             .invoke(&[
                 SqliteValue::Integer(0),
-                SqliteValue::Text(Arc::from("yes")),
-                SqliteValue::Text(Arc::from("no")),
+                SqliteValue::Text(SmallText::from_string("yes")),
+                SqliteValue::Text(SmallText::from_string("no")),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("no")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("no")));
     }
 
     #[test]
@@ -2545,12 +2556,12 @@ mod tests {
         let f = IifFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("  5  ")),
-                SqliteValue::Text(Arc::from("yes")),
-                SqliteValue::Text(Arc::from("no")),
+                SqliteValue::Text(SmallText::from_string("  5  ")),
+                SqliteValue::Text(SmallText::from_string("yes")),
+                SqliteValue::Text(SmallText::from_string("no")),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("yes")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("yes")));
     }
 
     // ── ifnull ───────────────────────────────────────────────────────────
@@ -2583,8 +2594,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &InstrFunc,
-                SqliteValue::Text(Arc::from("hello world")),
-                SqliteValue::Text(Arc::from("world"))
+                SqliteValue::Text(SmallText::from_string("hello world")),
+                SqliteValue::Text(SmallText::from_string("world"))
             )
             .unwrap(),
             SqliteValue::Integer(7)
@@ -2596,8 +2607,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &InstrFunc,
-                SqliteValue::Text(Arc::from("hello")),
-                SqliteValue::Text(Arc::from("xyz"))
+                SqliteValue::Text(SmallText::from_string("hello")),
+                SqliteValue::Text(SmallText::from_string("xyz"))
             )
             .unwrap(),
             SqliteValue::Integer(0)
@@ -2610,8 +2621,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &InstrFunc,
-                SqliteValue::Text(Arc::from("hello")),
-                SqliteValue::Text(Arc::from(""))
+                SqliteValue::Text(SmallText::from_string("hello")),
+                SqliteValue::Text(SmallText::new(""))
             )
             .unwrap(),
             SqliteValue::Integer(1)
@@ -2623,8 +2634,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &InstrFunc,
-                SqliteValue::Text(Arc::from("")),
-                SqliteValue::Text(Arc::from("x"))
+                SqliteValue::Text(SmallText::new("")),
+                SqliteValue::Text(SmallText::from_string("x"))
             )
             .unwrap(),
             SqliteValue::Integer(0)
@@ -2651,7 +2662,11 @@ mod tests {
     fn test_length_text_chars() {
         // café is 4 characters, 5 bytes
         assert_eq!(
-            invoke1(&LengthFunc, SqliteValue::Text(Arc::from("café"))).unwrap(),
+            invoke1(
+                &LengthFunc,
+                SqliteValue::Text(SmallText::from_string("café"))
+            )
+            .unwrap(),
             SqliteValue::Integer(4)
         );
     }
@@ -2670,7 +2685,11 @@ mod tests {
     fn test_octet_length_multibyte() {
         // café: 'c'=1, 'a'=1, 'f'=1, 'é'=2 bytes = 5 bytes total
         assert_eq!(
-            invoke1(&OctetLengthFunc, SqliteValue::Text(Arc::from("café"))).unwrap(),
+            invoke1(
+                &OctetLengthFunc,
+                SqliteValue::Text(SmallText::from_string("café"))
+            )
+            .unwrap(),
             SqliteValue::Integer(5)
         );
     }
@@ -2680,16 +2699,24 @@ mod tests {
     #[test]
     fn test_lower_ascii() {
         assert_eq!(
-            invoke1(&LowerFunc, SqliteValue::Text(Arc::from("HELLO"))).unwrap(),
-            SqliteValue::Text(Arc::from("hello"))
+            invoke1(
+                &LowerFunc,
+                SqliteValue::Text(SmallText::from_string("HELLO"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("hello"))
         );
     }
 
     #[test]
     fn test_upper_ascii() {
         assert_eq!(
-            invoke1(&UpperFunc, SqliteValue::Text(Arc::from("hello"))).unwrap(),
-            SqliteValue::Text(Arc::from("HELLO"))
+            invoke1(
+                &UpperFunc,
+                SqliteValue::Text(SmallText::from_string("hello"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("HELLO"))
         );
     }
 
@@ -2699,9 +2726,9 @@ mod tests {
     fn test_trim_default() {
         let f = TrimFunc;
         assert_eq!(
-            f.invoke(&[SqliteValue::Text(Arc::from("  hello  "))])
+            f.invoke(&[SqliteValue::Text(SmallText::from_string("  hello  "))])
                 .unwrap(),
-            SqliteValue::Text(Arc::from("hello"))
+            SqliteValue::Text(SmallText::from_string("hello"))
         );
     }
 
@@ -2709,9 +2736,9 @@ mod tests {
     fn test_ltrim_default() {
         let f = LtrimFunc;
         assert_eq!(
-            f.invoke(&[SqliteValue::Text(Arc::from("  hello"))])
+            f.invoke(&[SqliteValue::Text(SmallText::from_string("  hello"))])
                 .unwrap(),
-            SqliteValue::Text(Arc::from("hello"))
+            SqliteValue::Text(SmallText::from_string("hello"))
         );
     }
 
@@ -2720,11 +2747,11 @@ mod tests {
         let f = LtrimFunc;
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text(Arc::from("xxhello")),
-                SqliteValue::Text(Arc::from("x")),
+                SqliteValue::Text(SmallText::from_string("xxhello")),
+                SqliteValue::Text(SmallText::from_string("x")),
             ])
             .unwrap(),
-            SqliteValue::Text(Arc::from("hello"))
+            SqliteValue::Text(SmallText::from_string("hello"))
         );
     }
 
@@ -2762,23 +2789,23 @@ mod tests {
     fn test_typeof_each() {
         assert_eq!(
             invoke1(&TypeofFunc, SqliteValue::Null).unwrap(),
-            SqliteValue::Text(Arc::from("null"))
+            SqliteValue::Text(SmallText::from_string("null"))
         );
         assert_eq!(
             invoke1(&TypeofFunc, SqliteValue::Integer(1)).unwrap(),
-            SqliteValue::Text(Arc::from("integer"))
+            SqliteValue::Text(SmallText::from_string("integer"))
         );
         assert_eq!(
             invoke1(&TypeofFunc, SqliteValue::Float(1.0)).unwrap(),
-            SqliteValue::Text(Arc::from("real"))
+            SqliteValue::Text(SmallText::from_string("real"))
         );
         assert_eq!(
-            invoke1(&TypeofFunc, SqliteValue::Text(Arc::from("x"))).unwrap(),
-            SqliteValue::Text(Arc::from("text"))
+            invoke1(&TypeofFunc, SqliteValue::Text(SmallText::from_string("x"))).unwrap(),
+            SqliteValue::Text(SmallText::from_string("text"))
         );
         assert_eq!(
             invoke1(&TypeofFunc, SqliteValue::Blob(Arc::from([0].as_slice()))).unwrap(),
-            SqliteValue::Text(Arc::from("blob"))
+            SqliteValue::Text(SmallText::from_string("blob"))
         );
     }
 
@@ -2799,12 +2826,12 @@ mod tests {
         let f = ReplaceFunc;
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text(Arc::from("hello world")),
-                SqliteValue::Text(Arc::from("world")),
-                SqliteValue::Text(Arc::from("earth")),
+                SqliteValue::Text(SmallText::from_string("hello world")),
+                SqliteValue::Text(SmallText::from_string("world")),
+                SqliteValue::Text(SmallText::from_string("earth")),
             ])
             .unwrap(),
-            SqliteValue::Text(Arc::from("hello earth"))
+            SqliteValue::Text(SmallText::from_string("hello earth"))
         );
     }
 
@@ -2813,12 +2840,12 @@ mod tests {
         let f = ReplaceFunc;
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text(Arc::from("hello")),
-                SqliteValue::Text(Arc::from("")),
-                SqliteValue::Text(Arc::from("x")),
+                SqliteValue::Text(SmallText::from_string("hello")),
+                SqliteValue::Text(SmallText::new("")),
+                SqliteValue::Text(SmallText::from_string("x")),
             ])
             .unwrap(),
-            SqliteValue::Text(Arc::from("hello"))
+            SqliteValue::Text(SmallText::from_string("hello"))
         );
     }
 
@@ -2930,7 +2957,7 @@ mod tests {
     fn test_sign_non_numeric() {
         // C SQLite: math functions return NULL for strings that cannot be parsed as numeric.
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("abc"))).unwrap(),
+            invoke1(&SignFunc, SqliteValue::Text(SmallText::from_string("abc"))).unwrap(),
             SqliteValue::Null
         );
     }
@@ -2940,11 +2967,19 @@ mod tests {
         // Regression: SIGN('  5  ') must return 1, not NULL.
         // SQLite trims text before numeric parsing.
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("  5  "))).unwrap(),
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("  5  "))
+            )
+            .unwrap(),
             SqliteValue::Integer(1)
         );
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("  -3.14  "))).unwrap(),
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("  -3.14  "))
+            )
+            .unwrap(),
             SqliteValue::Integer(-1)
         );
     }
@@ -2965,7 +3000,7 @@ mod tests {
             "+inf",
         ] {
             assert_eq!(
-                invoke1(&SignFunc, SqliteValue::Text(Arc::from(*s))).unwrap(),
+                invoke1(&SignFunc, SqliteValue::Text(SmallText::from_string(*s))).unwrap(),
                 SqliteValue::Null,
                 "sign('{s}') should be NULL"
             );
@@ -2977,16 +3012,28 @@ mod tests {
         // "1e999" overflows to +inf in both Rust and C. C SQLite's sqlite3AtoF
         // accepts it as numeric, so sign() must return 1 (not NULL).
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("1e999"))).unwrap(),
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("1e999"))
+            )
+            .unwrap(),
             SqliteValue::Integer(1)
         );
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("-1e999"))).unwrap(),
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("-1e999"))
+            )
+            .unwrap(),
             SqliteValue::Integer(-1)
         );
         // Underflow to zero
         assert_eq!(
-            invoke1(&SignFunc, SqliteValue::Text(Arc::from("1e-999"))).unwrap(),
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("1e-999"))
+            )
+            .unwrap(),
             SqliteValue::Integer(0)
         );
     }
@@ -3046,8 +3093,12 @@ mod tests {
     #[test]
     fn test_quote_text() {
         assert_eq!(
-            invoke1(&QuoteFunc, SqliteValue::Text(Arc::from("it's"))).unwrap(),
-            SqliteValue::Text(Arc::from("'it''s'"))
+            invoke1(
+                &QuoteFunc,
+                SqliteValue::Text(SmallText::from_string("it's"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("'it''s'"))
         );
     }
 
@@ -3055,7 +3106,7 @@ mod tests {
     fn test_quote_null() {
         assert_eq!(
             invoke1(&QuoteFunc, SqliteValue::Null).unwrap(),
-            SqliteValue::Text(Arc::from("NULL"))
+            SqliteValue::Text(SmallText::from_string("NULL"))
         );
     }
 
@@ -3063,7 +3114,7 @@ mod tests {
     fn test_quote_blob() {
         assert_eq!(
             invoke1(&QuoteFunc, SqliteValue::Blob(Arc::from([0xAB].as_slice()))).unwrap(),
-            SqliteValue::Text(Arc::from("X'AB'"))
+            SqliteValue::Text(SmallText::from_string("X'AB'"))
         );
     }
 
@@ -3105,13 +3156,21 @@ mod tests {
 
     #[test]
     fn test_unhex_valid() {
-        let result = invoke1(&UnhexFunc, SqliteValue::Text(Arc::from("48656C6C6F"))).unwrap();
+        let result = invoke1(
+            &UnhexFunc,
+            SqliteValue::Text(SmallText::from_string("48656C6C6F")),
+        )
+        .unwrap();
         assert_eq!(result, SqliteValue::Blob(Arc::from(b"Hello".as_slice())));
     }
 
     #[test]
     fn test_unhex_invalid() {
-        let result = invoke1(&UnhexFunc, SqliteValue::Text(Arc::from("ZZZZ"))).unwrap();
+        let result = invoke1(
+            &UnhexFunc,
+            SqliteValue::Text(SmallText::from_string("ZZZZ")),
+        )
+        .unwrap();
         assert_eq!(result, SqliteValue::Null);
     }
 
@@ -3120,8 +3179,8 @@ mod tests {
         let f = UnhexFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("48-65-6C")),
-                SqliteValue::Text(Arc::from("-")),
+                SqliteValue::Text(SmallText::from_string("48-65-6C")),
+                SqliteValue::Text(SmallText::from_string("-")),
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Blob(Arc::from(b"Hel".as_slice())));
@@ -3132,7 +3191,7 @@ mod tests {
     #[test]
     fn test_unicode_first_char() {
         assert_eq!(
-            invoke1(&UnicodeFunc, SqliteValue::Text(Arc::from("A"))).unwrap(),
+            invoke1(&UnicodeFunc, SqliteValue::Text(SmallText::from_string("A"))).unwrap(),
             SqliteValue::Integer(65)
         );
     }
@@ -3142,8 +3201,12 @@ mod tests {
     #[test]
     fn test_soundex_basic() {
         assert_eq!(
-            invoke1(&SoundexFunc, SqliteValue::Text(Arc::from("Robert"))).unwrap(),
-            SqliteValue::Text(Arc::from("R163"))
+            invoke1(
+                &SoundexFunc,
+                SqliteValue::Text(SmallText::from_string("Robert"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("R163"))
         );
     }
 
@@ -3154,12 +3217,12 @@ mod tests {
         let f = SubstrFunc;
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text(Arc::from("hello")),
+                SqliteValue::Text(SmallText::from_string("hello")),
                 SqliteValue::Integer(2),
                 SqliteValue::Integer(3),
             ])
             .unwrap(),
-            SqliteValue::Text(Arc::from("ell"))
+            SqliteValue::Text(SmallText::from_string("ell"))
         );
     }
 
@@ -3169,12 +3232,12 @@ mod tests {
         let f = SubstrFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("hello")),
+                SqliteValue::Text(SmallText::from_string("hello")),
                 SqliteValue::Integer(0),
                 SqliteValue::Integer(3),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("he")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("he")));
     }
 
     #[test]
@@ -3183,17 +3246,17 @@ mod tests {
         let f = SubstrFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("hello")),
+                SqliteValue::Text(SmallText::from_string("hello")),
                 SqliteValue::Integer(-2),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("lo")));
+        assert_eq!(result, SqliteValue::Text(SmallText::from_string("lo")));
     }
 
     #[test]
     fn test_substr_negative_length() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(s));
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let i = SqliteValue::Integer;
         // SUBSTR('hello', 3, -2) => 'he' (2 chars before position 3)
         assert_eq!(f.invoke(&[t("hello"), i(3), i(-2)]).unwrap(), t("he"));
@@ -3206,7 +3269,7 @@ mod tests {
     #[test]
     fn test_substr_negative_start_negative_length() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(s));
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let i = SqliteValue::Integer;
         // SUBSTR('hello', -2, -2) => 'el' (C SQLite confirmed)
         assert_eq!(f.invoke(&[t("hello"), i(-2), i(-2)]).unwrap(), t("el"));
@@ -3215,7 +3278,7 @@ mod tests {
     #[test]
     fn test_substr_edge_cases() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(s));
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
         let i = SqliteValue::Integer;
         // Past end
         assert_eq!(f.invoke(&[t("hello"), i(6), i(2)]).unwrap(), t(""));
@@ -3250,8 +3313,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &LikeFunc,
-                SqliteValue::Text(Arc::from("ABC")),
-                SqliteValue::Text(Arc::from("abc"))
+                SqliteValue::Text(SmallText::from_string("ABC")),
+                SqliteValue::Text(SmallText::from_string("abc"))
             )
             .unwrap(),
             SqliteValue::Integer(1)
@@ -3263,9 +3326,9 @@ mod tests {
         let f = LikeFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("10\\%")),
-                SqliteValue::Text(Arc::from("10%")),
-                SqliteValue::Text(Arc::from("\\")),
+                SqliteValue::Text(SmallText::from_string("10\\%")),
+                SqliteValue::Text(SmallText::from_string("10%")),
+                SqliteValue::Text(SmallText::from_string("\\")),
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Integer(1));
@@ -3275,9 +3338,9 @@ mod tests {
     fn test_like_escape_rejects_empty_string() {
         let err = LikeFunc
             .invoke(&[
-                SqliteValue::Text(Arc::from("a")),
-                SqliteValue::Text(Arc::from("a")),
-                SqliteValue::Text(Arc::from("")),
+                SqliteValue::Text(SmallText::from_string("a")),
+                SqliteValue::Text(SmallText::from_string("a")),
+                SqliteValue::Text(SmallText::new("")),
             ])
             .unwrap_err();
         assert!(
@@ -3290,9 +3353,9 @@ mod tests {
     fn test_like_escape_rejects_multi_character_string() {
         let err = LikeFunc
             .invoke(&[
-                SqliteValue::Text(Arc::from("a")),
-                SqliteValue::Text(Arc::from("a")),
-                SqliteValue::Text(Arc::from("xx")),
+                SqliteValue::Text(SmallText::from_string("a")),
+                SqliteValue::Text(SmallText::from_string("a")),
+                SqliteValue::Text(SmallText::from_string("xx")),
             ])
             .unwrap_err();
         assert!(
@@ -3306,8 +3369,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &LikeFunc,
-                SqliteValue::Text(Arc::from("%ell%")),
-                SqliteValue::Text(Arc::from("Hello"))
+                SqliteValue::Text(SmallText::from_string("%ell%")),
+                SqliteValue::Text(SmallText::from_string("Hello"))
             )
             .unwrap(),
             SqliteValue::Integer(1)
@@ -3321,8 +3384,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &GlobFunc,
-                SqliteValue::Text(Arc::from("*.txt")),
-                SqliteValue::Text(Arc::from("file.txt"))
+                SqliteValue::Text(SmallText::from_string("*.txt")),
+                SqliteValue::Text(SmallText::from_string("file.txt"))
             )
             .unwrap(),
             SqliteValue::Integer(1)
@@ -3334,8 +3397,8 @@ mod tests {
         assert_eq!(
             invoke2(
                 &GlobFunc,
-                SqliteValue::Text(Arc::from("ABC")),
-                SqliteValue::Text(Arc::from("abc"))
+                SqliteValue::Text(SmallText::from_string("ABC")),
+                SqliteValue::Text(SmallText::from_string("abc"))
             )
             .unwrap(),
             SqliteValue::Integer(0)
@@ -3349,12 +3412,15 @@ mod tests {
         let f = FormatFunc;
         let result = f
             .invoke(&[
-                SqliteValue::Text(Arc::from("%d %s")),
+                SqliteValue::Text(SmallText::from_string("%d %s")),
                 SqliteValue::Integer(42),
-                SqliteValue::Text(Arc::from("hello")),
+                SqliteValue::Text(SmallText::from_string("hello")),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("42 hello")));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("42 hello"))
+        );
     }
 
     #[test]
@@ -3362,9 +3428,12 @@ mod tests {
         let f = FormatFunc;
         // %n should not crash or do anything
         let result = f
-            .invoke(&[SqliteValue::Text(Arc::from("before%nafter"))])
+            .invoke(&[SqliteValue::Text(SmallText::from_string("before%nafter"))])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text(Arc::from("beforeafter")));
+        assert_eq!(
+            result,
+            SqliteValue::Text(SmallText::from_string("beforeafter"))
+        );
     }
 
     // ── sqlite_version ───────────────────────────────────────────────────
@@ -3445,9 +3514,9 @@ mod tests {
         let typeof_fn = registry.find_scalar("typeof", 1).unwrap();
         assert_eq!(
             typeof_fn
-                .invoke(&[SqliteValue::Text(Arc::from("hello"))])
+                .invoke(&[SqliteValue::Text(SmallText::from_string("hello"))])
                 .unwrap(),
-            SqliteValue::Text(Arc::from("text"))
+            SqliteValue::Text(SmallText::from_string("text"))
         );
 
         // Look up coalesce (variadic), invoke with 4 args

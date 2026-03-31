@@ -7,7 +7,7 @@ use fsqlite_func::vtab::{
     VirtualTable, VirtualTableCursor, VtabModuleFactory,
 };
 use fsqlite_func::{FunctionRegistry, ScalarFunction};
-use fsqlite_types::{SqliteValue, cx::Cx};
+use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 
 // ---------------------------------------------------------------------------
 // Public API — extension name
@@ -1385,9 +1385,7 @@ impl ScalarFunction for GeopolyJsonFunc {
         let Some(vertices) = unary_polygon(self.name(), args)? else {
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Text(Arc::from(
-            geopoly_json(&vertices).as_str(),
-        )))
+        Ok(SqliteValue::Text(geopoly_json(&vertices).into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -1407,9 +1405,7 @@ impl ScalarFunction for GeopolySvgFunc {
         let Some(vertices) = unary_polygon(self.name(), args)? else {
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Text(Arc::from(
-            geopoly_svg(&vertices).as_str(),
-        )))
+        Ok(SqliteValue::Text(geopoly_svg(&vertices).into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -1595,7 +1591,7 @@ mod tests {
     }
 
     fn json_value(vertices: &[Point]) -> SqliteValue {
-        SqliteValue::Text(Arc::from(geopoly_json(vertices)))
+        SqliteValue::Text(SmallText::from_string(geopoly_json(vertices)))
     }
 
     fn blob_value(vertices: &[Point]) -> SqliteValue {
@@ -2103,7 +2099,10 @@ mod tests {
         let value = GeopolyJsonFunc
             .invoke(&[blob_value(&polygon)])
             .expect("json wrapper should succeed");
-        assert_eq!(value, SqliteValue::Text(Arc::from(geopoly_json(&polygon))));
+        assert_eq!(
+            value,
+            SqliteValue::Text(SmallText::from_string(geopoly_json(&polygon)))
+        );
     }
 
     #[test]
@@ -2174,7 +2173,7 @@ mod tests {
     #[test]
     fn test_geopoly_scalar_wrappers_reject_malformed_text() {
         let error = GeopolyJsonFunc
-            .invoke(&[SqliteValue::Text(Arc::from("not json"))])
+            .invoke(&[SqliteValue::Text(SmallText::from_string("not json"))])
             .expect_err("malformed polygon text should fail");
         assert!(matches!(error, FrankenError::FunctionError(_)));
     }
@@ -2730,7 +2729,7 @@ mod tests {
                 &cx,
                 RTREE_SCAN_GEOMETRY,
                 None,
-                &[SqliteValue::Text(Arc::from("upper_right"))],
+                &[SqliteValue::Text(SmallText::from_string("upper_right"))],
             )
             .unwrap();
         let rows = collect_rtree_rows(&mut cursor, &cx, 5);

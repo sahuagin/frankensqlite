@@ -26,7 +26,7 @@ use fsqlite_core::connection::{
     Connection as CoreConnection, PreparedStatement as CorePreparedStatement, Row as CoreRow,
 };
 use fsqlite_error::FrankenError;
-use fsqlite_types::SqliteValue;
+use fsqlite_types::{SmallText, SqliteValue};
 use js_sys::{Array, BigInt, Date, Number, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -450,7 +450,7 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
         return Ok(SqliteValue::Null);
     }
     if let Some(text) = value.as_string() {
-        return Ok(SqliteValue::Text(std::sync::Arc::from(text.as_str())));
+        return Ok(SqliteValue::Text(text.into()));
     }
     if let Some(boolean) = value.as_bool() {
         return Ok(SqliteValue::Integer(i64::from(boolean)));
@@ -460,9 +460,7 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
         return parse_bigint_sqlite_value(&bigint_text).map_err(franken_error_to_js);
     }
     if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
-        return Ok(SqliteValue::Blob(std::sync::Arc::from(
-            bytes.to_vec().as_slice(),
-        )));
+        return Ok(SqliteValue::Blob(bytes.to_vec().into()));
     }
     if let Some(date) = value.dyn_ref::<Date>() {
         return date_to_sqlite_value(date).map_err(franken_error_to_js);
@@ -650,9 +648,9 @@ fn date_to_sqlite_value(date: &Date) -> Result<SqliteValue, FrankenError> {
             actual: "invalid Date".to_owned(),
         });
     }
-    Ok(SqliteValue::Text(std::sync::Arc::from(
-        String::from(date.to_iso_string()).as_str(),
-    )))
+    Ok(SqliteValue::Text(SmallText::from_string(String::from(
+        date.to_iso_string(),
+    ))))
 }
 
 fn describe_js_value(value: &JsValue) -> String {

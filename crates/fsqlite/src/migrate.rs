@@ -20,8 +20,6 @@
 //! assert_eq!(result.current, 2);
 //! ```
 
-use std::sync::Arc;
-
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
@@ -195,7 +193,7 @@ impl MigrationRunner {
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
-                SqliteValue::Text(Arc::from(migration.name)),
+                SqliteValue::Text(migration.name.into()),
             ],
         )?;
         Ok(())

@@ -33,7 +33,7 @@ pub use glossary::{
     SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId, TxnSlot, TxnToken,
     VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
 };
-pub use value::SqliteValue;
+pub use value::{SmallText, SqliteValue};
 
 use std::fmt;
 use std::num::NonZeroU32;

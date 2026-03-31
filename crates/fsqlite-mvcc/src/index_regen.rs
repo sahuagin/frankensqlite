@@ -14,8 +14,6 @@
 //! 6. UNIQUE enforcement against committed base snapshot
 //! 7. Overflow page chain management (delegated to B-tree layer)
 
-use std::sync::Arc;
-
 use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{ColumnIdx, IndexId, IntentOpKind, RebaseExpr, RowId, TableId};
 use fsqlite_types::record::{parse_record, serialize_record};
@@ -460,13 +458,16 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
         }
         "typeof" => {
             if let Some(v) = args.first() {
-                Ok(SqliteValue::Text(Arc::from(match v {
-                    SqliteValue::Null => "null",
-                    SqliteValue::Integer(_) => "integer",
-                    SqliteValue::Float(_) => "real",
-                    SqliteValue::Text(_) => "text",
-                    SqliteValue::Blob(_) => "blob",
-                })))
+                Ok(SqliteValue::Text(
+                    match v {
+                        SqliteValue::Null => "null",
+                        SqliteValue::Integer(_) => "integer",
+                        SqliteValue::Float(_) => "real",
+                        SqliteValue::Text(_) => "text",
+                        SqliteValue::Blob(_) => "blob",
+                    }
+                    .into(),
+                ))
             } else {
                 Ok(SqliteValue::Null)
             }
@@ -616,7 +617,7 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
         Collation::Rtrim => {
             if let SqliteValue::Text(s) = val {
                 // SQLite RTRIM only ignores trailing spaces (ASCII 0x20), not all whitespace.
-                SqliteValue::Text(Arc::from(s.trim_end_matches(' ')))
+                SqliteValue::Text(s.trim_end_matches(' ').into())
             } else {
                 val
             }
