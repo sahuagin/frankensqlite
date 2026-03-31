@@ -381,6 +381,11 @@ pub struct BtCursor<P> {
     /// `self.rowid(cx)?` cell parse and use the cached value directly.
     /// Cleared on any non-append cursor operation.
     append_hint_cache: Option<(PageNumber, i64)>,
+    /// Sequential-seek cache: (leaf_page, last_rowid) from the most recent
+    /// successful seek. On the next seek, if target_rowid > last_rowid, try
+    /// the cached leaf first to skip root-to-leaf descent. Cleared on any
+    /// non-forward seek or tree modification.
+    seek_cache: Option<(PageNumber, i64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +405,7 @@ impl<P> BtCursor<P> {
         self.at_eof = true;
         self.stack.clear();
         self.append_hint_cache = None;
+        self.seek_cache = None;
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -774,6 +780,7 @@ impl<P: PageReader> BtCursor<P> {
             cell_buf: Vec::new(),
             last_insert_rowid: None,
             append_hint_cache: None,
+            seek_cache: None,
         }
     }
 
@@ -1426,6 +1433,56 @@ impl<P: PageReader> BtCursor<P> {
     /// the target belongs, even if it falls off the right edge.
     fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
         observe_cursor_cancellation(cx)?;
+
+        // Fast path: sequential seek cache. If target > cached_rowid, try the
+        // cached leaf directly to skip root-to-leaf descent.
+        if let Some((cached_page, cached_rowid)) = self.seek_cache {
+            if target_rowid > cached_rowid {
+                let entry = self.load_page(cx, cached_page)?;
+                if entry.header.page_type.is_leaf() && entry.header.page_type.is_table() {
+                    // Binary search on the cached leaf to confirm target belongs here.
+                    let result = Self::binary_search_table_leaf(cx, &entry, target_rowid)?;
+                    match result {
+                        BinarySearchResult::Found(idx) => {
+                            self.stack.clear();
+                            let mut entry = entry;
+                            entry.cell_idx = idx;
+                            self.stack.push(entry);
+                            self.at_eof = false;
+                            self.seek_cache = Some((cached_page, target_rowid));
+                            self.record_point_witness(WitnessKey::Cell {
+                                btree_root: self.root_page,
+                                leaf_page: cached_page,
+                                tag: Self::cell_tag_from_rowid(target_rowid),
+                            });
+                            return Ok(SeekResult::Found);
+                        }
+                        BinarySearchResult::NotFound(idx) => {
+                            // Target not found, but check if it belongs at end of this leaf.
+                            if idx >= entry.header.cell_count {
+                                // Target is past the end of this leaf — it may belong on
+                                // the next leaf. Fall through to full seek.
+                            } else {
+                                // Target belongs in the middle of this leaf.
+                                self.stack.clear();
+                                let mut entry = entry;
+                                entry.cell_idx = idx;
+                                self.stack.push(entry);
+                                self.at_eof = false;
+                                self.seek_cache = Some((cached_page, target_rowid));
+                                self.record_point_witness(WitnessKey::Cell {
+                                    btree_root: self.root_page,
+                                    leaf_page: cached_page,
+                                    tag: Self::cell_tag_from_rowid(target_rowid),
+                                });
+                                return Ok(SeekResult::NotFound);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         self.stack.clear();
         let mut current_page = self.root_page;
 
@@ -1462,6 +1519,8 @@ impl<P: PageReader> BtCursor<P> {
                         entry.cell_idx = idx;
                         self.stack.push(entry);
                         self.at_eof = false;
+                        // Cache leaf position for sequential seek optimization.
+                        self.seek_cache = Some((current_page, target_rowid));
                         self.record_point_witness(WitnessKey::Cell {
                             btree_root: self.root_page,
                             leaf_page: current_page,
@@ -1478,10 +1537,14 @@ impl<P: PageReader> BtCursor<P> {
                             entry.cell_idx = entry.header.cell_count.saturating_sub(1);
                             self.stack.push(entry);
                             self.at_eof = true;
+                            // Cache for sequential append optimization.
+                            self.seek_cache = Some((current_page, target_rowid));
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
                             self.at_eof = false;
+                            // Cache for sequential seek optimization.
+                            self.seek_cache = Some((current_page, target_rowid));
                         }
                         self.record_point_witness(WitnessKey::Cell {
                             btree_root: self.root_page,
