@@ -738,6 +738,16 @@ impl TransactionManager {
         visible_pages
     }
 
+    fn publish_cached_gc_horizon(&self, snapshot_counts: &BTreeMap<CommitSeq, usize>) {
+        let raw = active_snapshot_horizon_raw(snapshot_counts);
+        self.cached_gc_horizon.store(raw, Ordering::Release);
+        self.shm.store_gc_horizon(if raw == NO_GC_HORIZON {
+            CommitSeq::ZERO
+        } else {
+            CommitSeq::new(raw)
+        });
+    }
+
     fn register_active_snapshot(&self, txn_id: TxnId, snapshot_high: CommitSeq) {
         let mut active = self.active_snapshot_highs.lock();
         let mut snapshot_counts = self.active_snapshot_high_counts.lock();
@@ -747,10 +757,7 @@ impl TransactionManager {
         }
         increment_active_snapshot_refcount(&mut snapshot_counts, snapshot_high);
 
-        self.cached_gc_horizon.store(
-            active_snapshot_horizon_raw(&snapshot_counts),
-            Ordering::Release,
-        );
+        self.publish_cached_gc_horizon(&snapshot_counts);
     }
 
     fn unregister_active_snapshot(&self, txn_id: TxnId) {
@@ -761,10 +768,7 @@ impl TransactionManager {
             decrement_active_snapshot_refcount(&mut snapshot_counts, snapshot_high);
         }
 
-        self.cached_gc_horizon.store(
-            active_snapshot_horizon_raw(&snapshot_counts),
-            Ordering::Release,
-        );
+        self.publish_cached_gc_horizon(&snapshot_counts);
     }
 
     fn eager_gc_horizon(&self) -> CommitSeq {
@@ -1197,6 +1201,9 @@ impl TransactionManager {
 
     /// Serialized commit path.
     fn commit_serialized(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
+        let pages = txn.write_set.clone();
+        let snapshot_high = txn.snapshot.high;
+
         // FCW freshness validation: check that no page in write_set has been
         // committed since our snapshot.
         for &pgno in &txn.write_set {
@@ -1209,7 +1216,7 @@ impl TransactionManager {
         }
 
         // Publish: allocate commit_seq and publish versions.
-        let commit_seq = match self.publish_write_set(txn) {
+        let commit_seq = match self.publish_write_set(txn, &pages) {
             Ok(commit_seq) => commit_seq,
             Err(err) => {
                 self.abort(txn);
@@ -1219,6 +1226,7 @@ impl TransactionManager {
         self.txn_manager.finish_commit_seq(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
+        self.post_commit_version_maintenance(&pages, snapshot_high);
 
         tracing::info!(
             txn_id = %txn.txn_id,
@@ -1234,6 +1242,9 @@ impl TransactionManager {
     /// Pipeline: (1) SSI validation, (2) FCW CommitIndex check with rebase
     /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
+        let pages = txn.write_set.clone();
+        let snapshot_high = txn.snapshot.high;
+
         // Step 1: SSI validation — if dangerous structure, abort immediately.
         // Skipped when txn began with PRAGMA fsqlite.serializable = OFF (plain SI mode).
         if txn.ssi_enabled_at_begin && txn.has_dangerous_structure() {
@@ -1336,7 +1347,7 @@ impl TransactionManager {
         }
 
         // Step 4: Publish.
-        let commit_seq = match self.publish_write_set(txn) {
+        let commit_seq = match self.publish_write_set(txn, &pages) {
             Ok(commit_seq) => commit_seq,
             Err(err) => {
                 self.abort(txn);
@@ -1346,6 +1357,7 @@ impl TransactionManager {
         self.txn_manager.finish_commit_seq(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
+        self.post_commit_version_maintenance(&pages, snapshot_high);
 
         tracing::info!(
             txn_id = %txn.txn_id,
@@ -1482,10 +1494,12 @@ impl TransactionManager {
     /// Publish a transaction's write set into the version store and commit index.
     ///
     /// Returns the assigned `CommitSeq`.
-    fn publish_write_set(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
-        let pages: Vec<PageNumber> = txn.write_set.iter().copied().collect();
-
-        for &pgno in &pages {
+    fn publish_write_set(
+        &self,
+        txn: &mut Transaction,
+        pages: &[PageNumber],
+    ) -> Result<CommitSeq, MvccError> {
+        for &pgno in pages {
             self.enforce_chain_bound_for_page(pgno)?;
         }
 
@@ -1500,7 +1514,7 @@ impl TransactionManager {
         let mut data_map = Arc::try_unwrap(std::mem::take(&mut txn.write_set_data))
             .unwrap_or_else(|arc| (*arc).clone());
 
-        for &pgno in &pages {
+        for &pgno in pages {
             if let Some(data) = data_map.remove(&pgno) {
                 let version = PageVersion {
                     pgno,
@@ -1514,35 +1528,45 @@ impl TransactionManager {
                 };
                 self.version_store.publish(version);
             }
-            self.commit_index.update(pgno, commit_seq);
-            txn.mark_page_write_committed(pgno, commit_seq);
         }
 
         self.cell_log.commit_txn(txn_token, commit_seq);
-
-        // Proactive version chain compaction (§8.10 + §12.1 adaptive):
-        // attempt GC on written pages whose chains exceed the adaptive
-        // compaction threshold (2× EWMA of observed chain lengths).
-        // Cap at 16 pages per commit to bound overhead for bulk writes.
-        let horizon = self.eager_gc_horizon();
-        let compact_threshold = self.adaptive_compact_threshold();
-        for pgno in pages.iter().take(16) {
-            let chain_len = self.version_store.chain_length(*pgno);
-            self.record_chain_length_sample(chain_len);
-            if chain_len > compact_threshold {
-                let freed = self.version_store.prune_page_chain_eager(*pgno, horizon);
-                // C7 (bd-l9k8e.7): Record GC metric for proactive compaction.
-                if freed > 0 {
-                    let freed_u64 = u64::try_from(freed).unwrap_or(u64::MAX);
-                    GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
-                }
-            }
+        self.commit_index.batch_update(pages, commit_seq);
+        for &pgno in pages {
+            txn.mark_page_write_committed(pgno, commit_seq);
         }
 
         // Clear structural pages tracking now that commit is complete
         txn.clear_structural_pages();
 
         Ok(commit_seq)
+    }
+
+    fn post_commit_version_maintenance(&self, pages: &[PageNumber], snapshot_high: CommitSeq) {
+        let horizon = self.eager_gc_horizon();
+        let eager_cleanup = horizon >= snapshot_high;
+        let compact_threshold = self.adaptive_compact_threshold();
+        let maybe_prune = |pgno: PageNumber| {
+            let chain_len = self.version_store.chain_length(pgno);
+            self.record_chain_length_sample(chain_len);
+            if eager_cleanup || chain_len > compact_threshold {
+                let freed = self.version_store.prune_page_chain_eager(pgno, horizon);
+                if freed > 0 {
+                    let freed_u64 = u64::try_from(freed).unwrap_or(u64::MAX);
+                    GLOBAL_EBR_METRICS.record_gc_freed(freed_u64);
+                }
+            }
+        };
+
+        if eager_cleanup {
+            for &pgno in pages {
+                maybe_prune(pgno);
+            }
+        } else {
+            for &pgno in pages.iter().take(16) {
+                maybe_prune(pgno);
+            }
+        }
     }
 
     /// Release all resources held by a transaction.
@@ -6031,6 +6055,7 @@ mod tests {
         let mgr = mgr();
         let pgno = PageNumber::new(6_780).unwrap();
         assert!(mgr.cached_gc_horizon().is_none());
+        assert_eq!(mgr.shm.load_gc_horizon(), CommitSeq::ZERO);
 
         let mut deferred = mgr.begin(BeginKind::Deferred).unwrap();
         assert!(
@@ -6043,12 +6068,14 @@ mod tests {
             mgr.cached_gc_horizon().is_some(),
             "first read should register active snapshot horizon"
         );
+        assert_eq!(mgr.shm.load_gc_horizon(), deferred.snapshot.high);
 
         mgr.abort(&mut deferred);
         assert!(
             mgr.cached_gc_horizon().is_none(),
             "releasing last active snapshot should clear cached horizon"
         );
+        assert_eq!(mgr.shm.load_gc_horizon(), CommitSeq::ZERO);
     }
 
     #[test]
@@ -6145,6 +6172,38 @@ mod tests {
         assert!(
             mgr.cached_gc_horizon().is_none(),
             "cached horizon should clear after all active snapshots release"
+        );
+    }
+
+    #[test]
+    fn test_commit_releases_writer_pinned_chain_immediately_when_horizon_advances() {
+        let mgr = mgr();
+        let pgno = PageNumber::new(6_785).unwrap();
+
+        let mut seed = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut seed, pgno, test_data(0x10))
+            .expect("seed writer should stage page");
+        mgr.commit(&mut seed).expect("seed writer should commit");
+
+        let mut reader = mgr.begin(BeginKind::Deferred).unwrap();
+        let _ = mgr.read_page(&mut reader, pgno);
+
+        let mut writer_a = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_a, pgno, test_data(0x11))
+            .expect("writer_a should stage page");
+        mgr.commit(&mut writer_a).expect("writer_a should commit");
+        assert_eq!(mgr.version_store.chain_length(pgno), 2);
+
+        mgr.abort(&mut reader);
+
+        let mut writer_b = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut writer_b, pgno, test_data(0x12))
+            .expect("writer_b should stage page");
+        mgr.commit(&mut writer_b).expect("writer_b should commit");
+        assert_eq!(
+            mgr.version_store.chain_length(pgno),
+            1,
+            "once the last older snapshot releases, the next commit should eagerly prune superseded versions",
         );
     }
 
