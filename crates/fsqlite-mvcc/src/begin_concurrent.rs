@@ -368,6 +368,25 @@ impl ConcurrentHandle {
         }
     }
 
+    /// Record a metadata page read that does NOT participate in SSI tracking.
+    ///
+    /// E4 enhancement (bd-wwqen Track E): Page 1 (database header with freelist
+    /// metadata) is read by every transaction that allocates pages. Tracking
+    /// these reads in the SIREAD set causes massive false rw-antidependency
+    /// conflicts between disjoint inserts. By skipping SSI registration for
+    /// metadata-only reads, we eliminate this bottleneck.
+    ///
+    /// # Safety Guarantee
+    ///
+    /// This is safe because page 1 freelist reads are commutative operations:
+    /// multiple transactions can read the freelist pointer, allocate different
+    /// pages, and commit without conflict. The write-side is protected by FCW
+    /// (and E3's metadata_exempt for the actual freelist pointer update).
+    pub fn record_metadata_read(&mut self, _page: PageNumber) {
+        // Intentionally skip read_set and read_index registration.
+        // The page is still read, but won't trigger rw-antidependency edges.
+    }
+
     /// Record a granular read witness for fine-grained SSI.
     pub fn record_read_witness(&mut self, key: WitnessKey) {
         if let Some(p) = witness_key_page(&key) {
@@ -1462,6 +1481,29 @@ pub fn concurrent_write_metadata_page(
     concurrent_write_page(handle, lock_table, session_id, page, data)?;
     concurrent_mark_metadata_exempt(handle, page);
     Ok(())
+}
+
+/// Record a metadata page read without SSI tracking (E4 — bd-wwqen Track E).
+///
+/// Page 1 (database header with freelist metadata) is read by every transaction
+/// that allocates pages. Tracking these reads in the SSI SIREAD set causes
+/// massive false rw-antidependency conflicts between disjoint inserts.
+///
+/// By calling this function instead of the normal read tracking, the read
+/// is not registered in the SIREAD set and won't trigger conflicts with
+/// concurrent writers to page 1.
+///
+/// # Use Cases
+///
+/// - Reading freelist metadata from page 1 during page allocation
+/// - Reading structural B-tree metadata that doesn't affect user data semantics
+///
+/// # Safety
+///
+/// Safe because freelist reads are commutative: multiple transactions can
+/// read the freelist, allocate different pages, and commit without conflict.
+pub fn concurrent_record_metadata_read(handle: &mut ConcurrentHandle, page: PageNumber) {
+    handle.record_metadata_read(page);
 }
 
 /// Validate the write set against the commit index using first-committer-wins.
