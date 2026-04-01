@@ -23,7 +23,7 @@ pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::{PageCache, PageCacheMetricsSnapshot, ShardedPageCache};
 pub use pager::{
     PagerPublishedSnapshot, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
-    WalCommitSyncPolicy,
+    WalCommitSyncPolicy, remove_group_commit_queue,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,

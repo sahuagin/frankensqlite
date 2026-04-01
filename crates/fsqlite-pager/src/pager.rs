@@ -659,6 +659,20 @@ fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommi
     }
 }
 
+/// Remove the group commit queue for the given database path.
+///
+/// Called when the last connection using this path closes, to prevent stale
+/// consolidator state (epoch, db_size) from leaking into future connections
+/// that open a different file at the same path.
+pub fn remove_group_commit_queue(db_path: &Path) {
+    if let Some(queues) = GROUP_COMMIT_QUEUES.get() {
+        let mut queues = queues
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queues.remove(db_path);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalCommitSyncPolicy {
     Deferred,
