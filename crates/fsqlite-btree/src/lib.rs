@@ -1,3 +1,6 @@
+#![allow(internal_features)]
+#![feature(core_intrinsics)]
+
 use std::cmp::Ordering;
 
 pub mod balance;

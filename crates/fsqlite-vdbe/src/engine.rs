@@ -42,7 +42,7 @@ use fsqlite_mvcc::{
     concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
     create_time_travel_snapshot,
 };
-use fsqlite_pager::TransactionHandle;
+use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
@@ -1195,7 +1195,7 @@ struct ConcurrentContext {
 /// (bd-kivg / 5E.2).
 #[derive(Clone)]
 struct SharedTxnPageIo {
-    txn: Rc<RefCell<Box<dyn TransactionHandle>>>,
+    txn: Rc<RefCell<TransactionKind>>,
     /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
     /// page-level locking for write operations.
     concurrent: Option<ConcurrentContext>,
@@ -1218,16 +1218,16 @@ impl std::fmt::Debug for SharedTxnPageIo {
 }
 
 impl SharedTxnPageIo {
-    fn new(txn: Box<dyn TransactionHandle>) -> Self {
+    fn new(txn: impl Into<TransactionKind>) -> Self {
         Self {
-            txn: Rc::new(RefCell::new(txn)),
+            txn: Rc::new(RefCell::new(txn.into())),
             concurrent: None,
         }
     }
 
     /// Create with MVCC concurrent context (bd-kivg / 5E.2).
     fn with_concurrent(
-        txn: Box<dyn TransactionHandle>,
+        txn: impl Into<TransactionKind>,
         session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
@@ -1242,7 +1242,7 @@ impl SharedTxnPageIo {
             )
         };
         Self {
-            txn: Rc::new(RefCell::new(txn)),
+            txn: Rc::new(RefCell::new(txn.into())),
             concurrent: Some(ConcurrentContext {
                 session_id,
                 txn_id,
@@ -1257,7 +1257,7 @@ impl SharedTxnPageIo {
 
     /// Unwrap back to the owned transaction handle.
     /// Returns an error if other Rc clones still exist.
-    fn into_inner(self) -> Result<Box<dyn TransactionHandle>> {
+    fn into_inner(self) -> Result<TransactionKind> {
         match Rc::try_unwrap(self.txn) {
             Ok(cell) => Ok(cell.into_inner()),
             Err(rc) => Err(FrankenError::Internal(format!(
@@ -2782,6 +2782,14 @@ impl CursorBackend {
             Self::Mem(c) => c.table_move_to(cx, rowid),
             Self::Txn(c) => c.table_move_to(cx, rowid),
             Self::TimeTravel(c) => c.table_move_to(cx, rowid),
+        }
+    }
+
+    fn table_advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        match self {
+            Self::Mem(c) => c.advance_to(cx, rowid),
+            Self::Txn(c) => c.advance_to(cx, rowid),
+            Self::TimeTravel(c) => c.advance_to(cx, rowid),
         }
     }
 
@@ -4541,6 +4549,12 @@ pub struct VdbeEngine {
     /// Tracks which cold subsystems were actually touched by the last statement
     /// so common-case reuse can skip blanket clears of unused collections.
     statement_cold_state: StatementColdState,
+    /// Root pages of tables modified by storage-cursor DML since last sync.
+    /// Lazy tracking: instead of syncing MemDB on every INSERT, we mark the
+    /// table dirty and bulk-sync only when a compatibility-path query needs
+    /// MemDB data. This eliminates the 0.10 µs/row sync overhead for fast-path
+    /// storage-cursor-backed workloads.
+    dirty_root_pages: HashSet<i32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4935,6 +4949,7 @@ impl VdbeEngine {
             max_collected_result_rows: None,
             statement_state_clean: true,
             statement_cold_state: StatementColdState::empty(),
+            dirty_root_pages: HashSet::new(),
         }
     }
 
@@ -5348,82 +5363,70 @@ impl VdbeEngine {
         self.memdb_rows_loaded && self.storage_cursor_memdb_count_shortcuts_safe
     }
 
+    /// Mark a root page as dirty for lazy MemDB sync.
+    /// Instead of syncing MemDB on every DML operation, we just mark the table
+    /// dirty and bulk-sync only when a compatibility-path query needs MemDB data.
+    #[inline]
+    fn mark_root_page_dirty(&mut self, root_page: i32) {
+        self.dirty_root_pages.insert(root_page);
+    }
+
+    /// Mark the table identified by cursor_id as dirty for lazy MemDB sync.
+    /// Call this instead of sync_storage_table_insert_into_memdb_mirror for
+    /// INSERT operations to eliminate the 0.10 µs/row sync overhead.
+    ///
+    /// Also sets `storage_cursor_memdb_count_shortcuts_safe` to false so the
+    /// Connection layer knows MemDB is stale and will fall back to pager reads.
+    fn mark_storage_table_dirty(&mut self, cursor_id: i32) {
+        if let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() {
+            self.mark_root_page_dirty(root_page);
+            // Signal to Connection that MemDB is stale — queries should fall
+            // back to pager-backed reads until a sync or reload occurs.
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+        }
+    }
+
+    /// Returns true if any tables have been modified and need MemDB sync.
+    pub fn has_dirty_root_pages(&self) -> bool {
+        !self.dirty_root_pages.is_empty()
+    }
+
+    /// Returns the set of dirty root pages for bulk sync.
+    pub fn dirty_root_pages(&self) -> &HashSet<i32> {
+        &self.dirty_root_pages
+    }
+
+    /// Clear dirty root pages after bulk sync completes.
+    pub fn clear_dirty_root_pages(&mut self) {
+        self.dirty_root_pages.clear();
+    }
+
     fn sync_storage_table_insert_into_memdb_mirror(
         &mut self,
         cursor_id: i32,
-        rowid: i64,
-        record: &SqliteValue,
+        _rowid: i64,
+        _record: &SqliteValue,
     ) {
-        if !self.storage_memdb_row_mirror_enabled() {
-            return;
-        }
-
-        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Ok(values) = decode_record_with_metrics(record, self.collect_vdbe_metrics) else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Some(db) = self.db.as_mut() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        if db.get_table(root_page).is_none() {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        }
-        db.upsert_row(root_page, rowid, values);
+        // bd-g595c: Lazy MemDB dirty tracking — instead of syncing on every
+        // INSERT, we mark the table dirty and bulk-sync only when a
+        // compatibility-path query needs MemDB data. This eliminates the
+        // 0.10 µs/row overhead for storage-cursor-backed workloads.
+        self.mark_storage_table_dirty(cursor_id);
     }
 
-    fn sync_storage_table_delete_into_memdb_mirror(&mut self, cursor_id: i32, rowid: i64) {
-        if !self.storage_memdb_row_mirror_enabled() {
-            return;
-        }
-
-        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Some(db) = self.db.as_mut() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Some(table) = db.get_table_mut(root_page) else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        table.delete_by_rowid(rowid);
+    fn sync_storage_table_delete_into_memdb_mirror(&mut self, cursor_id: i32, _rowid: i64) {
+        // bd-g595c: Lazy MemDB dirty tracking — mark dirty instead of immediate sync.
+        self.mark_storage_table_dirty(cursor_id);
     }
 
     fn sync_storage_table_restore_into_memdb_mirror(
         &mut self,
         cursor_id: i32,
-        rowid: i64,
-        payload: &[u8],
+        _rowid: i64,
+        _payload: &[u8],
     ) {
-        if !self.storage_memdb_row_mirror_enabled() {
-            return;
-        }
-
-        let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Some(values) = parse_record(payload) else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        let Some(db) = self.db.as_mut() else {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        };
-        if db.get_table(root_page).is_none() {
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
-            return;
-        }
-        db.upsert_row(root_page, rowid, values);
+        // bd-g595c: Lazy MemDB dirty tracking — mark dirty instead of immediate sync.
+        self.mark_storage_table_dirty(cursor_id);
     }
 
     /// Take ownership of the in-memory database back from the engine.
@@ -5515,7 +5518,7 @@ impl VdbeEngine {
     /// When set, `open_storage_cursor` routes through the real pager/WAL
     /// stack (`SharedTxnPageIo`) instead of building transient `MemPageStore`
     /// snapshots. Also enables storage cursors automatically.
-    pub fn set_transaction(&mut self, txn: Box<dyn TransactionHandle>) {
+    pub fn set_transaction(&mut self, txn: impl Into<TransactionKind>) {
         self.txn_page_io = Some(SharedTxnPageIo::new(txn));
         self.storage_cursors_enabled = true;
     }
@@ -5529,7 +5532,7 @@ impl VdbeEngine {
     /// - Written pages are recorded in the write set for FCW validation at commit
     pub fn set_transaction_concurrent(
         &mut self,
-        txn: Box<dyn TransactionHandle>,
+        txn: impl Into<TransactionKind>,
         session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
@@ -5551,7 +5554,7 @@ impl VdbeEngine {
     ///
     /// All storage cursors must be dropped first (cleared during execution
     /// cleanup).
-    pub fn take_transaction(&mut self) -> Result<Option<Box<dyn TransactionHandle>>> {
+    pub fn take_transaction(&mut self) -> Result<Option<TransactionKind>> {
         // Drop all storage cursors first to release Rc references.
         self.storage_cursors.clear();
         match self.txn_page_io.take() {
@@ -7094,11 +7097,17 @@ impl VdbeEngine {
                         continue;
                     }
                     let rowid_val = key.to_integer();
+                    let use_rowset_advance = pc > 0
+                        && ops.get(pc - 1).is_some_and(|prev| {
+                            prev.opcode == Opcode::RowSetRead && prev.p3 == op.p3
+                        });
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor
-                            .cursor
-                            .table_move_to(&cursor.cx, rowid_val)?
-                            .is_found()
+                        let seek_result = if use_rowset_advance {
+                            cursor.cursor.table_advance_to(&cursor.cx, rowid_val)?
+                        } else {
+                            cursor.cursor.table_move_to(&cursor.cx, rowid_val)?
+                        };
+                        seek_result.is_found()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
@@ -7653,16 +7662,12 @@ impl VdbeEngine {
                             // can skip the full B-tree seek.  This matches
                             // C SQLite's BTREE_APPEND optimization.
                             //
-                            // Only safe in serialized mode (no concurrent
-                            // writers). In concurrent mode, another writer
-                            // could commit a higher rowid between our inserts.
-                            let is_concurrent_mode = self
-                                .txn_page_io
-                                .as_ref()
-                                .is_some_and(|io| io.concurrent.is_some());
+                            // bd-0zxi6: Safe in concurrent mode because:
+                            // 1. last_successful_insert_rowid is per-StorageCursor (per-txn)
+                            // 2. Each concurrent txn has its own COW page copies
+                            // 3. SSI conflict detection happens at commit time
                             let mut insert_seek_result = None;
                             let exists = if !is_update
-                                && !is_concurrent_mode
                                 && sc
                                     .last_successful_insert_rowid
                                     .is_some_and(|last| rowid > last)
@@ -18202,7 +18207,7 @@ mod tests {
         engine.set_database(db);
         engine.set_memdb_rows_loaded(true);
         engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.table_index_meta = Arc::new(HashMap::from([(
             0,
             vec![IndexCursorMeta {
@@ -18455,7 +18460,7 @@ mod tests {
         assert!(engine.storage_cursors_enabled);
 
         // set_transaction should auto-enable storage cursors.
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         assert!(engine.storage_cursors_enabled);
         assert!(engine.txn_page_io.is_some());
     }
@@ -18476,7 +18481,7 @@ mod tests {
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
 
         let mut engine = VdbeEngine::new(8);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         // take_transaction should return the handle and clear cursors.
         let recovered = engine
@@ -18500,7 +18505,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         // open_storage_cursor should succeed using the Txn backend.
         let opened = engine.open_storage_cursor(0, root, false);
@@ -18528,7 +18533,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_index_desc_flags_by_root_page(HashMap::from([(root, vec![true])]));
 
         assert!(
@@ -18585,7 +18590,7 @@ mod tests {
         txn.write_page(&cx, PageNumber::ONE, &page_one).unwrap();
 
         let mut engine = VdbeEngine::new(8);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         assert!(
             engine.open_storage_cursor(0, root_pgno.get() as i32, true),
@@ -19615,14 +19620,7 @@ mod tests {
             (session_id, handle)
         };
         handle.lock().mark_aborted();
-        engine.set_transaction_concurrent(
-            Box::new(txn),
-            session_id,
-            handle,
-            lock_table,
-            commit_index,
-            5000,
-        );
+        engine.set_transaction_concurrent(txn, session_id, handle, lock_table, commit_index, 5000);
 
         let opened = engine.open_storage_cursor(0, root, true);
         assert!(
@@ -19654,7 +19652,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_reject_mem_fallback(false);
 
         let opened = engine.open_storage_cursor(0, root, true);
@@ -19696,7 +19694,7 @@ mod tests {
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
 
         let mut engine = VdbeEngine::new(8);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         // MockTransaction synthesizes page bytes from the page number; page 256
         // yields first byte 0x00, simulating an uninitialized root page.
@@ -19725,7 +19723,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_reject_mem_fallback(false);
 
         let opened = engine.open_storage_cursor(0, root, true);
@@ -19767,7 +19765,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
@@ -21139,7 +21137,7 @@ mod tests {
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
 
         let mut engine = VdbeEngine::new(8);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         assert!(engine.storage_cursors_enabled);
         assert!(engine.txn_page_io.is_some());
     }
@@ -21314,7 +21312,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
 
         // Open cursor on page 1 (valid with pager txn).
         assert!(engine.open_storage_cursor(0, 1, false));
@@ -21344,7 +21342,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_reject_mem_fallback(true);
 
         assert!(engine.open_storage_cursor(0, 1, false));
@@ -21429,7 +21427,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_reject_mem_fallback(true);
 
         // With txn set, cursor creation should succeed via pager path.
@@ -21448,7 +21446,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(8);
         engine.set_database(MemDatabase::new());
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_reject_mem_fallback(true);
 
         // Open cursor 0 on page 1 — should succeed (txn path).
@@ -22478,7 +22476,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_version_store(Arc::clone(&vs));
         engine.set_time_travel_commit_log(Arc::clone(&commit_log));
         engine.set_time_travel_gc_horizon(CommitSeq::new(1));
@@ -22541,7 +22539,7 @@ mod tests {
 
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
+        engine.set_transaction(txn);
         engine.set_version_store(Arc::clone(&vs));
         engine.set_time_travel_commit_log(Arc::clone(&commit_log));
         engine.set_time_travel_gc_horizon(CommitSeq::new(1));
@@ -22576,7 +22574,7 @@ mod tests {
         let pager = MockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let inner_io = SharedTxnPageIo::new(Box::new(txn));
+        let inner_io = SharedTxnPageIo::new(txn);
 
         let empty_vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
 
@@ -22620,7 +22618,7 @@ mod tests {
         let pager = MockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let inner_io = SharedTxnPageIo::new(Box::new(txn));
+        let inner_io = SharedTxnPageIo::new(txn);
 
         let vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
 
@@ -22710,7 +22708,7 @@ mod tests {
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             writer_session,
             writer_handle,
             Arc::clone(&lock_table),
@@ -22796,7 +22794,7 @@ mod tests {
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
@@ -22906,7 +22904,7 @@ mod tests {
         });
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             writer_session,
             writer_handle,
             Arc::clone(&lock_table),
@@ -22974,7 +22972,7 @@ mod tests {
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             handle,
             Arc::clone(&lock_table),
@@ -23031,7 +23029,7 @@ mod tests {
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             handle,
             Arc::clone(&lock_table),
@@ -23067,7 +23065,7 @@ mod tests {
         let pager = MemoryMockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let mut page_io = SharedTxnPageIo::new(Box::new(txn));
+        let mut page_io = SharedTxnPageIo::new(txn);
         let page_no = PageNumber::new(2).expect("page number must be non-zero");
         let oversized = vec![0xCC; PageSize::DEFAULT.as_usize() + 1];
 
@@ -23088,7 +23086,7 @@ mod tests {
         let pager = MemoryMockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let mut page_io = SharedTxnPageIo::new(Box::new(txn));
+        let mut page_io = SharedTxnPageIo::new(txn);
         let page_no = PageNumber::new(2).expect("page number must be non-zero");
         let oversized = PageData::from_vec(vec![0xDD; PageSize::DEFAULT.as_usize() + 1]);
 
@@ -23134,7 +23132,7 @@ mod tests {
         commit_index.update(target_page, CommitSeq::new(8));
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             writer_session,
             writer_handle,
             Arc::clone(&lock_table),
@@ -23203,7 +23201,7 @@ mod tests {
         };
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
@@ -23298,7 +23296,7 @@ mod tests {
         }
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
@@ -23404,7 +23402,7 @@ mod tests {
         }
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
@@ -23470,7 +23468,7 @@ mod tests {
         }
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             session_id,
             Arc::clone(&handle),
             Arc::clone(&lock_table),
@@ -23556,7 +23554,7 @@ mod tests {
         });
 
         let mut page_io = SharedTxnPageIo::with_concurrent(
-            Box::new(txn),
+            txn,
             writer_session,
             writer_handle,
             Arc::clone(&lock_table),

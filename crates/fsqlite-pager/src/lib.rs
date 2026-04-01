@@ -32,5 +32,5 @@ pub use s3_fifo::{
 pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
     MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,
-    TransactionHandle, TransactionMode, WalBackend,
+    TransactionHandle, TransactionKind, TransactionMode, WalBackend,
 };

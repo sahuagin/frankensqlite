@@ -34,6 +34,8 @@ use fsqlite_types::serial_type::{
 };
 use fsqlite_types::{PageData, PageNumber, WitnessKey};
 use std::borrow::Cow;
+#[cfg(target_arch = "x86_64")]
+use std::intrinsics::prefetch_read_data;
 use std::sync::Arc;
 use tracing::{Level, debug, trace, warn};
 
@@ -41,6 +43,24 @@ use tracing::{Level, debug, trace, warn};
 fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prefetch_l1_read(ptr: *const u8) {
+    if ptr.is_null() {
+        return;
+    }
+
+    // Locality=3 is the strongest temporal-locality hint, which matches the
+    // `_MM_HINT_T0` intent of pulling the line toward the L1 data cache.
+    prefetch_read_data::<u8, 3>(ptr);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_l1_read(_ptr: *const u8) {}
+
+const TABLE_LEAF_INTERPOLATION_MAX_PROBES: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Page reader trait (for testability)
@@ -174,6 +194,7 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 pub struct MemPageStore {
     pages: std::collections::HashMap<u32, Vec<u8>, foldhash::fast::FixedState>,
     page_size: u32,
+    page_slots: Vec<u8>,
 }
 
 impl MemPageStore {
@@ -183,7 +204,26 @@ impl MemPageStore {
         Self {
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_size,
+            page_slots: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn page_slot_index(page_no: PageNumber) -> Option<usize> {
+        page_no
+            .get()
+            .checked_sub(1)
+            .and_then(|slot| usize::try_from(slot).ok())
+    }
+
+    fn set_page_slot_present(&mut self, page_no: PageNumber, present: bool) {
+        let Some(slot_idx) = Self::page_slot_index(page_no) else {
+            return;
+        };
+        if slot_idx >= self.page_slots.len() {
+            self.page_slots.resize(slot_idx + 1, 0);
+        }
+        self.page_slots[slot_idx] = u8::from(present);
     }
 
     /// Initialize an empty leaf-table root page at the given page number.
@@ -199,6 +239,7 @@ impl MemPageStore {
         let content_off = self.page_size as u16;
         page[5..7].copy_from_slice(&content_off.to_be_bytes());
         self.pages.insert(pgno.get(), page);
+        self.set_page_slot_present(pgno, true);
     }
 
     /// Create a page store pre-initialized with an empty leaf table B-tree
@@ -217,6 +258,7 @@ impl MemPageStore {
         page[5..7].copy_from_slice(&content_offset.to_be_bytes());
         // Byte 7: fragmented free bytes = 0.
         store.pages.insert(root_page.get(), page);
+        store.set_page_slot_present(root_page, true);
         store
     }
 
@@ -232,6 +274,7 @@ impl MemPageStore {
         page[5..7].copy_from_slice(&content_offset.to_be_bytes());
         // Byte 7: fragmented free bytes = 0.
         store.pages.insert(root_page.get(), page);
+        store.set_page_slot_present(root_page, true);
         store
     }
 }
@@ -242,6 +285,21 @@ impl PageReader for MemPageStore {
             .get(&page_no.get())
             .cloned()
             .ok_or_else(|| FrankenError::internal("page not found"))
+    }
+
+    fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        let Some(slot_idx) = Self::page_slot_index(page_no) else {
+            return;
+        };
+
+        if let Some(slot_present) = self.page_slots.get(slot_idx) {
+            prefetch_l1_read(std::ptr::from_ref(slot_present).cast::<u8>());
+        }
+
+        let Some(page) = self.pages.get(&page_no.get()) else {
+            return;
+        };
+        prefetch_l1_read(page.as_ptr());
     }
 }
 
@@ -261,6 +319,7 @@ impl PageWriter for MemPageStore {
         let copy_len = data.len().min(page_size);
         page[..copy_len].copy_from_slice(&data[..copy_len]);
         self.pages.insert(page_no.get(), page);
+        self.set_page_slot_present(page_no, true);
         Ok(())
     }
 
@@ -279,6 +338,7 @@ impl PageWriter for MemPageStore {
         let copy_len = data.len().min(page_size);
         page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
         self.pages.insert(page_no.get(), page);
+        self.set_page_slot_present(page_no, true);
         Ok(())
     }
 
@@ -293,11 +353,13 @@ impl PageWriter for MemPageStore {
             .ok_or(FrankenError::DatabaseFull)?;
         let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
         self.pages.insert(next, vec![0u8; self.page_size as usize]);
+        self.set_page_slot_present(pgno, true);
         Ok(pgno)
     }
 
     fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
         self.pages.remove(&page_no.get());
+        self.set_page_slot_present(page_no, false);
         Ok(())
     }
 
@@ -331,6 +393,15 @@ struct StackEntry {
 // ---------------------------------------------------------------------------
 // BtCursor
 // ---------------------------------------------------------------------------
+
+const TABLE_SEEK_CACHE_SLOTS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableSeekCacheEntry {
+    rowid: i64,
+    page_no: PageNumber,
+    cell_idx: u16,
+}
 
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
@@ -381,11 +452,12 @@ pub struct BtCursor<P> {
     /// `self.rowid(cx)?` cell parse and use the cached value directly.
     /// Cleared on any non-append cursor operation.
     append_hint_cache: Option<(PageNumber, i64)>,
-    /// Sequential-seek cache: (leaf_page, last_rowid) from the most recent
-    /// successful seek. On the next seek, if target_rowid > last_rowid, try
-    /// the cached leaf first to skip root-to-leaf descent. Cleared on any
-    /// non-forward seek or tree modification.
-    seek_cache: Option<(PageNumber, i64)>,
+    /// Four-entry LRU of table-seek leaf anchors.
+    ///
+    /// Each slot remembers the rowid probe plus the leaf page/cell position
+    /// where that seek landed. Later seeks probe cached leaves before they
+    /// fall back to a full root-to-leaf descent.
+    seek_cache: [Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,7 +477,7 @@ impl<P> BtCursor<P> {
         self.at_eof = true;
         self.stack.clear();
         self.append_hint_cache = None;
-        self.seek_cache = None;
+        self.seek_cache.fill(None);
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -460,6 +532,35 @@ impl<P> BtCursor<P> {
             self.usable_size
         );
         self.page_size = page_size;
+    }
+
+    fn clear_seek_cache(&mut self) {
+        self.seek_cache.fill(None);
+    }
+
+    fn remember_table_seek(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
+        let entry = TableSeekCacheEntry {
+            rowid,
+            page_no,
+            cell_idx,
+        };
+
+        let mut refreshed = [None; TABLE_SEEK_CACHE_SLOTS];
+        refreshed[0] = Some(entry);
+
+        let mut next_slot = 1usize;
+        for existing in self.seek_cache.into_iter().flatten() {
+            if existing.page_no == page_no {
+                continue;
+            }
+            if next_slot >= TABLE_SEEK_CACHE_SLOTS {
+                break;
+            }
+            refreshed[next_slot] = Some(existing);
+            next_slot += 1;
+        }
+
+        self.seek_cache = refreshed;
     }
 }
 
@@ -780,7 +881,7 @@ impl<P: PageReader> BtCursor<P> {
             cell_buf: Vec::new(),
             last_insert_rowid: None,
             append_hint_cache: None,
-            seek_cache: None,
+            seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
         }
     }
 
@@ -804,6 +905,18 @@ impl<P: PageReader> BtCursor<P> {
             return None;
         }
         self.stack.last().map(|entry| entry.page_no)
+    }
+
+    /// Advance a table cursor to `rowid`, reusing local leaf state when possible.
+    ///
+    /// This is intended for monotonic rowid probe streams such as the VDBE's
+    /// `RowSetRead` loops for batch UPDATE/DELETE. The cursor first probes the
+    /// current leaf, then the immediate next leaf, before falling back to the
+    /// normal root-to-leaf seek path.
+    pub fn advance_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
+            cursor.table_advance_to(cx, rowid)
+        })
     }
 
     /// Issue an explicit best-effort prefetch hint for `page_no`.
@@ -1123,6 +1236,10 @@ impl<P: PageReader> BtCursor<P> {
             );
         }
 
+        if !matches!(op_type, BtreeOpType::Seek) {
+            self.clear_seek_cache();
+        }
+
         let stats = self.active_op_stats.take().unwrap_or_default();
         span.record("pages_visited", stats.pages_visited);
         span.record("splits", stats.splits);
@@ -1429,58 +1546,43 @@ impl<P: PageReader> BtCursor<P> {
         Ok(res)
     }
 
+    /// Advance a table cursor to `target_rowid`, reusing nearby leaf pages first.
+    fn table_advance_to(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+        observe_cursor_cancellation(cx)?;
+
+        let Some(entry) = self.load_current_table_leaf(cx)? else {
+            return self.table_seek(cx, target_rowid);
+        };
+
+        let Some((min_rowid, max_rowid)) = self.table_leaf_rowid_bounds(&entry)? else {
+            return self.table_seek(cx, target_rowid);
+        };
+
+        if target_rowid >= min_rowid && target_rowid <= max_rowid {
+            return self.position_on_loaded_table_leaf(cx, entry, target_rowid);
+        }
+
+        if target_rowid > max_rowid
+            && self.advance_to_next_table_leaf(cx)?
+            && let Some(next_entry) = self.load_current_table_leaf(cx)?
+            && let Some((next_min_rowid, next_max_rowid)) =
+                self.table_leaf_rowid_bounds(&next_entry)?
+            && target_rowid >= next_min_rowid
+            && target_rowid <= next_max_rowid
+        {
+            return self.position_on_loaded_table_leaf(cx, next_entry, target_rowid);
+        }
+
+        self.table_seek(cx, target_rowid)
+    }
+
     /// Internal seek used by INSERT that anchors the cursor on the leaf where
     /// the target belongs, even if it falls off the right edge.
     fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
         observe_cursor_cancellation(cx)?;
 
-        // Fast path: sequential seek cache. If target > cached_rowid, try the
-        // cached leaf directly to skip root-to-leaf descent.
-        if let Some((cached_page, cached_rowid)) = self.seek_cache {
-            if target_rowid > cached_rowid {
-                let entry = self.load_page(cx, cached_page)?;
-                if entry.header.page_type.is_leaf() && entry.header.page_type.is_table() {
-                    // Binary search on the cached leaf to confirm target belongs here.
-                    let result = Self::binary_search_table_leaf(cx, &entry, target_rowid)?;
-                    match result {
-                        BinarySearchResult::Found(idx) => {
-                            self.stack.clear();
-                            let mut entry = entry;
-                            entry.cell_idx = idx;
-                            self.stack.push(entry);
-                            self.at_eof = false;
-                            self.seek_cache = Some((cached_page, target_rowid));
-                            self.record_point_witness(WitnessKey::Cell {
-                                btree_root: self.root_page,
-                                leaf_page: cached_page,
-                                tag: Self::cell_tag_from_rowid(target_rowid),
-                            });
-                            return Ok(SeekResult::Found);
-                        }
-                        BinarySearchResult::NotFound(idx) => {
-                            // Target not found, but check if it belongs at end of this leaf.
-                            if idx >= entry.header.cell_count {
-                                // Target is past the end of this leaf — it may belong on
-                                // the next leaf. Fall through to full seek.
-                            } else {
-                                // Target belongs in the middle of this leaf.
-                                self.stack.clear();
-                                let mut entry = entry;
-                                entry.cell_idx = idx;
-                                self.stack.push(entry);
-                                self.at_eof = false;
-                                self.seek_cache = Some((cached_page, target_rowid));
-                                self.record_point_witness(WitnessKey::Cell {
-                                    btree_root: self.root_page,
-                                    leaf_page: cached_page,
-                                    tag: Self::cell_tag_from_rowid(target_rowid),
-                                });
-                                return Ok(SeekResult::NotFound);
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(result) = self.try_table_seek_cache(cx, target_rowid)? {
+            return Ok(result);
         }
 
         self.stack.clear();
@@ -1511,16 +1613,16 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             if entry.header.page_type.is_leaf() {
-                // Binary search on the leaf page by rowid.
-                let result = Self::binary_search_table_leaf(cx, &entry, target_rowid)?;
+                // Table leaf pages are integer-keyed by rowid, so use a
+                // bounded interpolation probe before falling back to binary.
+                let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
                 match result {
                     BinarySearchResult::Found(idx) => {
                         let mut entry = entry;
                         entry.cell_idx = idx;
                         self.stack.push(entry);
                         self.at_eof = false;
-                        // Cache leaf position for sequential seek optimization.
-                        self.seek_cache = Some((current_page, target_rowid));
+                        self.remember_table_seek(target_rowid, current_page, idx);
                         self.record_point_witness(WitnessKey::Cell {
                             btree_root: self.root_page,
                             leaf_page: current_page,
@@ -1534,17 +1636,16 @@ impl<P: PageReader> BtCursor<P> {
                             // Target is strictly greater than the last key on this leaf.
                             // Keep the path anchored to this right-most leaf and mark EOF,
                             // so callers (notably INSERT) still have a valid stack context.
-                            entry.cell_idx = entry.header.cell_count.saturating_sub(1);
+                            let landed_cell_idx = entry.header.cell_count.saturating_sub(1);
+                            entry.cell_idx = landed_cell_idx;
                             self.stack.push(entry);
                             self.at_eof = true;
-                            // Cache for sequential append optimization.
-                            self.seek_cache = Some((current_page, target_rowid));
+                            self.remember_table_seek(target_rowid, current_page, landed_cell_idx);
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
                             self.at_eof = false;
-                            // Cache for sequential seek optimization.
-                            self.seek_cache = Some((current_page, target_rowid));
+                            self.remember_table_seek(target_rowid, current_page, idx);
                         }
                         self.record_point_witness(WitnessKey::Cell {
                             btree_root: self.root_page,
@@ -1567,8 +1668,188 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    /// Binary search a leaf table page for a rowid.
-    fn binary_search_table_leaf(
+    fn try_table_seek_cache(&mut self, cx: &Cx, target_rowid: i64) -> Result<Option<SeekResult>> {
+        observe_cursor_cancellation(cx)?;
+
+        for slot_idx in 0..TABLE_SEEK_CACHE_SLOTS {
+            let Some(cached) = self.seek_cache[slot_idx] else {
+                continue;
+            };
+
+            // If the cached landing point was the first cell on this leaf,
+            // any smaller rowid must belong to an earlier leaf.
+            if target_rowid < cached.rowid && cached.cell_idx == 0 {
+                continue;
+            }
+
+            let entry = self.load_page(cx, cached.page_no)?;
+            if !(entry.header.page_type.is_leaf() && entry.header.page_type.is_table()) {
+                continue;
+            }
+
+            let result = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
+            match result {
+                BinarySearchResult::Found(idx) => {
+                    self.stack.clear();
+                    let mut entry = entry;
+                    entry.cell_idx = idx;
+                    self.stack.push(entry);
+                    self.at_eof = false;
+                    self.remember_table_seek(target_rowid, cached.page_no, idx);
+                    self.record_point_witness(WitnessKey::Cell {
+                        btree_root: self.root_page,
+                        leaf_page: cached.page_no,
+                        tag: Self::cell_tag_from_rowid(target_rowid),
+                    });
+                    return Ok(Some(SeekResult::Found));
+                }
+                BinarySearchResult::NotFound(idx) if idx < entry.header.cell_count && idx > 0 => {
+                    self.stack.clear();
+                    let mut entry = entry;
+                    entry.cell_idx = idx;
+                    self.stack.push(entry);
+                    self.at_eof = false;
+                    self.remember_table_seek(target_rowid, cached.page_no, idx);
+                    self.record_point_witness(WitnessKey::Cell {
+                        btree_root: self.root_page,
+                        leaf_page: cached.page_no,
+                        tag: Self::cell_tag_from_rowid(target_rowid),
+                    });
+                    return Ok(Some(SeekResult::NotFound));
+                }
+                BinarySearchResult::NotFound(_) => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn load_current_table_leaf(&mut self, cx: &Cx) -> Result<Option<StackEntry>> {
+        let Some(current) = self.stack.last() else {
+            return Ok(None);
+        };
+        if self.at_eof
+            || !current.header.page_type.is_leaf()
+            || !current.header.page_type.is_table()
+        {
+            return Ok(None);
+        }
+        let current_page = current.page_no;
+        let entry = self.load_page(cx, current_page)?;
+        if entry.header.cell_count == 0 {
+            return Ok(None);
+        }
+        Ok(Some(entry))
+    }
+
+    fn table_leaf_rowid_bounds(&self, entry: &StackEntry) -> Result<Option<(i64, i64)>> {
+        if entry.header.cell_count == 0 {
+            return Ok(None);
+        }
+        let first_rowid = Self::table_leaf_rowid_at(entry, 0)?;
+        let last_rowid = Self::table_leaf_rowid_at(entry, entry.header.cell_count - 1)?;
+        Ok(Some((first_rowid, last_rowid)))
+    }
+
+    fn position_on_loaded_table_leaf(
+        &mut self,
+        cx: &Cx,
+        entry: StackEntry,
+        target_rowid: i64,
+    ) -> Result<SeekResult> {
+        let page_no = entry.page_no;
+        let search = Self::search_integer_key_table_leaf(cx, &entry, target_rowid)?;
+        let mut entry = entry;
+        let seek_result = match search {
+            BinarySearchResult::Found(idx) => {
+                entry.cell_idx = idx;
+                SeekResult::Found
+            }
+            BinarySearchResult::NotFound(idx) => {
+                entry.cell_idx = idx.min(entry.header.cell_count.saturating_sub(1));
+                SeekResult::NotFound
+            }
+        };
+
+        *self
+            .stack
+            .last_mut()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))? = entry;
+        self.at_eof = false;
+        let positioned_cell_idx = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+            .cell_idx;
+        self.remember_table_seek(target_rowid, page_no, positioned_cell_idx);
+        self.record_point_witness(WitnessKey::Cell {
+            btree_root: self.root_page,
+            leaf_page: page_no,
+            tag: Self::cell_tag_from_rowid(target_rowid),
+        });
+        Ok(seek_result)
+    }
+
+    fn advance_to_next_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
+        let Some(top) = self.stack.last().cloned() else {
+            return Ok(false);
+        };
+        if !top.header.page_type.is_leaf() || top.header.cell_count == 0 {
+            return Ok(false);
+        }
+
+        let current_page = top.page_no;
+        self.stack
+            .last_mut()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+            .cell_idx = top.header.cell_count - 1;
+        self.at_eof = false;
+
+        let advanced = self.advance_next_impl(cx, false)?;
+        Ok(advanced
+            && !self.at_eof
+            && self
+                .current_page()
+                .is_some_and(|next_page| next_page != current_page))
+    }
+
+    fn table_leaf_rowid_at(entry: &StackEntry, cell_idx: u16) -> Result<i64> {
+        let idx = usize::from(cell_idx);
+        if idx >= entry.cell_pointers.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell index {} out of bounds ({})",
+                    cell_idx,
+                    entry.cell_pointers.len()
+                ),
+            });
+        }
+
+        let offset = entry.cell_pointers[idx] as usize;
+        let cell_data = &entry.page_data.as_bytes()[offset..];
+        if let Some((_, payload_varint_len)) = read_varint(cell_data) {
+            if let Some((rowid, _)) = read_varint(&cell_data[payload_varint_len..]) {
+                #[allow(clippy::cast_possible_wrap)]
+                let rowid_val = rowid as i64;
+                Ok(rowid_val)
+            } else {
+                Err(FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell has invalid rowid varint".to_owned(),
+                })
+            }
+        } else {
+            Err(FrankenError::DatabaseCorrupt {
+                detail: "table leaf cell has invalid payload size varint".to_owned(),
+            })
+        }
+    }
+
+    /// Search an integer-keyed table leaf page for a rowid.
+    ///
+    /// This uses up to three interpolation probes on the current key range,
+    /// then falls back to the pure binary search helper over the remaining
+    /// window. Index/blob-key pages continue to use binary search only.
+    fn search_integer_key_table_leaf(
         cx: &Cx,
         entry: &StackEntry,
         target: i64,
@@ -1578,28 +1859,93 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(BinarySearchResult::NotFound(0));
         }
 
+        let first_rowid = Self::table_leaf_rowid_at(entry, 0)?;
+        match target.cmp(&first_rowid) {
+            std::cmp::Ordering::Less => return Ok(BinarySearchResult::NotFound(0)),
+            std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(0)),
+            std::cmp::Ordering::Greater => {}
+        }
+
+        let last_idx = count - 1;
+        let last_rowid = Self::table_leaf_rowid_at(entry, last_idx)?;
+        match target.cmp(&last_rowid) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(last_idx)),
+            std::cmp::Ordering::Greater => return Ok(BinarySearchResult::NotFound(count)),
+        }
+
         let mut lo = 0u16;
         let mut hi = count;
+        let mut lo_rowid = first_rowid;
+        let mut hi_rowid = last_rowid;
+
+        for _ in 0..TABLE_LEAF_INTERPOLATION_MAX_PROBES {
+            observe_cursor_cancellation(cx)?;
+
+            let window_len = hi - lo;
+            if window_len == 0 {
+                return Ok(BinarySearchResult::NotFound(lo));
+            }
+
+            let denominator = i128::from(hi_rowid) - i128::from(lo_rowid);
+            if denominator <= 0 {
+                break;
+            }
+
+            // Estimate the probe slot from the rowid's relative position in
+            // the current search window, then clamp to a valid cell index.
+            let estimate = ((i128::from(target) - i128::from(lo_rowid)) * i128::from(window_len))
+                / denominator;
+            let probe_offset_i128 = estimate.clamp(0, i128::from(window_len) - 1);
+            let probe_offset = u16::try_from(probe_offset_i128)
+                .map_err(|_| FrankenError::internal("table leaf interpolation offset overflow"))?;
+            let probe_idx = lo
+                .checked_add(probe_offset)
+                .ok_or_else(|| FrankenError::internal("table leaf interpolation index overflow"))?;
+            let probe_rowid = Self::table_leaf_rowid_at(entry, probe_idx)?;
+
+            match probe_rowid.cmp(&target) {
+                std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(probe_idx)),
+                std::cmp::Ordering::Less => {
+                    lo = probe_idx.saturating_add(1);
+                    if lo >= hi {
+                        return Ok(BinarySearchResult::NotFound(lo));
+                    }
+                    lo_rowid = Self::table_leaf_rowid_at(entry, lo)?;
+                }
+                std::cmp::Ordering::Greater => {
+                    hi = probe_idx;
+                    if lo >= hi {
+                        return Ok(BinarySearchResult::NotFound(lo));
+                    }
+                    hi_rowid = Self::table_leaf_rowid_at(entry, hi - 1)?;
+                }
+            }
+        }
+
+        Self::binary_search_table_leaf_range(cx, entry, target, lo, hi)
+    }
+
+    /// Binary search a leaf table page for a rowid.
+    fn binary_search_table_leaf(
+        cx: &Cx,
+        entry: &StackEntry,
+        target: i64,
+    ) -> Result<BinarySearchResult> {
+        Self::binary_search_table_leaf_range(cx, entry, target, 0, entry.header.cell_count)
+    }
+
+    fn binary_search_table_leaf_range(
+        cx: &Cx,
+        entry: &StackEntry,
+        target: i64,
+        mut lo: u16,
+        mut hi: u16,
+    ) -> Result<BinarySearchResult> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let offset = entry.cell_pointers[mid as usize] as usize;
-            let cell_data = &entry.page_data.as_bytes()[offset..];
-            let rowid = if let Some((_, n)) = read_varint(cell_data) {
-                if let Some((r, _)) = read_varint(&cell_data[n..]) {
-                    #[allow(clippy::cast_possible_wrap)]
-                    let rowid_val = r as i64;
-                    rowid_val
-                } else {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "table leaf cell has invalid rowid varint".to_owned(),
-                    });
-                }
-            } else {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "table leaf cell has invalid payload size varint".to_owned(),
-                });
-            };
+            let rowid = Self::table_leaf_rowid_at(entry, mid)?;
 
             match rowid.cmp(&target) {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -1965,7 +2311,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Advance to the next entry. Returns false if at EOF.
-    fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
+    fn advance_next_impl(&mut self, cx: &Cx, record_leaf_witness: bool) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
 
         if self.at_eof {
@@ -1975,7 +2321,7 @@ impl<P: PageReader> BtCursor<P> {
         if self.stack.is_empty() {
             // Allow recovering from a before-first state created by prev()
             // at the beginning of iteration.
-            return self.move_to_leftmost_leaf(cx, self.root_page, true);
+            return self.move_to_leftmost_leaf(cx, self.root_page, record_leaf_witness);
         }
 
         let depth = self.stack.len();
@@ -2015,12 +2361,12 @@ impl<P: PageReader> BtCursor<P> {
 
                     self.stack[depth - 1].cell_idx = next_child_idx;
                     self.issue_prefetch_hint(cx, child);
-                    let found = self.move_to_leftmost_leaf(cx, child, true)?;
+                    let found = self.move_to_leftmost_leaf(cx, child, record_leaf_witness)?;
                     if found {
                         return Ok(true);
                     }
                     self.at_eof = false;
-                    return self.advance_next(cx);
+                    return self.advance_next_impl(cx, record_leaf_witness);
                 }
                 // cell_idx == cell_count means we already visited right_child.
                 self.stack.pop();
@@ -2049,8 +2395,12 @@ impl<P: PageReader> BtCursor<P> {
             Ok(true)
         } else {
             self.at_eof = false;
-            self.advance_next(cx)
+            self.advance_next_impl(cx, record_leaf_witness)
         }
+    }
+
+    fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
+        self.advance_next_impl(cx, true)
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
@@ -2194,7 +2544,8 @@ fn decode_big_endian_signed_fast(bytes: &[u8]) -> i64 {
     }
 }
 
-/// Result of a binary search within a page.
+/// Result of a search within a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BinarySearchResult {
     /// Exact match found at this cell index.
     Found(u16),
@@ -3633,6 +3984,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+            // Delete may rebalance and then re-seek internally to restore
+            // cursor position. Any cache entries from the caller's prior seek
+            // can point at a leaf that this delete is about to rewrite or free.
+            cursor.clear_seek_cache();
+
             if cursor.at_eof || cursor.stack.is_empty() {
                 return Err(FrankenError::internal("cursor at EOF"));
             }
@@ -3923,12 +4279,63 @@ mod tests {
             self.inner.read_page(cx, page_no)
         }
 
-        fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
             self.hinted_pages.borrow_mut().push(page_no);
+            self.inner.prefetch_page_hint(cx, page_no);
         }
     }
 
     impl PageWriter for PrefetchProbeStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[derive(Debug, Clone)]
+    struct SeekProbeStore {
+        inner: MemPageStore,
+        read_pages: Rc<RefCell<Vec<PageNumber>>>,
+    }
+
+    impl SeekProbeStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self {
+                inner,
+                read_pages: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn clear_reads(&self) {
+            self.read_pages.borrow_mut().clear();
+        }
+
+        fn read_pages(&self) -> Vec<PageNumber> {
+            self.read_pages.borrow().clone()
+        }
+    }
+
+    impl PageReader for SeekProbeStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.read_pages.borrow_mut().push(page_no);
+            self.inner.read_page(cx, page_no)
+        }
+
+        fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
+            self.inner.prefetch_page_hint(cx, page_no);
+        }
+    }
+
+    impl PageWriter for SeekProbeStore {
         fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
             self.inner.write_page(cx, page_no, data)
         }
@@ -4724,6 +5131,121 @@ mod tests {
         let result = cursor.table_move_to(&cx, 20).unwrap();
         assert!(!result.is_found());
         assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_table_seek_cache_uses_four_slot_lru() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60), (pn(6), 80)], pn(7)),
+        );
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(10, b"a"), (20, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(30, b"c"), (40, b"d")]));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(50, b"e"), (60, b"f")]));
+        store
+            .pages
+            .insert(6, build_leaf_table(&[(70, b"g"), (80, b"h")]));
+        store
+            .pages
+            .insert(7, build_leaf_table(&[(90, b"i"), (100, b"j")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+
+        for rowid in [10_i64, 30, 50, 70] {
+            assert!(cursor.table_move_to(&cx, rowid).unwrap().is_found());
+        }
+
+        let cache_pages: Vec<PageNumber> = cursor
+            .seek_cache
+            .iter()
+            .flatten()
+            .map(|entry| entry.page_no)
+            .collect();
+        assert_eq!(cache_pages, vec![pn(6), pn(5), pn(4), pn(3)]);
+
+        cursor.pager.clear_reads();
+        let result = cursor.table_move_to(&cx, 15).unwrap();
+        assert!(!result.is_found());
+        assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+        let cache_pages: Vec<PageNumber> = cursor
+            .seek_cache
+            .iter()
+            .flatten()
+            .map(|entry| entry.page_no)
+            .collect();
+        assert_eq!(cache_pages, vec![pn(3), pn(6), pn(5), pn(4)]);
+
+        cursor.pager.clear_reads();
+        assert!(cursor.table_move_to(&cx, 90).unwrap().is_found());
+        assert_eq!(
+            cursor.pager.read_pages(),
+            vec![pn(6), pn(5), pn(4), pn(2), pn(7)]
+        );
+        let cache_pages: Vec<PageNumber> = cursor
+            .seek_cache
+            .iter()
+            .flatten()
+            .map(|entry| entry.page_no)
+            .collect();
+        assert_eq!(cache_pages, vec![pn(7), pn(3), pn(6), pn(5)]);
+
+        cursor.pager.clear_reads();
+        let result = cursor.table_move_to(&cx, 35).unwrap();
+        assert!(!result.is_found());
+        assert_eq!(cursor.pager.read_pages(), vec![pn(3), pn(2), pn(4)]);
+        let cache_pages: Vec<PageNumber> = cursor
+            .seek_cache
+            .iter()
+            .flatten()
+            .map(|entry| entry.page_no)
+            .collect();
+        assert_eq!(cache_pages, vec![pn(4), pn(7), pn(3), pn(6)]);
+
+        cursor.pager.clear_reads();
+        let result = cursor.table_move_to(&cx, 12).unwrap();
+        assert!(!result.is_found());
+        assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+    }
+
+    #[test]
+    fn test_table_leaf_interpolation_search_matches_binary_on_sparse_rowids() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_leaf_table(&[
+                (-4_000, b"a"),
+                (-17, b"b"),
+                (0, b"c"),
+                (275, b"d"),
+                (50_000, b"e"),
+            ]),
+        );
+
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+
+        for target in [
+            -9_999, -4_000, -18, -17, -16, 1, 274, 275, 276, 50_000, 99_999,
+        ] {
+            let interpolation =
+                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                    .unwrap();
+            let binary =
+                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
+            assert_eq!(
+                interpolation, binary,
+                "interpolation search must match binary search for target {target}"
+            );
+        }
     }
 
     #[test]
@@ -6001,6 +6523,66 @@ mod tests {
     }
 
     #[test]
+    fn test_table_seek_prefetches_interior_children_along_descent_path() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .write_page(&cx, pn(2), &build_interior_table(&[(pn(3), 15)], pn(4)))
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(3),
+                &build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)),
+            )
+            .unwrap();
+        store
+            .write_page(&cx, pn(4), &build_interior_table(&[(pn(8), 25)], pn(9)))
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(5),
+                &build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(6),
+                &build_leaf_table(&[(4, b"d"), (5, b"e"), (8, b"f")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(7),
+                &build_leaf_table(&[(9, b"g"), (10, b"h"), (15, b"i")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(8),
+                &build_leaf_table(&[(16, b"j"), (20, b"k"), (24, b"l")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(9),
+                &build_leaf_table(&[(26, b"m"), (30, b"n"), (40, b"o")]),
+            )
+            .unwrap();
+
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+        let result = cursor.table_move_to(&cx, 20).unwrap();
+
+        assert_eq!(result, SeekResult::Found);
+        assert_eq!(cursor.pager.hinted_pages(), vec![pn(4), pn(8)]);
+    }
+
+    #[test]
     fn test_btree_insert_delete_5k() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
@@ -6184,6 +6766,67 @@ mod tests {
             scanned.push(cursor.rowid(&cx).unwrap());
         }
         assert_eq!(scanned, expected_rowids);
+    }
+
+    #[test]
+    fn test_table_advance_to_reuses_local_and_sibling_leaf_before_full_seek() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
+
+        store
+            .pages
+            .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
+        store
+            .pages
+            .insert(4, build_interior_table(&[(pn(8), 25)], pn(9)));
+
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
+        store
+            .pages
+            .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
+        store
+            .pages
+            .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
+        store
+            .pages
+            .insert(8, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+        store
+            .pages
+            .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
+        let same_leaf = cursor.current_page().unwrap();
+        let same_leaf_seek = cursor.advance_to(&cx, 12).unwrap();
+        assert!(!same_leaf_seek.is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
+        assert_eq!(cursor.current_page().unwrap(), same_leaf);
+
+        assert!(cursor.table_move_to(&cx, 8).unwrap().is_found());
+        let left_leaf = cursor.current_page().unwrap();
+        let sibling_seek = cursor.advance_to(&cx, 10).unwrap();
+        assert!(sibling_seek.is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+        assert_ne!(cursor.current_page().unwrap(), left_leaf);
+
+        assert!(cursor.table_move_to(&cx, 8).unwrap().is_found());
+        let fallback_seek = cursor.advance_to(&cx, 30).unwrap();
+        assert!(fallback_seek.is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 30);
+        assert_eq!(cursor.current_page().unwrap(), pn(9));
+        assert!(
+            cursor
+                .witness_keys()
+                .iter()
+                .all(|key| matches!(key, WitnessKey::Cell { .. })),
+            "advance_to must remain a point probe and avoid page witnesses"
+        );
     }
 
     #[test]
@@ -6960,6 +7603,100 @@ mod tests {
                 &scanned_rowids,
                 &ref_rowids,
                 "bead_id=bd-2sm1 case=btree_vs_btreemap rowids mismatch"
+            );
+        }
+
+        #[test]
+        fn prop_table_seek_cache_matches_forced_full_descent(
+            workload in proptest::collection::vec(-64_i64..=320_i64, 1..200)
+        ) {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut seed_cursor = BtCursor::new(store, root, USABLE, true);
+
+            for rowid in 1_i64..=256_i64 {
+                let payload = vec![b'Q'; 160 + usize::try_from(rowid % 17).unwrap()];
+                seed_cursor.table_insert(&cx, rowid, &payload).unwrap();
+            }
+
+            let mut cached_cursor = BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
+            let mut baseline_cursor = BtCursor::new(seed_cursor.pager.clone(), root, USABLE, true);
+
+            for target in workload {
+                baseline_cursor.clear_seek_cache();
+
+                let baseline = baseline_cursor.table_move_to(&cx, target).unwrap();
+                let cached = cached_cursor.table_move_to(&cx, target).unwrap();
+
+                proptest::prop_assert_eq!(
+                    cached.is_found(),
+                    baseline.is_found(),
+                    "seek hit mismatch for rowid {}",
+                    target
+                );
+                proptest::prop_assert_eq!(
+                    cached_cursor.eof(),
+                    baseline_cursor.eof(),
+                    "EOF mismatch for rowid {}",
+                    target
+                );
+
+                if !cached_cursor.eof() {
+                    let cached_rowid = cached_cursor.rowid(&cx).unwrap();
+                    let baseline_rowid = baseline_cursor.rowid(&cx).unwrap();
+                    proptest::prop_assert_eq!(
+                        cached_rowid,
+                        baseline_rowid,
+                        "landing rowid mismatch for target {}",
+                        target
+                    );
+
+                    let cached_payload = cached_cursor.payload(&cx).unwrap();
+                    let baseline_payload = baseline_cursor.payload(&cx).unwrap();
+                    proptest::prop_assert_eq!(
+                        cached_payload,
+                        baseline_payload,
+                        "landing payload mismatch for target {}",
+                        target
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn prop_table_leaf_interpolation_matches_binary_search(
+            rowids in proptest::collection::btree_set(-10_000_i64..=10_000_i64, 0..128),
+            target in -12_000_i64..=12_000_i64,
+        ) {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            let payloads: Vec<Vec<u8>> = rowids
+                .iter()
+                .map(|rowid| rowid.to_le_bytes().to_vec())
+                .collect();
+            let entries: Vec<(i64, &[u8])> = rowids
+                .iter()
+                .zip(payloads.iter())
+                .map(|(rowid, payload)| (*rowid, payload.as_slice()))
+                .collect();
+            store.pages.insert(2, build_leaf_table(&entries));
+
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let entry = cursor.load_page(&cx, pn(2)).unwrap();
+
+            let interpolation =
+                BtCursor::<MemPageStore>::search_integer_key_table_leaf(&cx, &entry, target)
+                    .unwrap();
+            let binary =
+                BtCursor::<MemPageStore>::binary_search_table_leaf(&cx, &entry, target).unwrap();
+
+            proptest::prop_assert_eq!(
+                interpolation,
+                binary,
+                "interpolation search must match binary search for target {} and rowids {:?}",
+                target,
+                rowids
             );
         }
     }

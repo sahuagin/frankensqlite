@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -6,6 +7,77 @@ use std::sync::Arc;
 use memchr::{memchr, memchr2};
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
+
+// ============================================================================
+// Thread-Local Value Slab Allocator
+// ============================================================================
+
+/// Maximum number of values to keep in the thread-local pool.
+///
+/// 256 is chosen as a balance: large enough to cover typical row batch sizes,
+/// small enough to avoid unbounded memory retention per thread.
+const VALUE_POOL_CAP: usize = 256;
+
+thread_local! {
+    /// Thread-local pool of reusable `SqliteValue` objects.
+    ///
+    /// During hot-path execution (MakeRecord, Column decode), values are
+    /// acquired from this pool instead of allocating fresh, then returned
+    /// when the register is overwritten or the row changes.
+    static VALUE_POOL: RefCell<Vec<SqliteValue>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Acquire a value from the thread-local pool, if available.
+///
+/// Returns `Some(value)` if a pooled value was available, `None` otherwise.
+/// The returned value may contain stale data and should be overwritten
+/// with the desired variant before use.
+///
+/// # Example
+/// ```ignore
+/// let value = pool_acquire().unwrap_or(SqliteValue::Null);
+/// // Overwrite with actual data
+/// value = SqliteValue::Integer(42);
+/// ```
+#[inline]
+pub fn pool_acquire() -> Option<SqliteValue> {
+    VALUE_POOL.with(|pool| pool.borrow_mut().pop())
+}
+
+/// Return a value to the thread-local pool for reuse.
+///
+/// Values are only pooled if the pool has capacity (max 256 entries).
+/// Excess values are dropped normally, preventing unbounded memory growth.
+///
+/// For best effect, return values just before they would be dropped,
+/// allowing future `pool_acquire` calls to skip allocation.
+#[inline]
+pub fn pool_return(value: SqliteValue) {
+    VALUE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < VALUE_POOL_CAP {
+            pool.push(value);
+        }
+        // If pool is full, value is dropped normally
+    });
+}
+
+/// Clear the thread-local value pool.
+///
+/// Use this to release memory when a thread's workload is complete,
+/// or in test teardown to ensure deterministic behavior.
+#[inline]
+pub fn pool_clear() {
+    VALUE_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
+/// Returns the current number of values in the thread-local pool.
+///
+/// Useful for testing and diagnostics.
+#[inline]
+pub fn pool_len() -> usize {
+    VALUE_POOL.with(|pool| pool.borrow().len())
+}
 
 /// Maximum inline string length for `SmallText`.
 ///

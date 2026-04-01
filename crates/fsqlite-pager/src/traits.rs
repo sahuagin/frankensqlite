@@ -14,9 +14,17 @@
 
 use std::collections::HashMap;
 
+use crate::pager::SimpleTransaction;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageData, PageNumber, PageSize};
+#[cfg(target_os = "linux")]
+use fsqlite_vfs::IoUringVfs;
+use fsqlite_vfs::MemoryVfs;
+#[cfg(unix)]
+use fsqlite_vfs::UnixVfs;
+#[cfg(target_os = "windows")]
+use fsqlite_vfs::WindowsVfs;
 use fsqlite_wal::checksum::WalChecksumTransform;
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1008,211 @@ impl TransactionHandle for MemoryMockTransaction {
                 "no savepoint named '{name}'"
             )))
         }
+    }
+}
+
+/// Stack-allocated transaction wrapper used by upper layers to avoid boxing
+/// pager transactions behind `dyn TransactionHandle`.
+pub enum TransactionKind {
+    /// In-memory pager transaction (`:memory:` databases).
+    Memory(SimpleTransaction<MemoryVfs>),
+    /// Linux io_uring pager transaction.
+    #[cfg(target_os = "linux")]
+    IoUring(SimpleTransaction<IoUringVfs>),
+    /// Unix filesystem pager transaction.
+    #[cfg(unix)]
+    Unix(SimpleTransaction<UnixVfs>),
+    /// Windows filesystem pager transaction.
+    #[cfg(target_os = "windows")]
+    Windows(SimpleTransaction<WindowsVfs>),
+    /// Generic mock transaction used by cross-crate tests.
+    Mock(MockTransaction),
+    /// In-memory mock transaction used by cross-crate tests.
+    MemoryMock(MemoryMockTransaction),
+}
+
+impl std::fmt::Debug for TransactionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(_) => f.write_str("TransactionKind::Memory"),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => f.write_str("TransactionKind::IoUring"),
+            #[cfg(unix)]
+            Self::Unix(_) => f.write_str("TransactionKind::Unix"),
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => f.write_str("TransactionKind::Windows"),
+            Self::Mock(_) => f.write_str("TransactionKind::Mock"),
+            Self::MemoryMock(_) => f.write_str("TransactionKind::MemoryMock"),
+        }
+    }
+}
+
+impl TransactionKind {
+    fn with_handle<R>(&self, f: impl FnOnce(&dyn TransactionHandle) -> R) -> R {
+        match self {
+            Self::Memory(txn) => f(txn),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(txn) => f(txn),
+            #[cfg(unix)]
+            Self::Unix(txn) => f(txn),
+            #[cfg(target_os = "windows")]
+            Self::Windows(txn) => f(txn),
+            Self::Mock(txn) => f(txn),
+            Self::MemoryMock(txn) => f(txn),
+        }
+    }
+
+    fn with_handle_mut<R>(&mut self, f: impl FnOnce(&mut dyn TransactionHandle) -> R) -> R {
+        match self {
+            Self::Memory(txn) => f(txn),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(txn) => f(txn),
+            #[cfg(unix)]
+            Self::Unix(txn) => f(txn),
+            #[cfg(target_os = "windows")]
+            Self::Windows(txn) => f(txn),
+            Self::Mock(txn) => f(txn),
+            Self::MemoryMock(txn) => f(txn),
+        }
+    }
+}
+
+impl From<SimpleTransaction<MemoryVfs>> for TransactionKind {
+    fn from(txn: SimpleTransaction<MemoryVfs>) -> Self {
+        Self::Memory(txn)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<SimpleTransaction<IoUringVfs>> for TransactionKind {
+    fn from(txn: SimpleTransaction<IoUringVfs>) -> Self {
+        Self::IoUring(txn)
+    }
+}
+
+#[cfg(unix)]
+impl From<SimpleTransaction<UnixVfs>> for TransactionKind {
+    fn from(txn: SimpleTransaction<UnixVfs>) -> Self {
+        Self::Unix(txn)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl From<SimpleTransaction<WindowsVfs>> for TransactionKind {
+    fn from(txn: SimpleTransaction<WindowsVfs>) -> Self {
+        Self::Windows(txn)
+    }
+}
+
+impl From<MockTransaction> for TransactionKind {
+    fn from(txn: MockTransaction) -> Self {
+        Self::Mock(txn)
+    }
+}
+
+impl From<MemoryMockTransaction> for TransactionKind {
+    fn from(txn: MemoryMockTransaction) -> Self {
+        Self::MemoryMock(txn)
+    }
+}
+
+impl sealed::Sealed for TransactionKind {}
+
+impl TransactionHandle for TransactionKind {
+    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        self.with_handle(|txn| txn.get_page(cx, page_no))
+    }
+
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.with_handle_mut(|txn| txn.write_page(cx, page_no, data))
+    }
+
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        self.with_handle_mut(|txn| txn.write_page_data(cx, page_no, data))
+    }
+
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        self.with_handle_mut(|txn| txn.allocate_page(cx))
+    }
+
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.with_handle_mut(|txn| txn.free_page(cx, page_no))
+    }
+
+    fn commit(&mut self, cx: &Cx) -> Result<()> {
+        self.with_handle_mut(|txn| txn.commit(cx))
+    }
+
+    fn commit_and_retain(&mut self, cx: &Cx) -> Result<bool> {
+        self.with_handle_mut(|txn| txn.commit_and_retain(cx))
+    }
+
+    fn is_writer(&self) -> bool {
+        self.with_handle(|txn| txn.is_writer())
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        self.with_handle(|txn| txn.has_pending_writes())
+    }
+
+    fn published_visible_commit_seq_hint(&self) -> Option<fsqlite_types::CommitSeq> {
+        self.with_handle(|txn| txn.published_visible_commit_seq_hint())
+    }
+
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.with_handle(|txn| txn.pending_commit_pages())
+    }
+
+    fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        self.with_handle(|txn| txn.pending_conflict_pages())
+    }
+
+    fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
+        self.with_handle(|txn| txn.pending_conflict_pages_conservative())
+    }
+
+    fn write_set_page_numbers(&self) -> Vec<PageNumber> {
+        self.with_handle(|txn| txn.write_set_page_numbers())
+    }
+
+    fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        self.with_handle(|txn| txn.page_one_in_pending_commit_surface())
+    }
+
+    fn page_size(&self) -> PageSize {
+        self.with_handle(|txn| txn.page_size())
+    }
+
+    fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        self.with_handle(|txn| txn.allocate_page_requires_page_one_conflict_tracking())
+    }
+
+    fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.with_handle(|txn| txn.free_page_requires_page_one_conflict_tracking(page_no))
+    }
+
+    fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        self.with_handle(|txn| txn.write_page_requires_page_one_conflict_tracking(page_no))
+    }
+
+    fn rollback(&mut self, cx: &Cx) -> Result<()> {
+        self.with_handle_mut(|txn| txn.rollback(cx))
+    }
+
+    fn record_write_witness(&mut self, cx: &Cx, key: fsqlite_types::WitnessKey) {
+        self.with_handle_mut(|txn| txn.record_write_witness(cx, key));
+    }
+
+    fn savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.with_handle_mut(|txn| txn.savepoint(cx, name))
+    }
+
+    fn release_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.with_handle_mut(|txn| txn.release_savepoint(cx, name))
+    }
+
+    fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.with_handle_mut(|txn| txn.rollback_to_savepoint(cx, name))
     }
 }
 

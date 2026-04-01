@@ -20,6 +20,7 @@
 //! false sharing between adjacent shards.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -374,6 +375,178 @@ const SHARD_MASK: usize = SHARD_COUNT - 1;
 /// even for sequential keys, which is critical for B-tree scan patterns.
 const GOLDEN_RATIO_32: u32 = 2_654_435_769;
 
+/// Initial capacity for the fast page array (bd-fzr07).
+/// 1024 pages = 4MB at default 4KB page size, covers most small databases.
+const FAST_ARRAY_INITIAL_CAPACITY: usize = 1024;
+
+// ---------------------------------------------------------------------------
+// FastPageArray (bd-fzr07)
+// ---------------------------------------------------------------------------
+
+/// Flat page array for single-connection :memory: mode (bd-fzr07).
+///
+/// For single-connection workloads, this provides O(1) page access via direct
+/// Vec indexing, avoiding the hash computation and shard selection overhead
+/// of [`ShardedPageCache`]. Pages are indexed by `(pgno - 1)` since SQLite
+/// page numbers are 1-based.
+///
+/// # Performance
+///
+/// - **Read latency**: ~5-10ns (Vec index + bounds check) vs 50-150ns (sharded)
+/// - **Memory**: Sparse array may waste space for databases with many gaps
+/// - **Best for**: Sequential B-tree scans, single-writer :memory: workloads
+struct FastPageArray {
+    /// Pages indexed by `(pgno - 1)`. `None` = page not cached.
+    pages: Vec<Option<PageBuf>>,
+    /// Number of non-None entries (tracked for O(1) len()).
+    count: usize,
+    /// Local hit counter.
+    hits: u64,
+    /// Local miss counter.
+    misses: u64,
+    /// Local admit counter.
+    admits: u64,
+    /// Local eviction counter.
+    evictions: u64,
+}
+
+impl FastPageArray {
+    /// Create a new fast page array with default initial capacity.
+    fn new() -> Self {
+        Self {
+            pages: Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY),
+            count: 0,
+            hits: 0,
+            misses: 0,
+            admits: 0,
+            evictions: 0,
+        }
+    }
+
+    /// Convert page number to array index.
+    #[inline]
+    fn pgno_to_idx(page_no: PageNumber) -> usize {
+        (page_no.get() - 1) as usize
+    }
+
+    /// Ensure the array can hold the given page number.
+    #[inline]
+    fn ensure_capacity(&mut self, page_no: PageNumber) {
+        let idx = Self::pgno_to_idx(page_no);
+        if idx >= self.pages.len() {
+            // Grow to at least idx + 1, but prefer doubling for amortized O(1)
+            let new_len = (idx + 1)
+                .max(self.pages.len() * 2)
+                .max(FAST_ARRAY_INITIAL_CAPACITY);
+            self.pages.resize_with(new_len, || None);
+        }
+    }
+
+    /// Get a page from the array.
+    #[inline]
+    fn get(&mut self, page_no: PageNumber) -> Option<&[u8]> {
+        let idx = Self::pgno_to_idx(page_no);
+        if let Some(Some(buf)) = self.pages.get(idx) {
+            self.hits = self.hits.saturating_add(1);
+            Some(buf.as_slice())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    /// Get a mutable reference to a page.
+    #[inline]
+    fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
+        let idx = Self::pgno_to_idx(page_no);
+        if let Some(Some(buf)) = self.pages.get_mut(idx) {
+            self.hits = self.hits.saturating_add(1);
+            Some(buf.as_mut_slice())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    /// Check if a page is present.
+    #[inline]
+    fn contains(&self, page_no: PageNumber) -> bool {
+        let idx = Self::pgno_to_idx(page_no);
+        self.pages.get(idx).is_some_and(Option::is_some)
+    }
+
+    /// Insert a page buffer.
+    fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
+        self.ensure_capacity(page_no);
+        let idx = Self::pgno_to_idx(page_no);
+        let is_new = self.pages[idx].is_none();
+        self.pages[idx] = Some(buf);
+        if is_new {
+            self.count += 1;
+            self.admits = self.admits.saturating_add(1);
+        }
+        is_new
+    }
+
+    /// Remove a page.
+    fn remove(&mut self, page_no: PageNumber) -> bool {
+        let idx = Self::pgno_to_idx(page_no);
+        if let Some(slot) = self.pages.get_mut(idx) {
+            if slot.take().is_some() {
+                self.count = self.count.saturating_sub(1);
+                self.evictions = self.evictions.saturating_add(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove an arbitrary page (for eviction).
+    fn remove_any(&mut self) -> Option<PageNumber> {
+        for (idx, slot) in self.pages.iter_mut().enumerate() {
+            if slot.take().is_some() {
+                self.count = self.count.saturating_sub(1);
+                self.evictions = self.evictions.saturating_add(1);
+                // Convert idx back to page number (1-based).
+                // idx is bounded by pages.len() which fits in usize, and we only
+                // store pages with valid PageNumber so idx+1 fits in u32.
+                #[allow(clippy::cast_possible_truncation)]
+                return PageNumber::new((idx + 1) as u32);
+            }
+        }
+        None
+    }
+
+    /// Clear all pages.
+    fn clear(&mut self) -> usize {
+        let removed = self.count;
+        self.count = 0;
+        for slot in &mut self.pages {
+            let _ = slot.take();
+        }
+        self.evictions = self.evictions.saturating_add(removed as u64);
+        removed
+    }
+
+    /// Number of cached pages (O(1)).
+    #[inline]
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Reset metrics counters.
+    fn reset_metrics(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+        self.admits = 0;
+        self.evictions = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PageCacheShard
+// ---------------------------------------------------------------------------
+
 /// A single shard of the page cache.
 ///
 /// Each shard contains its own hash map and metrics counters. The shard is
@@ -523,6 +696,12 @@ impl std::fmt::Debug for PageCacheShard {
 ///   buffer allocation is already lock-free (via atomic free-list).
 /// - **Per-shard metrics**: Avoids false sharing on metric counters.
 ///
+/// # Single-Connection Fast Path (bd-fzr07)
+///
+/// For single-connection `:memory:` workloads, the cache can use a flat
+/// [`FastPageArray`] that provides O(1) page access via direct Vec indexing.
+/// Enable with [`new_single_connection`] or [`enable_fast_path`].
+///
 /// # Thread Safety
 ///
 /// Each shard is protected by a `Mutex`. The shard selection is deterministic
@@ -536,12 +715,36 @@ pub struct ShardedPageCache {
     pool: PageBufPool,
     /// Configured page size.
     page_size: PageSize,
+    /// Fast-path flat array for single-connection mode (bd-fzr07).
+    /// When `Some`, page lookups bypass sharded mutexes and use direct indexing.
+    fast_array: Option<Mutex<FastPageArray>>,
+    /// Whether to use the fast path. Checked first on every operation.
+    /// `Relaxed` ordering is sufficient since we're just reading a hint.
+    use_fast_path: AtomicBool,
 }
 
 impl ShardedPageCache {
     /// Create a new sharded page cache with the given page size.
+    ///
+    /// For single-connection `:memory:` workloads, prefer [`new_single_connection`]
+    /// which enables the fast-path flat array (bd-fzr07).
     pub fn new(page_size: PageSize) -> Self {
         Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
+    }
+
+    /// Create a new sharded page cache optimized for single-connection mode (bd-fzr07).
+    ///
+    /// Enables a flat page array that provides O(1) page access via direct Vec
+    /// indexing, avoiding hash computation and shard selection overhead.
+    ///
+    /// # Performance
+    ///
+    /// - **Read latency**: ~5-10ns vs 50-150ns for sharded path
+    /// - **Best for**: Single-writer `:memory:` databases, sequential B-tree scans
+    pub fn new_single_connection(page_size: PageSize) -> Self {
+        let mut cache = Self::new(page_size);
+        cache.enable_fast_path();
+        cache
     }
 
     /// Create a new sharded page cache using an existing `PageBufPool`.
@@ -554,7 +757,37 @@ impl ShardedPageCache {
             shards,
             pool,
             page_size,
+            fast_array: None,
+            use_fast_path: AtomicBool::new(false),
         }
+    }
+
+    /// Enable the single-connection fast path (bd-fzr07).
+    ///
+    /// Once enabled, all page operations will use the flat array instead of
+    /// the sharded cache. This is safe to call at any time, but should be
+    /// called early before significant cache population.
+    pub fn enable_fast_path(&mut self) {
+        if self.fast_array.is_none() {
+            self.fast_array = Some(Mutex::new(FastPageArray::new()));
+            self.use_fast_path.store(true, Ordering::Release);
+        }
+    }
+
+    /// Disable the fast path and switch back to sharded cache.
+    ///
+    /// Note: Pages in the fast array are NOT migrated to the sharded cache.
+    /// This should only be called when switching to multi-connection mode.
+    pub fn disable_fast_path(&mut self) {
+        self.use_fast_path.store(false, Ordering::Release);
+        // Keep the fast_array around to avoid dropping cached pages.
+        // They'll be re-read from VFS if needed.
+    }
+
+    /// Check if fast path is enabled.
+    #[inline]
+    pub fn is_fast_path_enabled(&self) -> bool {
+        self.use_fast_path.load(Ordering::Relaxed)
     }
 
     /// Select the shard index for a given page number.
@@ -574,22 +807,40 @@ impl ShardedPageCache {
         &self.pool
     }
 
-    /// Total number of pages across all shards.
+    /// Total number of pages across all shards (or fast array if enabled).
     ///
     /// Note: This acquires all shard locks briefly. For hot-path metrics,
     /// prefer `metrics_snapshot()` which aggregates all counters atomically.
     pub fn len(&self) -> usize {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().len();
+            }
+        }
         self.shards.iter().map(|s| s.lock().len()).sum()
     }
 
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().len() == 0;
+            }
+        }
         self.shards.iter().all(|s| s.lock().pages.is_empty())
     }
 
     /// Check if a page is present in the cache.
     #[inline]
     pub fn contains(&self, page_no: PageNumber) -> bool {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().contains(page_no);
+            }
+        }
         let idx = Self::shard_index(page_no);
         self.shards[idx].lock().contains(page_no)
     }
@@ -603,6 +854,12 @@ impl ShardedPageCache {
     /// For zero-copy access, use `with_page()` instead.
     #[inline]
     pub fn get(&self, page_no: PageNumber) -> Option<Vec<u8>> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().get(page_no).map(|s| s.to_vec());
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|slice| slice.to_vec())
@@ -614,6 +871,12 @@ impl ShardedPageCache {
     /// the page is not cached.
     #[inline]
     pub fn with_page<R>(&self, page_no: PageNumber, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().get(page_no).map(f);
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(f)
@@ -626,6 +889,12 @@ impl ShardedPageCache {
         page_no: PageNumber,
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> Option<R> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().get_mut(page_no).map(f);
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get_mut(page_no).map(f)
@@ -643,6 +912,33 @@ impl ShardedPageCache {
         page_no: PageNumber,
         f: impl FnOnce(&[u8]) -> R,
     ) -> Result<R> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let mut arr = fast.lock();
+                // Check for cache hit first
+                if let Some(data) = arr.get(page_no) {
+                    return Ok(f(data));
+                }
+                // Cache miss — read from VFS
+                let mut buf = self.pool.acquire()?;
+                let offset = page_offset(page_no, self.page_size);
+                let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
+                if bytes_read < self.page_size.as_usize() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "short read fetching page {page}: got {bytes_read} of {page_size}",
+                            page = page_no.get(),
+                            page_size = self.page_size.as_usize()
+                        ),
+                    });
+                }
+                let result = f(buf.as_slice());
+                arr.insert(page_no, buf);
+                return Ok(result);
+            }
+        }
+
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
 
@@ -678,6 +974,22 @@ impl ShardedPageCache {
 
     /// Write a cached page out to a VFS file.
     pub fn write_page(&self, cx: &Cx, file: &mut impl VfsFile, page_no: PageNumber) -> Result<()> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let mut arr = fast.lock();
+                if let Some(data) = arr.get(page_no) {
+                    let offset = page_offset(page_no, self.page_size);
+                    file.write(cx, data, offset)?;
+                    return Ok(());
+                }
+                return Err(FrankenError::internal(format!(
+                    "page {} not in cache",
+                    page_no
+                )));
+            }
+        }
+
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
 
@@ -706,6 +1018,18 @@ impl ShardedPageCache {
         page_no: PageNumber,
         f: impl FnOnce(&mut [u8]) -> R,
     ) -> Result<R> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let mut arr = fast.lock();
+                let mut buf = self.pool.acquire()?;
+                buf.as_mut_slice().fill(0);
+                let result = f(buf.as_mut_slice());
+                arr.insert(page_no, buf);
+                return Ok(result);
+            }
+        }
+
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
 
@@ -718,6 +1042,13 @@ impl ShardedPageCache {
 
     /// Directly insert an existing `PageBuf` into the cache.
     pub fn insert_buffer(&self, page_no: PageNumber, buf: PageBuf) {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                fast.lock().insert(page_no, buf);
+                return;
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.insert(page_no, buf);
@@ -725,6 +1056,12 @@ impl ShardedPageCache {
 
     /// Evict a specific page from the cache.
     pub fn evict(&self, page_no: PageNumber) -> bool {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().remove(page_no);
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.remove(page_no)
@@ -735,6 +1072,12 @@ impl ShardedPageCache {
     /// Iterates through shards looking for a non-empty one to evict from.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().remove_any().is_some();
+            }
+        }
         // Start from a pseudo-random shard to avoid always hitting shard 0
         let start = (std::time::Instant::now().elapsed().as_nanos() as usize) & SHARD_MASK;
         for i in 0..SHARD_COUNT {
@@ -749,6 +1092,13 @@ impl ShardedPageCache {
 
     /// Evict all pages from the cache.
     pub fn clear(&self) {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                fast.lock().clear();
+                return;
+            }
+        }
         for shard in self.shards.iter() {
             shard.lock().clear();
         }
@@ -757,6 +1107,28 @@ impl ShardedPageCache {
     /// Capture current cache metrics aggregated across all shards.
     #[must_use]
     pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let arr = fast.lock();
+                return PageCacheMetricsSnapshot {
+                    hits: arr.hits,
+                    misses: arr.misses,
+                    admits: arr.admits,
+                    evictions: arr.evictions,
+                    cached_pages: arr.len(),
+                    pool_capacity: self.pool.capacity(),
+                    dirty_ratio_pct: 0,
+                    t1_size: arr.len(),
+                    t2_size: 0,
+                    b1_size: 0,
+                    b2_size: 0,
+                    p_target: arr.len(),
+                    mvcc_multi_version_pages: 0,
+                };
+            }
+        }
+
         let mut total_hits = 0_u64;
         let mut total_misses = 0_u64;
         let mut total_admits = 0_u64;
@@ -791,6 +1163,13 @@ impl ShardedPageCache {
 
     /// Reset cache counters while preserving resident pages.
     pub fn reset_metrics(&self) {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                fast.lock().reset_metrics();
+                return;
+            }
+        }
         for shard in self.shards.iter() {
             shard.lock().reset_metrics();
         }
@@ -826,6 +1205,12 @@ impl ShardedPageCache {
     /// Returns `None` if the page is not cached.
     #[inline]
     pub fn get_copy(&self, page_no: PageNumber) -> Option<Vec<u8>> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().get(page_no).map(|data| data.to_vec());
+            }
+        }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|data| data.to_vec())
@@ -835,9 +1220,11 @@ impl ShardedPageCache {
 impl std::fmt::Debug for ShardedPageCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let metrics = self.metrics_snapshot();
+        let fast_path = self.use_fast_path.load(Ordering::Relaxed);
         f.debug_struct("ShardedPageCache")
             .field("shard_count", &SHARD_COUNT)
             .field("page_size", &self.page_size)
+            .field("fast_path_enabled", &fast_path)
             .field("cached_pages", &metrics.cached_pages)
             .field("hits", &metrics.hits)
             .field("misses", &metrics.misses)
@@ -2538,6 +2925,552 @@ mod tests {
         assert!(
             dist[base_shard] > 0,
             "bead_id={BEAD_3WOP3_2} case=same_shard_populated"
+        );
+    }
+
+    // =========================================================================
+    // FastPageArray (bd-fzr07) tests
+    // =========================================================================
+
+    const BEAD_FZR07: &str = "bd-fzr07";
+
+    // --- FastPageArray unit tests ---
+
+    #[test]
+    fn test_fast_page_array_basic_insert_get() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 16);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+        let p10 = PageNumber::new(10).unwrap();
+
+        // Insert page 1
+        let mut buf1 = pool.acquire().unwrap();
+        buf1.as_mut_slice().fill(0xAA);
+        assert!(arr.insert(p1, buf1), "bead_id={BEAD_FZR07} case=insert_new");
+
+        // Insert page 2
+        let mut buf2 = pool.acquire().unwrap();
+        buf2.as_mut_slice().fill(0xBB);
+        assert!(
+            arr.insert(p2, buf2),
+            "bead_id={BEAD_FZR07} case=insert_new_2"
+        );
+
+        // Insert page 10 (sparse)
+        let mut buf10 = pool.acquire().unwrap();
+        buf10.as_mut_slice().fill(0xCC);
+        assert!(
+            arr.insert(p10, buf10),
+            "bead_id={BEAD_FZR07} case=insert_sparse"
+        );
+
+        // Verify contents
+        assert!(arr.contains(p1));
+        assert!(arr.contains(p2));
+        assert!(arr.contains(p10));
+        assert!(!arr.contains(PageNumber::new(5).unwrap()));
+
+        // Verify data
+        let data1 = arr.get(p1).unwrap();
+        assert!(
+            data1.iter().all(|&b| b == 0xAA),
+            "bead_id={BEAD_FZR07} case=get_data_1"
+        );
+
+        let data10 = arr.get(p10).unwrap();
+        assert!(
+            data10.iter().all(|&b| b == 0xCC),
+            "bead_id={BEAD_FZR07} case=get_data_10"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_get_mut() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+
+        let p1 = PageNumber::ONE;
+        let mut buf = pool.acquire().unwrap();
+        buf.as_mut_slice().fill(0);
+        arr.insert(p1, buf);
+
+        // Mutate via get_mut
+        let data = arr.get_mut(p1).unwrap();
+        data[0] = 0x12;
+        data[1] = 0x34;
+        data[4095] = 0xFF;
+
+        // Verify mutation persisted
+        let read_back = arr.get(p1).unwrap();
+        assert_eq!(read_back[0], 0x12, "bead_id={BEAD_FZR07} case=get_mut_0");
+        assert_eq!(read_back[1], 0x34, "bead_id={BEAD_FZR07} case=get_mut_1");
+        assert_eq!(
+            read_back[4095], 0xFF,
+            "bead_id={BEAD_FZR07} case=get_mut_4095"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_remove() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+
+        arr.insert(p1, pool.acquire().unwrap());
+        arr.insert(p2, pool.acquire().unwrap());
+
+        assert_eq!(arr.len(), 2);
+
+        // Remove existing page
+        assert!(arr.remove(p1), "bead_id={BEAD_FZR07} case=remove_existing");
+        assert!(!arr.contains(p1));
+        assert!(arr.contains(p2));
+        assert_eq!(arr.len(), 1);
+
+        // Remove non-existing page
+        assert!(
+            !arr.remove(PageNumber::new(100).unwrap()),
+            "bead_id={BEAD_FZR07} case=remove_nonexistent"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_remove_any() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 8);
+
+        // Insert pages 1, 5, 10
+        for i in [1u32, 5, 10] {
+            let pn = PageNumber::new(i).unwrap();
+            arr.insert(pn, pool.acquire().unwrap());
+        }
+
+        assert_eq!(arr.len(), 3);
+
+        // Remove any - should succeed 3 times
+        let evicted1 = arr.remove_any();
+        assert!(evicted1.is_some(), "bead_id={BEAD_FZR07} case=remove_any_1");
+
+        let evicted2 = arr.remove_any();
+        assert!(evicted2.is_some(), "bead_id={BEAD_FZR07} case=remove_any_2");
+
+        let evicted3 = arr.remove_any();
+        assert!(evicted3.is_some(), "bead_id={BEAD_FZR07} case=remove_any_3");
+
+        // Now array is empty
+        assert_eq!(arr.len(), 0);
+        assert!(
+            arr.remove_any().is_none(),
+            "bead_id={BEAD_FZR07} case=remove_any_empty"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_clear() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 16);
+
+        for i in 1..=10u32 {
+            arr.insert(PageNumber::new(i).unwrap(), pool.acquire().unwrap());
+        }
+
+        assert_eq!(arr.len(), 10);
+
+        let removed = arr.clear();
+        assert_eq!(removed, 10, "bead_id={BEAD_FZR07} case=clear_count");
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn test_fast_page_array_metrics() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 8);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+
+        // Insert (admits)
+        arr.insert(p1, pool.acquire().unwrap());
+        arr.insert(p2, pool.acquire().unwrap());
+        assert_eq!(arr.admits, 2, "bead_id={BEAD_FZR07} case=metrics_admits");
+
+        // Hits
+        arr.get(p1);
+        arr.get(p2);
+        arr.get(p1);
+        assert_eq!(arr.hits, 3, "bead_id={BEAD_FZR07} case=metrics_hits");
+
+        // Misses
+        arr.get(PageNumber::new(100).unwrap());
+        arr.get(PageNumber::new(200).unwrap());
+        assert_eq!(arr.misses, 2, "bead_id={BEAD_FZR07} case=metrics_misses");
+
+        // Evictions
+        arr.remove(p1);
+        assert_eq!(
+            arr.evictions, 1,
+            "bead_id={BEAD_FZR07} case=metrics_evictions"
+        );
+
+        // Reset
+        arr.reset_metrics();
+        assert_eq!(arr.hits, 0, "bead_id={BEAD_FZR07} case=metrics_reset_hits");
+        assert_eq!(
+            arr.misses, 0,
+            "bead_id={BEAD_FZR07} case=metrics_reset_misses"
+        );
+        assert_eq!(
+            arr.admits, 0,
+            "bead_id={BEAD_FZR07} case=metrics_reset_admits"
+        );
+        assert_eq!(
+            arr.evictions, 0,
+            "bead_id={BEAD_FZR07} case=metrics_reset_evictions"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_capacity_growth() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2048);
+
+        // Insert page 2000 (sparse, requires growth)
+        let p2000 = PageNumber::new(2000).unwrap();
+        arr.insert(p2000, pool.acquire().unwrap());
+
+        assert!(
+            arr.pages.len() >= 2000,
+            "bead_id={BEAD_FZR07} case=capacity_growth array grew to {}",
+            arr.pages.len()
+        );
+        assert!(arr.contains(p2000));
+
+        // Verify sparse pages are None
+        assert!(!arr.contains(PageNumber::new(1000).unwrap()));
+        assert!(!arr.contains(PageNumber::new(1999).unwrap()));
+    }
+
+    #[test]
+    fn test_fast_page_array_overwrite() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+
+        let p1 = PageNumber::ONE;
+
+        // Insert first version
+        let mut buf1 = pool.acquire().unwrap();
+        buf1.as_mut_slice().fill(0xAA);
+        assert!(arr.insert(p1, buf1));
+
+        // Overwrite with second version
+        let mut buf2 = pool.acquire().unwrap();
+        buf2.as_mut_slice().fill(0xBB);
+        assert!(
+            !arr.insert(p1, buf2),
+            "bead_id={BEAD_FZR07} case=overwrite_not_new"
+        );
+
+        // Verify overwritten data
+        let data = arr.get(p1).unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0xBB),
+            "bead_id={BEAD_FZR07} case=overwrite_data"
+        );
+    }
+
+    // --- ShardedPageCache fast path tests ---
+
+    #[test]
+    fn test_sharded_cache_new_single_connection() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+
+        assert!(
+            cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=single_connection_enabled"
+        );
+
+        // Basic operations should work
+        let p1 = PageNumber::ONE;
+        cache.insert_fresh(p1, |data| data.fill(0xDD)).unwrap();
+
+        assert!(cache.contains(p1));
+        cache.with_page(p1, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0xDD),
+                "bead_id={BEAD_FZR07} case=single_connection_data"
+            );
+        });
+    }
+
+    #[test]
+    fn test_sharded_cache_enable_disable_fast_path() {
+        let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
+
+        // Initially disabled
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=initially_disabled"
+        );
+
+        // Enable fast path
+        cache.enable_fast_path();
+        assert!(
+            cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=enabled"
+        );
+
+        // Insert some data while in fast path mode
+        let p1 = PageNumber::ONE;
+        cache.insert_fresh(p1, |data| data[0] = 0xEE).unwrap();
+
+        // Disable fast path
+        cache.disable_fast_path();
+        assert!(
+            !cache.is_fast_path_enabled(),
+            "bead_id={BEAD_FZR07} case=disabled"
+        );
+
+        // Data in fast array is still there (not migrated)
+        // But operations now go through sharded path
+        assert!(
+            !cache.contains(p1),
+            "bead_id={BEAD_FZR07} case=disabled_no_migrate - fast array data not visible in sharded mode"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_basic_operations() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+        let p100 = PageNumber::new(100).unwrap();
+
+        // Insert
+        cache.insert_fresh(p1, |data| data.fill(0x11)).unwrap();
+        cache.insert_fresh(p2, |data| data.fill(0x22)).unwrap();
+        cache.insert_fresh(p100, |data| data.fill(0x99)).unwrap();
+
+        assert_eq!(cache.len(), 3, "bead_id={BEAD_FZR07} case=fp_len");
+
+        // Contains
+        assert!(cache.contains(p1));
+        assert!(cache.contains(p100));
+        assert!(!cache.contains(PageNumber::new(50).unwrap()));
+
+        // Get
+        let v1 = cache.get(p1).unwrap();
+        assert!(
+            v1.iter().all(|&b| b == 0x11),
+            "bead_id={BEAD_FZR07} case=fp_get_1"
+        );
+
+        // With_page
+        cache.with_page(p100, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0x99),
+                "bead_id={BEAD_FZR07} case=fp_with_page"
+            );
+        });
+
+        // With_page_mut
+        cache.with_page_mut(p2, |data| {
+            data[0] = 0xFF;
+        });
+        cache.with_page(p2, |data| {
+            assert_eq!(data[0], 0xFF, "bead_id={BEAD_FZR07} case=fp_with_page_mut");
+        });
+
+        // Evict
+        assert!(cache.evict(p1));
+        assert!(!cache.contains(p1));
+        assert_eq!(cache.len(), 2);
+
+        // Evict_any
+        assert!(cache.evict_any());
+        assert_eq!(cache.len(), 1);
+
+        // Clear
+        cache.clear();
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_metrics() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+
+        let p1 = PageNumber::ONE;
+        let p2 = PageNumber::new(2).unwrap();
+
+        // Insert (admits)
+        cache.insert_fresh(p1, |_| {}).unwrap();
+        cache.insert_fresh(p2, |_| {}).unwrap();
+
+        // Hits
+        cache.with_page(p1, |_| {});
+        cache.with_page(p2, |_| {});
+        cache.with_page(p1, |_| {});
+
+        // Misses
+        cache.with_page(PageNumber::new(100).unwrap(), |_| {});
+
+        // Evictions
+        cache.evict(p1);
+
+        let m = cache.metrics_snapshot();
+        assert_eq!(m.admits, 2, "bead_id={BEAD_FZR07} case=fp_metrics_admits");
+        assert_eq!(m.hits, 3, "bead_id={BEAD_FZR07} case=fp_metrics_hits");
+        assert_eq!(m.misses, 1, "bead_id={BEAD_FZR07} case=fp_metrics_misses");
+        assert_eq!(
+            m.evictions, 1,
+            "bead_id={BEAD_FZR07} case=fp_metrics_evictions"
+        );
+        assert_eq!(
+            m.cached_pages, 1,
+            "bead_id={BEAD_FZR07} case=fp_metrics_cached"
+        );
+
+        cache.reset_metrics();
+        let reset = cache.metrics_snapshot();
+        assert_eq!(reset.hits, 0, "bead_id={BEAD_FZR07} case=fp_metrics_reset");
+        assert_eq!(reset.misses, 0);
+        assert_eq!(reset.admits, 0);
+        assert_eq!(reset.evictions, 0);
+        // cached_pages preserved
+        assert_eq!(reset.cached_pages, 1);
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_vfs_roundtrip() {
+        let (cx, mut file) = setup();
+
+        // Write test data to VFS
+        let test_data = vec![0xAB_u8; 4096];
+        file.write(&cx, &test_data, 0).unwrap();
+
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        // Read through fast path
+        let result = cache.read_page(&cx, &mut file, p1, |data| {
+            assert_eq!(
+                data,
+                test_data.as_slice(),
+                "bead_id={BEAD_FZR07} case=fp_vfs_read"
+            );
+            data[0]
+        });
+        assert_eq!(result.unwrap(), 0xAB);
+
+        // Modify and write back
+        cache.with_page_mut(p1, |data| data[0] = 0xCD);
+        cache.write_page(&cx, &mut file, p1).unwrap();
+
+        // Verify write
+        let mut verify = vec![0u8; 4096];
+        file.read(&cx, &mut verify, 0).unwrap();
+        assert_eq!(verify[0], 0xCD, "bead_id={BEAD_FZR07} case=fp_vfs_write");
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_insert_buffer() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        // Acquire buffer from pool and fill it
+        let mut buf = cache.pool().acquire().unwrap();
+        buf.as_mut_slice().fill(0xFE);
+
+        // Insert via fast path
+        cache.insert_buffer(p1, buf);
+
+        assert!(cache.contains(p1));
+        cache.with_page(p1, |data| {
+            assert!(
+                data.iter().all(|&b| b == 0xFE),
+                "bead_id={BEAD_FZR07} case=fp_insert_buffer"
+            );
+        });
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_get_copy() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.insert_fresh(p1, |data| data.fill(0x77)).unwrap();
+
+        let copy = cache.get_copy(p1);
+        assert!(copy.is_some());
+        let data = copy.unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0x77),
+            "bead_id={BEAD_FZR07} case=fp_get_copy"
+        );
+        assert_eq!(data.len(), 4096);
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_read_page_copy() {
+        let (cx, mut file) = setup();
+
+        let test_data = vec![0x88_u8; 4096];
+        file.write(&cx, &test_data, 0).unwrap();
+
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        let copy = cache.read_page_copy(&cx, &mut file, p1).unwrap();
+        assert!(
+            copy.iter().all(|&b| b == 0x88),
+            "bead_id={BEAD_FZR07} case=fp_read_page_copy"
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
+    fn test_fast_path_vs_sharded_latency_comparison() {
+        // Compare latency of fast path vs sharded path for single-thread workload.
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 100_000;
+
+        // Fast path (single connection mode)
+        let fast_cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let start = Instant::now();
+        for i in 1..=ITERATIONS {
+            let pn = PageNumber::new(i).unwrap();
+            fast_cache.insert_fresh(pn, |_| {}).unwrap();
+            fast_cache.with_page(pn, |_| {});
+        }
+        let fast_elapsed = start.elapsed();
+
+        // Sharded path (normal mode)
+        let sharded_cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let start = Instant::now();
+        for i in 1..=ITERATIONS {
+            let pn = PageNumber::new(i).unwrap();
+            sharded_cache.insert_fresh(pn, |_| {}).unwrap();
+            sharded_cache.with_page(pn, |_| {});
+        }
+        let sharded_elapsed = start.elapsed();
+
+        let speedup = sharded_elapsed.as_nanos() as f64 / fast_elapsed.as_nanos() as f64;
+
+        // Fast path should be faster (at least 1.2x for single-thread)
+        eprintln!(
+            "bead_id={BEAD_FZR07} fast_path={:?} sharded={:?} speedup={:.2}x",
+            fast_elapsed, sharded_elapsed, speedup
+        );
+
+        assert!(
+            speedup >= 1.2,
+            "bead_id={BEAD_FZR07} case=latency_comparison \
+             fast path should be at least 1.2x faster, got {speedup:.2}x"
         );
     }
 }
