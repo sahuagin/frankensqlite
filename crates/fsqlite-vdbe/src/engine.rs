@@ -10145,9 +10145,15 @@ impl VdbeEngine {
                 AtomicOrdering::Relaxed,
             );
         }
-        let blob = std::mem::take(&mut rec_buf);
+        // bd-pt17g: Keep buffer capacity for reuse across rows.
+        // Previously: std::mem::take moved the allocation into blob, leaving
+        // make_record_buf with capacity 0 — forcing a fresh allocation per row.
+        // Now: copy bytes into Arc, then clear() (keeps capacity) so the next
+        // MakeRecord reuses the same allocation.
+        let blob: Arc<[u8]> = Arc::from(&rec_buf[..]);
+        rec_buf.clear(); // O(1): sets len=0, keeps capacity
         self.make_record_buf = rec_buf;
-        self.set_reg(target, SqliteValue::Blob(blob.into()));
+        self.set_reg(target, SqliteValue::Blob(blob));
     }
 
     #[cold]
