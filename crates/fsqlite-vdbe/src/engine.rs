@@ -5027,7 +5027,20 @@ impl VdbeEngine {
     /// After `reset()` the engine is equivalent to a freshly constructed one
     /// with the same `register_count` — but all `Vec`/`HashMap`/`SmallVec`
     /// retain their heap capacity.
-    pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
+    /// Reset engine state for reuse from the cached-engine pool.
+    ///
+    /// When `retain_cursors` is true, storage cursors and their root-page
+    /// mapping are kept alive so that repeated DML on the same table can
+    /// skip `OP_OpenWrite` cursor creation and `OP_Last` seek on subsequent
+    /// rows.  The caller is responsible for ensuring the transaction handle
+    /// (`txn_page_io`) stays valid across calls when cursors are retained.
+    pub fn reset_for_reuse_ex(
+        &mut self,
+        register_count: i32,
+        execution_cx: &Cx,
+        page_size: PageSize,
+        retain_cursors: bool,
+    ) {
         let count = register_count.max(0) as u32 + 1;
         // Clear + resize registers to reuse the SmallVec's inline/heap buffer.
         self.registers.clear();
@@ -5039,16 +5052,32 @@ impl VdbeEngine {
         self.trace_opcodes = opcode_trace_enabled();
         self.collect_vdbe_metrics = false;
         self.results.clear();
-        self.cursors.clear();
-        self.sorters.clear();
-        self.storage_cursors.clear();
-        self.pending_next_after_delete.clear();
-        self.storage_cursors_enabled = true;
-        self.txn_page_io = None;
-        self.reject_mem_fallback = true;
-        self.db = None;
-        self.memdb_rows_loaded = false;
-        self.storage_cursor_memdb_count_shortcuts_safe = false;
+        if retain_cursors {
+            // Keep cursors + cursor_root_pages + storage_cursors alive.
+            // OP_OpenWrite will detect an existing cursor on the same root
+            // page and reuse it instead of creating a new one.
+            // Clear only transient per-statement cursor state.
+            self.pending_next_after_delete.clear();
+        } else {
+            self.cursors.clear();
+            self.sorters.clear();
+            self.storage_cursors.clear();
+            self.pending_next_after_delete.clear();
+            self.storage_cursors_enabled = true;
+            self.txn_page_io = None;
+        }
+        if !retain_cursors {
+            self.reject_mem_fallback = true;
+            self.db = None;
+            self.memdb_rows_loaded = false;
+            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            self.cursor_root_pages.clear();
+            self.vtab_instances.clear();
+            self.time_travel_cursors.clear();
+            self.version_store = None;
+            self.time_travel_commit_log = None;
+            self.time_travel_gc_horizon = None;
+        }
         self.func_registry = None;
         self.scalar_function_cache.clear();
         self.aggregate_function_cache.clear();
@@ -5062,19 +5091,17 @@ impl VdbeEngine {
         self.last_insert_cursor_id = None;
         self.fk_counter = 0;
         self.autoincrement_seq_by_root_page.clear();
-        // Keep shared Arc refs — they'll be overwritten by set_*() calls.
-        self.cursor_root_pages.clear();
-        self.vtab_instances.clear();
-        self.time_travel_cursors.clear();
-        self.version_store = None;
-        self.time_travel_commit_log = None;
-        self.time_travel_gc_horizon = None;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_buf.truncate(0);
         self.collect_result_rows = true;
         self.max_collected_result_rows = None;
         self.statement_state_clean = true;
+    }
+
+    /// Convenience wrapper: reset without retaining cursors (legacy behavior).
+    pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
+        self.reset_for_reuse_ex(register_count, execution_cx, page_size, false);
     }
 
     /// Returns the number of rows modified (inserted, deleted, or updated).
