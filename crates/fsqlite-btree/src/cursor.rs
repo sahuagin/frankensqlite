@@ -382,7 +382,7 @@ struct StackEntry {
     /// Parsed page header.
     header: BtreePageHeader,
     /// Cell pointer offsets (cached from the cell pointer array).
-    cell_pointers: Arc<[u16]>,
+    cell_pointers: Box<[u16]>,
     /// Current cell index. For interior pages, this indicates which child
     /// was descended into. For leaf pages, this is the current position.
     /// A value equal to `cell_count` means "past the right-most child" on
@@ -1303,7 +1303,7 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = Arc::<[u16]>::from(cell::read_cell_pointers(
+        let cell_pointers = Box::from(cell::read_cell_pointers(
             page_data.as_bytes(),
             &header,
             header_offset,
@@ -1328,7 +1328,7 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = Arc::<[u16]>::from(cell::read_cell_pointers(
+        let cell_pointers = Box::from(cell::read_cell_pointers(
             page_data.as_bytes(),
             &header,
             header_offset,
@@ -2921,7 +2921,7 @@ impl<P: PageWriter> BtCursor<P> {
         let mut updated_cell_pointers = Vec::with_capacity(entry.cell_pointers.len() + 1);
         updated_cell_pointers.extend_from_slice(&entry.cell_pointers);
         updated_cell_pointers.push(new_cell_offset);
-        entry.cell_pointers = Arc::<[u16]>::from(updated_cell_pointers);
+        entry.cell_pointers = Box::from(updated_cell_pointers);
         entry.cell_idx = insert_idx;
 
         self.stack.push(entry);
