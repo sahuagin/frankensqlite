@@ -20,7 +20,10 @@ pub use journal::{
     lock_byte_page,
 };
 pub use page_buf::{PageBuf, PageBufPool};
-pub use page_cache::{PageCache, PageCacheMetricsSnapshot, ShardedPageCache};
+pub use page_cache::{
+    DEFAULT_PAGE_BUFFER_MAX, PageCache, PageCacheMetricsSnapshot, ShardedPageCache,
+    resolve_page_buffer_max,
+};
 pub use pager::{
     PagerPublishedSnapshot, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
     WalCommitSyncPolicy, remove_group_commit_queue,

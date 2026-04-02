@@ -3281,6 +3281,23 @@ where
         path: &Path,
         requested_page_size: PageSize,
     ) -> Result<Self> {
+        Self::open_with_cx_and_page_buffer_max(cx, vfs, path, requested_page_size, None)
+    }
+
+    /// Like [`open_with_cx`](Self::open_with_cx) but allows overriding the
+    /// page-buffer-pool ceiling.
+    ///
+    /// `page_buffer_max` is resolved via [`resolve_page_buffer_max`]: `Some(n)`
+    /// uses that value directly, `None` checks the `FSQLITE_PAGE_BUFFER_MAX`
+    /// env var, then falls back to [`DEFAULT_PAGE_BUFFER_MAX`] (262 144).
+    #[allow(clippy::too_many_lines)]
+    pub fn open_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        requested_page_size: PageSize,
+        page_buffer_max: Option<usize>,
+    ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
@@ -3452,7 +3469,8 @@ where
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
         let freelist_count = freelist.len();
-        let cache = ShardedPageCache::new(page_size);
+        let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
+        let cache = ShardedPageCache::with_max_buffers(page_size, resolved_max);
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,
@@ -3512,6 +3530,22 @@ where
         vfs: V,
         path: &Path,
         _requested_page_size: PageSize,
+    ) -> Result<Self> {
+        Self::open_readonly_with_cx_and_page_buffer_max(cx, vfs, path, _requested_page_size, None)
+    }
+
+    /// Like [`open_readonly_with_cx`](Self::open_readonly_with_cx) but allows
+    /// overriding the page-buffer-pool ceiling.
+    ///
+    /// See [`open_with_cx_and_page_buffer_max`](Self::open_with_cx_and_page_buffer_max)
+    /// for parameter semantics.
+    #[allow(clippy::too_many_lines)]
+    pub fn open_readonly_with_cx_and_page_buffer_max(
+        cx: &Cx,
+        vfs: V,
+        path: &Path,
+        _requested_page_size: PageSize,
+        page_buffer_max: Option<usize>,
     ) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB;
@@ -3597,7 +3631,8 @@ where
         let initial_commit_seq = CommitSeq::new(u64::from(
             header.as_ref().map_or(0, |header| header.change_counter),
         ));
-        let cache = ShardedPageCache::new(page_size);
+        let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
+        let cache = ShardedPageCache::with_max_buffers(page_size, resolved_max);
         let pool = cache.pool().clone();
         Ok(Self {
             vfs,

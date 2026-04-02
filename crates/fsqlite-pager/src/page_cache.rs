@@ -31,6 +31,44 @@ use fsqlite_vfs::VfsFile;
 use crate::page_buf::{PageBuf, PageBufPool};
 
 // ---------------------------------------------------------------------------
+// Page buffer pool sizing
+// ---------------------------------------------------------------------------
+
+/// Default maximum number of page buffers when no explicit configuration is
+/// provided.  At the standard 4 KiB page size this corresponds to **1 GiB** of
+/// buffer memory.
+///
+/// The previous default was 65 536 (256 MiB), which proved insufficient for
+/// multi-GiB databases with several indexed tables — normal B-tree operations
+/// during INSERT transactions could exhaust the pool and surface
+/// [`FrankenError::OutOfMemory`].
+///
+/// This value can be overridden at runtime via the `FSQLITE_PAGE_BUFFER_MAX`
+/// environment variable, or programmatically through
+/// [`PageCache::with_max_buffers`] / [`ShardedPageCache::with_max_buffers`].
+pub const DEFAULT_PAGE_BUFFER_MAX: usize = 262_144;
+
+/// Resolve the page-buffer-pool ceiling to use for a new cache.
+///
+/// Resolution order:
+/// 1. If `explicit` is `Some`, use that value.
+/// 2. If the `FSQLITE_PAGE_BUFFER_MAX` environment variable is set to a valid
+///    `usize`, use that.
+/// 3. Otherwise fall back to [`DEFAULT_PAGE_BUFFER_MAX`].
+///
+/// A value of `0` is silently promoted to `1` (a zero-capacity pool would be
+/// useless).
+pub fn resolve_page_buffer_max(explicit: Option<usize>) -> usize {
+    let raw = explicit.unwrap_or_else(|| {
+        std::env::var("FSQLITE_PAGE_BUFFER_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_PAGE_BUFFER_MAX)
+    });
+    raw.max(1)
+}
+
+// ---------------------------------------------------------------------------
 // PageCache
 // ---------------------------------------------------------------------------
 
@@ -105,8 +143,22 @@ pub struct PageCache {
 
 impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
+    ///
+    /// The buffer-pool ceiling is determined by
+    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
+    /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
     pub fn new(page_size: PageSize) -> Self {
-        Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
+        Self::with_max_buffers(page_size, resolve_page_buffer_max(None))
+    }
+
+    /// Create a new, empty `PageCache` with an explicit buffer-pool ceiling.
+    ///
+    /// `max_buffers` is the maximum number of live page buffers (idle + in-use)
+    /// the underlying [`PageBufPool`] will allow.  Once the bound is reached,
+    /// further buffer acquisitions fail with [`FrankenError::OutOfMemory`].
+    pub fn with_max_buffers(page_size: PageSize, max_buffers: usize) -> Self {
+        Self::with_pool(PageBufPool::new(page_size, max_buffers), page_size)
     }
 
     /// Create a new `PageCache` using an existing `PageBufPool`.
@@ -726,10 +778,24 @@ pub struct ShardedPageCache {
 impl ShardedPageCache {
     /// Create a new sharded page cache with the given page size.
     ///
+    /// The buffer-pool ceiling is determined by
+    /// [`resolve_page_buffer_max(None)`] — i.e. the `FSQLITE_PAGE_BUFFER_MAX`
+    /// environment variable if set, otherwise [`DEFAULT_PAGE_BUFFER_MAX`]
+    /// (262 144 buffers ≈ 1 GiB at 4 KiB pages).
+    ///
     /// For single-connection `:memory:` workloads, prefer [`new_single_connection`]
     /// which enables the fast-path flat array (bd-fzr07).
     pub fn new(page_size: PageSize) -> Self {
-        Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
+        Self::with_max_buffers(page_size, resolve_page_buffer_max(None))
+    }
+
+    /// Create a new sharded page cache with an explicit buffer-pool ceiling.
+    ///
+    /// `max_buffers` is the maximum number of live page buffers (idle + in-use)
+    /// the underlying [`PageBufPool`] will allow.  Once the bound is reached,
+    /// further buffer acquisitions fail with [`FrankenError::OutOfMemory`].
+    pub fn with_max_buffers(page_size: PageSize, max_buffers: usize) -> Self {
+        Self::with_pool(PageBufPool::new(page_size, max_buffers), page_size)
     }
 
     /// Create a new sharded page cache optimized for single-connection mode (bd-fzr07).
