@@ -159,10 +159,6 @@ fn estimate_make_record_capacity_for_affinity(
                 header_content_size += 1;
                 body_size += MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES;
             }
-            'A' | 'B' => {
-                header_content_size += 2;
-                body_size += variable_width_hint;
-            }
             _ => {
                 header_content_size += 2;
                 body_size += variable_width_hint;
@@ -1265,6 +1261,21 @@ impl SharedTxnPageIo {
                 Rc::strong_count(&rc),
             ))),
         }
+    }
+
+    /// bd-perf: Swap the inner transaction without breaking Rc references.
+    /// Retained StorageCursors hold clones of the same Rc, so replacing
+    /// the inner value keeps them valid. Returns the old transaction.
+    fn refill(&self, txn: TransactionKind) -> TransactionKind {
+        self.txn.replace(txn)
+    }
+
+    /// bd-perf: Extract the inner transaction without consuming self.
+    /// Used by take_transaction when cursors are retained — we need to
+    /// return the txn to the connection while keeping the Rc alive for
+    /// retained cursors (they'll get a fresh txn via refill next time).
+    fn drain(&self) -> TransactionKind {
+        self.txn.replace(TransactionKind::Drained)
     }
 
     fn clear_stale_synthetic_pending_commit_surface(
@@ -5620,6 +5631,28 @@ impl VdbeEngine {
             Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
             None => Ok(None),
         }
+    }
+
+    /// bd-perf: Swap the inner transaction without dropping the Rc.
+    /// Retained StorageCursors hold Rc clones that remain valid.
+    /// Returns the old transaction.
+    pub fn refill_transaction(
+        &mut self,
+        txn: impl Into<TransactionKind>,
+    ) -> Option<TransactionKind> {
+        self.txn_page_io.as_ref().map(|io| io.refill(txn.into()))
+    }
+
+    /// bd-perf: Extract the transaction while keeping the Rc alive for
+    /// retained cursors. The Rc inner becomes TransactionKind::Drained
+    /// until the next refill_transaction call.
+    pub fn drain_transaction(&mut self) -> Option<TransactionKind> {
+        self.txn_page_io.as_ref().map(|io| io.drain())
+    }
+
+    /// bd-perf: Check if a txn_page_io is present (for cursor reuse decisions).
+    pub fn has_txn_page_io(&self) -> bool {
+        self.txn_page_io.is_some()
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.

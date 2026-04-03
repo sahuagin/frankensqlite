@@ -1029,6 +1029,11 @@ pub enum TransactionKind {
     Mock(MockTransaction),
     /// In-memory mock transaction used by cross-crate tests.
     MemoryMock(MemoryMockTransaction),
+    /// bd-perf: Sentinel used by SharedTxnPageIo::drain() when the real
+    /// transaction is extracted while retaining cursor Rc references.
+    /// Any page read/write through this variant panics — it should only
+    /// exist transiently between drain and the next refill.
+    Drained,
 }
 
 impl std::fmt::Debug for TransactionKind {
@@ -1043,6 +1048,7 @@ impl std::fmt::Debug for TransactionKind {
             Self::Windows(_) => f.write_str("TransactionKind::Windows"),
             Self::Mock(_) => f.write_str("TransactionKind::Mock"),
             Self::MemoryMock(_) => f.write_str("TransactionKind::MemoryMock"),
+            Self::Drained => f.write_str("TransactionKind::Drained"),
         }
     }
 }
@@ -1059,6 +1065,7 @@ impl TransactionKind {
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
+            Self::Drained => panic!("TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"),
         }
     }
 
@@ -1073,6 +1080,7 @@ impl TransactionKind {
             Self::Windows(txn) => f(txn),
             Self::Mock(txn) => f(txn),
             Self::MemoryMock(txn) => f(txn),
+            Self::Drained => panic!("TransactionKind::Drained accessed — this is a transient sentinel between drain and refill"),
         }
     }
 }
