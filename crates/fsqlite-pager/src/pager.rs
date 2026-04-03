@@ -5098,8 +5098,10 @@ where
             && committed_snapshot.journal_mode != JournalMode::Wal
             && page_no.get() <= committed_snapshot.db_size
         {
-            if let Some(data) = self.cache.get_copy(page_no) {
-                return Ok(PageData::from_vec(data));
+            // bd-perf (V1.2): Use get_shared to get PageData directly,
+            // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
+            if let Some(page_data) = self.cache.get_shared(page_no) {
+                return Ok(page_data);
             }
         }
 

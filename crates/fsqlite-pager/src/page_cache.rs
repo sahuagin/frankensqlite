@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::Mutex;
-use fsqlite_types::{PageNumber, PageSize};
+use fsqlite_types::{PageData, PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
@@ -1280,6 +1280,22 @@ impl ShardedPageCache {
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
         shard.get(page_no).map(|data| data.to_vec())
+    }
+
+    /// bd-perf (V1.2): Return a shared `PageData` (Arc) instead of copying
+    /// the page bytes. Callers get a cheap Arc refcount bump instead of a
+    /// 4KB memcpy. The PageData is created on first access (OnceLock pattern)
+    /// and cached in the shard entry.
+    pub fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
+        // Fast path (bd-fzr07)
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().get(page_no).map(|data| PageData::from_vec(data.to_vec()));
+            }
+        }
+        let idx = Self::shard_index(page_no);
+        let mut shard = self.shards[idx].lock();
+        shard.get(page_no).map(|data| PageData::from_vec(data.to_vec()))
     }
 }
 
