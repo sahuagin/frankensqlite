@@ -1288,7 +1288,7 @@ mod tests {
         ]);
         let (header_size_u64, _) = read_varint(&record).expect("record header should parse");
         let header_size = usize::try_from(header_size_u64).expect("header size should fit");
-        let prefix = &record[..header_size + 1];
+        let prefix = &record[..=header_size];
 
         let mut offsets = Vec::new();
         let count = parse_record_header_prefix_into(prefix, &mut offsets)

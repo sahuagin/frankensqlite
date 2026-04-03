@@ -123,7 +123,7 @@ impl fmt::Display for TrieBuildError {
                 "input rows are not sorted at indices {previous_row_index} and {row_index}",
             ),
             Self::NonComparableKey { row_index, depth } => {
-                write!(f, "row {row_index} has non-comparable key at depth {depth}",)
+                write!(f, "row {row_index} has non-comparable key at depth {depth}")
             }
             Self::ArityTooLarge { arity } => write!(f, "key arity {arity} exceeds u16::MAX"),
         }
@@ -208,7 +208,7 @@ impl fmt::Display for LeapfrogJoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotEnoughRelations { found } => {
-                write!(f, "leapfrog requires at least 2 relations, found {found}",)
+                write!(f, "leapfrog requires at least 2 relations, found {found}")
             }
             Self::ArityMismatch {
                 expected,

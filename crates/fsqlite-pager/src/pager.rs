@@ -1911,27 +1911,6 @@ impl PublishedPagerState {
         self.finalize_publish(cx, update, page_set_size, start);
     }
 
-    fn store_metadata_single_connection(&self, update: PublishedPagerUpdate, clear_pages: bool) {
-        if clear_pages {
-            self.pages.clear();
-            self.page_set_size.store(0, AtomicOrdering::Release);
-        } else {
-            self.page_set_size
-                .store(self.pages.len(), AtomicOrdering::Release);
-        }
-        self.visible_commit_seq
-            .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
-        self.db_size.store(update.db_size, AtomicOrdering::Release);
-        self.journal_mode.store(
-            encode_journal_mode(update.journal_mode),
-            AtomicOrdering::Release,
-        );
-        self.freelist_count
-            .store(update.freelist_count, AtomicOrdering::Release);
-        self.checkpoint_active
-            .store(update.checkpoint_active, AtomicOrdering::Release);
-    }
-
     /// Publish truncate during checkpoint: retain pages up to max_page, then remove page one.
     fn publish_truncate_checkpoint(&self, cx: &Cx, update: PublishedPagerUpdate, max_page: u32) {
         let _publish_guard = self
@@ -3910,6 +3889,7 @@ impl StagedPage {
 /// batches increase lock contention on write-heavy workloads.
 const PAGE_LEASE_BATCH_SIZE: u32 = 8;
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
     journal_path: PathBuf,
@@ -9588,14 +9568,7 @@ mod tests {
                         self.wal.page_size(),
                         self.wal.big_endian_checksum(),
                     )?;
-                    Ok(crate::traits::PreparedWalChecksumTransform {
-                        a11: transform.a11,
-                        a12: transform.a12,
-                        a21: transform.a21,
-                        a22: transform.a22,
-                        c1: transform.c1,
-                        c2: transform.c2,
-                    })
+                    Ok(transform)
                 })
                 .collect::<Result<Vec<_>>>()?;
 

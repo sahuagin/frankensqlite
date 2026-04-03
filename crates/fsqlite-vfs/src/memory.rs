@@ -672,7 +672,6 @@ impl VfsFile for MemoryFile {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use fsqlite_types::PageData;
 
     fn make_vfs() -> MemoryVfs {
         MemoryVfs::new()

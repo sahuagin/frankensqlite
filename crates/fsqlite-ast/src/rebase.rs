@@ -4,8 +4,6 @@
 //! subset. Only proven-deterministic, side-effect-free expressions pass
 //! validation; everything else returns `None`.
 
-use std::sync::Arc;
-
 use fsqlite_types::SqliteValue;
 use fsqlite_types::glossary::{ColumnIdx, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp};
 

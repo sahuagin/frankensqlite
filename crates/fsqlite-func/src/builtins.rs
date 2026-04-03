@@ -1517,7 +1517,7 @@ impl ScalarFunction for SqliteCompileoptionGetFunc {
         ];
         #[allow(clippy::cast_sign_loss)]
         match options.get(n as usize) {
-            Some(opt) => Ok(SqliteValue::Text(SmallText::new(*opt))),
+            Some(opt) => Ok(SqliteValue::Text(SmallText::new(opt))),
             None => Ok(SqliteValue::Null),
         }
     }

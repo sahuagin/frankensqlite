@@ -36,7 +36,6 @@ use fsqlite_types::{PageData, PageNumber, WitnessKey};
 use std::borrow::Cow;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
-use std::sync::Arc;
 use tracing::{Level, debug, trace, warn};
 
 #[inline]
@@ -1107,9 +1106,8 @@ impl<P: PageReader> BtCursor<P> {
                     } else if let Some(rc) = right_child.take() {
                         current_page = rc;
                         break;
-                    } else {
-                        visit_stack.pop();
                     }
+                    visit_stack.pop();
                 }
             } else {
                 let cell_count = header.cell_count;
@@ -1140,24 +1138,6 @@ impl<P: PageReader> BtCursor<P> {
                 }
             }
         }
-    }
-
-    /// Extract the left_child page number from an interior cell at the given
-    /// index without full cell parsing. Interior cells store a 4-byte BE
-    /// page number at the start of the cell.
-    fn read_interior_cell_child(&self, entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
-        let cell_pointers = &entry.cell_pointers;
-        let idx = cell_idx as usize;
-        if idx >= cell_pointers.len() {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "cell index {idx} out of range for page with {} cells",
-                    cell_pointers.len()
-                ),
-            });
-        }
-        let cell_offset = cell_pointers[idx] as usize;
-        Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
     }
 
     /// bd-wwqen.1: Read a 4-byte BE child page number directly from raw page
@@ -1218,8 +1198,7 @@ impl<P: PageReader> BtCursor<P> {
         // Fast path: skip tracing span + stats when tracing is disabled (common case).
         // tracing::span! allocates metadata even when disabled (~20-50ns).
         // For hot-path operations like INSERT this matters: ~100ns saved per call.
-        let tracing_active =
-            tracing::enabled!(target: "fsqlite.btree", Level::DEBUG);
+        let tracing_active = tracing::enabled!(target: "fsqlite.btree", Level::DEBUG);
 
         if tracing_active {
             let span = tracing::span!(
@@ -1569,7 +1548,7 @@ impl<P: PageReader> BtCursor<P> {
             return self.table_seek(cx, target_rowid);
         };
 
-        let Some((min_rowid, max_rowid)) = self.table_leaf_rowid_bounds(&entry)? else {
+        let Some((min_rowid, max_rowid)) = Self::table_leaf_rowid_bounds(&entry)? else {
             return self.table_seek(cx, target_rowid);
         };
 
@@ -1581,7 +1560,7 @@ impl<P: PageReader> BtCursor<P> {
             && self.advance_to_next_table_leaf(cx)?
             && let Some(next_entry) = self.load_current_table_leaf(cx)?
             && let Some((next_min_rowid, next_max_rowid)) =
-                self.table_leaf_rowid_bounds(&next_entry)?
+                Self::table_leaf_rowid_bounds(&next_entry)?
             && target_rowid >= next_min_rowid
             && target_rowid <= next_max_rowid
         {
@@ -1757,7 +1736,7 @@ impl<P: PageReader> BtCursor<P> {
         Ok(Some(entry))
     }
 
-    fn table_leaf_rowid_bounds(&self, entry: &StackEntry) -> Result<Option<(i64, i64)>> {
+    fn table_leaf_rowid_bounds(entry: &StackEntry) -> Result<Option<(i64, i64)>> {
         if entry.header.cell_count == 0 {
             return Ok(None);
         }
@@ -1942,6 +1921,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Binary search a leaf table page for a rowid.
+    #[cfg(test)]
     fn binary_search_table_leaf(
         cx: &Cx,
         entry: &StackEntry,

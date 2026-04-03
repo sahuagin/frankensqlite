@@ -1638,10 +1638,8 @@ fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
         (Value::Object(object), PathSegment::Key(key)) => {
             object.remove(key);
         }
-        (Value::Array(array), PathSegment::Index(index)) => {
-            if *index < array.len() {
-                array.remove(*index);
-            }
+        (Value::Array(array), PathSegment::Index(index)) if *index < array.len() => {
+            array.remove(*index);
         }
         (Value::Array(array), PathSegment::FromEnd(from_end)) => {
             if *from_end == 0 || *from_end > array.len() {
@@ -3524,7 +3522,10 @@ mod tests {
             cursor.next(&cx).unwrap();
         }
 
-        assert_eq!(fullkeys, vec![Arc::from("$.a"), Arc::from("$.a.b")]);
+        assert_eq!(
+            fullkeys,
+            vec![SmallText::from("$.a"), SmallText::from("$.a.b")]
+        );
     }
 
     #[test]
@@ -3588,7 +3589,10 @@ mod tests {
             cursor.next(&cx).unwrap();
         }
 
-        assert_eq!(fullkeys, vec![Arc::from("$.a"), Arc::from("$.a.b")]);
+        assert_eq!(
+            fullkeys,
+            vec![SmallText::from("$.a"), SmallText::from("$.a.b")]
+        );
     }
 
     #[test]

@@ -453,12 +453,10 @@ fn codegen_select_no_from(
 
     // Allocate output registers and evaluate each expression.
     let out_regs = b.alloc_regs(out_col_count);
-    let mut reg = out_regs;
-    for col in columns {
+    for (reg, col) in (out_regs..).zip(columns.iter()) {
         if let ResultColumn::Expr { expr, .. } = col {
             emit_expr(b, expr, reg)?;
         }
-        reg += 1;
     }
 
     // Emit a single result row.

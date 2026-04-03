@@ -9,6 +9,14 @@
 //! Cursor-based opcodes (OpenRead, Rewind, Next, Column, etc.) are stubbed
 //! and will be wired to the B-tree layer in Phase 5.
 
+#![allow(
+    clippy::match_same_arms,
+    clippy::inline_always,
+    clippy::unnecessary_wraps,
+    clippy::option_option,
+    clippy::useless_let_if_seq,
+    clippy::collapsible_if
+)]
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::cell::RefCell;
@@ -5653,6 +5661,11 @@ impl VdbeEngine {
     /// bd-perf: Check if a txn_page_io is present (for cursor reuse decisions).
     pub fn has_txn_page_io(&self) -> bool {
         self.txn_page_io.is_some()
+    }
+
+    /// bd-perf: Check if storage cursors are empty (for drain vs take decision).
+    pub fn storage_cursors_empty(&self) -> bool {
+        self.storage_cursors.is_empty()
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.

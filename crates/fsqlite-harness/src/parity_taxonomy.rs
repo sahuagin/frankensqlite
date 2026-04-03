@@ -356,7 +356,7 @@ impl FeatureUniverse {
                     ParityStatus::Excluded => excluded += 1,
                 }
                 if let Some(contrib) = feat.status.score_contribution() {
-                    weighted_sum += feat.weight * contrib;
+                    weighted_sum = feat.weight.mul_add(contrib, weighted_sum);
                     weight_denom += feat.weight;
                 }
             }

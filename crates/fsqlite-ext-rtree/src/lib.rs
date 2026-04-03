@@ -7,7 +7,9 @@ use fsqlite_func::vtab::{
     VirtualTable, VirtualTableCursor, VtabModuleFactory,
 };
 use fsqlite_func::{FunctionRegistry, ScalarFunction};
-use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
+#[cfg(test)]
+use fsqlite_types::SmallText;
+use fsqlite_types::{SqliteValue, cx::Cx};
 
 // ---------------------------------------------------------------------------
 // Public API — extension name
@@ -890,7 +892,7 @@ impl VirtualTableCursor for RtreeCursor {
         }
 
         let coordinate_index = usize::try_from(col - 1).map_err(|error| {
-            FrankenError::function_error(format!("rtree column index conversion failed: {error}",))
+            FrankenError::function_error(format!("rtree column index conversion failed: {error}"))
         })?;
         if let Some(coord) = row.bbox.coords.get(coordinate_index) {
             ctx.set_value(self.coordinate_value(*coord)?);
@@ -1701,14 +1703,14 @@ mod tests {
         let mut index = RtreeIndex::new(config);
         let entry = RtreeEntry {
             id: 1,
-            bbox: MBoundingBox::new(vec![0.0, 10.0, 0.0, 10.0]).unwrap(),
+            bbox: MBoundingBox::new(vec![0.0, 5.0, 0.0, 10.0]).unwrap(),
         };
         assert!(index.insert(entry));
         assert_eq!(index.len(), 1);
         // Duplicate id rejected.
         let dup = RtreeEntry {
             id: 1,
-            bbox: MBoundingBox::new(vec![5.0, 15.0, 5.0, 15.0]).unwrap(),
+            bbox: MBoundingBox::new(vec![5.0, 15.0, 5.0, 20.0]).unwrap(),
         };
         assert!(!index.insert(dup));
     }
@@ -1757,7 +1759,7 @@ mod tests {
         let mut index = RtreeIndex::new(config);
         index.insert(RtreeEntry {
             id: 1,
-            bbox: MBoundingBox::new(vec![0.0, 5.0, 0.0, 5.0]).unwrap(),
+            bbox: MBoundingBox::new(vec![0.0, 5.0, 0.0, 10.0]).unwrap(),
         });
         assert!(index.delete(1));
         assert!(index.is_empty());
@@ -1770,7 +1772,7 @@ mod tests {
         let mut index = RtreeIndex::new(config);
         index.insert(RtreeEntry {
             id: 1,
-            bbox: MBoundingBox::new(vec![0.0, 5.0, 0.0, 5.0]).unwrap(),
+            bbox: MBoundingBox::new(vec![0.0, 5.0, 0.0, 10.0]).unwrap(),
         });
         let new_bbox = MBoundingBox::new(vec![10.0, 20.0, 10.0, 20.0]).unwrap();
         assert!(index.update(1, new_bbox));
@@ -2889,8 +2891,8 @@ mod tests {
     fn test_geopoly_svg_triangle() {
         let tri = [
             Point::new(0.0, 0.0),
-            Point::new(1.0, 0.0),
-            Point::new(0.5, 1.0),
+            Point::new(4.0, 0.0),
+            Point::new(2.0, 3.0),
         ];
         let svg = geopoly_svg(&tri);
         assert!(svg.contains('M'));

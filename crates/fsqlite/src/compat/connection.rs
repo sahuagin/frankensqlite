@@ -226,8 +226,7 @@ mod tests {
             )
             .expect("insert second");
 
-            let mut next_id = 3_i64;
-            for conversation_id in 2_i64..=25_000_i64 {
+            for (next_id, conversation_id) in (3_i64..).zip(2_i64..=25_000_i64) {
                 tx.execute(
                     "INSERT INTO messages (id, conversation_id, idx, role, author, created_at, content)
                      VALUES (?1, ?2, 0, 'assistant', 'bulk', ?3, ?4)",
@@ -239,7 +238,6 @@ mod tests {
                     ],
                 )
                 .expect("insert bulk row");
-                next_id += 1;
             }
 
             tx.commit().expect("commit fixture");

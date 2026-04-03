@@ -730,8 +730,8 @@ fn zipf_harmonic_terms(k: usize, s: f64) -> (f64, f64, f64) {
         let ln_rank = rank_f64.ln();
         let inv_pow = rank_f64.powf(-s);
         h += inv_pow;
-        h_prime -= ln_rank * inv_pow;
-        h_second += ln_rank * ln_rank * inv_pow;
+        h_prime = ln_rank.mul_add(-inv_pow, h_prime);
+        h_second = (ln_rank * ln_rank).mul_add(inv_pow, h_second);
     }
     (h, h_prime, h_second)
 }

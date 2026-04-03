@@ -2291,7 +2291,7 @@ mod tests {
                 .conn
                 .execute_with_params(
                     "INSERT INTO t(v) VALUES (?)",
-                    &[SqliteValue::Text(std::sync::Arc::from("a\0b"))],
+                    &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
                 )
                 .unwrap();
 
@@ -2337,7 +2337,7 @@ mod tests {
             conn.execute("CREATE TABLE t(v TEXT)").unwrap();
             conn.execute_with_params(
                 "INSERT INTO t(v) VALUES (?)",
-                &[SqliteValue::Text(std::sync::Arc::from("a\0b"))],
+                &[SqliteValue::Text(fsqlite_types::SmallText::from("a\0b"))],
             )
             .unwrap();
             let rows = conn.query("SELECT v FROM t").unwrap();

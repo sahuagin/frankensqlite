@@ -700,17 +700,14 @@ fn extract_index_key_from_cell(cell_bytes: &[u8], page_type: BTreePageType, usab
                 return &cell_bytes[payload_start..payload_end];
             }
         }
-        BTreePageType::InteriorIndex => {
-            if cell_bytes.len() >= 4 {
-                if let Some((payload_size, n1)) =
-                    fsqlite_types::serial_type::read_varint(&cell_bytes[4..])
-                {
-                    let local_payload = compute_local_payload_size(payload_size, usable, false);
-                    let payload_start = 4 + n1;
-                    let payload_end =
-                        (payload_start + local_payload as usize).min(cell_bytes.len());
-                    return &cell_bytes[payload_start..payload_end];
-                }
+        BTreePageType::InteriorIndex if cell_bytes.len() >= 4 => {
+            if let Some((payload_size, n1)) =
+                fsqlite_types::serial_type::read_varint(&cell_bytes[4..])
+            {
+                let local_payload = compute_local_payload_size(payload_size, usable, false);
+                let payload_start = 4 + n1;
+                let payload_end = (payload_start + local_payload as usize).min(cell_bytes.len());
+                return &cell_bytes[payload_start..payload_end];
             }
         }
         _ => {}

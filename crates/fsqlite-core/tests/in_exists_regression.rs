@@ -265,7 +265,7 @@ fn test_in_and_exists_combined() {
 
     // Categories 1-3 each have 4 products (ids: 1-20 mod 5). Each product has 3 siblings.
     assert!(
-        rows.len() > 0,
+        !rows.is_empty(),
         "should find products matching both IN and EXISTS"
     );
     // All returned products should be in categories 1-3.
@@ -356,7 +356,7 @@ fn guard_correlated_exists_completes_within_budget() {
 
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(250));
     assert!(
-        elapsed < std::time::Duration::from_millis(2000),
+        elapsed < std::time::Duration::from_secs(2),
         "500-row correlated EXISTS should complete in <2s (got {:?}); \
          possible regression — LIMIT 1 injection may be missing",
         elapsed

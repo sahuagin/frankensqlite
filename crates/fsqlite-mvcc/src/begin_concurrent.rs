@@ -96,6 +96,7 @@ pub struct ConcurrentHandle {
     marked_for_abort: Cell<bool>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 struct PageTxnState {
     staged_data: Option<PageData>,
@@ -1602,6 +1603,7 @@ pub enum SsiResult {
 /// conflict history and edge propagation. `planned_commit_seq` is an
 /// optimistic planning frontier, not necessarily the final published commit
 /// sequence if another commit slips in between prepare and finalize.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PreparedConcurrentCommit {
     session_id: u64,
@@ -4541,12 +4543,13 @@ mod tests {
 
         let (write_cell, write_page) =
             WitnessKey::for_point_write(test_page(70), b"key-a", test_page(700));
+        let write_keys: [WitnessKey; 2] = (write_cell, write_page).into();
         let mut candidates = registry
             .committed_reader_candidates(
                 test_token(999),
                 CommitSeq::new(10),
                 CommitSeq::new(20),
-                &summarize_witness_keys(&[write_cell, write_page]),
+                &summarize_witness_keys(write_keys.as_slice()),
             )
             .into_iter()
             .map(|reader| reader.token)

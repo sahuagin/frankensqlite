@@ -77,7 +77,7 @@ impl Histogram {
                 // Note: SqliteValue subtraction is not directly defined for all types.
                 // We use a heuristic interpolation for numeric types.
                 let fraction = interpolate_position(&bucket.lower, &bucket.upper, value);
-                count += bucket.count as f64 * fraction;
+                count = (bucket.count as f64).mul_add(fraction, count);
                 break;
             }
         }
@@ -98,7 +98,7 @@ impl Histogram {
                 // Value falls inside this bucket. Interpolate.
                 // Fraction = (upper - value) / (upper - lower)
                 let fraction = 1.0 - interpolate_position(&bucket.lower, &bucket.upper, value);
-                count += bucket.count as f64 * fraction;
+                count = (bucket.count as f64).mul_add(fraction, count);
                 break;
             }
         }
@@ -110,7 +110,7 @@ fn bytes_to_fraction(bytes: &[u8]) -> f64 {
     let mut fraction = 0.0;
     let mut weight = 1.0 / 256.0;
     for &b in bytes.iter().take(8) {
-        fraction += f64::from(b) * weight;
+        fraction = f64::from(b).mul_add(weight, fraction);
         weight /= 256.0;
     }
     fraction

@@ -1465,7 +1465,6 @@ impl BTreePageType {
 mod tests {
     use super::*;
     use crate::value::SmallText;
-    use std::sync::Arc;
 
     #[test]
     fn page_number_zero_is_invalid() {

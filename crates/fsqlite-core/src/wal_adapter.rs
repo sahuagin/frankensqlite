@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
-    PreparedWalChecksumSeed, PreparedWalChecksumTransform, PreparedWalFinalizationState,
-    PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef,
+    PreparedWalChecksumSeed, PreparedWalFinalizationState, PreparedWalFrameBatch,
+    PreparedWalFrameMeta, WalFrameRef,
 };
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
@@ -895,16 +895,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     self.wal.page_size(),
                     self.wal.big_endian_checksum(),
                 )
-            })
-            .map(|result| {
-                result.map(|transform| PreparedWalChecksumTransform {
-                    a11: transform.a11,
-                    a12: transform.a12,
-                    a21: transform.a21,
-                    a22: transform.a22,
-                    c1: transform.c1,
-                    c2: transform.c2,
-                })
             })
             .collect::<Result<Vec<_>>>()?;
         let frame_metas = frames

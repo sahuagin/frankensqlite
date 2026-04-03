@@ -944,7 +944,7 @@ impl std::fmt::Debug for ShardedFlatCombiner {
         f.debug_struct("ShardedFlatCombiner")
             .field("num_shards", &self.num_shards)
             .field("total_value", &self.total_value())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

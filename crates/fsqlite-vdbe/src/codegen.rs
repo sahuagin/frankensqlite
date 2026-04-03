@@ -3931,8 +3931,8 @@ fn codegen_select_count_star_indexed_in_scan(
     b.free_temp(r_key);
     b.free_temp(r_value);
 
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
     if use_materialized_semijoin_merge {
-        b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
         b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
 
         let r_probe_value = b.alloc_reg();
@@ -3983,8 +3983,6 @@ fn codegen_select_count_star_indexed_in_scan(
         let probe_loop_body = probe_loop_top as i32;
         b.emit_op(Opcode::Next, probe_cursor, probe_loop_body, 0, P4::None, 0);
     } else {
-        b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
-
         let r_probe_value = b.alloc_reg();
         let r_min_rowid = b.alloc_reg();
         let r_probe_record = b.alloc_reg();
@@ -4781,7 +4779,6 @@ fn codegen_select_ordered_scan(
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
     {
-        let mut reg = sorter_base;
         let scan = ScanCtx {
             cursor,
             table,
@@ -4790,7 +4787,7 @@ fn codegen_select_ordered_scan(
             register_base: None,
             secondary: None,
         };
-        for key in &sort_keys {
+        for (reg, key) in (sorter_base..).zip(sort_keys.iter()) {
             match key {
                 SortKeySource::Column(col_idx) => {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -4803,7 +4800,6 @@ fn codegen_select_ordered_scan(
                     emit_expr(b, expr, reg, Some(&scan));
                 }
             }
-            reg += 1;
         }
 
         // Evaluate result columns (including expressions) and store the final

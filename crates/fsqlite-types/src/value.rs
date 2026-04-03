@@ -140,12 +140,15 @@ impl SmallText {
 
     /// Create from an owned String, potentially reusing its allocation.
     #[inline]
-    pub fn from_string(s: String) -> Self {
-        if s.len() <= SMALL_TEXT_INLINE_CAP {
-            Self::new(&s)
+    pub fn from_string<S>(s: S) -> Self
+    where
+        S: Into<String> + AsRef<str>,
+    {
+        if s.as_ref().len() <= SMALL_TEXT_INLINE_CAP {
+            Self::new(s.as_ref())
         } else {
             Self {
-                repr: SmallTextRepr::Heap(Arc::from(s)),
+                repr: SmallTextRepr::Heap(Arc::from(s.into())),
             }
         }
     }

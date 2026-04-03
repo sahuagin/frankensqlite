@@ -241,7 +241,7 @@ pub fn build_triage_session(manifest: &ArtifactManifest, jsonl_content: &str) ->
             divergences.first().map(|div| ReplayConfig {
                 seed: div.seed,
                 scenario_id: div.scenario_id.clone(),
-                replay_command: format!("cargo test -p fsqlite-harness -- {}", div.scenario_id,),
+                replay_command: format!("cargo test -p fsqlite-harness -- {}", div.scenario_id),
                 lane: manifest.lane.clone(),
                 git_sha: manifest.git_sha.clone(),
                 good_commit: None,
@@ -304,7 +304,7 @@ impl TriageSession {
         let mut out = String::new();
 
         // Header
-        let _ = writeln!(out, "=== Failure Triage Report ({}) ===\n", self.bead_id,);
+        let _ = writeln!(out, "=== Failure Triage Report ({}) ===\n", self.bead_id);
 
         // Manifest summary
         let _ = writeln!(out, "--- Manifest ---");
@@ -369,18 +369,18 @@ impl TriageSession {
                     div.event_index, div.timestamp,
                 );
                 if !div.divergence_point.is_empty() {
-                    let _ = writeln!(out, "      Divergence: {}", div.divergence_point,);
+                    let _ = writeln!(out, "      Divergence: {}", div.divergence_point);
                 }
                 if !div.artifact_paths.is_empty() {
-                    let _ = writeln!(out, "      Artifacts: {}", div.artifact_paths.join(", "),);
+                    let _ = writeln!(out, "      Artifacts: {}", div.artifact_paths.join(", "));
                 }
             }
         }
 
         // Failures
         if !self.failure_indices.is_empty() {
-            let _ = writeln!(out, "\n--- Failures ({}) ---", self.failure_indices.len(),);
-            let _ = writeln!(out, "  Event indices: {:?}", self.failure_indices,);
+            let _ = writeln!(out, "\n--- Failures ({}) ---", self.failure_indices.len());
+            let _ = writeln!(out, "  Event indices: {:?}", self.failure_indices);
         }
 
         // Replay instructions
@@ -1758,7 +1758,7 @@ mod tests {
         let decoded = decode_jsonl_stream(&jsonl);
         let failures = extract_failures(&decoded.events);
 
-        assert_eq!(failures.len(), 1, "bead_id={BEAD_ID} case=extract_failures",);
+        assert_eq!(failures.len(), 1, "bead_id={BEAD_ID} case=extract_failures");
         assert_eq!(failures[0].1.event_type, LogEventType::Fail);
     }
 
@@ -1767,7 +1767,7 @@ mod tests {
         let jsonl = build_clean_jsonl();
         let decoded = decode_jsonl_stream(&jsonl);
         let failures = extract_failures(&decoded.events);
-        assert!(failures.is_empty(), "bead_id={BEAD_ID} case=no_failures",);
+        assert!(failures.is_empty(), "bead_id={BEAD_ID} case=no_failures");
     }
 
     // ---- Replay Config Tests ----
@@ -2162,7 +2162,7 @@ mod tests {
 
         let j1 = s1.to_json().unwrap();
         let j2 = s2.to_json().unwrap();
-        assert_eq!(j1, j2, "bead_id={BEAD_ID} case=session_determinism",);
+        assert_eq!(j1, j2, "bead_id={BEAD_ID} case=session_determinism");
     }
 
     #[test]
@@ -2175,7 +2175,7 @@ mod tests {
 
         let r1 = s1.render_triage_report();
         let r2 = s2.render_triage_report();
-        assert_eq!(r1, r2, "bead_id={BEAD_ID} case=report_determinism",);
+        assert_eq!(r1, r2, "bead_id={BEAD_ID} case=report_determinism");
     }
 
     // ---- Deterministic Bisect Orchestrator Tests (bd-mblr.7.6.2) ----

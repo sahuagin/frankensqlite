@@ -450,7 +450,7 @@ fn format_iso8601_from_ms(ms: u128) -> String {
     // Simple year/month/day calculation from days since 1970-01-01.
     let (year, month, day) = days_to_ymd(days_since_epoch);
 
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z",)
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.{millis:03}Z")
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -508,7 +508,7 @@ mod tests {
         // so from_env should synthesize it from the bead_id.
         // If RUN_ID happens to be set, the run_id will be that value instead.
         let ctx = RunContext::from_env("bd-test-env");
-        assert!(!ctx.run_id.is_empty(), "run_id should not be empty",);
+        assert!(!ctx.run_id.is_empty(), "run_id should not be empty");
         // If RUN_ID is not set, it should start with the bead_id prefix.
         if std::env::var("RUN_ID").is_err() {
             assert!(
