@@ -42,6 +42,7 @@ impl<V> Default for CursorSlots<V> {
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 impl<V> CursorSlots<V> {
     #[inline]
     fn new() -> Self {
@@ -97,11 +98,6 @@ impl<V> CursorSlots<V> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.is_some()).count()
     }
 
     pub fn values(&self) -> impl Iterator<Item = &V> {
@@ -4663,6 +4659,8 @@ pub struct VdbeEngine {
     /// Used by JSON functions to distinguish JSON text (subtype 74/'J')
     /// from regular text. Cleared on each register write.
     register_subtypes: HashMap<i32, u32>,
+    /// bd-perf (V1.4): Fast check — avoids HashMap::is_empty() on every register write.
+    has_subtypes: bool,
     /// Bloom filters keyed by cursor/filter register.
     /// Each entry is a fixed-size bit array used for early rejection
     /// during index lookups.
@@ -5089,6 +5087,7 @@ impl VdbeEngine {
             table_index_meta: Arc::new(HashMap::new()),
             window_contexts: SwissIndex::new(),
             register_subtypes: HashMap::new(),
+            has_subtypes: false,
             bloom_filters: HashMap::new(),
             make_record_buf: Vec::new(),
             make_record_sideband_reg: 0,
@@ -5153,6 +5152,7 @@ impl VdbeEngine {
             .contains(StatementColdState::REGISTER_SUBTYPES)
         {
             self.register_subtypes.clear();
+            self.has_subtypes = false;
         }
         if self
             .statement_cold_state
@@ -8186,6 +8186,14 @@ impl VdbeEngine {
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
                     let key_val = self.get_reg(key_reg).clone();
+                    let sideband_active = self.make_record_sideband_reg == key_reg
+                        && !self.make_record_buf.is_empty();
+                    let key_blob = if sideband_active {
+                        self.make_record_sideband_reg = 0;
+                        std::mem::take(&mut self.make_record_buf)
+                    } else {
+                        record_blob_bytes(&key_val).to_vec()
+                    };
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row.
@@ -8196,7 +8204,7 @@ impl VdbeEngine {
 
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
-                            let key_bytes = record_blob_bytes(&key_val);
+                            let key_bytes = key_blob.as_slice();
 
                             if is_unique && n_idx_cols > 0 {
                                 let columns_label = match &op.p4 {
@@ -8278,7 +8286,7 @@ impl VdbeEngine {
                                                     StatementColdState::CONFLICT_TRACKING,
                                                 );
                                                 self.pending_idx_entries
-                                                    .push((cursor_id, key_bytes.to_vec()));
+                                                    .push((cursor_id, key_blob.clone()));
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -8303,8 +8311,7 @@ impl VdbeEngine {
                                 self.mark_statement_cold_state(
                                     StatementColdState::CONFLICT_TRACKING,
                                 );
-                                self.pending_idx_entries
-                                    .push((cursor_id, key_bytes.to_vec()));
+                                self.pending_idx_entries.push((cursor_id, key_blob.clone()));
                             }
                         }
                     }
@@ -9739,6 +9746,7 @@ impl VdbeEngine {
                     } else {
                         self.mark_statement_cold_state(StatementColdState::REGISTER_SUBTYPES);
                         self.register_subtypes.insert(op.p2, st);
+                        self.has_subtypes = true;
                     }
                     pc += 1;
                 }
@@ -10687,7 +10695,7 @@ impl VdbeEngine {
     #[allow(clippy::inline_always)]
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
-            if !self.register_subtypes.is_empty() {
+            if self.has_subtypes {
                 self.register_subtypes.remove(&r);
             }
             std::mem::replace(&mut self.registers[r as usize], SqliteValue::Null)
@@ -10760,7 +10768,7 @@ impl VdbeEngine {
             "register {r} out of pre-sized bounds"
         );
         if idx < self.registers.len() {
-            if !self.register_subtypes.is_empty() {
+            if self.has_subtypes {
                 self.register_subtypes.remove(&r);
             }
             self.registers[idx] = SqliteValue::Integer(val);
@@ -10854,7 +10862,7 @@ impl VdbeEngine {
         } else {
             let includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
                 payload_includes_rowid_alias_lazy(
-                    &mut cursor.row_decode,
+                    &cursor.row_decode,
                     &cursor.payload_buf,
                     rowid,
                     ipk,
@@ -11020,7 +11028,7 @@ impl VdbeEngine {
                             .zip(ipk_col_idx)
                             .is_some_and(|(root_page, ipk_col_idx)| {
                                 payload_includes_rowid_alias_lazy(
-                                    &mut cursor.row_decode,
+                                    &cursor.row_decode,
                                     &cursor.payload_buf,
                                     rowid,
                                     ipk_col_idx,
@@ -12557,25 +12565,19 @@ fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
 #[allow(dead_code)]
 fn payload_includes_rowid_alias(
     payload_values: &[SqliteValue],
-    rowid: i64,
+    _rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
 ) -> bool {
     let payload_cols = payload_values.len();
-    if let Some(table_cols) = table_column_count
-        && payload_cols >= table_cols
-    {
-        return true;
+    if let Some(table_cols) = table_column_count {
+        return payload_cols == table_cols;
     }
     if payload_cols <= ipk_col_idx {
         return false;
     }
 
-    match payload_values.get(ipk_col_idx) {
-        Some(SqliteValue::Null) => true,
-        Some(SqliteValue::Integer(encoded_rowid)) => *encoded_rowid == rowid,
-        _ => false,
-    }
+    matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null))
 }
 
 /// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
@@ -12586,17 +12588,15 @@ fn payload_includes_rowid_alias(
 /// (zero-decode).  For the integer-match case, a single column is decoded
 /// on demand and cached in the caller-owned scratch buffer.
 fn payload_includes_rowid_alias_lazy(
-    row_decode: &mut RowDecodeScratch,
-    payload_buf: &[u8],
-    rowid: i64,
+    row_decode: &RowDecodeScratch,
+    _payload_buf: &[u8],
+    _rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
 ) -> bool {
     let payload_cols = row_decode.column_count();
-    if let Some(table_cols) = table_column_count
-        && payload_cols >= table_cols
-    {
-        return true;
+    if let Some(table_cols) = table_column_count {
+        return payload_cols == table_cols;
     }
     if payload_cols <= ipk_col_idx {
         return false;
@@ -12610,29 +12610,6 @@ fn payload_includes_rowid_alias_lazy(
     match classify_serial_type(col.serial_type) {
         // NULL serial type → rowid alias is present (stored as NULL placeholder).
         SerialTypeClass::Null => true,
-        // Zero constant (serial type 8 = integer 0).
-        SerialTypeClass::Zero => rowid == 0,
-        // One constant (serial type 9 = integer 1).
-        SerialTypeClass::One => rowid == 1,
-        // Integer: decode just this one column to compare.
-        SerialTypeClass::Integer => {
-            // Lazily decode and cache.
-            if row_decode.cached_value_ready(ipk_col_idx) {
-                // Already decoded.
-                match row_decode.cached_value(ipk_col_idx) {
-                    Some(SqliteValue::Integer(v)) => *v == rowid,
-                    _ => false,
-                }
-            } else if let Some(val) =
-                fsqlite_types::record::decode_column_from_offset(payload_buf, col, false)
-            {
-                let result = matches!(&val, SqliteValue::Integer(v) if *v == rowid);
-                row_decode.cache_decoded(ipk_col_idx, val);
-                result
-            } else {
-                false
-            }
-        }
         _ => false,
     }
 }
@@ -13351,6 +13328,72 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn test_payload_includes_rowid_alias_does_not_false_positive_when_first_stored_value_matches_rowid()
+     {
+        let payload_values = vec![
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ];
+
+        assert!(
+            !payload_includes_rowid_alias(&payload_values, 1, 0, Some(4)),
+            "omitted INTEGER PRIMARY KEY aliases must be detected by payload width, not by a coincidental value match"
+        );
+        assert!(
+            !payload_includes_rowid_alias(&payload_values, 1, 0, None),
+            "countless fallback must not treat a matching first stored integer as proof that the rowid alias is present"
+        );
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_lazy_does_not_false_positive_when_first_stored_value_matches_rowid()
+     {
+        let record = serialize_record(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert!(
+            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, Some(4)),
+            "lazy rowid-alias detection must not shift columns when the first stored value happens to equal the rowid"
+        );
+        assert!(
+            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, None),
+            "countless lazy fallback must stay conservative instead of trusting value equality"
+        );
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_lazy_accepts_explicit_null_placeholder() {
+        let record = serialize_record(&[
+            SqliteValue::Null,
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert!(payload_includes_rowid_alias_lazy(
+            &scratch,
+            &record,
+            1,
+            0,
+            Some(3)
+        ));
+        assert!(payload_includes_rowid_alias_lazy(
+            &scratch, &record, 1, 0, None
+        ));
+    }
+
     fn install_duplicate_prefix_index_fixture(
         engine: &mut VdbeEngine,
         cursor_id: i32,
@@ -13394,6 +13437,60 @@ mod tests {
         let mut engine = VdbeEngine::new(8);
         let (conflict_key, miss_key) = install_duplicate_prefix_index_fixture(&mut engine, 0);
         (engine, conflict_key, miss_key)
+    }
+
+    #[test]
+    fn test_idxinsert_consumes_make_record_sideband_for_storage_cursor() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let found = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_insert_val = b.alloc_reg();
+        let r_insert_key = b.alloc_reg();
+        let r_probe_val = b.alloc_reg();
+        let r_probe_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_insert_val, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::MakeRecord,
+            r_insert_val,
+            1,
+            r_insert_key,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::IdxInsert, 0, r_insert_key, 0, P4::None, 0);
+
+        b.emit_op(Opcode::Integer, 7, r_probe_val, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_probe_val, 1, r_probe_key, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, 0, r_probe_key, found, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+        b.resolve_label(found);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.resolve_label(done);
+
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 
     fn build_no_conflict_opcode_probe_program(
@@ -18004,7 +18101,12 @@ mod tests {
         );
         assert!(!engine.cursors.contains_key(&0));
         // Verify it's marked writable.
-        assert!(engine.storage_cursors[&0].writable);
+        assert!(
+            engine
+                .storage_cursors
+                .get(&0)
+                .is_some_and(|cursor| cursor.writable)
+        );
     }
 
     #[test]
