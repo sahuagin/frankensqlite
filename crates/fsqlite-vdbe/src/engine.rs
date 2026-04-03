@@ -5107,6 +5107,7 @@ impl VdbeEngine {
             // OP_OpenWrite will detect an existing cursor on the same root
             // page and reuse it instead of creating a new one.
             // Clear only transient per-statement cursor state.
+            self.sorters.clear();
             self.pending_next_after_delete.clear();
         } else {
             self.cursors.clear();
@@ -8218,7 +8219,14 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let record = self.take_reg(op.p2);
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let blob = record_blob_bytes(&record).to_vec();
+                        let sideband_active = self.make_record_sideband_reg == op.p2
+                            && !self.make_record_buf.is_empty();
+                        let blob = if sideband_active {
+                            self.make_record_sideband_reg = 0;
+                            std::mem::take(&mut self.make_record_buf)
+                        } else {
+                            record_blob_bytes(&record).to_vec()
+                        };
                         let key_values =
                             fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
                                 .ok_or_else(|| FrankenError::DatabaseCorrupt {

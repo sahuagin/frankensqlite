@@ -340,7 +340,7 @@ fn default_meta_always_has_concurrent_mode() {
         meta.concurrent_mode,
         "bead_id={BEAD_ID} case=default_concurrent",
     );
-    assert!(meta.wal_mode, "bead_id={BEAD_ID} case=default_wal",);
+    assert!(meta.wal_mode, "bead_id={BEAD_ID} case=default_wal");
 }
 
 // ---------------------------------------------------------------------------

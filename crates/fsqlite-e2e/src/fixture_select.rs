@@ -2042,42 +2042,29 @@ pub fn parse_filter_args(args: &[String]) -> FixtureFilter {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--db" => {
-                if i + 1 < args.len() {
-                    filter.db_selector = Some(args[i + 1].clone());
-                    i += 1;
-                }
+            "--db" if i + 1 < args.len() => {
+                filter.db_selector = Some(args[i + 1].clone());
+                i += 1;
             }
-            "--tag" => {
-                if i + 1 < args.len() {
-                    filter.require_tags.push(args[i + 1].clone());
-                    i += 1;
-                }
+            "--tag" if i + 1 < args.len() => {
+                filter.require_tags.push(args[i + 1].clone());
+                i += 1;
             }
-            "--exclude-tag" => {
-                if i + 1 < args.len() {
-                    filter.exclude_tags.push(args[i + 1].clone());
-                    i += 1;
-                }
+            "--exclude-tag" if i + 1 < args.len() => {
+                filter.exclude_tags.push(args[i + 1].clone());
+                i += 1;
             }
-            "--min-size" => {
-                if i + 1 < args.len() {
-                    if let Some(bytes) = parse_size(&args[i + 1]) {
-                        filter.min_size_bytes = Some(bytes);
-                    }
-                    i += 1;
+            "--min-size" if i + 1 < args.len() => {
+                if let Some(bytes) = parse_size(&args[i + 1]) {
+                    filter.min_size_bytes = Some(bytes);
                 }
+                i += 1;
             }
-            "--max-size" => {
-                if i + 1 < args.len() {
-                    if let Some(bytes) = parse_size(&args[i + 1]) {
-                        filter.max_size_bytes = Some(bytes);
-                    }
-                    i += 1;
+            "--max-size" if i + 1 < args.len() => {
+                if let Some(bytes) = parse_size(&args[i + 1]) {
+                    filter.max_size_bytes = Some(bytes);
                 }
-            }
-            "--requires-wal" => {
-                filter.requires_wal = true;
+                i += 1;
             }
             "--ci-safe" => {
                 filter.ci_safe_only = true;

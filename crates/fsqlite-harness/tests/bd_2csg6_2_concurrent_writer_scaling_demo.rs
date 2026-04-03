@@ -221,7 +221,7 @@ fn test_first_committer_wins_conflict() {
     {
         let mut h = registry.get_mut(s2).unwrap();
         let result = concurrent_write_page(&mut h, &lock_table, s2, page(5), page_data(0xB2));
-        assert!(result.is_err(), "bead_id={BEAD_ID} case=page_lock_conflict",);
+        assert!(result.is_err(), "bead_id={BEAD_ID} case=page_lock_conflict");
     }
 
     // s1 commits successfully.
@@ -312,7 +312,7 @@ fn test_throughput_scaling_comparison() {
     // At 4+ threads, MVCC should show some scaling advantage.
     // (The registry mutex may limit scaling, but should still beat single-writer.)
     if let Some((_, _, _, committed, _, _)) = results.iter().find(|(n, _, _, _, _, _)| *n == 4) {
-        assert!(*committed > 0, "bead_id={BEAD_ID} case=4_thread_committed",);
+        assert!(*committed > 0, "bead_id={BEAD_ID} case=4_thread_committed");
     }
 
     // All single-thread runs should commit all ops.
@@ -432,7 +432,7 @@ fn test_ssi_abort_rate_transparency() {
     println!("  attempted={total} committed={comm} aborted={abrt} abort_rate={abort_rate:.1}%");
 
     // With overlapping pages, some aborts are expected.
-    assert!(comm > 0, "bead_id={BEAD_ID} case=some_commits_succeeded",);
+    assert!(comm > 0, "bead_id={BEAD_ID} case=some_commits_succeeded");
     // Total should equal committed + aborted.
     assert_eq!(
         total,
@@ -524,7 +524,7 @@ fn test_scaling_ratio() {
 
     // With no contention and separate page ranges, we expect some scaling.
     // The registry mutex limits throughput, but 4 threads should be faster than 1.
-    assert!(committed_4 > 0, "bead_id={BEAD_ID} case=4_thread_commits",);
+    assert!(committed_4 > 0, "bead_id={BEAD_ID} case=4_thread_commits");
 }
 
 // ── 10. Conformance summary ─────────────────────────────────────────────────

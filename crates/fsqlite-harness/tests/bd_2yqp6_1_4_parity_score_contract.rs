@@ -221,7 +221,7 @@ fn compute_weighted_parity_score(
             let Some(weight_multiplier) = status_weight(contract, status) else {
                 panic!("status '{status}' has no configured score weight");
             };
-            numerator += weight * weight_multiplier;
+            numerator = weight.mul_add(weight_multiplier, numerator);
             denominator += weight;
             continue;
         }

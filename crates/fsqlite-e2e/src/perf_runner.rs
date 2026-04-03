@@ -4532,7 +4532,7 @@ pub fn run_perf_matrix(config: &PerfMatrixConfig) -> PerfResult {
     let mut error_count = 0usize;
 
     for (i, cell) in cells.iter().enumerate() {
-        eprintln!("[perf] ({}/{}) running {}", i + 1, total, cell,);
+        eprintln!("[perf] ({}/{}) running {}", i + 1, total, cell);
 
         let outcome = run_cell(cell, config);
 

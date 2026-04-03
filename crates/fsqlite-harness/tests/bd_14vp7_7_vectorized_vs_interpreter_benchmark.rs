@@ -235,7 +235,7 @@ fn interpreter_q6(rows: &[Vec<SqliteValue>]) -> (f64, usize) {
         };
 
         if quantity < 24 && (0.05..=0.07).contains(&discount) {
-            revenue += price * discount;
+            revenue = price.mul_add(discount, revenue);
             count += 1;
         }
     }

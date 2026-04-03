@@ -118,32 +118,24 @@ where
             "--verbose" | "-v" => config.verbose = true,
             "--json" => config.json_output = true,
             "--no-color" => config.no_color = true,
-            "--output" => {
-                if i + 1 < tail.len() {
-                    config.output_dir = PathBuf::from(&tail[i + 1]);
+            "--output" if i + 1 < tail.len() => {
+                config.output_dir = PathBuf::from(&tail[i + 1]);
+            }
+            "--golden" if i + 1 < tail.len() => {
+                config.golden_dir = PathBuf::from(&tail[i + 1]);
+            }
+            "--seed" if i + 1 < tail.len() => {
+                if let Ok(s) = tail[i + 1].parse::<u64>() {
+                    config.seed = s;
                 }
             }
-            "--golden" => {
-                if i + 1 < tail.len() {
-                    config.golden_dir = PathBuf::from(&tail[i + 1]);
-                }
+            "--filter" if i + 1 < tail.len() => {
+                config.filter = Some(tail[i + 1].clone());
             }
-            "--seed" => {
-                if i + 1 < tail.len() {
-                    if let Ok(s) = tail[i + 1].parse::<u64>() {
-                        config.seed = s;
-                    }
-                }
-            }
-            "--filter" => {
-                if i + 1 < tail.len() {
-                    config.filter = Some(tail[i + 1].clone());
-                }
-            }
-            "run-smoke" | "run-correctness" | "run-recovery" | "run-all" | "report" => {
-                if subcmd_idx.is_none() {
-                    subcmd_idx = Some(i);
-                }
+            "run-smoke" | "run-correctness" | "run-recovery" | "run-all" | "report"
+                if subcmd_idx.is_none() =>
+            {
+                subcmd_idx = Some(i);
             }
             _ => {
                 // Skip option values (already consumed above).
@@ -157,7 +149,6 @@ where
         print_help();
         return 2;
     };
-
     match tail[idx].as_str() {
         "run-smoke" => cmd_run_smoke(&config),
         "run-correctness" => cmd_run_correctness(&config),
