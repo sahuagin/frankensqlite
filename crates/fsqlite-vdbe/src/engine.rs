@@ -4558,6 +4558,11 @@ pub struct VdbeEngine {
     /// Reusable buffer for `MakeRecord` serialization.
     /// Avoids allocating a new `Vec<u8>` for every row during INSERT/UPDATE.
     make_record_buf: Vec<u8>,
+    /// bd-perf: When non-zero, Insert/IdxInsert should read record bytes from
+    /// `make_record_buf` instead of the register blob. Set by MakeRecord hot
+    /// path to avoid Arc<[u8]> allocation per row. Stores the target register
+    /// number; cleared after Insert consumes the sideband.
+    make_record_sideband_reg: i32,
     /// Whether `OP_ResultRow` should materialize and retain result rows.
     /// DML-only execution lanes can disable this to avoid row-buffer work.
     collect_result_rows: bool,
@@ -4974,6 +4979,7 @@ impl VdbeEngine {
             register_subtypes: HashMap::new(),
             bloom_filters: HashMap::new(),
             make_record_buf: Vec::new(),
+            make_record_sideband_reg: 0,
             collect_result_rows: true,
             max_collected_result_rows: None,
             statement_state_clean: true,
@@ -5119,6 +5125,7 @@ impl VdbeEngine {
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_buf.truncate(0);
+        self.make_record_sideband_reg = 0;
         self.collect_result_rows = true;
         self.max_collected_result_rows = None;
         self.statement_state_clean = true;
@@ -5413,10 +5420,6 @@ impl VdbeEngine {
     /// storage-backed table contents for fast-path reads.
     pub fn storage_cursor_memdb_count_shortcuts_safe(&self) -> bool {
         self.storage_cursor_memdb_count_shortcuts_safe
-    }
-
-    fn storage_memdb_row_mirror_enabled(&self) -> bool {
-        self.memdb_rows_loaded && self.storage_cursor_memdb_count_shortcuts_safe
     }
 
     /// Mark a root page as dirty for lazy MemDB sync.
@@ -5792,6 +5795,7 @@ impl VdbeEngine {
                 .reserve(estimated_make_record_capacity - self.make_record_buf.capacity());
         }
         self.make_record_buf.truncate(0);
+        self.make_record_sideband_reg = 0;
         if !self.statement_state_clean {
             self.clear_statement_cold_state();
             self.results.clear();
@@ -7709,11 +7713,27 @@ impl VdbeEngine {
                     // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
                     // StorageCursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
+                    //
+                    // bd-perf: Sideband buffer — if MakeRecord stored bytes in
+                    // make_record_buf (sideband), take ownership here to avoid
+                    // Arc allocation. Otherwise fall back to register blob.
+                    let sideband_active = self.make_record_sideband_reg == record_reg
+                        && !self.make_record_buf.is_empty();
+                    let sideband_buf = if sideband_active {
+                        self.make_record_sideband_reg = 0;
+                        std::mem::take(&mut self.make_record_buf)
+                    } else {
+                        Vec::new()
+                    };
                     let mut actually_inserted = false;
                     let mut inserted_via_storage = false;
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
-                            let blob = record_blob_bytes(&record_val);
+                            let blob = if sideband_active {
+                                &sideband_buf[..]
+                            } else {
+                                record_blob_bytes(&record_val)
+                            };
                             // bd-p666i: Append fast-path — if the new rowid
                             // is strictly greater than the last successfully
                             // inserted rowid on this cursor, the row cannot
@@ -7913,6 +7933,12 @@ impl VdbeEngine {
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
                     // infinite loops when the rowid doesn't change.
                     self.pending_next_after_delete.remove(&cursor_id);
+                    // bd-perf: Return sideband buffer for reuse (keeps capacity).
+                    if sideband_active {
+                        let mut buf = sideband_buf;
+                        buf.clear();
+                        self.make_record_buf = buf;
+                    }
 
                     pc += 1;
                 }
@@ -10245,15 +10271,15 @@ impl VdbeEngine {
                 AtomicOrdering::Relaxed,
             );
         }
-        // bd-pt17g: Keep buffer capacity for reuse across rows.
-        // Previously: std::mem::take moved the allocation into blob, leaving
-        // make_record_buf with capacity 0 — forcing a fresh allocation per row.
-        // Now: copy bytes into Arc, then clear() (keeps capacity) so the next
-        // MakeRecord reuses the same allocation.
-        let blob: Arc<[u8]> = Arc::from(&rec_buf[..]);
-        rec_buf.clear(); // O(1): sets len=0, keeps capacity
-        self.make_record_buf = rec_buf;
-        self.set_reg(target, SqliteValue::Blob(blob));
+        // bd-perf: Sideband buffer — keep record bytes in make_record_buf
+        // and let Insert/IdxInsert read from there directly, avoiding the
+        // Arc<[u8]> heap allocation + memcpy per row. The sideband register
+        // number tells Insert which register to intercept.
+        self.make_record_buf = rec_buf; // keep bytes (don't clear!)
+        self.make_record_sideband_reg = target;
+        // Set register to Null sentinel. Non-Insert consumers (rare) will
+        // see Null and fall back to normal behavior.
+        self.set_reg(target, SqliteValue::Null);
     }
 
     #[cold]
