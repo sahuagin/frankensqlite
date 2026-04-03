@@ -77,14 +77,18 @@ impl ConnectionExt for Connection {
         &self,
         sql: &str,
         params: &[ParamValue],
-        f: F,
+        mut f: F,
     ) -> Result<Vec<T>, FrankenError>
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        let rows = self.query_with_params(sql, &values)?;
-        rows.iter().map(f).collect()
+        let mut mapped = Vec::new();
+        self.query_with_params_for_each(sql, &values, |row| {
+            mapped.push(f(row)?);
+            Ok(())
+        })?;
+        Ok(mapped)
     }
 
     fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
@@ -132,6 +136,47 @@ mod tests {
             .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| row.get_typed(0))
             .unwrap();
         assert_eq!(results, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn query_map_collect_supports_side_effect_only_row_processing() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('c')").unwrap();
+
+        let mut seen = Vec::new();
+        let results: Vec<()> = conn
+            .query_map_collect("SELECT val FROM t ORDER BY id", &[], |row| {
+                seen.push(row.get_typed::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(seen, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn query_map_collect_supports_explain_statements() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO t (val) VALUES ('b')").unwrap();
+
+        let opcodes: Vec<String> = conn
+            .query_map_collect(
+                "EXPLAIN SELECT val FROM t WHERE id = ?1",
+                &[ParamValue::from(1_i64)],
+                |row| row.get_typed(1),
+            )
+            .unwrap();
+
+        assert!(!opcodes.is_empty());
+        assert!(opcodes.iter().any(|opcode| opcode == "OpenRead"));
     }
 
     #[test]

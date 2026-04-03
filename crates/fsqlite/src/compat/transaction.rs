@@ -134,14 +134,18 @@ impl<'a> Transaction<'a> {
         &self,
         sql: &str,
         params: &[ParamValue],
-        f: F,
+        mut f: F,
     ) -> Result<Vec<T>, FrankenError>
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
-        let rows = self.conn.query_with_params(sql, &values)?;
-        rows.iter().map(f).collect()
+        let mut mapped = Vec::new();
+        self.conn.query_with_params_for_each(sql, &values, |row| {
+            mapped.push(f(row)?);
+            Ok(())
+        })?;
+        Ok(mapped)
     }
 
     /// Execute a string containing multiple SQL statements separated by

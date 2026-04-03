@@ -4584,6 +4584,8 @@ pub struct VdbeEngine {
     dirty_root_pages: HashSet<i32>,
 }
 
+type ResultRowCallback<'a> = dyn FnMut(smallvec::SmallVec<[SqliteValue; 16]>) -> Result<()> + 'a;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExactResultRowOutcome {
     NoRows,
@@ -5740,7 +5742,7 @@ impl VdbeEngine {
         clippy::cast_possible_wrap
     )]
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
-        self.execute_with_borrowed_bindings(program, None)
+        self.execute_with_borrowed_bindings_internal(program, None, None)
     }
 
     /// Execute a program using a borrowed binding slice for this run only.
@@ -5758,6 +5760,29 @@ impl VdbeEngine {
         &mut self,
         program: &VdbeProgram,
         borrowed_bindings: Option<&[SqliteValue]>,
+    ) -> Result<ExecOutcome> {
+        self.execute_with_borrowed_bindings_internal(program, borrowed_bindings, None)
+    }
+
+    /// Execute a program using a borrowed binding slice and a per-row callback.
+    ///
+    /// The callback is invoked for each `OP_ResultRow` payload as soon as the
+    /// row is materialized, allowing callers to process large result sets
+    /// without retaining them in `self.results`.
+    pub fn execute_with_borrowed_bindings_and_row_handler(
+        &mut self,
+        program: &VdbeProgram,
+        borrowed_bindings: Option<&[SqliteValue]>,
+        row_handler: &mut ResultRowCallback<'_>,
+    ) -> Result<ExecOutcome> {
+        self.execute_with_borrowed_bindings_internal(program, borrowed_bindings, Some(row_handler))
+    }
+
+    fn execute_with_borrowed_bindings_internal(
+        &mut self,
+        program: &VdbeProgram,
+        borrowed_bindings: Option<&[SqliteValue]>,
+        mut row_handler: Option<&mut ResultRowCallback<'_>>,
     ) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
         let estimated_make_record_capacity =
@@ -5967,7 +5992,7 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
-            if self.try_execute_hot_opcode(op, &mut pc, collect_vdbe_metrics)? {
+            if self.try_execute_hot_opcode(op, &mut pc, collect_vdbe_metrics, &mut row_handler)? {
                 continue;
             }
             #[allow(unreachable_patterns)]
@@ -6132,33 +6157,7 @@ impl VdbeEngine {
 
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
-                    // Output p2 registers starting at p1. Move values out of
-                    // the register file instead of cloning. DML-only lanes can
-                    // discard the row entirely while preserving register-clearing
-                    // semantics.
-                    let count = usize::try_from(op.p2).unwrap_or(0);
-                    let should_retain_row = self.collect_result_rows
-                        && match self.max_collected_result_rows {
-                            Some(limit) => self.results.len() < limit,
-                            None => true,
-                        };
-                    if should_retain_row {
-                        let materialize_start = collect_vdbe_metrics.then(Instant::now);
-                        let row = self.take_reg_range(op.p1, count);
-                        if collect_vdbe_metrics {
-                            if let Some(materialize_start) = materialize_start {
-                                FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
-                                    u64::try_from(materialize_start.elapsed().as_nanos())
-                                        .unwrap_or(u64::MAX),
-                                    AtomicOrdering::Relaxed,
-                                );
-                            }
-                            record_result_row_metrics(&row);
-                        }
-                        self.results.push(row);
-                    } else {
-                        self.discard_reg_range(op.p1, count);
-                    }
+                    self.execute_result_row_hot(op, collect_vdbe_metrics, &mut row_handler)?;
                     pc += 1;
                 }
 
@@ -7732,10 +7731,12 @@ impl VdbeEngine {
                                     .last_successful_insert_rowid
                                     .is_some_and(|last| rowid > last)
                             {
-                                FSQLITE_VDBE_INSERT_APPEND_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                                FSQLITE_VDBE_INSERT_APPEND_COUNT
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
                                 false // Append: key is larger than anything in the table
                             } else {
-                                FSQLITE_VDBE_INSERT_SEEK_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                                FSQLITE_VDBE_INSERT_SEEK_COUNT
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
                                 let seek_result = sc.cursor.table_move_to(&sc.cx, rowid)?;
                                 insert_seek_result = Some(seek_result);
                                 seek_result.is_found()
@@ -9975,6 +9976,7 @@ impl VdbeEngine {
         op: &VdbeOp,
         pc: &mut usize,
         collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
     ) -> Result<bool> {
         match op.opcode {
             Opcode::Column => {
@@ -9983,7 +9985,7 @@ impl VdbeEngine {
                 Ok(true)
             }
             Opcode::ResultRow => {
-                self.execute_result_row_hot(op, collect_vdbe_metrics);
+                self.execute_result_row_hot(op, collect_vdbe_metrics, row_handler)?;
                 *pc += 1;
                 Ok(true)
             }
@@ -10044,14 +10046,19 @@ impl VdbeEngine {
     }
 
     #[inline(always)]
-    fn execute_result_row_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
+    fn execute_result_row_hot(
+        &mut self,
+        op: &VdbeOp,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<()> {
         let count = usize::try_from(op.p2).unwrap_or(0);
         let should_retain_row = self.collect_result_rows
             && match self.max_collected_result_rows {
                 Some(limit) => self.results.len() < limit,
                 None => true,
             };
-        if should_retain_row {
+        if row_handler.is_some() || should_retain_row {
             let materialize_start = collect_vdbe_metrics.then(Instant::now);
             let row = self.take_reg_range(op.p1, count);
             if collect_vdbe_metrics {
@@ -10063,10 +10070,15 @@ impl VdbeEngine {
                 }
                 record_result_row_metrics(&row);
             }
-            self.results.push(row);
+            if let Some(handler) = row_handler.as_mut() {
+                (*handler)(row)?;
+            } else {
+                self.results.push(row);
+            }
         } else {
             self.discard_reg_range(op.p1, count);
         }
+        Ok(())
     }
 
     #[inline(always)]
@@ -13367,6 +13379,44 @@ mod tests {
         assert_eq!(engine.get_reg(r4), &SqliteValue::Null);
         assert_eq!(engine.get_reg(r5), &SqliteValue::Null);
         assert_eq!(engine.get_reg(r6), &SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_result_row_handler_streams_rows_without_retaining_results() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        b.emit_op(Opcode::Integer, 7, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 8, r2, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut streamed_rows = Vec::new();
+        let outcome = engine
+            .execute_with_borrowed_bindings_and_row_handler(&program, None, &mut |row| {
+                streamed_rows.push(row.into_vec());
+                Ok(())
+            })
+            .expect("execution should succeed");
+
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            streamed_rows,
+            vec![vec![SqliteValue::Integer(7)], vec![SqliteValue::Integer(8)],],
+            "row handler should observe result rows in program order"
+        );
+        assert!(
+            engine.results().is_empty(),
+            "streaming callback should avoid retaining result rows in the engine buffer"
+        );
+        assert_eq!(engine.get_reg(r1), &SqliteValue::Null);
+        assert_eq!(engine.get_reg(r2), &SqliteValue::Null);
     }
 
     #[test]
