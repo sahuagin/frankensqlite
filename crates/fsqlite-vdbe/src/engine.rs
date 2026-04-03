@@ -26,6 +26,100 @@ use std::collections::VecDeque;
 use fsqlite_btree::swiss_index::SwissIndex;
 use fsqlite_types::PageSize;
 use std::rc::Rc;
+
+/// bd-perf (V1.6): Flat array replacing HashMap for cursor storage.
+/// Cursor IDs are small non-negative integers (0-15 typical). Direct array
+/// indexing is ~10-20x faster than HashMap probing for every cursor access.
+/// API matches SwissIndex<i32, V> so call sites need minimal changes.
+#[derive(Debug)]
+struct CursorSlots<V> {
+    slots: Vec<Option<V>>,
+}
+
+impl<V> Default for CursorSlots<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> CursorSlots<V> {
+    #[inline]
+    fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    #[inline]
+    fn ensure_slot(&mut self, id: i32) {
+        let idx = id as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize_with(idx + 1, || None);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, id: &i32) -> Option<&V> {
+        self.slots.get(*id as usize).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, id: &i32) -> Option<&mut V> {
+        self.slots.get_mut(*id as usize).and_then(Option::as_mut)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, id: i32, value: V) -> Option<V> {
+        self.ensure_slot(id);
+        self.slots[id as usize].replace(value)
+    }
+
+    #[inline]
+    pub fn remove(&mut self, id: &i32) -> Option<V> {
+        let idx = *id as usize;
+        if idx < self.slots.len() {
+            self.slots[idx].take()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, id: &i32) -> bool {
+        self.slots
+            .get(*id as usize)
+            .is_some_and(Option::is_some)
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        for slot in &mut self.slots {
+            *slot = None;
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.iter().filter_map(Option::as_ref)
+    }
+
+    /// Iterate over occupied (key, &value) pairs. Keys are derived from slot indices.
+    /// Used by diagnostic/parity-cert paths, not on the hot path.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &V)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|v| (i as i32, v)))
+    }
+}
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -4450,11 +4544,12 @@ pub struct VdbeEngine {
     /// Result rows accumulated during execution.
     results: Vec<smallvec::SmallVec<[SqliteValue; 16]>>,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
-    cursors: SwissIndex<i32, MemCursor>,
+    /// bd-perf (V1.6): Flat array instead of HashMap — direct O(1) index.
+    cursors: CursorSlots<MemCursor>,
     /// Open sorter cursors keyed by cursor number.
-    sorters: SwissIndex<i32, SorterCursor>,
+    sorters: CursorSlots<SorterCursor>,
     /// Open storage-backed cursors keyed by cursor number (read and write).
-    storage_cursors: SwissIndex<i32, StorageCursor>,
+    storage_cursors: CursorSlots<StorageCursor>,
     /// Cursors that deleted the current row and should treat the next `Next`
     /// as a no-advance "consume successor" step.
     pending_next_after_delete: HashSet<i32>,
@@ -4951,9 +5046,9 @@ impl VdbeEngine {
             trace_opcodes: opcode_trace_enabled(),
             collect_vdbe_metrics: false,
             results: Vec::with_capacity(64),
-            cursors: SwissIndex::new(),
-            sorters: SwissIndex::new(),
-            storage_cursors: SwissIndex::new(),
+            cursors: CursorSlots::new(),
+            sorters: CursorSlots::new(),
+            storage_cursors: CursorSlots::new(),
             pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
             txn_page_io: None,
@@ -5579,7 +5674,7 @@ impl VdbeEngine {
             .storage_cursors
             .iter()
             .filter(|(_, sc)| sc.cursor.is_mem())
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .collect();
         if mem_cursors.is_empty() {
             Ok(())
