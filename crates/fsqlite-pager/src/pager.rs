@@ -3805,9 +3805,14 @@ struct StagedPage {
 
 impl StagedPage {
     fn from_buf(buf: PageBuf) -> Self {
+        // bd-perf (V1.3): Eagerly create the published PageData at write time
+        // to avoid the lazy 4KB copy on the first read. The write already has
+        // the bytes — wrap them in Arc now rather than paying later.
+        let published = OnceLock::new();
+        let _ = published.set(PageData::from_vec(buf.as_slice().to_vec()));
         Self {
             backing: StagedPageBacking::Buffered(buf),
-            published: OnceLock::new(),
+            published,
         }
     }
 
