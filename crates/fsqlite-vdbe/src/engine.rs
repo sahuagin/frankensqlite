@@ -131,12 +131,12 @@ use fsqlite_mvcc::ConcurrentPageState;
 #[cfg(test)]
 use fsqlite_mvcc::concurrent_write_page;
 use fsqlite_mvcc::{
-    CommitIndex, CommitLog, InProcessPageLockTable, MvccError, SharedConcurrentHandle,
-    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_clear_page_state,
-    concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
-    concurrent_prepare_write_page, concurrent_read_page, concurrent_restore_page_state,
-    concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
-    create_time_travel_snapshot,
+    AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
+    MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
+    concurrent_clear_page_state, concurrent_free_page, concurrent_page_is_freed,
+    concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
+    concurrent_restore_page_state, concurrent_stage_prepared_write_page,
+    concurrent_track_write_conflict_page, create_time_travel_snapshot,
 };
 use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
@@ -149,8 +149,8 @@ use fsqlite_types::value::{
     SmallText, SqlLikeFastPathKind, SqliteValue, sql_like_fast_path_matches,
 };
 use fsqlite_types::{
-    CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, SchemaEpoch,
-    StrictColumnType, WitnessKey,
+    CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader, PageData, PageNumber, RowId, RowIdMode,
+    SchemaEpoch, StrictColumnType, TableId, WitnessKey,
 };
 
 use crate::{TableIndexMetaMap, VdbeProgram, opcode_register_spans};
@@ -4615,12 +4615,18 @@ pub struct VdbeEngine {
     /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
     /// Populated from `sqlite_sequence` by the Connection before execution.
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    /// Shared allocator used for implicit rowid assignment in concurrent mode.
+    concurrent_rowid_allocator: Option<Arc<ConcurrentRowIdAllocator>>,
+    /// Schema epoch namespace for concurrent rowid reservations.
+    concurrent_rowid_schema_epoch: SchemaEpoch,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
     /// Declared table column counts keyed by root page number.
     /// Used to distinguish canonical SQLite payloads from legacy short records.
     table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
+    /// Earliest non-IPK NOT NULL column keyed by root page number.
+    first_not_null_non_ipk_col_by_root_page: Arc<HashMap<i32, usize>>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
     sequence_counters: HashMap<i32, i64>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
@@ -5071,8 +5077,11 @@ impl VdbeEngine {
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
+            concurrent_rowid_allocator: None,
+            concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
@@ -5235,6 +5244,10 @@ impl VdbeEngine {
         self.last_insert_cursor_id = None;
         self.fk_counter = 0;
         self.autoincrement_seq_by_root_page.clear();
+        if !retain_cursors {
+            self.concurrent_rowid_allocator = None;
+            self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
+        }
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_buf.truncate(0);
@@ -5722,6 +5735,134 @@ impl VdbeEngine {
         self.storage_cursors_enabled = true;
     }
 
+    /// Provide the shared concurrent rowid allocator for implicit inserts.
+    pub fn set_concurrent_rowid_allocator(
+        &mut self,
+        allocator: Arc<ConcurrentRowIdAllocator>,
+        schema_epoch: SchemaEpoch,
+    ) {
+        self.concurrent_rowid_allocator = Some(allocator);
+        self.concurrent_rowid_schema_epoch = schema_epoch;
+    }
+
+    fn storage_cursor_autoincrement_high_water(&self, cursor_id: i32) -> i64 {
+        self.cursor_root_pages
+            .get(&cursor_id)
+            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn storage_cursor_rowid_mode(&self, root_page: i32) -> RowIdMode {
+        if self.autoincrement_seq_by_root_page.contains_key(&root_page) {
+            RowIdMode::AutoIncrement
+        } else {
+            RowIdMode::Normal
+        }
+    }
+
+    fn storage_cursor_visible_max_rowid(sc: &mut StorageCursor) -> Result<i64> {
+        if sc.cursor.last(&sc.cx)? {
+            sc.cursor.rowid(&sc.cx)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn concurrent_rowid_key(schema_epoch: SchemaEpoch, root_page: i32) -> Result<AllocatorKey> {
+        let root_page_u32 = u32::try_from(root_page).map_err(|_| {
+            FrankenError::internal(format!(
+                "invalid concurrent rowid root page {root_page} for allocator"
+            ))
+        })?;
+        Ok(AllocatorKey {
+            schema_epoch,
+            table_id: TableId::new(root_page_u32),
+        })
+    }
+
+    fn map_rowid_allocator_error(
+        err: impl std::fmt::Display,
+        detail: &'static str,
+    ) -> FrankenError {
+        FrankenError::VdbeExecutionError {
+            detail: format!("{detail}: {err}"),
+        }
+    }
+
+    fn allocate_serialized_storage_rowid(
+        sc: &mut StorageCursor,
+        autoinc_max: i64,
+        overflow_detail: &'static str,
+    ) -> Result<i64> {
+        let base = if sc.last_alloc_rowid > 0 {
+            sc.last_alloc_rowid.max(autoinc_max)
+        } else {
+            Self::storage_cursor_visible_max_rowid(sc)?.max(autoinc_max)
+        };
+        let rowid = base
+            .checked_add(1)
+            .ok_or_else(|| FrankenError::VdbeExecutionError {
+                detail: overflow_detail.into(),
+            })?;
+        sc.last_alloc_rowid = rowid;
+        Ok(rowid)
+    }
+
+    fn allocate_concurrent_storage_rowid(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        overflow_detail: &'static str,
+    ) -> Result<i64> {
+        let visible_max = if sc.last_alloc_rowid > 0 {
+            sc.last_alloc_rowid.max(autoinc_max)
+        } else {
+            Self::storage_cursor_visible_max_rowid(sc)?.max(autoinc_max)
+        };
+        let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
+        allocator.ensure_table_floor(
+            key,
+            (visible_max > 0).then(|| RowId::new(visible_max)),
+            autoinc_max,
+            mode,
+        );
+        let rowid = allocator
+            .allocate_one(key)
+            .map_err(|err| Self::map_rowid_allocator_error(err, overflow_detail))?
+            .get();
+        sc.last_alloc_rowid = rowid;
+        Ok(rowid)
+    }
+
+    fn bump_concurrent_storage_rowid_floor(
+        allocator: &ConcurrentRowIdAllocator,
+        schema_epoch: SchemaEpoch,
+        root_page: i32,
+        mode: RowIdMode,
+        autoinc_max: i64,
+        sc: &mut StorageCursor,
+        rowid: i64,
+    ) -> Result<()> {
+        let visible_max = Self::storage_cursor_visible_max_rowid(sc)?
+            .max(autoinc_max)
+            .max(rowid);
+        let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
+        allocator.ensure_table_floor(
+            key,
+            (visible_max > 0).then(|| RowId::new(visible_max)),
+            autoinc_max,
+            mode,
+        );
+        allocator
+            .bump_explicit(key, RowId::new(rowid))
+            .map_err(|err| Self::map_rowid_allocator_error(err, "explicit rowid bump failed"))?;
+        Ok(())
+    }
+
     /// Take back the pager transaction after execution.
     ///
     /// All storage cursors must be dropped first (cleared during execution
@@ -5831,6 +5972,19 @@ impl VdbeEngine {
     /// Reuse shared declared table column counts keyed by root page.
     pub fn set_shared_table_column_count_by_root_page(&mut self, map: Arc<HashMap<i32, usize>>) {
         self.table_column_count_by_root_page = map;
+    }
+
+    /// Provide earliest non-IPK NOT NULL columns keyed by root page.
+    pub fn set_first_not_null_non_ipk_col_by_root_page(&mut self, map: HashMap<i32, usize>) {
+        self.first_not_null_non_ipk_col_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse shared earliest non-IPK NOT NULL columns keyed by root page.
+    pub fn set_shared_first_not_null_non_ipk_col_by_root_page(
+        &mut self,
+        map: Arc<HashMap<i32, usize>>,
+    ) {
+        self.first_not_null_non_ipk_col_by_root_page = map;
     }
 
     /// Set column default values by root page, used for ALTER TABLE ADD COLUMN.
@@ -7355,7 +7509,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let key_val = self.get_reg(op.p3).clone();
+                    let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
@@ -7626,7 +7780,7 @@ impl VdbeEngine {
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
-                    let key_val = self.get_reg(op.p3).clone();
+                    let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
@@ -7679,7 +7833,7 @@ impl VdbeEngine {
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
-                    let key_val = self.get_reg(op.p3).clone();
+                    let key_val = self.clone_reg_materialized(op.p3);
                     if key_val.is_null() {
                         pc += 1;
                         continue;
@@ -7731,7 +7885,7 @@ impl VdbeEngine {
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
-                    let key_val = self.get_reg(op.p3).clone();
+                    let key_val = self.clone_reg_materialized(op.p3);
 
                     // NULL short-circuit: NULL != NULL for UNIQUE purposes.
                     if key_val.is_null() {
@@ -7771,50 +7925,51 @@ impl VdbeEngine {
                 Opcode::NewRowid => {
                     // Allocate a new rowid for cursor p1, store in register p2.
                     //
-                    // Phase 5B.2 (bd-1yi8): when a StorageCursor exists, read
-                    // the max rowid directly from the B-tree (navigate to
-                    // last entry) instead of relying on MemDatabase counters.
-                    // Falls back to MemDatabase for legacy Phase 4 cursors.
+                    // In concurrent mode, StorageCursor inserts must reserve
+                    // rowids from the shared coordinator allocator so separate
+                    // writers do not reuse `max(rowid)+1` from the same
+                    // snapshot and silently overwrite each other.
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let concurrent_mode = op.p3 != 0;
+                    let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+                    let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
+                    let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
+                    let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+                    let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         // Storage NewRowid probes max rowid via `last()`, which
                         // repositions the cursor. Clear any pending delete/next
                         // state so subsequent Next/Prev behavior is consistent
                         // with the new position.
                         self.pending_next_after_delete.remove(&cursor_id);
-                        // For AUTOINCREMENT tables, also consult the high-water
-                        // mark from sqlite_sequence to prevent rowid reuse after
-                        // deletion (bd-31j76).
-                        let autoinc_max = self
-                            .cursor_root_pages
-                            .get(&cursor_id)
-                            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
-                            .copied()
-                            .unwrap_or(0);
-                        // bd-perf: Skip B-tree traversal when we already know
-                        // the last allocated rowid. C SQLite caches this in the
-                        // cursor register and only calls sqlite3BtreeLast() on
-                        // the first insert. Saves ~200-500ns per row.
-                        let base = if sc.last_alloc_rowid > 0 {
-                            sc.last_alloc_rowid.max(autoinc_max)
-                        } else {
-                            // First insert: navigate to last entry to find max rowid.
-                            let btree_max = if sc.cursor.last(&sc.cx)? {
-                                sc.cursor.rowid(&sc.cx)?
+                        if concurrent_mode {
+                            if let (Some(allocator), Some(root_page), Some(mode)) =
+                                (concurrent_allocator.as_ref(), root_page, rowid_mode)
+                            {
+                                Self::allocate_concurrent_storage_rowid(
+                                    allocator,
+                                    concurrent_schema_epoch,
+                                    root_page,
+                                    mode,
+                                    autoinc_max,
+                                    sc,
+                                    "rowid overflow: maximum rowid reached",
+                                )?
                             } else {
-                                0 // empty table
-                            };
-                            btree_max.max(autoinc_max)
-                        };
-                        let new_rowid = base.checked_add(1).ok_or_else(|| {
-                            FrankenError::VdbeExecutionError {
-                                detail: "rowid overflow: maximum rowid reached".into(),
+                                Self::allocate_serialized_storage_rowid(
+                                    sc,
+                                    autoinc_max,
+                                    "rowid overflow: maximum rowid reached",
+                                )?
                             }
-                        })?;
-                        sc.last_alloc_rowid = new_rowid;
-                        new_rowid
+                        } else {
+                            Self::allocate_serialized_storage_rowid(
+                                sc,
+                                autoinc_max,
+                                "rowid overflow: maximum rowid reached",
+                            )?
+                        }
                     } else {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let root = self.cursors.get(&cursor_id).map(|c| c.root_page);
@@ -7849,6 +8004,11 @@ impl VdbeEngine {
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let rowid = self.get_reg(rowid_reg).to_integer();
+                    let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+                    let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
+                    let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
+                    let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+                    let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     // take_reg moves the value out (replacing with Null) instead
                     // of cloning — avoids a heap allocation for Blob/Text records.
                     // Safe because MakeRecord overwrites the register each iteration.
@@ -8040,6 +8200,21 @@ impl VdbeEngine {
                                 actually_inserted = true;
                             }
                         }
+                    }
+                    if inserted_via_storage
+                        && let (Some(allocator), Some(root_page), Some(mode)) =
+                            (concurrent_allocator.as_ref(), root_page, rowid_mode)
+                        && let Some(sc) = self.storage_cursors.get_mut(&cursor_id)
+                    {
+                        Self::bump_concurrent_storage_rowid_floor(
+                            allocator,
+                            concurrent_schema_epoch,
+                            root_page,
+                            mode,
+                            autoinc_max,
+                            sc,
+                            rowid,
+                        )?;
                     }
                     if inserted_via_storage {
                         self.sync_storage_table_insert_into_memdb_mirror(
@@ -8924,7 +9099,7 @@ impl VdbeEngine {
                 // (0 means use all columns from the probe).
                 Opcode::IdxLE | Opcode::IdxGT | Opcode::IdxLT | Opcode::IdxGE => {
                     let cursor_id = op.p1;
-                    let probe_val = self.get_reg(op.p3).clone();
+                    let probe_val = self.clone_reg_materialized(op.p3);
 
                     let root_page = self
                         .cursor_root_pages
@@ -10157,6 +10332,43 @@ impl VdbeEngine {
             .and_then(|delta| start.checked_add(delta))
     }
 
+    #[inline]
+    fn invalidate_make_record_sideband_if_overwritten(&mut self, r: i32) {
+        if self.make_record_sideband_reg == r {
+            self.make_record_sideband_reg = 0;
+            self.make_record_buf.clear();
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn materialize_make_record_sideband(&mut self, r: i32) {
+        if self.make_record_sideband_reg != r || self.make_record_buf.is_empty() {
+            return;
+        }
+        if !(0..=65535).contains(&r) {
+            self.make_record_sideband_reg = 0;
+            self.make_record_buf.clear();
+            return;
+        }
+        let idx = r as usize;
+        if idx >= self.registers.len() {
+            self.registers.resize(idx + 1, SqliteValue::Null);
+        }
+        if !self.register_subtypes.is_empty() {
+            self.register_subtypes.remove(&r);
+        }
+        self.registers[idx] =
+            SqliteValue::Blob(Arc::<[u8]>::from(std::mem::take(&mut self.make_record_buf)));
+        self.make_record_sideband_reg = 0;
+    }
+
+    #[inline]
+    fn clone_reg_materialized(&mut self, r: i32) -> SqliteValue {
+        self.materialize_make_record_sideband(r);
+        self.get_reg(r).clone()
+    }
+
     /// Explicit hot-opcode fast lane for the main interpreter loop.
     ///
     /// We keep direct enum dispatch instead of switching to indexed
@@ -10229,32 +10441,34 @@ impl VdbeEngine {
                 let cursor_id = op.p1;
                 let first_reg = op.p2;
                 let num_cols = usize::try_from(op.p3).unwrap_or(0);
+                let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+                let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
+                let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
+                let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+                let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
 
                 if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                     if sc.writable {
-                        // 1. Allocate rowid (same logic as NewRowid hot cache)
-                        let autoinc_max = self
-                            .cursor_root_pages
-                            .get(&cursor_id)
-                            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
-                            .copied()
-                            .unwrap_or(0);
-                        let base = if sc.last_alloc_rowid > 0 {
-                            sc.last_alloc_rowid.max(autoinc_max)
+                        // 1. Allocate rowid (same logic as NewRowid).
+                        let rowid = if let (Some(allocator), Some(root_page), Some(mode)) =
+                            (concurrent_allocator.as_ref(), root_page, rowid_mode)
+                        {
+                            Self::allocate_concurrent_storage_rowid(
+                                allocator,
+                                concurrent_schema_epoch,
+                                root_page,
+                                mode,
+                                autoinc_max,
+                                sc,
+                                "rowid overflow in FusedAppendInsert",
+                            )?
                         } else {
-                            let btree_max = if sc.cursor.last(&sc.cx)? {
-                                sc.cursor.rowid(&sc.cx)?
-                            } else {
-                                0
-                            };
-                            btree_max.max(autoinc_max)
+                            Self::allocate_serialized_storage_rowid(
+                                sc,
+                                autoinc_max,
+                                "rowid overflow in FusedAppendInsert",
+                            )?
                         };
-                        let rowid = base.checked_add(1).ok_or_else(|| {
-                            FrankenError::VdbeExecutionError {
-                                detail: "rowid overflow in FusedAppendInsert".into(),
-                            }
-                        })?;
-                        sc.last_alloc_rowid = rowid;
 
                         // 2. Serialize record from registers into sideband buf
                         let mut rec_buf = std::mem::take(&mut self.make_record_buf);
@@ -10508,15 +10722,16 @@ impl VdbeEngine {
                 AtomicOrdering::Relaxed,
             );
         }
+        // Set the register to a Null sentinel first so any stale sideband
+        // state attached to this register is cleared before arming the new
+        // sideband payload below.
+        self.set_reg(target, SqliteValue::Null);
         // bd-perf: Sideband buffer — keep record bytes in make_record_buf
         // and let Insert/IdxInsert read from there directly, avoiding the
         // Arc<[u8]> heap allocation + memcpy per row. The sideband register
         // number tells Insert which register to intercept.
         self.make_record_buf = rec_buf; // keep bytes (don't clear!)
         self.make_record_sideband_reg = target;
-        // Set register to Null sentinel. Non-Insert consumers (rare) will
-        // see Null and fall back to normal behavior.
-        self.set_reg(target, SqliteValue::Null);
     }
 
     #[cold]
@@ -10642,11 +10857,15 @@ impl VdbeEngine {
         Ok(())
     }
 
-    fn collect_reg_range(&self, start: i32, count: usize) -> smallvec::SmallVec<[SqliteValue; 16]> {
+    fn collect_reg_range(
+        &mut self,
+        start: i32,
+        count: usize,
+    ) -> smallvec::SmallVec<[SqliteValue; 16]> {
         let mut row = smallvec::SmallVec::with_capacity(count);
         for offset in 0..count {
             let val = Self::reg_with_offset(start, offset)
-                .map_or_else(|| SqliteValue::Null, |reg| self.get_reg(reg).clone());
+                .map_or_else(|| SqliteValue::Null, |reg| self.clone_reg_materialized(reg));
             row.push(val);
         }
         row
@@ -10695,6 +10914,7 @@ impl VdbeEngine {
     #[allow(clippy::inline_always)]
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
+            self.materialize_make_record_sideband(r);
             if self.has_subtypes {
                 self.register_subtypes.remove(&r);
             }
@@ -10716,6 +10936,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        self.invalidate_make_record_sideband_if_overwritten(r);
         // Register writes replace the logical value, so any prior subtype
         // metadata must be discarded as well.  Guard with is_empty() to
         // avoid a HashMap probe on every register write — subtypes are
@@ -10743,6 +10964,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        self.invalidate_make_record_sideband_if_overwritten(r);
         if !self.register_subtypes.is_empty() {
             self.register_subtypes.remove(&r);
         }
@@ -10768,6 +10990,7 @@ impl VdbeEngine {
             "register {r} out of pre-sized bounds"
         );
         if idx < self.registers.len() {
+            self.invalidate_make_record_sideband_if_overwritten(r);
             if self.has_subtypes {
                 self.register_subtypes.remove(&r);
             }
@@ -10789,6 +11012,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        self.invalidate_make_record_sideband_if_overwritten(r);
         if !self.register_subtypes.is_empty() {
             self.register_subtypes.remove(&r);
         }
@@ -10809,6 +11033,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
+        self.invalidate_make_record_sideband_if_overwritten(r);
         if !self.register_subtypes.is_empty() {
             self.register_subtypes.remove(&r);
         }
@@ -10867,6 +11092,9 @@ impl VdbeEngine {
                     rowid,
                     ipk,
                     self.table_column_count_by_root_page.get(&rp).copied(),
+                    self.first_not_null_non_ipk_col_by_root_page
+                        .get(&rp)
+                        .copied(),
                 )
             });
             cursor.payload_includes_rowid_alias = Some(includes);
@@ -10918,6 +11146,10 @@ impl VdbeEngine {
                     if (0..=65535).contains(&target) {
                         if reg_idx >= self.registers.len() {
                             self.registers.resize(reg_idx + 1, SqliteValue::Null);
+                        }
+                        if self.make_record_sideband_reg == target {
+                            self.make_record_sideband_reg = 0;
+                            self.make_record_buf.clear();
                         }
                         if !self.register_subtypes.is_empty() {
                             self.register_subtypes.remove(&target);
@@ -11033,6 +11265,9 @@ impl VdbeEngine {
                                     rowid,
                                     ipk_col_idx,
                                     self.table_column_count_by_root_page
+                                        .get(&root_page)
+                                        .copied(),
+                                    self.first_not_null_non_ipk_col_by_root_page
                                         .get(&root_page)
                                         .copied(),
                                 )
@@ -12568,10 +12803,29 @@ fn payload_includes_rowid_alias(
     _rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
 ) -> bool {
     let payload_cols = payload_values.len();
     if let Some(table_cols) = table_column_count {
-        return payload_cols == table_cols;
+        if payload_cols == table_cols {
+            return true;
+        }
+        if let Some(not_null_col_idx) =
+            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
+        {
+            let omitted_payload_idx = not_null_col_idx - 1;
+            let present_payload_idx = not_null_col_idx;
+            if omitted_payload_idx < payload_cols
+                && present_payload_idx < payload_cols
+                && matches!(
+                    payload_values.get(omitted_payload_idx),
+                    Some(SqliteValue::Null)
+                )
+            {
+                return true;
+            }
+        }
+        return false;
     }
     if payload_cols <= ipk_col_idx {
         return false;
@@ -12593,10 +12847,29 @@ fn payload_includes_rowid_alias_lazy(
     _rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
 ) -> bool {
     let payload_cols = row_decode.column_count();
     if let Some(table_cols) = table_column_count {
-        return payload_cols == table_cols;
+        if payload_cols == table_cols {
+            return true;
+        }
+        if let Some(not_null_col_idx) =
+            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
+        {
+            let omitted_payload_idx = not_null_col_idx - 1;
+            let present_payload_idx = not_null_col_idx;
+            if omitted_payload_idx < payload_cols
+                && present_payload_idx < payload_cols
+                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
+            {
+                use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+                if matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
     if payload_cols <= ipk_col_idx {
         return false;
@@ -13338,11 +13611,11 @@ mod tests {
         ];
 
         assert!(
-            !payload_includes_rowid_alias(&payload_values, 1, 0, Some(4)),
+            !payload_includes_rowid_alias(&payload_values, 1, 0, Some(4), Some(1)),
             "omitted INTEGER PRIMARY KEY aliases must be detected by payload width, not by a coincidental value match"
         );
         assert!(
-            !payload_includes_rowid_alias(&payload_values, 1, 0, None),
+            !payload_includes_rowid_alias(&payload_values, 1, 0, None, Some(1)),
             "countless fallback must not treat a matching first stored integer as proof that the rowid alias is present"
         );
     }
@@ -13361,11 +13634,11 @@ mod tests {
             .expect("payload should decode");
 
         assert!(
-            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, Some(4)),
+            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, Some(4), Some(1)),
             "lazy rowid-alias detection must not shift columns when the first stored value happens to equal the rowid"
         );
         assert!(
-            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, None),
+            !payload_includes_rowid_alias_lazy(&scratch, &record, 1, 0, None, Some(1)),
             "countless lazy fallback must stay conservative instead of trusting value equality"
         );
     }
@@ -13387,10 +13660,103 @@ mod tests {
             &record,
             1,
             0,
-            Some(3)
+            Some(3),
+            Some(1)
         ));
         assert!(payload_includes_rowid_alias_lazy(
-            &scratch, &record, 1, 0, None
+            &scratch,
+            &record,
+            1,
+            0,
+            None,
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_detects_short_alter_row_via_not_null_column_metadata() {
+        let payload_values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(2),
+            SqliteValue::Integer(2),
+            SqliteValue::Text("remote-ci".into()),
+            SqliteValue::Text("/sessions/b.jsonl".into()),
+            SqliteValue::Integer(1_700_000_001_000),
+        ];
+
+        assert!(payload_includes_rowid_alias(
+            &payload_values,
+            2,
+            0,
+            Some(7),
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_lazy_detects_short_alter_row_via_not_null_column_metadata()
+    {
+        let record = serialize_record(&[
+            SqliteValue::Null,
+            SqliteValue::Integer(2),
+            SqliteValue::Integer(2),
+            SqliteValue::Text("remote-ci".into()),
+            SqliteValue::Text("/sessions/b.jsonl".into()),
+            SqliteValue::Integer(1_700_000_001_000),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert!(payload_includes_rowid_alias_lazy(
+            &scratch,
+            &record,
+            2,
+            0,
+            Some(7),
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_does_not_false_positive_when_first_actual_column_is_null()
+    {
+        let payload_values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(5),
+            SqliteValue::Text("tail".into()),
+        ];
+
+        assert!(!payload_includes_rowid_alias(
+            &payload_values,
+            9,
+            0,
+            Some(4),
+            Some(2)
+        ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_lazy_does_not_false_positive_when_first_actual_column_is_null()
+     {
+        let record = serialize_record(&[
+            SqliteValue::Null,
+            SqliteValue::Integer(5),
+            SqliteValue::Text("tail".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert!(!payload_includes_rowid_alias_lazy(
+            &scratch,
+            &record,
+            9,
+            0,
+            Some(4),
+            Some(2)
         ));
     }
 
@@ -13491,6 +13857,42 @@ mod tests {
         let program = b.finish().expect("program should build");
         let rows = execute_program_with_engine(&mut engine, &program);
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_no_conflict_consumes_make_record_sideband_probe_key() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut engine, _, _) = build_storage_index_engine_with_duplicate_prefixes();
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let no_conflict = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        b.emit_op(Opcode::Integer, 7, r_probe, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 1, r_key, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::NoConflict, 0, r_key, no_conflict, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+        b.resolve_label(no_conflict);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.resolve_label(done);
+
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
     }
 
     fn build_no_conflict_opcode_probe_program(
@@ -17616,6 +18018,24 @@ mod tests {
 
         let decoded = decode_record(&rows[0][0]).expect("record should decode");
         assert_eq!(decoded, vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_make_record_sideband_is_invalidated_by_register_overwrite() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::Integer, 42, r_record, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
     }
 
     #[test]

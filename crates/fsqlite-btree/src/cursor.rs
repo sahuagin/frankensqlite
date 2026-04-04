@@ -1284,11 +1284,7 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = cell::read_cell_pointers(
-            page_data.as_bytes(),
-            &header,
-            header_offset,
-        )?;
+        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
 
         Ok(StackEntry {
             page_no,
@@ -1309,11 +1305,7 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = cell::read_cell_pointers(
-            page_data.as_bytes(),
-            &header,
-            header_offset,
-        )?;
+        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
         Ok(StackEntry {
             page_no,
             page_data,
@@ -3509,6 +3501,207 @@ impl<P: PageWriter> BtCursor<P> {
         Ok((leaf_page_no, new_count))
     }
 
+    fn separator_ancestor_level_for_deleted_leaf_max(&self) -> Option<usize> {
+        if self.stack.len() < 2 {
+            return None;
+        }
+
+        for level in (0..self.stack.len().saturating_sub(1)).rev() {
+            let entry = &self.stack[level];
+            if usize::from(entry.cell_idx) < usize::from(entry.header.cell_count) {
+                return Some(level);
+            }
+        }
+
+        None
+    }
+
+    fn separator_repair_for_deleted_leaf_max(
+        &self,
+        leaf_entry: &StackEntry,
+    ) -> Result<Option<(PageNumber, u16, i64)>> {
+        if !self.is_table {
+            return Ok(None);
+        }
+        if usize::from(leaf_entry.cell_idx) + 1 != usize::from(leaf_entry.header.cell_count) {
+            return Ok(None);
+        }
+        if leaf_entry.header.cell_count <= 1 {
+            return Ok(None);
+        }
+
+        let Some(level) = self.separator_ancestor_level_for_deleted_leaf_max() else {
+            return Ok(None);
+        };
+        let separator = self
+            .stack
+            .get(level)
+            .ok_or_else(|| FrankenError::internal("separator level out of bounds"))?;
+        let predecessor_idx = leaf_entry
+            .cell_idx
+            .checked_sub(1)
+            .ok_or_else(|| FrankenError::internal("last leaf cell has no predecessor"))?;
+        let predecessor = self.parse_cell_at(leaf_entry, predecessor_idx)?;
+        let new_rowid = predecessor
+            .rowid
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf predecessor on page {} is missing a rowid",
+                    leaf_entry.page_no
+                ),
+            })?;
+
+        Ok(Some((separator.page_no, separator.cell_idx, new_rowid)))
+    }
+
+    fn replace_table_interior_separator_rowid(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        separator_idx: u16,
+        new_rowid: i64,
+    ) -> Result<()> {
+        let entry = self.reload_page_fresh(cx, page_no)?;
+        if entry.header.page_type != cell::BtreePageType::InteriorTable {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "expected interior table page at page {}, found {:?}",
+                    page_no, entry.header.page_type
+                ),
+            });
+        }
+
+        let separator_idx_usize = usize::from(separator_idx);
+        if separator_idx_usize >= usize::from(entry.header.cell_count) {
+            return Err(FrankenError::internal(format!(
+                "separator index {} out of bounds for page {} with {} cells",
+                separator_idx_usize, entry.page_no, entry.header.cell_count
+            )));
+        }
+
+        let separator_cell = self.parse_cell_at(&entry, separator_idx)?;
+        let left_child =
+            separator_cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior table separator missing left child".to_owned(),
+                })?;
+
+        let mut new_cell = [0_u8; 13];
+        new_cell[0..4].copy_from_slice(&left_child.get().to_be_bytes());
+        #[allow(clippy::cast_sign_loss)]
+        let varint_len = write_varint(&mut new_cell[4..], new_rowid as u64);
+        let new_cell = &new_cell[..4 + varint_len];
+
+        let page_no = entry.page_no;
+        let header_offset = cell::header_offset_for_page(page_no);
+        let mut page_data = self.pager.read_page_data(cx, page_no)?;
+        let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        if separator_idx_usize >= ptrs.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "separator index {} out of bounds for page {} with {} cells",
+                    separator_idx_usize,
+                    page_no,
+                    ptrs.len()
+                ),
+            });
+        }
+        ptrs.remove(separator_idx_usize);
+
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+        let mut cells_to_move = Vec::with_capacity(ptrs.len());
+        for (i, &off) in ptrs.iter().enumerate() {
+            let ptr = usize::from(off);
+            let cell = CellRef::parse(
+                page_data.as_bytes(),
+                ptr,
+                header.page_type,
+                self.usable_size,
+            )?;
+            let size = crate::payload::cell_on_page_size(&cell, ptr);
+            cells_to_move.push((ptr, size, i));
+        }
+        cells_to_move.sort_unstable_by_key(|(ptr, _, _)| std::cmp::Reverse(*ptr));
+
+        let mut new_content_offset = self.usable_size as usize;
+        for (ptr, size, i) in cells_to_move {
+            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "cell size overflow during separator repair".to_owned(),
+                }
+            })?;
+            if new_content_offset < ptr_array_end {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "separator repair would overlap the pointer array".to_owned(),
+                });
+            }
+            page_data
+                .as_bytes_mut()
+                .copy_within(ptr..ptr + size, new_content_offset);
+            ptrs[i] =
+                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "separator repair cell offset exceeds u16 range".to_owned(),
+                })?;
+        }
+
+        let ptr_array_end_with_new = ptr_array_end + 2;
+        let fits = ptr_array_end_with_new
+            .checked_add(new_cell.len())
+            .is_some_and(|needed| new_content_offset >= needed);
+        if !fits {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "separator repair for page {} could not fit the updated divider",
+                    page_no
+                ),
+            });
+        }
+
+        new_content_offset -= new_cell.len();
+        ptrs.insert(
+            separator_idx_usize,
+            u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "separator repair new offset exceeds u16 range".to_owned(),
+            })?,
+        );
+        header.cell_count =
+            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "separator repair cell count exceeds u16 range".to_owned(),
+            })?;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "separator repair content offset exceeds u32 range".to_owned(),
+            })?;
+        header.fragmented_free_bytes = 0;
+        header.first_freeblock = 0;
+
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            page_bytes[new_content_offset..new_content_offset + new_cell.len()]
+                .copy_from_slice(new_cell);
+            if new_content_offset > ptr_array_end_with_new {
+                page_bytes[ptr_array_end_with_new..new_content_offset].fill(0);
+            }
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        }
+
+        self.pager.write_page_data(cx, page_no, page_data)?;
+
+        let refreshed = self.reload_page_fresh(cx, page_no)?;
+        for stack_entry in &mut self.stack {
+            if stack_entry.page_no == page_no {
+                let mut updated = refreshed.clone();
+                updated.cell_idx = stack_entry.cell_idx;
+                *stack_entry = updated;
+            }
+        }
+        Ok(())
+    }
+
     fn table_insert_from_current_position(
         &mut self,
         cx: &Cx,
@@ -3995,6 +4188,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 .last()
                 .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
                 .clone();
+            let separator_repair = cursor.separator_repair_for_deleted_leaf_max(&top)?;
 
             if !top.header.page_type.is_leaf() {
                 // Interior node deletion (index B-trees):
@@ -4140,6 +4334,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                         }
                     }
                 }
+            } else if let Some((page_no, separator_idx, new_max_rowid)) = separator_repair {
+                cursor.replace_table_interior_separator_rowid(
+                    cx,
+                    page_no,
+                    separator_idx,
+                    new_max_rowid,
+                )?;
             }
 
             Ok(())
@@ -4490,6 +4691,19 @@ mod tests {
 
     const USABLE: u32 = 4096;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TableSubtreeBounds {
+        min_rowid: i64,
+        max_rowid: i64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct IndexSubtreeBounds {
+        min_key: Vec<u8>,
+        max_key: Vec<u8>,
+        entry_count: usize,
+    }
+
     fn collect_reachable_pages(
         store: &MemPageStore,
         page_no: PageNumber,
@@ -4525,6 +4739,427 @@ mod tests {
             .right_child
             .expect("interior page should reference right child");
         collect_reachable_pages(store, right_child, usable_size, out);
+    }
+
+    fn validate_table_tree_invariants<P: PageReader>(
+        pager: &P,
+        root: PageNumber,
+        usable_size: u32,
+    ) -> Result<Option<TableSubtreeBounds>> {
+        let cx = Cx::new();
+        let mut visited = BTreeSet::new();
+        validate_table_subtree_invariants(pager, &cx, root, usable_size, true, &mut visited)
+    }
+
+    fn validate_table_subtree_invariants<P: PageReader>(
+        pager: &P,
+        cx: &Cx,
+        page_no: PageNumber,
+        usable_size: u32,
+        is_root: bool,
+        visited: &mut BTreeSet<u32>,
+    ) -> Result<Option<TableSubtreeBounds>> {
+        if !visited.insert(page_no.get()) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("table b-tree contains a cycle at page {}", page_no.get()),
+            });
+        }
+
+        let page = pager.read_page(cx, page_no)?;
+        let header_offset = cell::header_offset_for_page(page_no);
+        let header = BtreePageHeader::parse(&page, header_offset)?;
+        if !header.page_type.is_table() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "expected table b-tree page at {}, found {:?}",
+                    page_no.get(),
+                    header.page_type
+                ),
+            });
+        }
+
+        let ptrs = cell::read_cell_pointers(&page, &header, header_offset)?;
+        if header.page_type == cell::BtreePageType::LeafTable {
+            if ptrs.is_empty() {
+                if is_root {
+                    return Ok(None);
+                }
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("non-root table leaf page {} is empty", page_no.get()),
+                });
+            }
+
+            let mut min_rowid = None;
+            let mut max_rowid = None;
+            let mut prev_rowid = None;
+            for ptr in ptrs {
+                let cell = CellRef::parse(&page, usize::from(ptr), header.page_type, usable_size)?;
+                let rowid = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell on page {} is missing a rowid",
+                        page_no.get()
+                    ),
+                })?;
+                if let Some(prev) = prev_rowid
+                    && rowid <= prev
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf page {} rowids are out of order: {} after {}",
+                            page_no.get(),
+                            rowid,
+                            prev
+                        ),
+                    });
+                }
+                min_rowid.get_or_insert(rowid);
+                max_rowid = Some(rowid);
+                prev_rowid = Some(rowid);
+            }
+
+            return Ok(Some(TableSubtreeBounds {
+                min_rowid: min_rowid.expect("non-empty leaf must have a minimum rowid"),
+                max_rowid: max_rowid.expect("non-empty leaf must have a maximum rowid"),
+            }));
+        }
+
+        if ptrs.is_empty() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("interior table page {} has no divider cells", page_no.get()),
+            });
+        }
+
+        let mut overall_min = None;
+        let mut prev_separator = None;
+        for ptr in ptrs {
+            let cell = CellRef::parse(&page, usize::from(ptr), header.page_type, usable_size)?;
+            let left_child = cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior table page {} divider is missing a left child",
+                        page_no.get()
+                    ),
+                })?;
+            let separator = cell.rowid.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table page {} divider is missing a rowid",
+                    page_no.get()
+                ),
+            })?;
+            let child_bounds = validate_table_subtree_invariants(
+                pager,
+                cx,
+                left_child,
+                usable_size,
+                false,
+                visited,
+            )?
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table page {} points to an empty child subtree {}",
+                    page_no.get(),
+                    left_child.get()
+                ),
+            })?;
+
+            if child_bounds.max_rowid != separator {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior table page {} separator {} does not match child {} max {}",
+                        page_no.get(),
+                        separator,
+                        left_child.get(),
+                        child_bounds.max_rowid
+                    ),
+                });
+            }
+            if let Some(prev) = prev_separator {
+                if separator <= prev {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior table page {} separators are out of order: {} after {}",
+                            page_no.get(),
+                            separator,
+                            prev
+                        ),
+                    });
+                }
+                if child_bounds.min_rowid <= prev {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior table page {} child {} overlaps prior separator {}",
+                            page_no.get(),
+                            left_child.get(),
+                            prev
+                        ),
+                    });
+                }
+            }
+
+            overall_min.get_or_insert(child_bounds.min_rowid);
+            prev_separator = Some(separator);
+        }
+
+        let right_child = header
+            .right_child
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table page {} is missing a right child",
+                    page_no.get()
+                ),
+            })?;
+        let right_bounds =
+            validate_table_subtree_invariants(pager, cx, right_child, usable_size, false, visited)?
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior table page {} points to an empty right subtree {}",
+                        page_no.get(),
+                        right_child.get()
+                    ),
+                })?;
+
+        if let Some(prev) = prev_separator
+            && right_bounds.min_rowid <= prev
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior table page {} right child {} overlaps separator {}",
+                    page_no.get(),
+                    right_child.get(),
+                    prev
+                ),
+            });
+        }
+
+        Ok(Some(TableSubtreeBounds {
+            min_rowid: overall_min.expect("interior table page with cells must have a minimum"),
+            max_rowid: right_bounds.max_rowid,
+        }))
+    }
+
+    fn compare_index_test_keys<P: PageReader>(
+        cursor: &BtCursor<P>,
+        lhs: &[u8],
+        rhs: &[u8],
+    ) -> std::cmp::Ordering {
+        let parsed_rhs = parse_record(rhs);
+        cursor.compare_index_key_bytes(lhs, rhs, parsed_rhs.as_deref())
+    }
+
+    fn validate_index_tree_invariants<P: PageReader>(
+        cursor: &mut BtCursor<P>,
+        root: PageNumber,
+    ) -> Result<Option<IndexSubtreeBounds>> {
+        let cx = Cx::new();
+        let mut visited = BTreeSet::new();
+        validate_index_subtree_invariants(cursor, &cx, root, true, &mut visited)
+    }
+
+    fn validate_index_subtree_invariants<P: PageReader>(
+        cursor: &mut BtCursor<P>,
+        cx: &Cx,
+        page_no: PageNumber,
+        is_root: bool,
+        visited: &mut BTreeSet<u32>,
+    ) -> Result<Option<IndexSubtreeBounds>> {
+        if !visited.insert(page_no.get()) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("index b-tree contains a cycle at page {}", page_no.get()),
+            });
+        }
+
+        let entry = cursor.load_page(cx, page_no)?;
+        if !entry.header.page_type.is_index() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "expected index b-tree page at {}, found {:?}",
+                    page_no.get(),
+                    entry.header.page_type
+                ),
+            });
+        }
+
+        if entry.header.page_type == cell::BtreePageType::LeafIndex {
+            if entry.cell_pointers.is_empty() {
+                if is_root {
+                    return Ok(None);
+                }
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("non-root index leaf page {} is empty", page_no.get()),
+                });
+            }
+
+            let mut min_key = None;
+            let mut max_key = None;
+            let mut prev_key = None::<Vec<u8>>;
+            for idx in 0..entry.header.cell_count {
+                let cell = cursor.parse_cell_at(&entry, idx)?;
+                let key = cursor.read_cell_payload(cx, &entry, &cell)?.into_owned();
+                if let Some(prev) = &prev_key
+                    && compare_index_test_keys(cursor, prev, &key) != std::cmp::Ordering::Less
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "index leaf page {} keys are out of order or duplicated",
+                            page_no.get()
+                        ),
+                    });
+                }
+                if min_key.is_none() {
+                    min_key = Some(key.clone());
+                }
+                max_key = Some(key.clone());
+                prev_key = Some(key);
+            }
+
+            return Ok(Some(IndexSubtreeBounds {
+                min_key: min_key.expect("non-empty index leaf must have a minimum key"),
+                max_key: max_key.expect("non-empty index leaf must have a maximum key"),
+                entry_count: usize::from(entry.header.cell_count),
+            }));
+        }
+
+        if entry.header.cell_count == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior index page {} has no separator cells",
+                    page_no.get()
+                ),
+            });
+        }
+
+        let mut overall_min = None::<Vec<u8>>;
+        let mut prev_separator = None::<Vec<u8>>;
+        let mut entry_count = 0usize;
+
+        for idx in 0..entry.header.cell_count {
+            let left_child = cursor.child_page_at(&entry, idx)?;
+            let left_bounds =
+                validate_index_subtree_invariants(cursor, cx, left_child, false, visited)?
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior index page {} points to an empty child subtree {}",
+                            page_no.get(),
+                            left_child.get()
+                        ),
+                    })?;
+
+            let cell = cursor.parse_cell_at(&entry, idx)?;
+            let separator_key = cursor.read_cell_payload(cx, &entry, &cell)?.into_owned();
+
+            if compare_index_test_keys(cursor, &left_bounds.max_key, &separator_key)
+                != std::cmp::Ordering::Less
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior index page {} separator does not sort after child {} max key",
+                        page_no.get(),
+                        left_child.get()
+                    ),
+                });
+            }
+            if let Some(prev) = &prev_separator {
+                if compare_index_test_keys(cursor, prev, &separator_key) != std::cmp::Ordering::Less
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior index page {} separators are out of order or duplicated",
+                            page_no.get()
+                        ),
+                    });
+                }
+                if compare_index_test_keys(cursor, prev, &left_bounds.min_key)
+                    != std::cmp::Ordering::Less
+                {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior index page {} child {} overlaps the prior separator range",
+                            page_no.get(),
+                            left_child.get()
+                        ),
+                    });
+                }
+            }
+
+            if overall_min.is_none() {
+                overall_min = Some(left_bounds.min_key.clone());
+            }
+            prev_separator = Some(separator_key);
+            entry_count = entry_count
+                .checked_add(left_bounds.entry_count + 1)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "index subtree entry count overflow".to_owned(),
+                })?;
+        }
+
+        let right_child =
+            entry
+                .header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior index page {} is missing a right child",
+                        page_no.get()
+                    ),
+                })?;
+        let right_bounds =
+            validate_index_subtree_invariants(cursor, cx, right_child, false, visited)?
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior index page {} points to an empty right subtree {}",
+                        page_no.get(),
+                        right_child.get()
+                    ),
+                })?;
+
+        if let Some(prev) = &prev_separator
+            && compare_index_test_keys(cursor, prev, &right_bounds.min_key)
+                != std::cmp::Ordering::Less
+        {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior index page {} right child {} overlaps the last separator range",
+                    page_no.get(),
+                    right_child.get()
+                ),
+            });
+        }
+
+        entry_count = entry_count
+            .checked_add(right_bounds.entry_count)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "index subtree entry count overflow".to_owned(),
+            })?;
+
+        Ok(Some(IndexSubtreeBounds {
+            min_key: overall_min.expect("interior index page with cells must have a minimum key"),
+            max_key: right_bounds.max_key,
+            entry_count,
+        }))
+    }
+
+    fn scan_all_index_keys<P: PageWriter>(
+        cursor: &mut BtCursor<P>,
+        cx: &Cx,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut scanned = Vec::new();
+        if cursor.first(cx)? {
+            loop {
+                scanned.push(cursor.payload(cx)?);
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+        }
+        Ok(scanned)
+    }
+
+    fn synthetic_index_key(id: i64) -> Vec<u8> {
+        serialize_record(&[
+            SqliteValue::Integer(id.rem_euclid(17)),
+            SqliteValue::Integer(id),
+        ])
     }
 
     #[test]
@@ -6135,6 +6770,167 @@ mod tests {
             scanned, expected,
             "interior delete must remove the separator without leaving a stale logical entry"
         );
+
+        let bounds = validate_index_tree_invariants(&mut cursor, root)
+            .expect("index invariants should hold after deleting an interior separator");
+        assert_eq!(
+            bounds
+                .expect("non-empty index tree should report bounds")
+                .entry_count,
+            expected.len(),
+            "index invariant harness should count the same logical entries as the scan"
+        );
+    }
+
+    #[test]
+    fn test_cursor_index_delete_updates_nonroot_interior_sequence_in_depth3_tree() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_index(&[(pn(3), b"m")], pn(4)));
+        store.pages.insert(
+            3,
+            build_interior_index(&[(pn(5), b"d"), (pn(6), b"h")], pn(7)),
+        );
+        store
+            .pages
+            .insert(4, build_interior_index(&[(pn(8), b"s")], pn(9)));
+        store.pages.insert(5, build_leaf_index(&[b"a", b"b"]));
+        store.pages.insert(6, build_leaf_index(&[b"e", b"f"]));
+        store.pages.insert(7, build_leaf_index(&[b"i", b"j"]));
+        store.pages.insert(8, build_leaf_index(&[b"n", b"q"]));
+        store.pages.insert(9, build_leaf_index(&[b"t", b"z"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        let scanned_before = scan_all_index_keys(&mut cursor, &cx).unwrap();
+        assert_eq!(
+            scanned_before,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+                b"h".to_vec(),
+                b"i".to_vec(),
+                b"j".to_vec(),
+                b"m".to_vec(),
+                b"n".to_vec(),
+                b"q".to_vec(),
+                b"s".to_vec(),
+                b"t".to_vec(),
+                b"z".to_vec(),
+            ]
+        );
+        validate_index_tree_invariants(&mut cursor, pn(2))
+            .expect("hand-built depth-3 index tree should satisfy structural invariants");
+
+        let seek = cursor.index_move_to(&cx, b"h").unwrap();
+        assert!(
+            seek.is_found(),
+            "target separator should exist before delete"
+        );
+        assert!(
+            !cursor
+                .stack
+                .last()
+                .expect("seek should leave a cursor frame")
+                .header
+                .page_type
+                .is_leaf(),
+            "target key must resolve to the non-root interior separator"
+        );
+
+        cursor.delete(&cx).unwrap();
+
+        let scanned_after = scan_all_index_keys(&mut cursor, &cx).unwrap();
+        assert_eq!(
+            scanned_after,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+                b"i".to_vec(),
+                b"j".to_vec(),
+                b"m".to_vec(),
+                b"n".to_vec(),
+                b"q".to_vec(),
+                b"s".to_vec(),
+                b"t".to_vec(),
+                b"z".to_vec(),
+            ],
+            "non-root interior delete should preserve a strictly ordered logical sequence"
+        );
+        assert!(!cursor.index_move_to(&cx, b"h").unwrap().is_found());
+
+        let bounds = validate_index_tree_invariants(&mut cursor, pn(2))
+            .expect("index invariants should hold after non-root interior delete");
+        assert_eq!(
+            bounds
+                .expect("non-empty index tree should report bounds")
+                .entry_count,
+            scanned_after.len(),
+        );
+    }
+
+    #[test]
+    fn test_cursor_index_delete_then_reinsert_same_key_preserves_exact_count() {
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, USABLE, false);
+
+        let provenance_key = serialize_record(&[
+            SqliteValue::Text("local".into()),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("dup-session".into()),
+            SqliteValue::Integer(1),
+        ]);
+        let source_id_key =
+            serialize_record(&[SqliteValue::Text("local".into()), SqliteValue::Integer(1)]);
+
+        for key in [&provenance_key, &source_id_key] {
+            cursor.index_insert(&cx, key).unwrap();
+            assert_eq!(
+                cursor.count_all_rows(&cx).unwrap(),
+                1,
+                "freshly inserted key should count exactly once"
+            );
+
+            assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
+            cursor.delete(&cx).unwrap();
+            assert_eq!(
+                cursor.count_all_rows(&cx).unwrap(),
+                0,
+                "deleted key should be removed completely"
+            );
+
+            cursor.index_insert(&cx, key).unwrap();
+            assert_eq!(
+                cursor.count_all_rows(&cx).unwrap(),
+                1,
+                "reinserting the same key must not leave a duplicate logical entry"
+            );
+
+            let mut scanned = Vec::new();
+            if cursor.first(&cx).unwrap() {
+                loop {
+                    scanned.push(cursor.payload(&cx).unwrap());
+                    if !cursor.next(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(scanned, vec![key.clone()]);
+
+            assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
+            cursor.delete(&cx).unwrap();
+            assert_eq!(cursor.count_all_rows(&cx).unwrap(), 0);
+        }
     }
 
     #[test]
@@ -6348,6 +7144,140 @@ mod tests {
             root_header.cell_count, 4,
             "root collapse should preserve the surviving leaf rows"
         );
+    }
+
+    #[test]
+    fn test_cursor_delete_updates_nonroot_table_separator_after_leaf_max_delete() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let mut max_rowid = 0_i64;
+        for rowid in 1..=2_000_i64 {
+            let payload = vec![b'S'; 1_400];
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            max_rowid = rowid;
+
+            if measure_tree_depth(&cursor.pager, pn(2), USABLE) >= 3 {
+                break;
+            }
+        }
+
+        assert!(
+            measure_tree_depth(&cursor.pager, pn(2), USABLE) >= 3,
+            "failed to build a depth-3 table tree (reached rowid {max_rowid})"
+        );
+
+        let root_entry = cursor.load_page(&cx, pn(2)).unwrap();
+        assert_eq!(
+            root_entry.header.page_type,
+            cell::BtreePageType::InteriorTable
+        );
+        let root_separator_before = cursor.parse_cell_at(&root_entry, 0).unwrap().rowid.unwrap();
+
+        let left_subtree_page = cursor.child_page_at(&root_entry, 0).unwrap();
+        let left_subtree_before = cursor.load_page(&cx, left_subtree_page).unwrap();
+        assert_eq!(
+            left_subtree_before.header.page_type,
+            cell::BtreePageType::InteriorTable
+        );
+
+        let target_rowid = cursor
+            .parse_cell_at(&left_subtree_before, 0)
+            .unwrap()
+            .rowid
+            .unwrap();
+        assert!(
+            target_rowid > 1,
+            "target rowid must leave the leaf non-empty after delete"
+        );
+
+        let seek = cursor.table_move_to(&cx, target_rowid).unwrap();
+        assert!(seek.is_found(), "target rowid should exist before delete");
+        cursor.delete(&cx).unwrap();
+
+        let root_after = cursor.load_page(&cx, pn(2)).unwrap();
+        let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
+        assert_eq!(
+            root_separator_after, root_separator_before,
+            "deleting a non-root subtree maximum must not perturb the enclosing subtree maximum"
+        );
+
+        let left_subtree_after = cursor.load_page(&cx, left_subtree_page).unwrap();
+        let repaired_separator = cursor
+            .parse_cell_at(&left_subtree_after, 0)
+            .unwrap()
+            .rowid
+            .unwrap();
+        assert_eq!(
+            repaired_separator,
+            target_rowid - 1,
+            "non-root interior separator must shrink to the deleted leaf's new maximum"
+        );
+
+        let seek_after = cursor.table_move_to(&cx, target_rowid).unwrap();
+        assert!(
+            !seek_after.is_found(),
+            "deleted rowid must not remain reachable after separator repair"
+        );
+        assert!(
+            cursor
+                .table_move_to(&cx, target_rowid - 1)
+                .unwrap()
+                .is_found()
+        );
+    }
+
+    #[test]
+    fn test_cursor_delete_updates_ancestor_table_separator_for_rightmost_descendant_max() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 15)], pn(4)));
+        store
+            .pages
+            .insert(3, build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(1, b"L1"), (3, b"L3")]));
+        store
+            .pages
+            .insert(6, build_leaf_table(&[(5, b"L5"), (8, b"L8")]));
+        store
+            .pages
+            .insert(7, build_leaf_table(&[(10, b"L10"), (15, b"L15")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let root_before = cursor.load_page(&cx, pn(2)).unwrap();
+        let root_separator_before = cursor
+            .parse_cell_at(&root_before, 0)
+            .unwrap()
+            .rowid
+            .unwrap();
+        assert_eq!(root_separator_before, 15);
+
+        let seek = cursor.table_move_to(&cx, 15).unwrap();
+        assert!(seek.is_found(), "target rowid should exist before delete");
+        cursor.delete(&cx).unwrap();
+
+        let root_after = cursor.load_page(&cx, pn(2)).unwrap();
+        let root_separator_after = cursor.parse_cell_at(&root_after, 0).unwrap().rowid.unwrap();
+        assert_eq!(
+            root_separator_after, 10,
+            "ancestor separator must shrink when the subtree's rightmost descendant maximum is deleted"
+        );
+
+        validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+            .expect("table invariants should still hold after ancestor separator repair");
+        assert!(!cursor.table_move_to(&cx, 15).unwrap().is_found());
+        assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
     }
 
     #[test]
@@ -7601,6 +8531,161 @@ mod tests {
                 &ref_rowids,
                 "bead_id=bd-2sm1 case=btree_vs_btreemap rowids mismatch"
             );
+        }
+
+        #[test]
+        fn prop_table_btree_structural_invariants_hold_after_random_mutations(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2_000_i64, proptest::collection::vec(proptest::num::u8::ANY, 10..100))
+                        .prop_map(|(r, p)| (true, r, p)),
+                    1 => (1..=2_000_i64,).prop_map(|(r,)| (false, r, Vec::new())),
+                ],
+                1..400
+            )
+        ) {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+
+            for (step, (is_insert, rowid, payload)) in ops.iter().enumerate() {
+                if *is_insert {
+                    if reference.contains_key(rowid) {
+                        let result = cursor.table_insert(&cx, *rowid, payload);
+                        proptest::prop_assert!(
+                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                            "duplicate rowid {} at step {} should produce PrimaryKeyViolation, got {:?}",
+                            rowid,
+                            step,
+                            result,
+                        );
+                    } else {
+                        cursor.table_insert(&cx, *rowid, payload).unwrap();
+                        reference.insert(*rowid, payload.clone());
+                    }
+                } else if reference.contains_key(rowid) {
+                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(rowid);
+                    }
+                }
+
+                let bounds = validate_table_tree_invariants(&cursor.pager, pn(2), USABLE)
+                    .map_err(|err| {
+                        proptest::test_runner::TestCaseError::fail(format!(
+                            "table structural invariant failed after step {} ({:?}, {}, payload_len={}): {}",
+                            step,
+                            if *is_insert { "insert" } else { "delete" },
+                            rowid,
+                            payload.len(),
+                            err
+                        ))
+                    })?;
+
+                let expected_bounds = match (
+                    reference.keys().next().copied(),
+                    reference.keys().next_back().copied(),
+                ) {
+                    (Some(min_rowid), Some(max_rowid)) => Some(TableSubtreeBounds {
+                        min_rowid,
+                        max_rowid,
+                    }),
+                    (None, None) => None,
+                    _ => unreachable!("BTreeMap first/last should agree on emptiness"),
+                };
+                proptest::prop_assert_eq!(
+                    bounds,
+                    expected_bounds,
+                    "table subtree bounds diverged from reference after step {}",
+                    step
+                );
+            }
+        }
+
+        #[test]
+        fn prop_index_btree_structural_invariants_hold_after_random_mutations(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2_000_i64,).prop_map(|(id,)| (true, id)),
+                    1 => (1..=2_000_i64,).prop_map(|(id,)| (false, id)),
+                ],
+                1..220
+            )
+        ) {
+            const INDEX_USABLE: u32 = 512;
+
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, INDEX_USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, INDEX_USABLE, false);
+            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+
+            for (step, (is_insert, id)) in ops.iter().enumerate() {
+                let key = synthetic_index_key(*id);
+
+                if *is_insert {
+                    if !reference.contains_key(id) {
+                        cursor.index_insert(&cx, &key).unwrap();
+                        reference.insert(*id, key);
+                    }
+                } else if reference.contains_key(id) {
+                    let seek = cursor.index_move_to(&cx, &key).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(id);
+                    }
+                }
+
+                let bounds = validate_index_tree_invariants(&mut cursor, root).map_err(|err| {
+                    proptest::test_runner::TestCaseError::fail(format!(
+                        "index structural invariant failed after step {} ({:?}, {}): {}",
+                        step,
+                        if *is_insert { "insert" } else { "delete" },
+                        id,
+                        err
+                    ))
+                })?;
+
+                let mut expected_keys: Vec<Vec<u8>> = reference.values().cloned().collect();
+                expected_keys.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+
+                let scanned = scan_all_index_keys(&mut cursor, &cx).map_err(|err| {
+                    proptest::test_runner::TestCaseError::fail(format!(
+                        "index scan failed after step {} ({:?}, {}): {}",
+                        step,
+                        if *is_insert { "insert" } else { "delete" },
+                        id,
+                        err
+                    ))
+                })?;
+
+                let expected_bounds = match (expected_keys.first(), expected_keys.last()) {
+                    (Some(min_key), Some(max_key)) => Some(IndexSubtreeBounds {
+                        min_key: min_key.clone(),
+                        max_key: max_key.clone(),
+                        entry_count: expected_keys.len(),
+                    }),
+                    (None, None) => None,
+                    _ => unreachable!("expected key bounds should agree on emptiness"),
+                };
+
+                proptest::prop_assert_eq!(
+                    scanned,
+                    expected_keys,
+                    "index logical sequence diverged from the reference after step {}",
+                    step
+                );
+                proptest::prop_assert_eq!(
+                    bounds,
+                    expected_bounds,
+                    "index subtree bounds diverged from the reference after step {}",
+                    step
+                );
+            }
         }
 
         #[test]
