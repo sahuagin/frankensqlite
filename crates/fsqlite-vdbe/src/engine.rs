@@ -10374,7 +10374,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
-        if !self.register_subtypes.is_empty() {
+        if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
         self.registers[idx] =
@@ -10973,7 +10973,7 @@ impl VdbeEngine {
         // metadata must be discarded as well.  Guard with is_empty() to
         // avoid a HashMap probe on every register write — subtypes are
         // rare (only JSON/pointer types).
-        if !self.register_subtypes.is_empty() {
+        if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
         self.registers[idx] = match val {
@@ -10997,7 +10997,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if !self.register_subtypes.is_empty() {
+        if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
         self.registers[idx] = match val {
@@ -11045,7 +11045,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if !self.register_subtypes.is_empty() {
+        if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
         self.registers[idx] = SqliteValue::Text(SmallText::new(text));
@@ -11066,7 +11066,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if !self.register_subtypes.is_empty() {
+        if self.has_subtypes {
             self.register_subtypes.remove(&r);
         }
         self.registers[idx] = SqliteValue::Blob(Arc::from(blob));
@@ -11183,7 +11183,7 @@ impl VdbeEngine {
                             self.make_record_sideband_reg = 0;
                             self.make_record_buf.clear();
                         }
-                        if !self.register_subtypes.is_empty() {
+                        if self.has_subtypes {
                             self.register_subtypes.remove(&target);
                         }
                         match cached {
@@ -12842,6 +12842,9 @@ fn payload_includes_rowid_alias(
         if payload_cols == table_cols {
             return true;
         }
+        if payload_cols + 1 == table_cols {
+            return true;
+        }
         if let Some(not_null_col_idx) =
             first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
         {
@@ -12884,6 +12887,9 @@ fn payload_includes_rowid_alias_lazy(
     let payload_cols = row_decode.column_count();
     if let Some(table_cols) = table_column_count {
         if payload_cols == table_cols {
+            return true;
+        }
+        if payload_cols + 1 == table_cols {
             return true;
         }
         if let Some(not_null_col_idx) =
