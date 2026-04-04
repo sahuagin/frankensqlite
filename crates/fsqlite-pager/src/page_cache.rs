@@ -1290,12 +1290,17 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get(page_no).map(|data| PageData::from_vec(data.to_vec()));
+                return fast
+                    .lock()
+                    .get(page_no)
+                    .map(|data| PageData::from_vec(data.to_vec()));
             }
         }
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get(page_no).map(|data| PageData::from_vec(data.to_vec()))
+        shard
+            .get(page_no)
+            .map(|data| PageData::from_vec(data.to_vec()))
     }
 }
 
