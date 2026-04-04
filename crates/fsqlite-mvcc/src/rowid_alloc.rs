@@ -248,6 +248,46 @@ impl ConcurrentRowIdAllocator {
         self.tables.lock().insert(key, state);
     }
 
+    /// Ensure a table allocator exists and never regresses below the durable tip.
+    ///
+    /// This is safe to call repeatedly from multiple concurrent connections.
+    /// If the allocator already exists, the next rowid and AUTOINCREMENT
+    /// high-water mark are advanced monotonically rather than reset.
+    pub fn ensure_table_floor(
+        &self,
+        key: AllocatorKey,
+        max_committed_rowid: Option<RowId>,
+        sqlite_sequence_seq: i64,
+        mode: RowIdMode,
+    ) {
+        let derived = TableAllocatorState::new(max_committed_rowid, sqlite_sequence_seq, mode);
+
+        {
+            let mut current_epoch = self.current_epoch.lock();
+            if key.schema_epoch.get() > current_epoch.get() {
+                *current_epoch = key.schema_epoch;
+            }
+        }
+
+        let mut tables = self.tables.lock();
+        match tables.get_mut(&key) {
+            Some(state) => {
+                state.next_rowid = state.next_rowid.max(derived.next_rowid);
+                state.mode = mode;
+                if mode == RowIdMode::AutoIncrement {
+                    state.autoincrement_high_water = state
+                        .autoincrement_high_water
+                        .max(derived.autoincrement_high_water);
+                } else {
+                    state.autoincrement_high_water = 0;
+                }
+            }
+            None => {
+                tables.insert(key, derived);
+            }
+        }
+    }
+
     /// Update the current durable schema epoch.
     pub fn set_current_epoch(&self, epoch: SchemaEpoch) {
         *self.current_epoch.lock() = epoch;
