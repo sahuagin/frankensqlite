@@ -252,7 +252,7 @@ struct GroupCommitQueue {
     completed_epoch: AtomicU64,
     /// Failure outcomes by epoch. Kept so late-scheduled waiters cannot miss
     /// a failed flush after a newer epoch completes successfully.
-    failed_epochs: Mutex<HashMap<u64, String>>,
+    failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
     /// Narrow per-target-epoch wake slots for waiter coordination.
     epoch_waiters: KeyedWaitRegistry,
 }
@@ -264,6 +264,40 @@ enum WaitForEpochOutcome {
         batches: Vec<TransactionFrameBatch>,
         flush_epoch: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+enum GroupCommitEpochFailure {
+    Busy,
+    BusyRecovery,
+    BusySnapshot { conflicting_pages: String },
+    Other(String),
+}
+
+impl GroupCommitEpochFailure {
+    fn from_error(error: &FrankenError) -> Self {
+        match error {
+            FrankenError::Busy => Self::Busy,
+            FrankenError::BusyRecovery => Self::BusyRecovery,
+            FrankenError::BusySnapshot { conflicting_pages } => Self::BusySnapshot {
+                conflicting_pages: conflicting_pages.clone(),
+            },
+            _ => Self::Other(error.to_string()),
+        }
+    }
+
+    fn into_error(self, target_epoch: u64) -> FrankenError {
+        match self {
+            Self::Busy => FrankenError::Busy,
+            Self::BusyRecovery => FrankenError::BusyRecovery,
+            Self::BusySnapshot { conflicting_pages } => {
+                FrankenError::BusySnapshot { conflicting_pages }
+            }
+            Self::Other(detail) => FrankenError::internal(format!(
+                "group commit flush failed for epoch {target_epoch}: {detail}"
+            )),
+        }
+    }
 }
 
 impl GroupCommitQueue {
@@ -320,7 +354,7 @@ impl GroupCommitQueue {
             .failed_epochs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        failed_epochs.insert(epoch, error.to_string());
+        failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
         drop(failed_epochs);
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
     }
@@ -385,7 +419,7 @@ impl GroupCommitQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&target_epoch)
             .cloned();
-        if let Some(detail) = failed_detail {
+        if let Some(failure) = failed_detail {
             GLOBAL_CONSOLIDATION_METRICS
                 .wake_reasons
                 .failed_epoch
@@ -397,9 +431,7 @@ impl GroupCommitQueue {
                 target_epoch,
                 "waiter observed failed epoch"
             );
-            return Err(FrankenError::internal(format!(
-                "group commit flush failed for epoch {target_epoch}: {detail}"
-            )));
+            return Err(failure.into_error(target_epoch));
         }
 
         if self.is_epoch_complete(target_epoch) {
@@ -1478,6 +1510,71 @@ fn build_group_commit_batch(
     }
 
     Ok(Some((TransactionFrameBatch::new(frames), new_db_size)))
+}
+
+fn flatten_group_commit_batches<'a>(
+    current_db_size: u32,
+    batches: &'a [TransactionFrameBatch],
+) -> (Vec<traits::WalFrameRef<'a>>, u32) {
+    let total_frames: usize = batches.iter().map(|batch| batch.frames.len()).sum();
+    let mut frame_refs: Vec<traits::WalFrameRef<'a>> = Vec::with_capacity(total_frames);
+    let mut final_db_size = current_db_size;
+    let mut last_commit_frame_idx = None;
+
+    for batch in batches {
+        for frame in &batch.frames {
+            if frame.db_size_if_commit > final_db_size {
+                final_db_size = frame.db_size_if_commit;
+            }
+            if frame.db_size_if_commit != 0 {
+                last_commit_frame_idx = Some(frame_refs.len());
+            }
+            frame_refs.push(traits::WalFrameRef {
+                page_number: frame.page_number,
+                page_data: &frame.page_data,
+                db_size_if_commit: 0,
+            });
+        }
+    }
+
+    if let Some(last_commit_frame_idx) = last_commit_frame_idx {
+        frame_refs[last_commit_frame_idx].db_size_if_commit = final_db_size;
+    }
+
+    (frame_refs, final_db_size)
+}
+
+fn conflicting_pages_across_group_commit_batches(batches: &[TransactionFrameBatch]) -> Vec<u32> {
+    let mut first_batch_by_page = HashMap::<u32, usize>::new();
+    let mut conflicts = HashSet::<u32>::new();
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let mut seen_in_batch = HashSet::<u32>::new();
+        for frame in &batch.frames {
+            if frame.page_number == 1 {
+                // Page 1 carries the shared database header and legitimately
+                // appears in disjoint commits; treating it as a hard overlap
+                // would spuriously abort safe group-commit epochs.
+                continue;
+            }
+            if !seen_in_batch.insert(frame.page_number) {
+                continue;
+            }
+            match first_batch_by_page.get(&frame.page_number).copied() {
+                Some(previous_batch_idx) if previous_batch_idx != batch_idx => {
+                    conflicts.insert(frame.page_number);
+                }
+                None => {
+                    first_batch_by_page.insert(frame.page_number, batch_idx);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    let mut conflicts = conflicts.into_iter().collect::<Vec<_>>();
+    conflicts.sort_unstable();
+    conflicts
 }
 
 const SNAPSHOT_PUBLICATION_MODE: &str = "seqlock_published_pages";
@@ -3805,9 +3902,15 @@ struct StagedPage {
 
 impl StagedPage {
     fn from_buf(buf: PageBuf) -> Self {
+        // bd-perf (V1.3): Eagerly create the published PageData at write time.
+        // StagedPage is never mutated after creation (only replaced wholesale
+        // via insert_staged_page), so the eager snapshot is always correct.
+        // This avoids a lazy 4KB copy + Arc allocation on first read.
+        let published = OnceLock::new();
+        let _ = published.set(PageData::from_vec(buf.as_slice().to_vec()));
         Self {
             backing: StagedPageBacking::Buffered(buf),
-            published: OnceLock::new(),
+            published,
         }
     }
 
@@ -4541,25 +4644,46 @@ where
                     flush
                 };
 
+                let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
+                if !conflicting_pages.is_empty() {
+                    let error = FrankenError::BusySnapshot {
+                        conflicting_pages: conflicting_pages
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    };
+                    tracing::warn!(
+                        target: "fsqlite::wal::lock_scope",
+                        epoch = flush_epoch,
+                        conflicting_pages = ?conflicting_pages,
+                        "aborting group-commit epoch with cross-batch same-page overlap"
+                    );
+                    let (abort_result, wake_next_epoch) = {
+                        let mut consolidator = queue
+                            .consolidator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let abort_result = consolidator.abort_flush();
+                        let wake_next_epoch =
+                            abort_result.is_ok() && consolidator.has_flusher_vacancy();
+                        (abort_result, wake_next_epoch)
+                    };
+                    queue.publish_failed_epoch(flush_epoch, &error, wake_next_epoch);
+                    if let Err(abort_error) = abort_result {
+                        return Err(FrankenError::internal(format!(
+                            "group commit overlap abort failed for epoch {flush_epoch}: overlap={error}; abort={abort_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+
                 // bd-db300.3.8.6: Fused single-pass assembly — build frame_refs
                 // and compute final_db_size in one iteration over batches,
                 // eliminating the intermediate `all_frames` Vec allocation.
                 let batch_count = batches.len();
-                let total_frames: usize = batches.iter().map(|b| b.frames.len()).sum();
-                let mut frame_refs: Vec<traits::WalFrameRef<'_>> = Vec::with_capacity(total_frames);
-                let mut final_db_size = current_db_size;
-                for batch in &batches {
-                    for frame in &batch.frames {
-                        frame_refs.push(traits::WalFrameRef {
-                            page_number: frame.page_number,
-                            page_data: &frame.page_data,
-                            db_size_if_commit: frame.db_size_if_commit,
-                        });
-                        if frame.db_size_if_commit > final_db_size {
-                            final_db_size = frame.db_size_if_commit;
-                        }
-                    }
-                }
+                let (frame_refs, final_db_size) =
+                    flatten_group_commit_batches(current_db_size, &batches);
                 let frame_count = frame_refs.len();
 
                 let mut prepared_batch = with_wal_backend(wal_backend, |wal| {
@@ -16806,7 +16930,8 @@ mod tests {
     }
 
     /// bd-db300.3.8.6: Prove fused batch assembly preserves cross-batch frame
-    /// order and final_db_size semantics, including the all-zero boundary.
+    /// order while collapsing multiple per-transaction commit markers into a
+    /// single trailing commit frame that carries the max db_size for the group.
     #[test]
     fn test_fused_batch_assembly_preserves_order_and_db_size() {
         use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
@@ -16845,23 +16970,7 @@ mod tests {
         ];
 
         let current_db_size: u32 = 5;
-
-        // Fused single-pass assembly (mirrors the production code exactly).
-        let total_frames: usize = batches.iter().map(|b| b.frames.len()).sum();
-        let mut frame_refs: Vec<traits::WalFrameRef<'_>> = Vec::with_capacity(total_frames);
-        let mut final_db_size = current_db_size;
-        for batch in &batches {
-            for frame in &batch.frames {
-                frame_refs.push(traits::WalFrameRef {
-                    page_number: frame.page_number,
-                    page_data: &frame.page_data,
-                    db_size_if_commit: frame.db_size_if_commit,
-                });
-                if frame.db_size_if_commit > final_db_size {
-                    final_db_size = frame.db_size_if_commit;
-                }
-            }
-        }
+        let (frame_refs, final_db_size) = flatten_group_commit_batches(current_db_size, &batches);
 
         // 1. Frame order: batch-by-batch, frame-by-frame.
         let page_numbers: Vec<u32> = frame_refs.iter().map(|f| f.page_number).collect();
@@ -16881,10 +16990,87 @@ mod tests {
             "bd-db300.3.8.6: final_db_size must be max commit size across group"
         );
 
-        // 4. Pre-sized capacity: no reallocation should have occurred.
+        // 4. Group commit must publish exactly one trailing commit marker so the
+        // WAL-visible db_size cannot regress to a smaller earlier transaction.
+        let commit_sizes: Vec<u32> = frame_refs
+            .iter()
+            .map(|frame| frame.db_size_if_commit)
+            .collect();
+        assert_eq!(
+            commit_sizes,
+            vec![0, 0, 0, 0, 12],
+            "only the final frame should carry the consolidated commit db_size"
+        );
+
+        // 5. Pre-sized capacity: no reallocation should have occurred.
         assert!(
             frame_refs.capacity() >= 5,
             "Vec should have been pre-sized to avoid realloc"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_conflict_detection_reports_only_cross_batch_page_overlaps() {
+        use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
+
+        let batches = vec![
+            TransactionFrameBatch::new(vec![
+                FrameSubmission {
+                    page_number: 1,
+                    page_data: vec![0xA0; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 2,
+                    page_data: vec![0xAA; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 2,
+                    page_data: vec![0xAB; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 3,
+                    page_data: vec![0xAC; 4096],
+                    db_size_if_commit: 10,
+                },
+            ]),
+            TransactionFrameBatch::new(vec![
+                FrameSubmission {
+                    page_number: 1,
+                    page_data: vec![0xB0; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 4,
+                    page_data: vec![0xBA; 4096],
+                    db_size_if_commit: 11,
+                },
+            ]),
+            TransactionFrameBatch::new(vec![
+                FrameSubmission {
+                    page_number: 1,
+                    page_data: vec![0xC0; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 3,
+                    page_data: vec![0xCA; 4096],
+                    db_size_if_commit: 0,
+                },
+                FrameSubmission {
+                    page_number: 4,
+                    page_data: vec![0xCB; 4096],
+                    db_size_if_commit: 12,
+                },
+            ]),
+        ];
+
+        assert_eq!(
+            conflicting_pages_across_group_commit_batches(&batches),
+            vec![3, 4],
+            "only pages written by multiple distinct transaction batches should force an epoch retry"
         );
     }
 
@@ -16909,18 +17095,15 @@ mod tests {
         ])];
 
         let current_db_size: u32 = 7;
-        let mut final_db_size = current_db_size;
-        for batch in &batches {
-            for frame in &batch.frames {
-                if frame.db_size_if_commit > final_db_size {
-                    final_db_size = frame.db_size_if_commit;
-                }
-            }
-        }
+        let (frame_refs, final_db_size) = flatten_group_commit_batches(current_db_size, &batches);
 
         assert_eq!(
             final_db_size, 7,
             "bd-db300.3.8.6: all-zero db_size_if_commit must preserve current_db_size"
+        );
+        assert!(
+            frame_refs.iter().all(|frame| frame.db_size_if_commit == 0),
+            "all-zero inputs must stay non-commit after flattening"
         );
     }
 }
