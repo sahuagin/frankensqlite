@@ -530,6 +530,19 @@ impl MemTable {
         self.rows.clear();
     }
 
+    /// Pad all existing rows to have at least `target_cols` columns,
+    /// appending `default_val` for any missing trailing columns.
+    /// Used after ALTER TABLE ADD COLUMN to make pre-existing rows
+    /// visible with the new column's default value.
+    pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {
+        self.num_columns = target_cols;
+        for row in &mut self.rows {
+            while row.values.len() < target_cols {
+                row.values.push(default_val.clone());
+            }
+        }
+    }
+
     /// Find a row by rowid. Returns the index.
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()
