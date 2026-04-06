@@ -12891,19 +12891,64 @@ fn payload_includes_rowid_alias(
 /// on demand and cached in the caller-owned scratch buffer.
 fn payload_includes_rowid_alias_lazy(
     row_decode: &RowDecodeScratch,
-    _payload_buf: &[u8],
-    _rowid: i64,
+    payload_buf: &[u8],
+    rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
     first_not_null_non_ipk_col_idx: Option<usize>,
 ) -> bool {
+    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+
     let payload_cols = row_decode.column_count();
     if let Some(table_cols) = table_column_count {
         if payload_cols == table_cols {
             return true;
         }
         if payload_cols + 1 == table_cols {
+            // Payload has one fewer column than the table.  This is the
+            // ambiguous case: it could be an IPK-omitted record (standard
+            // SQLite) OR a record written with IPK included but the table
+            // later gained one column via ALTER TABLE ADD COLUMN.
+            //
+            // FrankenSQLite's INSERT codegen stores IPK in the payload, so
+            // return `true` here. Real SQLite records would have one fewer
+            // column because IPK is omitted, so this path also returns true
+            // (correct: payload_cols == original_table_cols, which equals
+            // table_cols - 1 only if one ALTER happened).
             return true;
+        }
+        // payload_cols < table_cols - 1: the table gained 2+ columns after
+        // the record was written (multiple ALTER TABLE ADD COLUMNs). We
+        // need to determine whether the payload includes the IPK by
+        // inspecting the value at the IPK position.
+        if ipk_col_idx < payload_cols {
+            // The IPK position exists in the payload. Check its serial
+            // type: if it's an integer that matches the rowid, the payload
+            // includes the IPK alias.
+            if let Some(col) = row_decode.column_offset(ipk_col_idx) {
+                match classify_serial_type(col.serial_type) {
+                    SerialTypeClass::Null => {
+                        // NULL placeholder at IPK position → IPK is included.
+                        return true;
+                    }
+                    SerialTypeClass::Integer => {
+                        // Decode the integer at the IPK position and compare
+                        // to the rowid.
+                        if let Some(val) = fsqlite_types::record::decode_column_from_offset(
+                            payload_buf,
+                            col,
+                            false,
+                        ) {
+                            if let SqliteValue::Integer(v) = val {
+                                if v == rowid {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         if let Some(not_null_col_idx) =
             first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
@@ -12914,7 +12959,6 @@ fn payload_includes_rowid_alias_lazy(
                 && present_payload_idx < payload_cols
                 && let Some(col) = row_decode.column_offset(omitted_payload_idx)
             {
-                use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
                 if matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null) {
                     return true;
                 }
@@ -12929,7 +12973,6 @@ fn payload_includes_rowid_alias_lazy(
     let Some(col) = row_decode.column_offset(ipk_col_idx) else {
         return false;
     };
-    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
 
     match classify_serial_type(col.serial_type) {
         // NULL serial type → rowid alias is present (stored as NULL placeholder).
