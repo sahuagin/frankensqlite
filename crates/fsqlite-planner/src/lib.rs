@@ -610,8 +610,24 @@ impl QueryPlanner {
         cracking_hints: Option<&mut CrackingHintStore>,
         feature_flags: PlannerFeatureFlags,
     ) -> Arc<QueryPlan> {
+        // Adaptive cracking hints are mutable runtime state, not schema state.
+        // They can legitimately change the preferred index for the same SQL
+        // template, so they must not be served from the stable plan cache.
+        if cracking_hints.is_some() {
+            return Arc::new(order_joins_with_hints_and_features(
+                tables,
+                indexes,
+                where_terms,
+                needed_columns,
+                cross_join_pairs,
+                table_index_hints,
+                cracking_hints,
+                feature_flags,
+            ));
+        }
+
         self.invalidate_plan_cache_if_schema_cookie_changed(schema_cookie);
-        let key = plan_cache_key(sql_template, schema_cookie);
+        let key = plan_cache_key_with_feature_flags(sql_template, schema_cookie, feature_flags);
 
         if let Some(plan) = self.plan_cache.get(&key) {
             if let Some(store) = cracking_hints {
@@ -660,6 +676,19 @@ fn plan_cache_key(sql_template: &str, schema_cookie: u32) -> u64 {
     let mut material = Vec::with_capacity(sql_template.len() + std::mem::size_of::<u32>());
     material.extend_from_slice(sql_template.as_bytes());
     material.extend_from_slice(&schema_cookie.to_le_bytes());
+    xxh3_64(&material)
+}
+
+fn plan_cache_key_with_feature_flags(
+    sql_template: &str,
+    schema_cookie: u32,
+    feature_flags: PlannerFeatureFlags,
+) -> u64 {
+    let mut material = Vec::with_capacity(sql_template.len() + std::mem::size_of::<u32>() + 2);
+    material.extend_from_slice(sql_template.as_bytes());
+    material.extend_from_slice(&schema_cookie.to_le_bytes());
+    material.push(u8::from(feature_flags.leapfrog_join));
+    material.push(u8::from(feature_flags.dpccp_join));
     xxh3_64(&material)
 }
 
@@ -7718,6 +7747,147 @@ mod tests {
             panic!("expected hottest entry to survive eviction")
         });
         assert!(Arc::ptr_eq(&hottest_plan, &hottest_plan_again));
+    }
+
+    #[test]
+    fn test_query_planner_cache_separates_feature_flag_variants() {
+        let tables = [
+            table_stats("a", 1024, 1_000_000),
+            table_stats("b", 1024, 1_000_000),
+            table_stats("c", 1024, 1_000_000),
+        ];
+        let terms = [join_term("a", "k", "b", "k"), join_term("b", "k", "c", "k")];
+        let sql_template = "SELECT * FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k";
+        let mut planner = QueryPlanner::default();
+
+        let hash_only = planner.order_joins_with_cache(
+            sql_template,
+            7,
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags::default(),
+        );
+        let leapfrog = planner.order_joins_with_cache(
+            sql_template,
+            7,
+            &tables,
+            &[],
+            &terms,
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags {
+                leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
+            },
+        );
+
+        assert!(
+            hash_only
+                .join_segments
+                .iter()
+                .all(|segment| segment.operator == JoinOperator::HashJoin),
+            "disabled feature flag should keep hash-only plan: {:?}",
+            hash_only.join_segments
+        );
+        assert!(
+            leapfrog
+                .join_segments
+                .iter()
+                .any(|segment| segment.operator == JoinOperator::LeapfrogTriejoin),
+            "enabled feature flag should allow leapfrog routing: {:?}",
+            leapfrog.join_segments
+        );
+        assert!(
+            !Arc::ptr_eq(&hash_only, &leapfrog),
+            "feature-flag variants must not alias the same cached Arc<QueryPlan>"
+        );
+        assert_eq!(planner.plan_cache_len(), 2);
+    }
+
+    #[test]
+    fn test_query_planner_cache_bypasses_adaptive_cracking_hints() {
+        let tables = [table_stats("t1", 256, 20_000)];
+        let indexes = [
+            IndexInfo {
+                name: "idx_a".to_owned(),
+                table: "t1".to_owned(),
+                columns: vec!["a".to_owned()],
+                unique: false,
+                n_pages: 16,
+                source: StatsSource::Heuristic,
+                partial_where: None,
+                expression_columns: vec![],
+            },
+            IndexInfo {
+                name: "idx_b".to_owned(),
+                table: "t1".to_owned(),
+                columns: vec!["a".to_owned()],
+                unique: false,
+                n_pages: 12,
+                source: StatsSource::Heuristic,
+                partial_where: None,
+                expression_columns: vec![],
+            },
+        ];
+        let terms = [eq_term("a")];
+        let sql_template = "SELECT * FROM t1 WHERE a = ?1";
+        let mut planner = QueryPlanner::default();
+
+        let mut first_hints = CrackingHintStore::default();
+        first_hints.record_access_path(&AccessPath {
+            table: "t1".to_owned(),
+            kind: AccessPathKind::IndexScanEquality,
+            index: Some("idx_a".to_owned()),
+            estimated_cost: 1.0,
+            estimated_rows: 1.0,
+            time_travel: None,
+        });
+        let first = planner.order_joins_with_cache(
+            sql_template,
+            5,
+            &tables,
+            &indexes,
+            &terms,
+            None,
+            &[],
+            None,
+            Some(&mut first_hints),
+            PlannerFeatureFlags::default(),
+        );
+
+        let mut second_hints = CrackingHintStore::default();
+        second_hints.record_access_path(&AccessPath {
+            table: "t1".to_owned(),
+            kind: AccessPathKind::IndexScanEquality,
+            index: Some("idx_b".to_owned()),
+            estimated_cost: 1.0,
+            estimated_rows: 1.0,
+            time_travel: None,
+        });
+        let second = planner.order_joins_with_cache(
+            sql_template,
+            5,
+            &tables,
+            &indexes,
+            &terms,
+            None,
+            &[],
+            None,
+            Some(&mut second_hints),
+            PlannerFeatureFlags::default(),
+        );
+
+        assert_eq!(first.access_paths[0].index.as_deref(), Some("idx_a"));
+        assert_eq!(second.access_paths[0].index.as_deref(), Some("idx_b"));
+        assert_eq!(planner.plan_cache_len(), 0);
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 }
 #[test]
