@@ -680,10 +680,18 @@ impl EbrRetireQueue {
             return;
         }
 
-        self.pending.lock().push(RetiredBatch {
-            retire_epoch: current_epoch,
-            indices: batch_indices,
-        });
+        let mut pending = self.pending.lock();
+        match pending.binary_search_by_key(&current_epoch, |batch| batch.retire_epoch) {
+            Ok(existing) => pending[existing].indices.extend(batch_indices),
+            Err(insert_at) => pending.insert(
+                insert_at,
+                RetiredBatch {
+                    retire_epoch: current_epoch,
+                    indices: batch_indices,
+                },
+            ),
+        }
+        drop(pending);
         self.total_retired.fetch_add(count, Ordering::Relaxed);
         for _ in 0..count {
             GLOBAL_EBR_METRICS.record_retirement_deferred();
@@ -717,13 +725,22 @@ impl EbrRetireQueue {
         });
         let drain_batches = pending
             .iter()
-            .take_while(|batch| batch.retire_epoch < safe_epoch)
+            .filter(|batch| batch.retire_epoch < safe_epoch)
             .count();
         if drain_batches == 0 {
             return Vec::new();
         }
 
-        let drained_batches: Vec<_> = pending.drain(..drain_batches).collect();
+        let mut drained_batches = Vec::with_capacity(drain_batches);
+        let mut retained_batches = Vec::with_capacity(pending.len().saturating_sub(drain_batches));
+        for batch in pending.drain(..) {
+            if batch.retire_epoch < safe_epoch {
+                drained_batches.push(batch);
+            } else {
+                retained_batches.push(batch);
+            }
+        }
+        *pending = retained_batches;
         drop(pending);
 
         let mut drained = Vec::new();
@@ -1297,6 +1314,26 @@ mod tests {
         // Once no active readers remain, the remaining batch can also drain.
         let drained = queue.drain_if_safe(4, None);
         assert_eq!(drained.len(), 1, "the later batch drains separately");
+    }
+
+    #[test]
+    fn ebr_retire_queue_out_of_order_epochs() {
+        let queue = EbrRetireQueue::new();
+
+        queue.retire(VersionIdx::new(0, 0, 0), 5);
+        queue.retire(VersionIdx::new(0, 1, 0), 3);
+
+        let drained = queue.drain_if_safe(5, Some(5));
+        assert_eq!(
+            drained,
+            vec![VersionIdx::new(0, 1, 0)],
+            "reclaimable older batches must drain even when a newer batch was queued first",
+        );
+        assert_eq!(queue.pending_count(), 1);
+
+        let drained = queue.drain_if_safe(6, Some(6));
+        assert_eq!(drained, vec![VersionIdx::new(0, 0, 0)]);
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
