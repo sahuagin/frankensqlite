@@ -1670,6 +1670,17 @@ impl Fts5Table {
         debug!(rowid, "fts5: removed document");
     }
 
+    /// Rebuild the in-memory index and rowid allocator from persisted rows.
+    pub fn rebuild_documents(&mut self, rows: &[(i64, Vec<String>)]) {
+        self.index = InvertedIndex::new();
+        self.documents.clear();
+        self.next_rowid = 1;
+        for (rowid, columns) in rows {
+            self.insert_document(*rowid, columns);
+            self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+        }
+    }
+
     /// Search the FTS5 table with a query, returning matching rowids ranked
     /// by BM25.
     pub fn search(&self, query: &str) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {

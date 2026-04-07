@@ -555,6 +555,59 @@ impl RtreeVirtualTable {
     pub fn register_geometry(&mut self, name: &str, geom: Box<dyn RtreeGeometry>) {
         self.index.register_geometry(name, geom);
     }
+
+    /// Rebuild the in-memory R-tree from persisted row values.
+    pub fn rebuild_rows(&mut self, rows: &[(i64, Vec<SqliteValue>)]) -> Result<()> {
+        let config = self.index.config.clone();
+        let geometry_registry = self.index.geometry_registry.clone();
+        self.index = RtreeIndex {
+            config,
+            entries: Vec::new(),
+            geometry_registry,
+        };
+
+        for (rowid, values) in rows {
+            let expected_coord_values = self.index.dimensions() * 2;
+            let (entry_id, coord_values) = match values.len() {
+                len if len == expected_coord_values => (*rowid, values.as_slice()),
+                len if len == expected_coord_values + 1 => {
+                    let id =
+                        values[0]
+                            .as_integer()
+                            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "rtree persisted row {rowid} stores a non-integer id column"
+                                ),
+                            })?;
+                    if id != *rowid {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "rtree persisted row {rowid} stores mismatched id column {id}"
+                            ),
+                        });
+                    }
+                    (id, &values[1..])
+                }
+                len => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "rtree persisted row {rowid} has {len} values; expected {expected_coord_values} or {}",
+                            expected_coord_values + 1
+                        ),
+                    });
+                }
+            };
+
+            let bbox = self.parse_bbox_values(coord_values)?;
+            if !self.index.insert(RtreeEntry { id: entry_id, bbox }) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("rtree persisted row {rowid} duplicates entry id {entry_id}"),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl VirtualTable for RtreeVirtualTable {
