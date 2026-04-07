@@ -161,7 +161,8 @@ use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
-    ColumnOffset, RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
+    ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
+    parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
 };
 use fsqlite_types::serial_type::{read_varint, serial_type_len};
 use fsqlite_types::value::{
@@ -290,13 +291,31 @@ fn estimate_make_record_buffer_capacity(program: &VdbeProgram, page_size: PageSi
         .ops()
         .iter()
         .filter(|op| op.opcode == Opcode::MakeRecord)
-        .map(|op| {
+        .map(|op| -> usize {
             let n_cols = usize::try_from(op.p2.max(0)).unwrap_or(0);
-            let affinity = match &op.p4 {
-                P4::Affinity(aff) => Some(aff.as_str()),
-                _ => None,
+            let capacity = match &op.p4 {
+                P4::Affinity(aff) => estimate_make_record_capacity_for_affinity(
+                    Some(aff.as_str()),
+                    n_cols,
+                    variable_width_hint,
+                ),
+                P4::PrecomputedHeader(header) => {
+                    let body_size = header
+                        .slots
+                        .iter()
+                        .map(|slot| match slot.kind {
+                            PrecomputedSerialTypeKind::NullPlaceholder => 0,
+                            PrecomputedSerialTypeKind::IntegerOrNull
+                            | PrecomputedSerialTypeKind::RealOrNull => {
+                                MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES
+                            }
+                        })
+                        .sum::<usize>();
+                    header.template.len() + body_size
+                }
+                _ => estimate_make_record_capacity_for_affinity(None, n_cols, variable_width_hint),
             };
-            estimate_make_record_capacity_for_affinity(affinity, n_cols, variable_width_hint)
+            capacity
         })
         .max()
         .unwrap_or(0)
@@ -3500,6 +3519,8 @@ static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 /// bd-7vkes: Count times a full B-tree seek was needed for INSERT.
 static FSQLITE_VDBE_INSERT_SEEK_COUNT: AtomicU64 = AtomicU64::new(0);
+/// bd-qayid: Count times a cached append hint was cleared conservatively.
+static FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Decoded NULL values.
 static FSQLITE_VDBE_DECODED_NULLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Decoded INTEGER values.
@@ -3957,6 +3978,8 @@ pub struct VdbeMetricsSnapshot {
     pub insert_append_count: u64,
     /// Total INSERT executions that had to perform an existence seek.
     pub insert_seek_count: u64,
+    /// Total times the cached append hint had to be cleared conservatively.
+    pub insert_append_hint_clear_count: u64,
     /// Storage-class breakdown of decoded values.
     pub decoded_value_types: ValueTypeMetricsSnapshot,
     /// Storage-class breakdown of emitted result values.
@@ -4041,6 +4064,8 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
             .load(AtomicOrdering::Relaxed),
         insert_append_count: FSQLITE_VDBE_INSERT_APPEND_COUNT.load(AtomicOrdering::Relaxed),
         insert_seek_count: FSQLITE_VDBE_INSERT_SEEK_COUNT.load(AtomicOrdering::Relaxed),
+        insert_append_hint_clear_count: FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+            .load(AtomicOrdering::Relaxed),
         decoded_value_types: ValueTypeMetricsSnapshot {
             total_values: FSQLITE_VDBE_DECODED_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
             nulls: FSQLITE_VDBE_DECODED_NULLS_TOTAL.load(AtomicOrdering::Relaxed),
@@ -4137,6 +4162,7 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_INSERT_APPEND_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_INSERT_SEEK_COUNT.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_NULLS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_INTEGERS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_DECODED_REALS_TOTAL.store(0, AtomicOrdering::Relaxed);
@@ -4419,10 +4445,20 @@ fn hash_program(program: &VdbeProgram) -> u64 {
                 mix_len(hash, value.len());
                 mix(hash, value.as_bytes());
             }
-            P4::RecordHeaderTemplate(value) => {
+            P4::PrecomputedHeader(value) => {
                 mix(hash, &[14]);
-                mix_len(hash, value.len());
-                mix(hash, value);
+                mix_len(hash, value.template.len());
+                mix(hash, &value.template);
+                mix_len(hash, value.slots.len());
+                for slot in &value.slots {
+                    let kind = match slot.kind {
+                        PrecomputedSerialTypeKind::NullPlaceholder => 0_u8,
+                        PrecomputedSerialTypeKind::IntegerOrNull => 1_u8,
+                        PrecomputedSerialTypeKind::RealOrNull => 2_u8,
+                    };
+                    mix(hash, &[kind]);
+                    mix_len(hash, slot.header_offset);
+                }
             }
         }
     }
@@ -5627,18 +5663,23 @@ impl VdbeEngine {
         self.dirty_root_pages.insert(root_page);
     }
 
-    /// Mark the table identified by cursor_id as dirty for lazy MemDB sync.
-    /// Call this instead of sync_storage_table_insert_into_memdb_mirror for
-    /// INSERT operations to eliminate the 0.10 µs/row sync overhead.
-    ///
+    /// Mark a known storage-backed table root page dirty without another
+    /// cursor-to-root lookup on the hot write path.
+    #[inline]
+    fn mark_storage_root_page_dirty(&mut self, root_page: i32) {
+        self.mark_root_page_dirty(root_page);
+        // Signal to Connection that MemDB is stale — queries should fall
+        // back to pager-backed reads until a sync or reload occurs.
+        self.storage_cursor_memdb_count_shortcuts_safe = false;
+    }
+
+    /// Mark the table identified by cursor_id as dirty for lazy MemDB sync
+    /// when the caller does not already know the table root page.
     /// Also sets `storage_cursor_memdb_count_shortcuts_safe` to false so the
     /// Connection layer knows MemDB is stale and will fall back to pager reads.
     fn mark_storage_table_dirty(&mut self, cursor_id: i32) {
         if let Some(root_page) = self.cursor_root_pages.get(&cursor_id).copied() {
-            self.mark_root_page_dirty(root_page);
-            // Signal to Connection that MemDB is stale — queries should fall
-            // back to pager-backed reads until a sync or reload occurs.
-            self.storage_cursor_memdb_count_shortcuts_safe = false;
+            self.mark_storage_root_page_dirty(root_page);
         }
     }
 
@@ -5655,19 +5696,6 @@ impl VdbeEngine {
     /// Clear dirty root pages after bulk sync completes.
     pub fn clear_dirty_root_pages(&mut self) {
         self.dirty_root_pages.clear();
-    }
-
-    fn sync_storage_table_insert_into_memdb_mirror(
-        &mut self,
-        cursor_id: i32,
-        _rowid: i64,
-        _record: &SqliteValue,
-    ) {
-        // bd-g595c: Lazy MemDB dirty tracking — instead of syncing on every
-        // INSERT, we mark the table dirty and bulk-sync only when a
-        // compatibility-path query needs MemDB data. This eliminates the
-        // 0.10 µs/row overhead for storage-cursor-backed workloads.
-        self.mark_storage_table_dirty(cursor_id);
     }
 
     fn sync_storage_table_delete_into_memdb_mirror(&mut self, cursor_id: i32, _rowid: i64) {
@@ -8146,7 +8174,10 @@ impl VdbeEngine {
                             };
 
                             if exists {
-                                sc.last_successful_insert_rowid = None;
+                                if sc.last_successful_insert_rowid.take().is_some() {
+                                    FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                }
                                 // Match on the low OE_* bits directly — p5 is
                                 // not a plain bitfield in this engine because
                                 // it also carries the custom OPFLAG_ISUPDATE
@@ -8196,15 +8227,17 @@ impl VdbeEngine {
                                             &sc.cx, rowid,
                                         )?;
                                         sc.last_successful_insert_rowid = Some(rowid);
-                                    } else {
-                                        sc.last_successful_insert_rowid = None;
+                                    } else if sc.last_successful_insert_rowid.take().is_some() {
+                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                            .fetch_add(1, AtomicOrdering::Relaxed);
                                     }
                                 } else {
                                     sc.cursor.table_insert(&sc.cx, rowid, blob)?;
                                     if append_eligible {
                                         sc.last_successful_insert_rowid = Some(rowid);
-                                    } else {
-                                        sc.last_successful_insert_rowid = None;
+                                    } else if sc.last_successful_insert_rowid.take().is_some() {
+                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                            .fetch_add(1, AtomicOrdering::Relaxed);
                                     }
                                 }
                                 invalidate_storage_cursor_row_cache_with_reason(
@@ -8300,12 +8333,11 @@ impl VdbeEngine {
                             rowid,
                         )?;
                     }
-                    if inserted_via_storage {
-                        self.sync_storage_table_insert_into_memdb_mirror(
-                            cursor_id,
-                            rowid,
-                            &record_val,
-                        );
+                    if inserted_via_storage && let Some(root_page) = root_page {
+                        // Hot INSERT path already knows the table root page, so
+                        // avoid another cursor_root_pages lookup when marking
+                        // the MemDB mirror stale.
+                        self.mark_storage_root_page_dirty(root_page);
                     }
 
                     // Track last insert rowid only when a row was actually inserted.
@@ -10795,29 +10827,59 @@ impl VdbeEngine {
     #[inline(always)]
     fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
         let target = op.p3;
-        let n_cols = usize::try_from(op.p2).unwrap_or(0);
         let mut rec_buf = std::mem::take(&mut self.make_record_buf);
         {
             let this = &*self;
-            if let P4::Affinity(aff) = &op.p4 {
-                let null_placeholder = SqliteValue::Null;
-                let iter = aff.chars().enumerate().map(|(i, ch)| {
-                    if ch == 'X' {
-                        &null_placeholder
-                    } else {
+            match &op.p4 {
+                P4::PrecomputedHeader(header) => {
+                    let null_placeholder = SqliteValue::Null;
+                    let make_iter = || {
+                        header
+                            .slots
+                            .iter()
+                            .enumerate()
+                            .map(|(i, slot)| match slot.kind {
+                                PrecomputedSerialTypeKind::NullPlaceholder => &null_placeholder,
+                                _ => {
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    let reg = op.p1 + i as i32;
+                                    this.get_reg(reg)
+                                }
+                            })
+                    };
+                    if !serialize_record_iter_with_precomputed_header_into(
+                        make_iter(),
+                        header,
+                        &mut rec_buf,
+                    ) {
+                        fsqlite_types::record::serialize_record_iter_into(
+                            make_iter(),
+                            &mut rec_buf,
+                        );
+                    }
+                }
+                P4::Affinity(aff) => {
+                    let null_placeholder = SqliteValue::Null;
+                    let iter = aff.chars().enumerate().map(|(i, ch)| {
+                        if ch == 'X' {
+                            &null_placeholder
+                        } else {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let reg = op.p1 + i as i32;
+                            this.get_reg(reg)
+                        }
+                    });
+                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                }
+                _ => {
+                    let n_cols = usize::try_from(op.p2).unwrap_or(0);
+                    let iter = (0..n_cols).map(move |i| {
                         #[allow(clippy::cast_possible_wrap)]
                         let reg = op.p1 + i as i32;
                         this.get_reg(reg)
-                    }
-                });
-                fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-            } else {
-                let iter = (0..n_cols).map(move |i| {
-                    #[allow(clippy::cast_possible_wrap)]
-                    let reg = op.p1 + i as i32;
-                    this.get_reg(reg)
-                });
-                fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                    });
+                    fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                }
             }
         }
         if collect_vdbe_metrics {
@@ -18190,6 +18252,72 @@ mod tests {
     }
 
     #[test]
+    fn test_make_record_precomputed_header_matches_generic_path() {
+        let precomputed = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+            fsqlite_types::record::PrecomputedSerialTypeKind::RealOrNull,
+        ]);
+
+        let generic_rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_rowid = b.alloc_reg();
+            let r_int = b.alloc_reg();
+            let r_real = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 77, r_rowid, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_int, 0, P4::None, 0);
+            b.emit_op(Opcode::Real, 0, r_real, 0, P4::Real(2.5), 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_rowid,
+                3,
+                r_record,
+                P4::Affinity("XDE".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let precomputed_rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_rowid = b.alloc_reg();
+            let r_int = b.alloc_reg();
+            let r_real = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 77, r_rowid, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_int, 0, P4::None, 0);
+            b.emit_op(Opcode::Real, 0, r_real, 0, P4::Real(2.5), 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_rowid,
+                3,
+                r_record,
+                P4::PrecomputedHeader(precomputed.clone()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(precomputed_rows, generic_rows);
+        let decoded = decode_record(&precomputed_rows[0][0]).expect("record should decode");
+        assert_eq!(
+            decoded,
+            vec![
+                SqliteValue::Null,
+                SqliteValue::Integer(5),
+                SqliteValue::Float(2.5),
+            ]
+        );
+    }
+
+    #[test]
     fn test_make_record_sideband_is_invalidated_by_register_overwrite() {
         let rows = run_program(|b| {
             let end = b.emit_label();
@@ -19152,6 +19280,48 @@ mod tests {
 
         let table = final_db.get_table(root).expect("table should exist");
         assert_eq!(table.rows.len(), 0, "write-through must skip MemDatabase");
+    }
+
+    #[test]
+    fn test_insert_write_through_marks_root_page_dirty_for_lazy_memdb_sync() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 99, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&root));
+        assert_eq!(engine.dirty_root_pages().len(), 1);
+        assert!(
+            !engine.storage_cursor_memdb_count_shortcuts_safe(),
+            "storage-backed INSERT should leave MemDB fast paths disabled until reload"
+        );
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "write-through must keep MemDatabase stale"
+        );
     }
 
     #[test]

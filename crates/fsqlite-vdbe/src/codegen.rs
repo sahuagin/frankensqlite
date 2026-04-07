@@ -18,7 +18,7 @@ use fsqlite_ast::{
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
-use fsqlite_types::serial_type::{varint_len, write_varint};
+use fsqlite_types::record::{PrecomputedRecordHeader, PrecomputedSerialTypeKind};
 use fsqlite_types::value::classify_sql_like_fast_path;
 use fsqlite_types::{SmallText, SqliteValue, StrictColumnType, TypeAffinity};
 
@@ -79,17 +79,6 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
         Some(ConflictAction::Fail) => OE_FAIL,
         Some(ConflictAction::Ignore) => OE_IGNORE,
         Some(ConflictAction::Replace) => OE_REPLACE,
-    }
-}
-
-fn compute_record_header_size(content_size: usize) -> usize {
-    let mut header_size = content_size + 1;
-    loop {
-        let needed = varint_len(header_size as u64) + content_size;
-        if needed <= header_size {
-            return header_size;
-        }
-        header_size = needed;
     }
 }
 
@@ -9908,41 +9897,28 @@ fn emit_table_insert_record(
 }
 
 fn make_insert_record_p4(table: &TableSchema, affinity: &str) -> P4 {
-    try_build_insert_record_header_template(table)
-        .map(P4::RecordHeaderTemplate)
+    try_build_precomputed_record_header(table)
+        .map(P4::PrecomputedHeader)
         .unwrap_or_else(|| P4::Affinity(affinity.to_owned()))
 }
 
-fn try_build_insert_record_header_template(table: &TableSchema) -> Option<Vec<u8>> {
-    let mut serial_types = Vec::with_capacity(table.columns.len());
+fn try_build_precomputed_record_header(table: &TableSchema) -> Option<PrecomputedRecordHeader> {
+    let mut kinds = Vec::with_capacity(table.columns.len());
     for column in &table.columns {
-        if column.is_ipk {
-            serial_types.push(0);
-            continue;
-        }
-        serial_types.push(fixed_insert_serial_type(column)?);
+        kinds.push(precomputed_serial_type_kind(column)?);
     }
-    Some(encode_record_header_template(&serial_types))
+    Some(PrecomputedRecordHeader::new(&kinds))
 }
 
-fn fixed_insert_serial_type(column: &ColumnInfo) -> Option<u64> {
+fn precomputed_serial_type_kind(column: &ColumnInfo) -> Option<PrecomputedSerialTypeKind> {
+    if column.is_ipk {
+        return Some(PrecomputedSerialTypeKind::NullPlaceholder);
+    }
     match column.strict_type {
-        Some(StrictColumnType::Real) if column.notnull => Some(7),
+        Some(StrictColumnType::Integer) => Some(PrecomputedSerialTypeKind::IntegerOrNull),
+        Some(StrictColumnType::Real) => Some(PrecomputedSerialTypeKind::RealOrNull),
         _ => None,
     }
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn encode_record_header_template(serial_types: &[u64]) -> Vec<u8> {
-    let header_content_size = serial_types.iter().copied().map(varint_len).sum::<usize>();
-    let header_size = compute_record_header_size(header_content_size);
-    let mut header = vec![0; header_size];
-    let mut offset = write_varint(&mut header, u64::try_from(header_size).unwrap_or(u64::MAX));
-    for serial_type in serial_types {
-        offset += write_varint(&mut header[offset..], *serial_type);
-    }
-    debug_assert_eq!(offset, header_size);
-    header
 }
 
 /// Build a table-record blob at codegen time for rows whose stored image is
@@ -17729,6 +17705,47 @@ mod tests {
         }]
     }
 
+    fn schema_with_ipk_and_strict_text() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'D',
+                    is_ipk: true,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: true,
+                    unique: true,
+                    default_value: None,
+                    strict_type: Some(StrictColumnType::Integer),
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "payload".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: Some(StrictColumnType::Text),
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: true,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     fn schema_with_visible_rowid_column() -> Vec<TableSchema> {
         vec![TableSchema {
             name: "t".to_owned(),
@@ -25147,7 +25164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_insert_values_known_schema_uses_record_header_template() {
+    fn test_codegen_insert_values_known_schema_uses_precomputed_header() {
         let stmt = InsertStatement {
             with: None,
             or_conflict: None,
@@ -25174,11 +25191,45 @@ mod tests {
             .find(|op| op.opcode == Opcode::MakeRecord)
             .expect("expected MakeRecord for parameterized INSERT");
         assert!(
-            matches!(
-                &make_record.p4,
-                P4::RecordHeaderTemplate(bytes) if bytes == &vec![3, 0, 7]
-            ),
-            "expected fixed record header template [3, 0, 7] for IPK + REAL NOT NULL schema"
+            matches!(&make_record.p4, P4::PrecomputedHeader(header)
+                if header.template == vec![3, 0, 0]
+                    && header.slots.len() == 2
+                    && header.slots[0].kind == PrecomputedSerialTypeKind::NullPlaceholder
+                    && header.slots[1].kind == PrecomputedSerialTypeKind::RealOrNull),
+            "expected a precomputed header for IPK + STRICT REAL schema"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_values_dynamic_text_schema_falls_back_to_affinity() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_and_strict_text();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("expected MakeRecord for parameterized INSERT");
+        assert!(
+            matches!(&make_record.p4, P4::Affinity(aff) if aff == "XB"),
+            "STRICT TEXT schema should stay on the generic affinity-driven MakeRecord path"
         );
     }
 

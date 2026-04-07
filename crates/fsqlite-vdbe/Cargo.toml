@@ -58,5 +58,9 @@ harness = false
 name = "vectorized_dispatch"
 harness = false
 
+[[bench]]
+name = "make_record"
+harness = false
+
 [lints]
 workspace = true

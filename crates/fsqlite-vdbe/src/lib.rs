@@ -773,7 +773,7 @@ impl VdbeProgram {
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
-                P4::RecordHeaderTemplate(bytes) => format!("(hdr)[{}B]", bytes.len()),
+                P4::PrecomputedHeader(header) => format!("(hdr)[{}B]", header.template.len()),
                 P4::TimeTravelCommitSeq(seq) => format!("(tt-seq){seq}"),
                 P4::TimeTravelTimestamp(ts) => format!("(tt-ts){ts}"),
             };
@@ -1659,7 +1659,10 @@ mod tests {
             P4::FuncName("count".to_owned()),
             P4::Table("users".to_owned()),
             P4::Affinity("ddd".to_owned()),
-            P4::RecordHeaderTemplate(vec![3, 0, 7]),
+            P4::PrecomputedHeader(fsqlite_types::record::PrecomputedRecordHeader::new(&[
+                fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+                fsqlite_types::record::PrecomputedSerialTypeKind::RealOrNull,
+            ])),
         ];
         assert_eq!(variants.len(), 11);
 
@@ -1674,9 +1677,10 @@ mod tests {
         assert!(matches!(variants[7], P4::FuncName(ref s) if s == "count"));
         assert!(matches!(variants[8], P4::Table(ref s) if s == "users"));
         assert!(matches!(variants[9], P4::Affinity(ref s) if s == "ddd"));
-        assert!(
-            matches!(variants[10], P4::RecordHeaderTemplate(ref bytes) if bytes == &vec![3, 0, 7])
-        );
+        assert!(matches!(
+            variants[10],
+            P4::PrecomputedHeader(ref header) if header.template == vec![3, 0, 0]
+        ));
     }
 
     // ── test_label_emit_and_resolve ─────────────────────────────────────

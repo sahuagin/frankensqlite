@@ -1076,7 +1076,7 @@ pub enum P4 {
     /// An affinity string (one char per column).
     Affinity(String),
     /// A precomputed SQLite record header template for `MakeRecord`.
-    RecordHeaderTemplate(Vec<u8>),
+    PrecomputedHeader(crate::record::PrecomputedRecordHeader),
     /// Time-travel target: commit sequence for `FOR SYSTEM_TIME AS OF COMMITSEQ <n>`.
     TimeTravelCommitSeq(u64),
     /// Time-travel target: ISO-8601 timestamp for `FOR SYSTEM_TIME AS OF '<ts>'`.
@@ -1436,7 +1436,7 @@ impl VdbeProgram {
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
-                P4::RecordHeaderTemplate(bytes) => format!("(hdr)[{}B]", bytes.len()),
+                P4::PrecomputedHeader(header) => format!("(hdr)[{}B]", header.template.len()),
                 P4::TimeTravelCommitSeq(seq) => format!("(tt-seq){seq}"),
                 P4::TimeTravelTimestamp(ts) => format!("(tt-ts){ts}"),
             };

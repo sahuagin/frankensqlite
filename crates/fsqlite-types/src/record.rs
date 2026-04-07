@@ -824,6 +824,148 @@ pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteVal
     Some(values)
 }
 
+/// Supported compile-time header slots for `OP_MakeRecord`.
+///
+/// These are the cases where codegen can prove the SQLite record header width
+/// up front, so execution only needs to memcpy a header template and patch the
+/// remaining one-byte serial types in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrecomputedSerialTypeKind {
+    /// INTEGER PRIMARY KEY aliases are stored as the rowid, so the record
+    /// payload always contains a NULL placeholder for that column.
+    NullPlaceholder,
+    /// STRICT INTEGER column after `TypeCheck`/`Affinity`: either NULL or an
+    /// integer serial type in the 0/1..=9 range (always a one-byte varint).
+    IntegerOrNull,
+    /// STRICT REAL column after `TypeCheck`/`Affinity`: either NULL or REAL.
+    /// NaN still normalizes to NULL during serialization.
+    RealOrNull,
+}
+
+impl PrecomputedSerialTypeKind {
+    fn header_varint_len(self) -> usize {
+        match self {
+            Self::NullPlaceholder | Self::IntegerOrNull | Self::RealOrNull => 1,
+        }
+    }
+
+    const fn max_payload_len(self) -> usize {
+        match self {
+            Self::NullPlaceholder => 0,
+            Self::IntegerOrNull | Self::RealOrNull => 8,
+        }
+    }
+
+    fn serial_byte_and_payload_len(self, value: &SqliteValue) -> Option<(u8, usize)> {
+        match self {
+            Self::NullPlaceholder => Some((0, 0)),
+            Self::IntegerOrNull => match value {
+                SqliteValue::Null => Some((0, 0)),
+                SqliteValue::Integer(i) => {
+                    let serial_type = serial_type_for_integer(*i);
+                    let payload_len = match serial_type {
+                        8 | 9 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => 3,
+                        4 => 4,
+                        5 => 6,
+                        6 => 8,
+                        _ => unreachable!("integer serial type must be in 1..=9"),
+                    };
+                    Some((u8::try_from(serial_type).unwrap_or(0), payload_len))
+                }
+                _ => None,
+            },
+            Self::RealOrNull => match value {
+                SqliteValue::Null => Some((0, 0)),
+                SqliteValue::Float(f) => {
+                    if f.is_nan() {
+                        Some((0, 0))
+                    } else {
+                        Some((7, 8))
+                    }
+                }
+                _ => None,
+            },
+        }
+    }
+
+    const fn needs_runtime_patch(self) -> bool {
+        matches!(self, Self::IntegerOrNull | Self::RealOrNull)
+    }
+}
+
+/// A precomputed SQLite record-header template plus per-column slot metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrecomputedRecordHeader {
+    /// Fully encoded header bytes, including the header-size varint.
+    ///
+    /// Dynamic serial-type slots are initialized to `0` and patched in-place at
+    /// execution time.
+    pub template: Vec<u8>,
+    /// Slot metadata in column order.
+    pub slots: Vec<PrecomputedSerialTypeSlot>,
+    /// Worst-case payload bytes for all supported runtime values.
+    pub max_body_size: usize,
+}
+
+impl PrecomputedRecordHeader {
+    /// Build a header template for a sequence of supported serial-type slots.
+    #[must_use]
+    pub fn new(kinds: &[PrecomputedSerialTypeKind]) -> Self {
+        let header_content_size = kinds
+            .iter()
+            .map(|kind| kind.header_varint_len())
+            .sum::<usize>();
+        let header_size = compute_header_size(header_content_size);
+        let mut template = vec![0; header_size];
+        let mut offset = write_varint(
+            template.as_mut_slice(),
+            u64::try_from(header_size).unwrap_or(u64::MAX),
+        );
+        let mut slots = Vec::with_capacity(kinds.len());
+        let mut max_body_size = 0usize;
+
+        for &kind in kinds {
+            let slot_offset = offset;
+            if kind.needs_runtime_patch() {
+                template[offset] = 0;
+                offset += 1;
+            } else {
+                offset += write_varint(&mut template[offset..], 0);
+            }
+            slots.push(PrecomputedSerialTypeSlot {
+                kind,
+                header_offset: slot_offset,
+            });
+            max_body_size += kind.max_payload_len();
+        }
+
+        debug_assert_eq!(offset, header_size);
+        Self {
+            template,
+            slots,
+            max_body_size,
+        }
+    }
+
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+/// Column-order metadata for a precomputed record header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrecomputedSerialTypeSlot {
+    /// Compile-time slot behavior.
+    pub kind: PrecomputedSerialTypeKind,
+    /// Offset within [`PrecomputedRecordHeader::template`] where this slot's
+    /// serial-type varint begins.
+    pub header_offset: usize,
+}
+
 /// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter())
@@ -858,6 +1000,48 @@ where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
     serialize_record_iter_into_impl(values, buf);
+}
+
+/// Serialize a record using a compile-time precomputed header template.
+///
+/// Returns `false` when the runtime values do not match the header contract,
+/// allowing callers to fall back to the generic path.
+pub fn serialize_record_iter_with_precomputed_header_into<'a, I>(
+    values: I,
+    header: &PrecomputedRecordHeader,
+    buf: &mut Vec<u8>,
+) -> bool
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let header_size = header.template.len();
+    let total_capacity = header_size + header.max_body_size;
+    buf.clear();
+    buf.resize(total_capacity, 0);
+    buf[..header_size].copy_from_slice(&header.template);
+
+    let mut body_offset = header_size;
+    let mut value_iter = values;
+    for slot in &header.slots {
+        let Some(value) = value_iter.next() else {
+            return false;
+        };
+        let Some((serial_byte, payload_len)) = slot.kind.serial_byte_and_payload_len(value) else {
+            return false;
+        };
+        if slot.kind.needs_runtime_patch() {
+            buf[slot.header_offset] = serial_byte;
+        }
+        let end = body_offset + payload_len;
+        encode_serialized_value(value, payload_len, &mut buf[body_offset..end]);
+        body_offset = end;
+    }
+    if value_iter.next().is_some() {
+        return false;
+    }
+
+    buf.truncate(body_offset);
+    true
 }
 
 /// Compute the total header size (including the header-size varint itself).
@@ -1834,6 +2018,83 @@ mod tests {
                     lazy_val,
                 );
             }
+        }
+    }
+
+    proptest::prop_compose! {
+        fn arb_precomputed_header_case()
+            (kind in 0_u8..3, i in any::<i64>(), f in any::<f64>())
+            -> (PrecomputedSerialTypeKind, SqliteValue, SqliteValue)
+        {
+            match kind {
+                0 => (
+                    PrecomputedSerialTypeKind::NullPlaceholder,
+                    SqliteValue::Integer(i),
+                    SqliteValue::Null,
+                ),
+                1 => {
+                    if i.rem_euclid(3) == 0 {
+                        (
+                            PrecomputedSerialTypeKind::IntegerOrNull,
+                            SqliteValue::Null,
+                            SqliteValue::Null,
+                        )
+                    } else {
+                        let value = SqliteValue::Integer(i);
+                        (
+                            PrecomputedSerialTypeKind::IntegerOrNull,
+                            value.clone(),
+                            value,
+                        )
+                    }
+                }
+                _ => {
+                    if i.rem_euclid(3) == 0 {
+                        (
+                            PrecomputedSerialTypeKind::RealOrNull,
+                            SqliteValue::Null,
+                            SqliteValue::Null,
+                        )
+                    } else {
+                        let value = SqliteValue::Float(f);
+                        (
+                            PrecomputedSerialTypeKind::RealOrNull,
+                            value.clone(),
+                            value,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn prop_precomputed_header_matches_generic_record(
+            cases in proptest::collection::vec(arb_precomputed_header_case(), 1..16)
+        ) {
+            let kinds: Vec<_> = cases.iter().map(|(kind, _, _)| *kind).collect();
+            let source_values: Vec<_> = cases.iter().map(|(_, source, _)| source.clone()).collect();
+            let generic_values: Vec<_> = cases.iter().map(|(_, _, generic)| generic.clone()).collect();
+            let header = PrecomputedRecordHeader::new(&kinds);
+            let mut encoded = Vec::new();
+
+            prop_assert!(
+                serialize_record_iter_with_precomputed_header_into(
+                    source_values.iter(),
+                    &header,
+                    &mut encoded,
+                ),
+                "precomputed header should accept generated supported values",
+            );
+
+            prop_assert_eq!(
+                encoded,
+                serialize_record(&generic_values),
+                "precomputed header encoding must match the generic record serializer",
+            );
         }
     }
 }
