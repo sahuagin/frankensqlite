@@ -1271,6 +1271,13 @@ impl<P: PageReader> BtCursor<P> {
         } else {
             // Hot path: no tracing, no stats, minimal overhead.
             let result = work(self);
+            if let Err(error) = self.record_depth_gauge(cx) {
+                debug!(
+                    op_type = op_type.as_str(),
+                    error = %error,
+                    "failed to refresh btree depth gauge"
+                );
+            }
             if !matches!(op_type, BtreeOpType::Seek) {
                 self.clear_seek_cache();
             }
@@ -1317,6 +1324,7 @@ impl<P: PageReader> BtCursor<P> {
     fn reload_page_fresh(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         observe_cursor_cancellation(cx)?;
         self.note_page_visit(page_no);
+        instrumentation::record_page_header_rebuild();
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
@@ -1373,12 +1381,13 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 let leaf_page_no = entry.page_no;
                 if entry.header.cell_count == 0 {
+                    entry.cell_idx = 0;
                     self.stack.push(entry);
-                    self.at_eof = true;
                     if record_leaf_witness {
                         self.record_range_page_witness(leaf_page_no);
                     }
-                    return Ok(false);
+                    self.at_eof = false;
+                    return self.advance_next_impl(cx, record_leaf_witness);
                 }
                 self.stack.push(entry);
                 self.at_eof = false;
@@ -1438,12 +1447,13 @@ impl<P: PageReader> BtCursor<P> {
             if entry.header.page_type.is_leaf() {
                 let leaf_page_no = entry.page_no;
                 if entry.header.cell_count == 0 {
+                    entry.cell_idx = 0;
                     self.stack.push(entry);
-                    self.at_eof = true;
                     if record_leaf_witness {
                         self.record_range_page_witness(leaf_page_no);
                     }
-                    return Ok(false);
+                    self.at_eof = false;
+                    return self.advance_prev(cx);
                 }
                 entry.cell_idx = entry.header.cell_count - 1;
                 self.stack.push(entry);
@@ -2558,6 +2568,54 @@ enum BinarySearchResult {
 }
 
 impl<P: PageWriter> BtCursor<P> {
+    fn seed_empty_root_leaf_cursor(&mut self, cx: &Cx) -> Result<bool> {
+        self.collapse_empty_table_root_if_needed(cx)?;
+
+        let mut root_entry = self.load_page(cx, self.root_page)?;
+        if !root_entry.header.page_type.is_leaf() || root_entry.header.cell_count != 0 {
+            return Ok(false);
+        }
+
+        root_entry.cell_idx = 0;
+        self.stack.clear();
+        self.stack.push(root_entry);
+        self.at_eof = true;
+        Ok(true)
+    }
+
+    fn collapse_empty_table_root_if_needed(&mut self, cx: &Cx) -> Result<()> {
+        if !self.is_table {
+            return Ok(());
+        }
+
+        let root_entry = self.reload_page_fresh(cx, self.root_page)?;
+        if root_entry.header.page_type.is_leaf() || self.count_all_rows_iterative(cx)? != 0 {
+            return Ok(());
+        }
+
+        let header_offset = cell::header_offset_for_page(self.root_page);
+        let mut page = vec![0u8; self.page_size as usize];
+        if header_offset > 0 {
+            page[..header_offset]
+                .copy_from_slice(&root_entry.page_data.as_bytes()[..header_offset]);
+        }
+
+        let header = BtreePageHeader {
+            page_type: cell::BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 0,
+            cell_content_offset: self.usable_size,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        header.write(&mut page, header_offset);
+        self.pager
+            .write_page_data(cx, self.root_page, PageData::from_vec(page))?;
+        self.stack.clear();
+        self.at_eof = true;
+        Ok(())
+    }
+
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
         if let Some(page_no) = self.current_page() {
             self.remember_rightmost_leaf(page_no, rowid);
@@ -2800,58 +2858,347 @@ impl<P: PageWriter> BtCursor<P> {
         Ok((out, overflow))
     }
 
+    fn current_table_leaf_needs_compaction(&self) -> bool {
+        self.stack.last().is_some_and(|entry| {
+            entry.header.page_type == cell::BtreePageType::LeafTable
+                && (entry.header.first_freeblock != 0 || entry.header.fragmented_free_bytes != 0)
+        })
+    }
+
+    fn compact_current_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
+        if !self.current_table_leaf_needs_compaction() {
+            return Ok(false);
+        }
+
+        let saved_entry = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+        let saved_eof = self.at_eof;
+        let page_no = saved_entry.page_no;
+        let header_offset = cell::header_offset_for_page(page_no);
+
+        let mut compacted = vec![0u8; self.page_size as usize];
+        if header_offset > 0 {
+            compacted[..header_offset]
+                .copy_from_slice(&saved_entry.page_data.as_bytes()[..header_offset]);
+        }
+
+        let mut cell_bytes = Vec::with_capacity(saved_entry.cell_pointers.len());
+        for &off in &saved_entry.cell_pointers {
+            let ptr = usize::from(off);
+            let cell = CellRef::parse(
+                saved_entry.page_data.as_bytes(),
+                ptr,
+                saved_entry.header.page_type,
+                self.usable_size,
+            )?;
+            let size = crate::payload::cell_on_page_size(&cell, ptr);
+            cell_bytes.push(saved_entry.page_data.as_bytes()[ptr..ptr + size].to_vec());
+        }
+
+        let mut new_ptrs = Vec::with_capacity(cell_bytes.len());
+        let mut new_content_offset = self.usable_size as usize;
+        for bytes in cell_bytes.iter().rev() {
+            new_content_offset = new_content_offset.checked_sub(bytes.len()).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("table leaf compaction underflow on page {}", page_no.get()),
+                }
+            })?;
+            compacted[new_content_offset..new_content_offset + bytes.len()].copy_from_slice(bytes);
+            new_ptrs.push(u16::try_from(new_content_offset).map_err(|_| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf compaction offset {} exceeds u16 range on page {}",
+                        new_content_offset,
+                        page_no.get()
+                    ),
+                }
+            })?);
+        }
+        new_ptrs.reverse();
+
+        let mut header = saved_entry.header;
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+        header.cell_count =
+            u16::try_from(new_ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf compaction cell count exceeds u16 range on page {}",
+                    page_no.get()
+                ),
+            })?;
+        header.cell_content_offset = if new_ptrs.is_empty() {
+            self.usable_size
+        } else {
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf compaction content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    page_no.get()
+                ),
+            })?
+        };
+        header.write(&mut compacted, header_offset);
+        cell::write_cell_pointers(&mut compacted, header_offset, &header, &new_ptrs);
+
+        self.pager
+            .write_page_data(cx, page_no, PageData::from_vec(compacted))?;
+
+        let mut refreshed = self.reload_page_fresh(cx, page_no)?;
+        if refreshed.header.cell_count == 0 {
+            refreshed.cell_idx = 0;
+        } else {
+            refreshed.cell_idx = saved_entry
+                .cell_idx
+                .min(refreshed.header.cell_count.saturating_sub(1));
+        }
+        if let Some(top) = self.stack.last_mut() {
+            *top = refreshed;
+        }
+        self.at_eof = saved_eof;
+        Ok(true)
+    }
+
+    fn try_allocate_table_leaf_freeblock(
+        entry: &mut StackEntry,
+        cell_len: usize,
+        usable_size: u32,
+    ) -> Result<Option<u16>> {
+        if entry.header.page_type != cell::BtreePageType::LeafTable
+            || entry.header.first_freeblock == 0
+        {
+            return Ok(None);
+        }
+
+        let usable_limit =
+            usize::try_from(usable_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "usable size {} exceeds usize range on page {}",
+                    usable_size,
+                    entry.page_no.get()
+                ),
+            })?;
+        let page_bytes = entry.page_data.as_bytes_mut();
+        let mut previous_freeblock = None;
+        let mut current_freeblock = entry.header.first_freeblock;
+
+        while current_freeblock != 0 {
+            let freeblock_offset = usize::from(current_freeblock);
+            if freeblock_offset + 4 > usable_limit {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock header at offset {} extends past usable space on page {}",
+                        freeblock_offset,
+                        entry.page_no.get()
+                    ),
+                });
+            }
+
+            let next_freeblock = u16::from_be_bytes([
+                page_bytes[freeblock_offset],
+                page_bytes[freeblock_offset + 1],
+            ]);
+            let freeblock_size = usize::from(u16::from_be_bytes([
+                page_bytes[freeblock_offset + 2],
+                page_bytes[freeblock_offset + 3],
+            ]));
+
+            if freeblock_size < 4 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock size {} is too small on page {}",
+                        freeblock_size,
+                        entry.page_no.get()
+                    ),
+                });
+            }
+            if freeblock_offset + freeblock_size > usable_limit {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock [{}..{}) exceeds usable space on page {}",
+                        freeblock_offset,
+                        freeblock_offset + freeblock_size,
+                        entry.page_no.get()
+                    ),
+                });
+            }
+
+            if freeblock_size >= cell_len {
+                let leftover = freeblock_size - cell_len;
+                if leftover >= 4 {
+                    let leftover_offset = freeblock_offset + cell_len;
+                    let leftover_offset_u16 = u16::try_from(leftover_offset).map_err(|_| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "leftover freeblock offset {} exceeds u16 range on page {}",
+                                leftover_offset,
+                                entry.page_no.get()
+                            ),
+                        }
+                    })?;
+                    let leftover_size_u16 =
+                        u16::try_from(leftover).map_err(|_| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "leftover freeblock size {} exceeds u16 range on page {}",
+                                leftover,
+                                entry.page_no.get()
+                            ),
+                        })?;
+
+                    page_bytes[leftover_offset..leftover_offset + 2]
+                        .copy_from_slice(&next_freeblock.to_be_bytes());
+                    page_bytes[leftover_offset + 2..leftover_offset + 4]
+                        .copy_from_slice(&leftover_size_u16.to_be_bytes());
+                    if leftover > 4 {
+                        page_bytes[leftover_offset + 4..freeblock_offset + freeblock_size].fill(0);
+                    }
+
+                    if let Some(previous_offset) = previous_freeblock {
+                        page_bytes[previous_offset..previous_offset + 2]
+                            .copy_from_slice(&leftover_offset_u16.to_be_bytes());
+                    } else {
+                        entry.header.first_freeblock = leftover_offset_u16;
+                    }
+                } else {
+                    if let Some(previous_offset) = previous_freeblock {
+                        page_bytes[previous_offset..previous_offset + 2]
+                            .copy_from_slice(&next_freeblock.to_be_bytes());
+                    } else {
+                        entry.header.first_freeblock = next_freeblock;
+                    }
+
+                    entry.header.fragmented_free_bytes = entry
+                        .header
+                        .fragmented_free_bytes
+                        .saturating_add(u8::try_from(leftover).unwrap_or(u8::MAX));
+                }
+
+                return Ok(Some(current_freeblock));
+            }
+
+            previous_freeblock = Some(freeblock_offset);
+            current_freeblock = next_freeblock;
+        }
+
+        Ok(None)
+    }
+
     /// Try to insert a cell directly onto the leaf page at the top of the
     /// cursor stack. Returns `Ok(true)` if the cell was inserted, or
     /// `Ok(false)` if the page is full and balance is needed.
     fn try_insert_on_leaf(&mut self, cx: &Cx, insert_idx: u16, cell_data: &[u8]) -> Result<bool> {
-        let depth = self.stack.len();
-        if depth == 0 {
-            return Err(FrankenError::internal("cursor stack is empty"));
-        }
-        let leaf_page_no = self.stack[depth - 1].page_no;
+        observe_cursor_cancellation(cx)?;
+        let (leaf_page_no, staged_page, insert_at) = {
+            let entry = self
+                .stack
+                .last_mut()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            if !entry.header.page_type.is_leaf() {
+                return Err(FrankenError::internal(
+                    "try_insert_on_leaf requires a leaf stack entry",
+                ));
+            }
 
-        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
-        let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
-        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+            let leaf_page_no = entry.page_no;
+            let header_offset = cell::header_offset_for_page(leaf_page_no);
+            let content_offset = entry.header.content_offset(self.usable_size);
+            let insert_at = usize::from(insert_idx).min(entry.cell_pointers.len());
+            let ptr_array_end = header_offset
+                + usize::from(entry.header.page_type.header_size())
+                + (entry.cell_pointers.len() + 1) * 2;
+            let new_cell_offset = if ptr_array_end <= content_offset {
+                if let Some(reused_offset) = Self::try_allocate_table_leaf_freeblock(
+                    entry,
+                    cell_data.len(),
+                    self.usable_size,
+                )? {
+                    reused_offset
+                } else if let Some(new_content_offset) = content_offset.checked_sub(cell_data.len())
+                    && ptr_array_end <= new_content_offset
+                {
+                    entry.header.cell_content_offset =
+                        u32::try_from(new_content_offset).map_err(|_| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "new leaf content offset {} exceeds u32 range on page {}",
+                                    new_content_offset,
+                                    leaf_page_no.get()
+                                ),
+                            }
+                        })?;
+                    u16::try_from(new_content_offset).map_err(|_| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "new leaf cell offset {} exceeds u16 range on page {}",
+                                new_content_offset,
+                                leaf_page_no.get()
+                            ),
+                        }
+                    })?
+                } else {
+                    debug!(
+                        page_number = leaf_page_no.get(),
+                        requested_insert_idx = insert_idx,
+                        reason = "content_underflow",
+                        "leaf insert requires balance or compaction"
+                    );
+                    return Ok(false);
+                }
+            } else {
+                debug!(
+                    page_number = leaf_page_no.get(),
+                    requested_insert_idx = insert_idx,
+                    reason = "pointer_array_overlap",
+                    "leaf insert requires balance or compaction"
+                );
+                return Ok(false);
+            };
+            entry.cell_pointers.insert(insert_at, new_cell_offset);
+            entry.header.cell_count = u16::try_from(entry.cell_pointers.len()).map_err(|_| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "leaf page {} cell count exceeds u16 range during insert",
+                        leaf_page_no.get()
+                    ),
+                }
+            })?;
 
-        let content_offset = header.content_offset(self.usable_size);
-        let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
-            return Ok(false); // Page full.
+            {
+                let page_bytes = entry.page_data.as_bytes_mut();
+                let new_cell_offset_usize = usize::from(new_cell_offset);
+                page_bytes[new_cell_offset_usize..new_cell_offset_usize + cell_data.len()]
+                    .copy_from_slice(cell_data);
+                entry.header.write(page_bytes, header_offset);
+                cell::write_cell_pointers(
+                    page_bytes,
+                    header_offset,
+                    &entry.header,
+                    &entry.cell_pointers,
+                );
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                entry.cell_idx = insert_at as u16;
+            }
+
+            debug!(
+                page_number = leaf_page_no.get(),
+                insert_at,
+                cell_count = entry.header.cell_count,
+                "reused current leaf state after no-split insert"
+            );
+            instrumentation::record_no_split_reuse_hit();
+            (leaf_page_no, entry.page_data.clone(), insert_at)
         };
 
-        let ptr_array_end = header_offset
-            + usize::from(header.page_type.header_size())
-            + (usize::from(header.cell_count) + 1) * 2;
-        if ptr_array_end > new_content_offset {
-            return Ok(false); // Page full.
-        }
-
-        let insert_at = usize::from(insert_idx).min(ptrs.len());
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            ptrs.insert(insert_at, new_content_offset as u16);
-            header.cell_count = ptrs.len() as u16;
-            header.cell_content_offset = new_content_offset as u32;
-        }
-        {
-            let page_bytes = page_data.as_bytes_mut();
-            page_bytes[new_content_offset..new_content_offset + cell_data.len()]
-                .copy_from_slice(cell_data);
-            header.write(page_bytes, header_offset);
-            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
-        }
-
-        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
-
-        // Refresh the top stack entry from the pager.
-        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            refreshed.cell_idx = insert_at as u16;
-        }
-        self.stack[depth - 1] = refreshed;
+        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
         self.at_eof = false;
+        trace!(
+            page_number = leaf_page_no.get(),
+            insert_at, "published retained no-split leaf insert without reload"
+        );
         Ok(true)
     }
 
@@ -3397,6 +3744,137 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
+    fn remove_table_cell_from_leaf_deferred(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
+        let depth = self.stack.len();
+        if depth == 0 || self.at_eof {
+            return Err(FrankenError::internal("cursor at EOF during remove"));
+        }
+
+        let (overflow_head, delete_idx, delete_offset, delete_size, leaf_page_no) = {
+            let top = &self.stack[depth - 1];
+            if top.header.page_type != cell::BtreePageType::LeafTable {
+                return Err(FrankenError::internal(
+                    "remove_table_cell_from_leaf_deferred requires a table leaf page",
+                ));
+            }
+
+            let delete_idx = usize::from(top.cell_idx);
+            let delete_offset = usize::from(
+                *top.cell_pointers
+                    .get(delete_idx)
+                    .ok_or_else(|| FrankenError::internal("cursor position out of bounds"))?,
+            );
+            let cell_ref = self.parse_cell_at(top, top.cell_idx)?;
+            let delete_size = crate::payload::cell_on_page_size(&cell_ref, delete_offset);
+            (
+                cell_ref.overflow_page,
+                delete_idx,
+                delete_offset,
+                delete_size,
+                top.page_no,
+            )
+        };
+
+        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
+        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let original_len = ptrs.len();
+        if delete_idx >= original_len {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "delete_idx {} out of bounds for page {} with {} cells",
+                    delete_idx,
+                    leaf_page_no,
+                    ptrs.len()
+                ),
+            });
+        }
+        ptrs.remove(delete_idx);
+
+        if ptrs.is_empty() {
+            header.first_freeblock = 0;
+            header.fragmented_free_bytes = 0;
+            header.cell_content_offset = self.usable_size;
+            page_data.as_bytes_mut()[header_offset..self.usable_size as usize].fill(0);
+        } else if delete_size >= 4 {
+            let delete_offset_u16 =
+                u16::try_from(delete_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock offset {} exceeds u16 range on page {}",
+                        delete_offset,
+                        leaf_page_no.get()
+                    ),
+                })?;
+            let freeblock_size =
+                u16::try_from(delete_size).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "freeblock size {} exceeds u16 range on page {}",
+                        delete_size,
+                        leaf_page_no.get()
+                    ),
+                })?;
+            let page_bytes = page_data.as_bytes_mut();
+            page_bytes[delete_offset..delete_offset + 2]
+                .copy_from_slice(&header.first_freeblock.to_be_bytes());
+            page_bytes[delete_offset + 2..delete_offset + 4]
+                .copy_from_slice(&freeblock_size.to_be_bytes());
+            if delete_size > 4 {
+                page_bytes[delete_offset + 4..delete_offset + delete_size].fill(0);
+            }
+            header.first_freeblock = delete_offset_u16;
+        } else {
+            header.fragmented_free_bytes = header
+                .fragmented_free_bytes
+                .saturating_add(u8::try_from(delete_size).unwrap_or(u8::MAX));
+            page_data.as_bytes_mut()[delete_offset..delete_offset + delete_size].fill(0);
+        }
+
+        header.cell_count =
+            u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf page {} cell count exceeds u16 range during delete",
+                    leaf_page_no.get()
+                ),
+            })?;
+
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+            let stale_ptr_offset =
+                header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+            if original_len > ptrs.len() && stale_ptr_offset + 2 <= page_bytes.len() {
+                page_bytes[stale_ptr_offset..stale_ptr_offset + 2].fill(0);
+            }
+        }
+
+        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
+
+        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
+        let new_count = refreshed.header.cell_count;
+        if new_count == 0 {
+            refreshed.cell_idx = 0;
+            self.at_eof = true;
+            self.stack[depth - 1] = refreshed;
+        } else if delete_idx >= usize::from(new_count) {
+            refreshed.cell_idx = new_count - 1;
+            self.at_eof = false;
+            self.stack[depth - 1] = refreshed;
+            self.advance_next(cx)?;
+        } else {
+            refreshed.cell_idx = delete_idx as u16;
+            self.at_eof = false;
+            self.stack[depth - 1] = refreshed;
+        }
+
+        if let Some(first) = overflow_head {
+            self.free_overflow_chain(cx, first)?;
+        }
+
+        Ok((leaf_page_no, new_count))
+    }
+
     fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
@@ -3741,7 +4219,11 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        let insert_idx = {
+        if self.stack.is_empty() && !self.seed_empty_root_leaf_cursor(cx)? {
+            return Err(FrankenError::internal("cursor stack is empty"));
+        }
+
+        let mut insert_idx = {
             let top = self
                 .stack
                 .last()
@@ -3756,30 +4238,52 @@ impl<P: PageWriter> BtCursor<P> {
         // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let mut attempted_compaction = false;
 
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-            Ok(true) => {
-                self.cell_buf = cell_data;
-                self.last_insert_rowid = Some(rowid);
-                Ok(())
-            }
-            Ok(false) => {
-                // Page full — balance and redistribute.
-                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
-                self.cell_buf = cell_data;
-                if balance_result.is_ok() {
+        loop {
+            match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+                Ok(true) => {
+                    self.cell_buf = cell_data;
                     self.last_insert_rowid = Some(rowid);
-                } else if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                    return Ok(());
                 }
-                balance_result
-            }
-            Err(error) => {
-                self.cell_buf = cell_data;
-                if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+                Ok(false) => {
+                    if !attempted_compaction
+                        && self.current_table_leaf_needs_compaction()
+                        && self.compact_current_table_leaf(cx)?
+                    {
+                        attempted_compaction = true;
+                        insert_idx = {
+                            let top = self
+                                .stack
+                                .last()
+                                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                            if self.at_eof {
+                                top.header.cell_count
+                            } else {
+                                top.cell_idx
+                            }
+                        };
+                        continue;
+                    }
+
+                    instrumentation::record_conservative_reload_fallback();
+                    let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                    self.cell_buf = cell_data;
+                    if balance_result.is_ok() {
+                        self.last_insert_rowid = Some(rowid);
+                    } else if let Some(first) = overflow_head {
+                        let _ = self.free_overflow_chain(cx, first);
+                    }
+                    return balance_result;
                 }
-                Err(error)
+                Err(error) => {
+                    self.cell_buf = cell_data;
+                    if let Some(first) = overflow_head {
+                        let _ = self.free_overflow_chain(cx, first);
+                    }
+                    return Err(error);
+                }
             }
         }
     }
@@ -3811,6 +4315,7 @@ impl<P: PageWriter> BtCursor<P> {
                 Ok(())
             }
             Ok(false) => {
+                instrumentation::record_conservative_reload_fallback();
                 let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
                 self.cell_buf = cell_data;
                 if balance_result.is_err() {
@@ -4041,14 +4546,30 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        self.move_to_leftmost_leaf(cx, self.root_page, true)
+        if self.is_table && self.count_all_rows_iterative(cx)? == 0 {
+            self.collapse_empty_table_root_if_needed(cx)?;
+            return Ok(false);
+        }
+        let found = self.move_to_leftmost_leaf(cx, self.root_page, true)?;
+        if !found {
+            self.collapse_empty_table_root_if_needed(cx)?;
+        }
+        Ok(found)
     }
 
     fn last(&mut self, cx: &Cx) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
-        self.move_to_rightmost_leaf(cx, self.root_page, true)
+        if self.is_table && self.count_all_rows_iterative(cx)? == 0 {
+            self.collapse_empty_table_root_if_needed(cx)?;
+            return Ok(false);
+        }
+        let found = self.move_to_rightmost_leaf(cx, self.root_page, true)?;
+        if !found {
+            self.collapse_empty_table_root_if_needed(cx)?;
+        }
+        Ok(found)
     }
 
     fn next(&mut self, cx: &Cx) -> Result<bool> {
@@ -4128,6 +4649,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
                 Ok(false) => {
                     // Page full — balance and redistribute.
+                    instrumentation::record_conservative_reload_fallback();
                     let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
                     cursor.cell_buf = cell_data;
                     if balance_result.is_err() {
@@ -4386,36 +4908,50 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 None
             };
 
-            // Remove the cell from the leaf. This handles overflow chain
-            // cleanup and refreshes the stack entry.
-            let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx)?;
-
-            // Trigger structural rebalance only when a non-root leaf drains.
-            // This avoids aggressive full-sibling rewrites on every delete while
-            // still fixing the "empty leftmost leaf breaks first()" failure mode.
-            if new_count == 0 {
-                cursor.balance_for_delete(cx)?;
-
-                // If we balanced, the stack was cleared. Re-seek to the anchor.
-                // Since the anchor key was just deleted, the seek will land on
-                // the *next* entry (or EOF), which is exactly what we want.
-                if let Some(anc) = anchor {
-                    match anc {
-                        Anchor::Rowid(r) => {
-                            cursor.table_move_to(cx, r)?;
+            if cursor.is_table {
+                let (_leaf_page_no, new_count) = cursor.remove_table_cell_from_leaf_deferred(cx)?;
+                if new_count == 0 {
+                    if let Some(anc) = anchor {
+                        match anc {
+                            Anchor::Rowid(r) => {
+                                cursor.table_move_to(cx, r)?;
+                            }
+                            Anchor::Key(k) => {
+                                cursor.index_move_to(cx, &k)?;
+                            }
                         }
-                        Anchor::Key(k) => {
-                            cursor.index_move_to(cx, &k)?;
+                    }
+                } else if let Some((page_no, separator_idx, new_max_rowid)) = separator_repair {
+                    cursor.replace_table_interior_separator_rowid(
+                        cx,
+                        page_no,
+                        separator_idx,
+                        new_max_rowid,
+                    )?;
+                }
+            } else {
+                // Remove the cell from the leaf. This handles overflow chain
+                // cleanup and refreshes the stack entry.
+                let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx)?;
+
+                // Trigger structural rebalance only when a non-root leaf drains.
+                if new_count == 0 {
+                    cursor.balance_for_delete(cx)?;
+
+                    // If we balanced, the stack was cleared. Re-seek to the anchor.
+                    // Since the anchor key was just deleted, the seek will land on
+                    // the *next* entry (or EOF), which is exactly what we want.
+                    if let Some(anc) = anchor {
+                        match anc {
+                            Anchor::Rowid(r) => {
+                                cursor.table_move_to(cx, r)?;
+                            }
+                            Anchor::Key(k) => {
+                                cursor.index_move_to(cx, &k)?;
+                            }
                         }
                     }
                 }
-            } else if let Some((page_no, separator_idx, new_max_rowid)) = separator_repair {
-                cursor.replace_table_interior_separator_rowid(
-                    cx,
-                    page_no,
-                    separator_idx,
-                    new_max_rowid,
-                )?;
             }
 
             Ok(())
@@ -4522,11 +5058,13 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
+    use std::sync::{LazyLock, Mutex};
     use std::time::{Duration, Instant};
 
     // MemPageStore is now defined at module scope (pub) and imported via
     // `use super::*;`.  Tests use `MemPageStore::new(USABLE)` instead of
     // the former `MemPageStore::new(USABLE)`.
+    static LEAF_REUSE_CURSOR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[derive(Debug, Clone)]
     struct PrefetchProbeStore {
@@ -4831,7 +5369,7 @@ mod tests {
         cx: &Cx,
         page_no: PageNumber,
         usable_size: u32,
-        is_root: bool,
+        _is_root: bool,
         visited: &mut BTreeSet<u32>,
     ) -> Result<Option<TableSubtreeBounds>> {
         if !visited.insert(page_no.get()) {
@@ -4856,12 +5394,7 @@ mod tests {
         let ptrs = cell::read_cell_pointers(&page, &header, header_offset)?;
         if header.page_type == cell::BtreePageType::LeafTable {
             if ptrs.is_empty() {
-                if is_root {
-                    return Ok(None);
-                }
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("non-root table leaf page {} is empty", page_no.get()),
-                });
+                return Ok(None);
             }
 
             let mut min_rowid = None;
@@ -4899,9 +5432,22 @@ mod tests {
         }
 
         if ptrs.is_empty() {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("interior table page {} has no divider cells", page_no.get()),
-            });
+            let right_child = header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior table page {} is missing a right child",
+                        page_no.get()
+                    ),
+                })?;
+            return validate_table_subtree_invariants(
+                pager,
+                cx,
+                right_child,
+                usable_size,
+                false,
+                visited,
+            );
         }
 
         let mut overall_min = None;
@@ -4929,26 +5475,8 @@ mod tests {
                 usable_size,
                 false,
                 visited,
-            )?
-            .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "interior table page {} points to an empty child subtree {}",
-                    page_no.get(),
-                    left_child.get()
-                ),
-            })?;
+            )?;
 
-            if child_bounds.max_rowid != separator {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "interior table page {} separator {} does not match child {} max {}",
-                        page_no.get(),
-                        separator,
-                        left_child.get(),
-                        child_bounds.max_rowid
-                    ),
-                });
-            }
             if let Some(prev) = prev_separator {
                 if separator <= prev {
                     return Err(FrankenError::DatabaseCorrupt {
@@ -4960,7 +5488,7 @@ mod tests {
                         ),
                     });
                 }
-                if child_bounds.min_rowid <= prev {
+                if child_bounds.is_some_and(|bounds| bounds.min_rowid <= prev) {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "interior table page {} child {} overlaps prior separator {}",
@@ -4972,7 +5500,20 @@ mod tests {
                 }
             }
 
-            overall_min.get_or_insert(child_bounds.min_rowid);
+            if let Some(child_bounds) = child_bounds {
+                if child_bounds.max_rowid > separator {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "interior table page {} child {} max {} exceeds separator {}",
+                            page_no.get(),
+                            left_child.get(),
+                            child_bounds.max_rowid,
+                            separator
+                        ),
+                    });
+                }
+                overall_min.get_or_insert(child_bounds.min_rowid);
+            }
             prev_separator = Some(separator);
         }
 
@@ -4985,17 +5526,10 @@ mod tests {
                 ),
             })?;
         let right_bounds =
-            validate_table_subtree_invariants(pager, cx, right_child, usable_size, false, visited)?
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "interior table page {} points to an empty right subtree {}",
-                        page_no.get(),
-                        right_child.get()
-                    ),
-                })?;
+            validate_table_subtree_invariants(pager, cx, right_child, usable_size, false, visited)?;
 
         if let Some(prev) = prev_separator
-            && right_bounds.min_rowid <= prev
+            && right_bounds.is_some_and(|bounds| bounds.min_rowid <= prev)
         {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -5007,10 +5541,22 @@ mod tests {
             });
         }
 
-        Ok(Some(TableSubtreeBounds {
-            min_rowid: overall_min.expect("interior table page with cells must have a minimum"),
-            max_rowid: right_bounds.max_rowid,
-        }))
+        if let Some(right_bounds) = right_bounds {
+            return Ok(Some(TableSubtreeBounds {
+                min_rowid: overall_min.unwrap_or(right_bounds.min_rowid),
+                max_rowid: right_bounds.max_rowid,
+            }));
+        }
+
+        if let Some(min_rowid) = overall_min {
+            return Ok(Some(TableSubtreeBounds {
+                min_rowid,
+                max_rowid: prev_separator
+                    .expect("interior table page with cells must have a separator"),
+            }));
+        }
+
+        Ok(None)
     }
 
     fn compare_index_test_keys<P: PageReader>(
@@ -7100,7 +7646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_delete_after_root_split() {
+    fn test_cursor_delete_after_root_split_defers_root_collapse() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -7143,25 +7689,19 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        // After balance_shallower, the root collapses from interior
-        // (with 0 cells and a single right-child) down to whatever page
-        // type the right-child was.  For a depth-2 tree the right-child
-        // is a leaf, so the root becomes a leaf.
         let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
         let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
         assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after all rows deleted, got {:?}",
+            root_header.page_type.is_interior(),
+            "deferred delete should keep the split root in place, got {:?}",
             root_header.page_type
         );
-        assert_eq!(
-            root_header.cell_count, 4,
-            "root collapse should preserve the surviving leaf rows"
-        );
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
     }
 
     #[test]
-    fn test_cursor_delete_rebalances_empty_leftmost_leaf() {
+    fn test_cursor_delete_defers_rebalance_of_empty_leftmost_leaf() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
@@ -7204,21 +7744,15 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        // After balance_shallower, the root collapses from interior
-        // (with 0 cells and a single right-child) down to whatever page
-        // type the right-child was.  For a depth-2 tree the right-child
-        // is a leaf, so the root becomes a leaf.
         let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
         let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
         assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after all rows deleted, got {:?}",
+            root_header.page_type.is_interior(),
+            "deferred delete should leave the root interior, got {:?}",
             root_header.page_type
         );
-        assert_eq!(
-            root_header.cell_count, 4,
-            "root collapse should preserve the surviving leaf rows"
-        );
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), leftmost_max_rowid + 1);
     }
 
     #[test]
@@ -7353,6 +7887,114 @@ mod tests {
             .expect("table invariants should still hold after ancestor separator repair");
         assert!(!cursor.table_move_to(&cx, 15).unwrap().is_found());
         assert!(cursor.table_move_to(&cx, 10).unwrap().is_found());
+    }
+
+    #[test]
+    fn test_table_delete_defers_empty_leaf_rebalance_until_later_cleanup() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 10)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"L1"), (5, b"L5"), (10, b"L10")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(20, b"L20"), (25, b"L25")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        for rowid in [1_i64, 5, 10] {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
+        assert!(
+            root_header.page_type.is_interior(),
+            "deferred delete should not immediately collapse the root"
+        );
+
+        let left_leaf = cursor.pager.read_page(&cx, pn(3)).unwrap();
+        let left_header = BtreePageHeader::parse(&left_leaf, 0).unwrap();
+        assert_eq!(
+            left_header.cell_count, 0,
+            "left leaf should be logically empty"
+        );
+
+        assert!(
+            cursor.first(&cx).unwrap(),
+            "remaining right subtree should still be reachable"
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
+    }
+
+    #[test]
+    fn test_table_delete_reclaims_dead_space_on_next_insert_rewrite() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        for rowid in 1_i64..=3 {
+            cursor
+                .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+                .unwrap();
+        }
+
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        cursor.delete(&cx).unwrap();
+
+        let page_before = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let header_before = BtreePageHeader::parse(&page_before, 0).unwrap();
+        assert!(
+            header_before.first_freeblock != 0 || header_before.fragmented_free_bytes != 0,
+            "deferred delete should leave reclaimable dead space on the page"
+        );
+
+        let reclaimed_payload = vec![0x5A; payload_for_rowid(2).len()];
+        cursor
+            .table_insert(&cx, 4, reclaimed_payload.as_slice())
+            .unwrap();
+
+        let page_after = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let header_after = BtreePageHeader::parse(&page_after, 0).unwrap();
+        assert_eq!(header_after.first_freeblock, 0);
+        assert_eq!(header_after.fragmented_free_bytes, 0);
+        assert!(!cursor.table_move_to(&cx, 2).unwrap().is_found());
+        assert!(cursor.table_move_to(&cx, 4).unwrap().is_found());
+    }
+
+    #[test]
+    fn test_table_delete_explicit_compaction_clears_reclaimable_space() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        for rowid in 1_i64..=3 {
+            cursor
+                .table_insert(&cx, rowid, payload_for_rowid(rowid).as_slice())
+                .unwrap();
+        }
+
+        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
+        cursor.delete(&cx).unwrap();
+        assert!(
+            cursor.compact_current_table_leaf(&cx).unwrap(),
+            "explicit compaction should rewrite leaves with reclaimable dead space"
+        );
+
+        let page = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let header = BtreePageHeader::parse(&page, 0).unwrap();
+        assert_eq!(header.first_freeblock, 0);
+        assert_eq!(header.fragmented_free_bytes, 0);
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
     }
 
     #[test]
@@ -7791,6 +8433,257 @@ mod tests {
             .table_insert(&cx, split_insert_rowid + 1, &payload)
             .unwrap();
         assert_eq!(cursor.pager.read_pages(), vec![cached_after_split.page_no]);
+    }
+
+    #[test]
+    fn test_table_insert_from_current_position_reuses_leaf_state_without_reload() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in [10_i64, 30, 50] {
+            let payload = payload_for_rowid(rowid);
+            cursor
+                .table_insert(&cx, rowid, payload.as_slice())
+                .expect("seed insert should succeed");
+        }
+
+        let insert_rowid = 40_i64;
+        assert!(
+            !cursor
+                .table_move_to(&cx, insert_rowid)
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "test rowid should target a missing insertion point"
+        );
+
+        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+        cursor.pager.clear_reads();
+        let payload = payload_for_rowid(insert_rowid);
+        cursor
+            .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
+            .expect("no-split insert should succeed");
+
+        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "no-split insert should not re-read the current leaf"
+        );
+        assert!(
+            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+            "the no-split reuse counter should advance for an in-place leaf insert"
+        );
+
+        let mut rowids = Vec::new();
+        assert!(cursor.first(&cx).expect("scan should start"));
+        loop {
+            rowids.push(cursor.rowid(&cx).expect("rowid should decode"));
+            if !cursor.next(&cx).expect("scan should advance") {
+                break;
+            }
+        }
+        assert_eq!(rowids, vec![10, 30, 40, 50]);
+    }
+
+    #[test]
+    fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, false);
+
+        for id in [10_i64, 30, 50] {
+            let key = synthetic_index_key(id);
+            cursor
+                .index_insert(&cx, &key)
+                .expect("seed index insert should succeed");
+        }
+
+        let inserted_id = 40_i64;
+        let inserted_key = synthetic_index_key(inserted_id);
+        assert!(
+            !cursor
+                .index_move_to(&cx, &inserted_key)
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "inserted key should be missing before the test insert"
+        );
+
+        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+        cursor.pager.clear_reads();
+        cursor
+            .index_insert_from_current_position(&cx, &inserted_key)
+            .expect("no-split index insert should succeed");
+
+        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "no-split index insert should not re-read the current leaf"
+        );
+        assert!(
+            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+            "the no-split reuse counter should advance for an in-place index insert"
+        );
+
+        let scanned = scan_all_index_keys(&mut cursor, &cx).expect("scan should succeed");
+        let mut expected = vec![
+            synthetic_index_key(10),
+            synthetic_index_key(30),
+            synthetic_index_key(40),
+            synthetic_index_key(50),
+        ];
+        expected.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
+        assert_eq!(scanned, expected);
+    }
+
+    #[test]
+    fn test_table_insert_from_current_position_after_delete_reuses_leaf_state() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in [10_i64, 20, 40] {
+            let payload = payload_for_rowid(rowid);
+            cursor
+                .table_insert(&cx, rowid, payload.as_slice())
+                .expect("seed insert should succeed");
+        }
+
+        assert!(
+            cursor
+                .table_move_to(&cx, 20)
+                .expect("seek before delete should succeed")
+                .is_found(),
+            "seed row must exist before delete"
+        );
+        cursor.delete(&cx).expect("delete should succeed");
+
+        let insert_rowid = 30_i64;
+        assert!(
+            !cursor
+                .table_move_to(&cx, insert_rowid)
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "deleted-gap rowid should be missing before reinsertion"
+        );
+
+        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+        cursor.pager.clear_reads();
+        let payload = payload_for_rowid(insert_rowid);
+        cursor
+            .table_insert_from_current_position(&cx, insert_rowid, payload.as_slice())
+            .expect("insert after delete should reuse the retained leaf state");
+
+        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "insert-after-delete should not force a leaf reload on the retained leaf"
+        );
+        assert!(
+            snapshot.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+            "insert-after-delete should still count as an in-place leaf reuse"
+        );
+
+        let mut rowids = Vec::new();
+        assert!(cursor.first(&cx).expect("scan should start"));
+        loop {
+            rowids.push(cursor.rowid(&cx).expect("rowid should decode"));
+            if !cursor.next(&cx).expect("scan should advance") {
+                break;
+            }
+        }
+        assert_eq!(rowids, vec![10, 30, 40]);
+    }
+
+    #[test]
+    fn test_table_insert_from_current_position_records_fallback_when_balance_needed() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        const SMALL_USABLE: u32 = 256;
+
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+        let payload = vec![b'F'; 120];
+
+        cursor
+            .table_insert(&cx, 10, &payload)
+            .expect("first insert should succeed");
+        cursor
+            .table_insert(&cx, 30, &payload)
+            .expect("second insert should succeed");
+
+        assert!(
+            !cursor
+                .table_move_to(&cx, 20)
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "middle rowid should be absent before insert"
+        );
+
+        let mut cell_data = Vec::new();
+        cursor
+            .encode_table_leaf_cell_into(&cx, 20, &payload, &mut cell_data)
+            .expect("cell encoding should succeed");
+        let top = cursor
+            .stack
+            .last()
+            .expect("seek should leave the leaf on stack");
+        let content_offset = top.header.content_offset(cursor.usable_size);
+        let would_fit = content_offset
+            .checked_sub(cell_data.len())
+            .is_some_and(|new_offset| {
+                let ptr_array_end = cell::header_offset_for_page(top.page_no)
+                    + usize::from(top.header.page_type.header_size())
+                    + (top.cell_pointers.len() + 1) * 2;
+                ptr_array_end <= new_offset
+            });
+        assert!(
+            !would_fit,
+            "test setup must force the balance/reload fallback path"
+        );
+
+        let before = crate::instrumentation::btree_leaf_reuse_snapshot();
+        cursor.pager.clear_reads();
+        cursor
+            .table_insert_from_current_position(&cx, 20, &payload)
+            .expect("fallback insert should still succeed via balance");
+
+        let snapshot = crate::instrumentation::btree_leaf_reuse_snapshot();
+        assert!(
+            snapshot.conservative_reload_fallbacks
+                >= before.conservative_reload_fallbacks.saturating_add(1),
+            "the fallback counter should advance when the insert must rebalance"
+        );
+        assert!(
+            validate_table_tree_invariants(&cursor.pager, root, SMALL_USABLE).is_ok(),
+            "balance fallback must preserve table invariants"
+        );
     }
 
     #[test]

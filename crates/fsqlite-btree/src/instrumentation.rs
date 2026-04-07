@@ -87,6 +87,17 @@ pub struct BtreeCopyProfileSnapshot {
     pub interior_cell_rebuild_bytes: u64,
 }
 
+/// Snapshot of residual leaf-state reuse counters for W3-style insert paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BtreeLeafReuseSnapshot {
+    /// Successful no-split leaf inserts that reused the in-memory stack entry.
+    pub no_split_reuse_hits: u64,
+    /// Cases that fell back to the conservative balance/reload path.
+    pub conservative_reload_fallbacks: u64,
+    /// Full header + cell-pointer rebuilds performed via `reload_page_fresh`.
+    pub page_header_rebuild_count: u64,
+}
+
 /// Per-operation mutable stats while a `btree_op` span is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct BtreeOpRuntimeStats {
@@ -145,6 +156,9 @@ static BTREE_INDEX_LEAF_CELL_ASSEMBLY_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_INDEX_LEAF_CELL_ASSEMBLY_BYTES: AtomicU64 = AtomicU64::new(0);
 static BTREE_INTERIOR_CELL_REBUILD_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_INTERIOR_CELL_REBUILD_BYTES: AtomicU64 = AtomicU64::new(0);
+static BTREE_NO_SPLIT_REUSE_HITS: AtomicU64 = AtomicU64::new(0);
+static BTREE_CONSERVATIVE_RELOAD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static BTREE_PAGE_HEADER_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn copy_profile_enabled() -> bool {
@@ -221,6 +235,18 @@ pub(crate) fn record_interior_cell_rebuild(bytes: usize) {
     }
     BTREE_INTERIOR_CELL_REBUILD_CALLS.fetch_add(1, Ordering::Relaxed);
     saturating_add_bytes(&BTREE_INTERIOR_CELL_REBUILD_BYTES, bytes);
+}
+
+pub(crate) fn record_no_split_reuse_hit() {
+    BTREE_NO_SPLIT_REUSE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_conservative_reload_fallback() {
+    BTREE_CONSERVATIVE_RELOAD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_page_header_rebuild() {
+    BTREE_PAGE_HEADER_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 pub(crate) fn record_split_event() {
@@ -322,6 +348,15 @@ pub fn btree_copy_profile_snapshot() -> BtreeCopyProfileSnapshot {
     }
 }
 
+#[must_use]
+pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
+    BtreeLeafReuseSnapshot {
+        no_split_reuse_hits: BTREE_NO_SPLIT_REUSE_HITS.load(Ordering::Relaxed),
+        conservative_reload_fallbacks: BTREE_CONSERVATIVE_RELOAD_FALLBACKS.load(Ordering::Relaxed),
+        page_header_rebuild_count: BTREE_PAGE_HEADER_REBUILD_COUNT.load(Ordering::Relaxed),
+    }
+}
+
 /// Reset all B-tree observability counters.
 pub fn reset_btree_metrics() {
     BTREE_OP_SEEK_TOTAL.store(0, Ordering::Relaxed);
@@ -354,11 +389,23 @@ pub fn reset_btree_copy_profile() {
     BTREE_INTERIOR_CELL_REBUILD_BYTES.store(0, Ordering::Relaxed);
 }
 
+pub fn reset_btree_leaf_reuse_profile() {
+    BTREE_NO_SPLIT_REUSE_HITS.store(0, Ordering::Relaxed);
+    BTREE_CONSERVATIVE_RELOAD_FALLBACKS.store(0, Ordering::Relaxed);
+    BTREE_PAGE_HEADER_REBUILD_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) static LEAF_REUSE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BtreeOpType, btree_copy_profile_snapshot, btree_metrics_snapshot, record_operation,
-        reset_btree_copy_profile, reset_btree_metrics, set_btree_copy_profile_enabled,
+        BtreeOpType, btree_copy_profile_snapshot, btree_leaf_reuse_snapshot,
+        btree_metrics_snapshot, record_conservative_reload_fallback, record_no_split_reuse_hit,
+        record_operation, record_page_header_rebuild, reset_btree_copy_profile,
+        reset_btree_metrics, set_btree_copy_profile_enabled,
     };
     use crate::{BtCursor, BtreeCursorOps, MemPageStore};
     use fsqlite_types::PageNumber;
@@ -483,5 +530,32 @@ mod tests {
         );
         assert!(after.overflow_chain_overflow_bytes > before.overflow_chain_overflow_bytes);
         assert!(after.overflow_page_reads > before.overflow_page_reads);
+    }
+
+    #[test]
+    fn leaf_reuse_profile_tracks_reuse_fallback_and_rebuilds() {
+        let _guard = super::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse test lock");
+        let before = btree_leaf_reuse_snapshot();
+
+        record_no_split_reuse_hit();
+        record_conservative_reload_fallback();
+        record_page_header_rebuild();
+
+        let after = btree_leaf_reuse_snapshot();
+        assert!(
+            after.no_split_reuse_hits >= before.no_split_reuse_hits.saturating_add(1),
+            "no-split reuse counter should advance"
+        );
+        assert!(
+            after.conservative_reload_fallbacks
+                >= before.conservative_reload_fallbacks.saturating_add(1),
+            "fallback counter should advance"
+        );
+        assert!(
+            after.page_header_rebuild_count >= before.page_header_rebuild_count.saturating_add(1),
+            "page-header rebuild counter should advance"
+        );
     }
 }
