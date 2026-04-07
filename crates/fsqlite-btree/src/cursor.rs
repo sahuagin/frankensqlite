@@ -2374,11 +2374,13 @@ impl<P: PageReader> BtCursor<P> {
                     let child = self.child_page_at(parent, next_child_idx)?;
 
                     self.stack[depth - 1].cell_idx = next_child_idx;
+                    let resume_stack = self.stack.clone();
                     self.issue_prefetch_hint(cx, child);
                     let found = self.move_to_leftmost_leaf(cx, child, record_leaf_witness)?;
                     if found {
                         return Ok(true);
                     }
+                    self.stack = resume_stack;
                     self.at_eof = false;
                     return self.advance_next_impl(cx, record_leaf_witness);
                 }
@@ -2394,6 +2396,15 @@ impl<P: PageReader> BtCursor<P> {
         // On an interior page (only happens for index B-trees).
         // The current position is the separator cell itself.
         // The next logical entry is the leftmost descendant of the right subtree.
+        if cell_idx >= cell_count {
+            self.stack.pop();
+            if self.stack.is_empty() {
+                self.at_eof = true;
+                return Ok(false);
+            }
+            self.at_eof = false;
+            return self.advance_next_impl(cx, record_leaf_witness);
+        }
         let next_child_idx = cell_idx + 1;
         let child = {
             let top = &self.stack[depth - 1];
@@ -2403,11 +2414,13 @@ impl<P: PageReader> BtCursor<P> {
             .last_mut()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
             .cell_idx = next_child_idx;
+        let resume_stack = self.stack.clone();
         self.issue_prefetch_hint(cx, child);
         let found = self.move_to_leftmost_leaf(cx, child, false)?;
         if found {
             Ok(true)
         } else {
+            self.stack = resume_stack;
             self.at_eof = false;
             self.advance_next_impl(cx, record_leaf_witness)
         }
@@ -9288,6 +9301,63 @@ mod tests {
         assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
         assert!(cursor.next(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+    }
+
+    #[test]
+    fn test_cursor_next_skips_empty_table_child_subtree_without_restarting_root() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_table(&[(pn(3), 5), (pn(4), 10)], pn(5)),
+        );
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+        store.pages.insert(4, build_leaf_table(&[]));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(20, b"twenty"), (25, b"twenty-five")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(
+            cursor.rowid(&cx).unwrap(),
+            20,
+            "next() should skip the empty middle child subtree and continue forward"
+        );
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 25);
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_cursor_next_handles_empty_rightmost_table_child_subtree() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
+        store.pages.insert(4, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 5);
+        assert!(
+            !cursor.next(&cx).unwrap(),
+            "advancing past an empty rightmost child subtree should cleanly reach EOF"
+        );
     }
 
     #[test]
