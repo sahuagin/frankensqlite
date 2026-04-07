@@ -19,10 +19,13 @@ use fsqlite_ast::{
     JoinConstraint, JoinKind, LikeOp, Literal, NullsOrder, OrderingTerm, ResultColumn, SelectBody,
     SelectCore, SortDirection, Span, TableOrSubquery,
 };
+use lru::LruCache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
+use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
 // Compound ORDER BY resolution (§19 quirk: first SELECT wins)
@@ -503,6 +506,161 @@ pub struct QueryPlan {
     pub join_segments: Vec<JoinPlanSegment>,
     /// Total estimated cost in page reads.
     pub total_cost: f64,
+}
+
+/// Default number of cached query plans retained by [`QueryPlanner`].
+pub const DEFAULT_PLAN_CACHE_CAPACITY: usize = 128;
+
+/// Stateful planner wrapper that memoizes query plans by SQL template and schema cookie.
+///
+/// The caller is responsible for supplying a stable SQL template string for the
+/// query shape being planned. Literal normalization, placeholder canonicalization,
+/// and any higher-level SQL parsing remain above this crate's current scope.
+#[derive(Debug)]
+pub struct QueryPlanner {
+    plan_cache: LruCache<u64, Arc<QueryPlan>>,
+    cached_schema_cookie: Option<u32>,
+}
+
+impl Default for QueryPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueryPlanner {
+    /// Construct a planner with the default 128-entry LRU plan cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_plan_cache_capacity(DEFAULT_PLAN_CACHE_CAPACITY)
+    }
+
+    /// Construct a planner with a caller-provided cache capacity.
+    ///
+    /// A zero capacity is clamped to 1 so callers can tune the cache without
+    /// dealing with `NonZeroUsize`.
+    #[must_use]
+    pub fn with_plan_cache_capacity(capacity: usize) -> Self {
+        Self {
+            plan_cache: LruCache::new(normalize_plan_cache_capacity(capacity)),
+            cached_schema_cookie: None,
+        }
+    }
+
+    /// Return the number of cached plans currently retained.
+    #[must_use]
+    pub fn plan_cache_len(&self) -> usize {
+        self.plan_cache.len()
+    }
+
+    /// Return `true` when no cached plans are currently retained.
+    #[must_use]
+    pub fn is_plan_cache_empty(&self) -> bool {
+        self.plan_cache.is_empty()
+    }
+
+    /// Clear all cached plans and forget the schema cookie they were built under.
+    pub fn clear_plan_cache(&mut self) {
+        self.plan_cache.clear();
+        self.cached_schema_cookie = None;
+    }
+
+    /// Return a cached plan for the given SQL template and schema cookie, or compute one.
+    ///
+    /// When the schema cookie changes, the entire cache is flushed because any
+    /// DDL may invalidate earlier planning decisions.
+    #[must_use]
+    pub fn cached_plan<F>(
+        &mut self,
+        sql_template: &str,
+        schema_cookie: u32,
+        build: F,
+    ) -> Arc<QueryPlan>
+    where
+        F: FnOnce() -> QueryPlan,
+    {
+        self.invalidate_plan_cache_if_schema_cookie_changed(schema_cookie);
+        let key = plan_cache_key(sql_template, schema_cookie);
+
+        if let Some(plan) = self.plan_cache.get(&key) {
+            return Arc::clone(plan);
+        }
+
+        let plan = Arc::new(build());
+        self.plan_cache.put(key, Arc::clone(&plan));
+        plan
+    }
+
+    /// Cached wrapper around [`order_joins_with_hints_and_features`].
+    ///
+    /// This preserves the current stateless free-function API while exposing a
+    /// planner-local cache for repeated SELECT templates.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn order_joins_with_cache(
+        &mut self,
+        sql_template: &str,
+        schema_cookie: u32,
+        tables: &[TableStats],
+        indexes: &[IndexInfo],
+        where_terms: &[WhereTerm<'_>],
+        needed_columns: Option<&[String]>,
+        cross_join_pairs: &[(String, String)],
+        table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+        cracking_hints: Option<&mut CrackingHintStore>,
+        feature_flags: PlannerFeatureFlags,
+    ) -> Arc<QueryPlan> {
+        self.invalidate_plan_cache_if_schema_cookie_changed(schema_cookie);
+        let key = plan_cache_key(sql_template, schema_cookie);
+
+        if let Some(plan) = self.plan_cache.get(&key) {
+            if let Some(store) = cracking_hints {
+                for access_path in &plan.access_paths {
+                    store.record_access_path(access_path);
+                }
+            }
+            return Arc::clone(plan);
+        }
+
+        let plan = Arc::new(order_joins_with_hints_and_features(
+            tables,
+            indexes,
+            where_terms,
+            needed_columns,
+            cross_join_pairs,
+            table_index_hints,
+            cracking_hints,
+            feature_flags,
+        ));
+        self.plan_cache.put(key, Arc::clone(&plan));
+        plan
+    }
+
+    fn invalidate_plan_cache_if_schema_cookie_changed(&mut self, schema_cookie: u32) {
+        if self
+            .cached_schema_cookie
+            .is_some_and(|cached| cached != schema_cookie)
+        {
+            self.plan_cache.clear();
+        }
+        self.cached_schema_cookie = Some(schema_cookie);
+    }
+}
+
+fn normalize_plan_cache_capacity(capacity: usize) -> NonZeroUsize {
+    let normalized = capacity.max(1);
+    if let Some(capacity) = NonZeroUsize::new(normalized) {
+        capacity
+    } else {
+        unreachable!("cache capacity is clamped to a non-zero value");
+    }
+}
+
+fn plan_cache_key(sql_template: &str, schema_cookie: u32) -> u64 {
+    let mut material = Vec::with_capacity(sql_template.len() + std::mem::size_of::<u32>());
+    material.extend_from_slice(sql_template.as_bytes());
+    material.extend_from_slice(&schema_cookie.to_le_bytes());
+    xxh3_64(&material)
 }
 
 /// Planner feature toggles.
@@ -3781,7 +3939,7 @@ mod tests {
         OrderingTerm, QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
         TableOrSubquery,
     };
-    use std::{path::PathBuf, time::Instant};
+    use std::{cell::Cell, path::PathBuf, sync::Arc, time::Instant};
 
     /// Helper: build a SELECT core with named result columns.
     fn select_core_with_aliases(aliases: &[&str]) -> SelectCore {
@@ -3861,6 +4019,15 @@ mod tests {
             group_by: vec![],
             having: None,
             windows: vec![],
+        }
+    }
+
+    fn sample_cached_query_plan(label: &str) -> QueryPlan {
+        QueryPlan {
+            join_order: vec![label.to_owned()],
+            access_paths: vec![],
+            join_segments: vec![],
+            total_cost: label.len() as f64,
         }
     }
 
@@ -7427,6 +7594,130 @@ mod tests {
             try_constant_fold(&expr),
             FoldResult::Literal(Literal::Integer(42))
         );
+    }
+
+    #[test]
+    fn test_query_planner_cache_hit_matches_uncached_join_plan() {
+        let tables = vec![
+            TableStats {
+                name: "small".to_owned(),
+                n_pages: 4,
+                n_rows: 40,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "large".to_owned(),
+                n_pages: 40,
+                n_rows: 4_000,
+                source: StatsSource::Heuristic,
+            },
+        ];
+        let uncached = order_joins(&tables, &[], &[], None, &[]);
+
+        let mut planner = QueryPlanner::default();
+        let sql_template = "SELECT * FROM small JOIN large ON small.id = large.small_id";
+
+        let first = planner.order_joins_with_cache(
+            sql_template,
+            7,
+            &tables,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags::default(),
+        );
+        let second = planner.order_joins_with_cache(
+            sql_template,
+            7,
+            &tables,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags::default(),
+        );
+
+        assert_eq!(*first, uncached);
+        assert_eq!(*second, uncached);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(planner.plan_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_query_planner_cache_invalidates_all_entries_on_schema_cookie_change() {
+        let mut planner = QueryPlanner::default();
+        let build_count = Cell::new(0);
+
+        let plan_a = planner.cached_plan("SELECT * FROM t1", 11, || {
+            build_count.set(build_count.get() + 1);
+            sample_cached_query_plan("t1-v11")
+        });
+        let _plan_b = planner.cached_plan("SELECT * FROM t2", 11, || {
+            build_count.set(build_count.get() + 1);
+            sample_cached_query_plan("t2-v11")
+        });
+
+        assert_eq!(planner.plan_cache_len(), 2);
+
+        let rebuilt_plan_a = planner.cached_plan("SELECT * FROM t1", 12, || {
+            build_count.set(build_count.get() + 1);
+            sample_cached_query_plan("t1-v12")
+        });
+
+        assert_eq!(build_count.get(), 3);
+        assert_eq!(planner.plan_cache_len(), 1);
+        assert_eq!(rebuilt_plan_a.join_order, vec!["t1-v12".to_owned()]);
+        assert!(
+            !Arc::ptr_eq(&plan_a, &rebuilt_plan_a),
+            "schema cookie change must discard prior Arc<QueryPlan> entries"
+        );
+    }
+
+    #[test]
+    fn test_query_planner_cache_lru_eviction_at_capacity() {
+        let mut planner = QueryPlanner::default();
+        let schema_cookie = 21;
+
+        for idx in 0..DEFAULT_PLAN_CACHE_CAPACITY {
+            let sql = format!("SELECT * FROM cached_table WHERE id = ?{idx}");
+            let _ = planner.cached_plan(&sql, schema_cookie, || sample_cached_query_plan(&sql));
+        }
+
+        assert_eq!(planner.plan_cache_len(), DEFAULT_PLAN_CACHE_CAPACITY);
+
+        let hottest_sql = "SELECT * FROM cached_table WHERE id = ?0";
+        let hottest_plan = planner.cached_plan(hottest_sql, schema_cookie, || {
+            panic!("expected hottest cache entry to already exist")
+        });
+
+        let cold_key = plan_cache_key("SELECT * FROM cached_table WHERE id = ?1", schema_cookie);
+        let hot_key = plan_cache_key(hottest_sql, schema_cookie);
+
+        let _ = planner.cached_plan(
+            "SELECT * FROM cached_table WHERE id = ?overflow",
+            schema_cookie,
+            || sample_cached_query_plan("overflow"),
+        );
+
+        assert_eq!(planner.plan_cache_len(), DEFAULT_PLAN_CACHE_CAPACITY);
+        assert!(
+            planner.plan_cache.iter().any(|(key, _)| *key == hot_key),
+            "re-accessed entry should remain resident after LRU eviction"
+        );
+        assert!(
+            !planner.plan_cache.iter().any(|(key, _)| *key == cold_key),
+            "least-recently-used entry should be evicted at capacity"
+        );
+
+        let hottest_plan_again = planner.cached_plan(hottest_sql, schema_cookie, || {
+            panic!("expected hottest entry to survive eviction")
+        });
+        assert!(Arc::ptr_eq(&hottest_plan, &hottest_plan_again));
     }
 }
 #[test]
