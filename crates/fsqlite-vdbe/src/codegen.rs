@@ -16943,6 +16943,27 @@ pub fn emit_scan_filter(
     b.free_temp(filter_reg);
 }
 
+/// Emit opcodes that evaluate `expr` and store the result in `target_reg`,
+/// reading column values from `cursor` which is opened on `table`.
+/// Used by index backfill to evaluate expression-index key terms.
+pub fn emit_backfill_key_expr(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    target_reg: i32,
+    cursor: i32,
+    table: &TableSchema,
+) {
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias: None,
+        schema: None,
+        register_base: None,
+        secondary: None,
+    };
+    emit_expr(b, expr, target_reg, Some(&scan));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

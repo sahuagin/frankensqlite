@@ -21171,7 +21171,6 @@ fn test_conformance_insert_or_ignore_s238() {
 }
 
 #[test]
-#[ignore = "expression indexes (CREATE INDEX ... ON t(LOWER(name))) not implemented"]
 fn test_conformance_expression_index_results_s239() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -27818,7 +27817,6 @@ fn test_conformance_insert_or_ignore_s486() {
 }
 
 #[test]
-#[ignore = "expression indexes not supported"]
 fn test_conformance_expression_index_s487() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
