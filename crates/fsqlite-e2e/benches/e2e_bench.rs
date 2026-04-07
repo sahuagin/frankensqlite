@@ -136,7 +136,12 @@ fn setup_fsqlite_in_regression_bench(row_count: i64) -> fsqlite::Connection {
     conn
 }
 
-// ─── Sequential INSERT benchmark (100 rows) ────────────────────────────
+// ─── Sequential INSERT benchmark (100 rows, autocommit per row) ────────
+//
+// Important: this benchmark intentionally does NOT wrap the loop in
+// BEGIN/COMMIT. Each statement therefore pays the connection's normal
+// autocommit resolve path, so this group is the right place to look at
+// per-row autocommit overhead rather than batched insert throughput.
 
 fn bench_sequential_inserts(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_inserts_100");
@@ -175,6 +180,61 @@ fn bench_sequential_inserts(c: &mut Criterion) {
                     stmt.execute_with_params(&[SqliteValue::Integer(i)])
                         .unwrap();
                 }
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
+// ─── Sequential INSERT benchmark (100 rows, one explicit transaction) ──
+//
+// This is the batched counterpart to `sequential_inserts_100`. The statement
+// execution loop stays identical, but commit work is paid once at the end
+// instead of once per row.
+
+fn bench_sequential_inserts_single_txn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sequential_inserts_100_single_txn");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(10));
+
+    group.bench_function("csqlite", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                    .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute_batch("BEGIN").unwrap();
+                let mut stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
+                for i in 0..100_i64 {
+                    stmt.execute(rusqlite::params![i]).unwrap();
+                }
+                conn.execute_batch("COMMIT").unwrap();
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("frankensqlite", |b| {
+        b.iter_batched(
+            || {
+                let conn = fsqlite::Connection::open(":memory:").unwrap();
+                conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                    .unwrap();
+                conn
+            },
+            |conn| {
+                conn.execute("BEGIN").unwrap();
+                let stmt = conn.prepare("INSERT INTO t VALUES (?1, 'val');").unwrap();
+                for i in 0..100_i64 {
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
+                }
+                conn.execute("COMMIT").unwrap();
             },
             BatchSize::LargeInput,
         );
@@ -1048,6 +1108,7 @@ criterion_group!(
     config = criterion_config();
     targets =
         bench_sequential_inserts,
+        bench_sequential_inserts_single_txn,
         bench_bulk_inserts,
         bench_select_queries,
         bench_mixed_dml,
