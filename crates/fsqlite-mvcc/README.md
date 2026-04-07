@@ -78,7 +78,7 @@ fsqlite-wal  fsqlite-btree
 
 - `VersionGuardRegistry` / `VersionGuard` -- Epoch-based reader registration for safe old-version reclamation.
 - `QsbrRegistry` / `QsbrHandle` -- Quiescent-state-based reclamation (QSBR) for lock-free data structures.
-- `GcScheduler` / `gc_tick` / `prune_page_chain` -- Background garbage collection of unreachable page versions.
+- `EbrRetireQueue` / `VersionStore` / `prune_page_chain` -- Commit-time retirement and batch recycling of unreachable page versions once pinned readers advance.
 - `RcuCell` / `RcuPair` / `RcuTriple` -- Read-copy-update primitives.
 
 ### Concurrency Primitives

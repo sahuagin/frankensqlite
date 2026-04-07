@@ -535,11 +535,6 @@ pub struct VersionStore {
     /// added here. After epoch advancement, `try_recycle_retired_slots()` drains
     /// this queue and batch-adds slots back to the arena free_list.
     retire_queue: EbrRetireQueue,
-    /// Monotonic epoch counter for EBR slot recycling.
-    ///
-    /// Incremented each gc_tick. Used by `retire_queue` to determine when it's
-    /// safe to recycle slots (after sufficient epoch advancement).
-    gc_epoch: AtomicU64,
 }
 
 impl VersionStore {
@@ -562,7 +557,6 @@ impl VersionStore {
             page_size,
             guard_registry,
             retire_queue: EbrRetireQueue::new(),
-            gc_epoch: AtomicU64::new(0),
         }
     }
 
@@ -570,6 +564,32 @@ impl VersionStore {
     #[must_use]
     pub fn guard_registry(&self) -> &Arc<VersionGuardRegistry> {
         &self.guard_registry
+    }
+
+    /// Current global EBR epoch observed by this store.
+    #[must_use]
+    pub fn current_epoch(&self) -> u64 {
+        self.guard_registry.current_epoch()
+    }
+
+    /// Advance the global EBR epoch and recycle any newly reclaimable slots.
+    ///
+    /// Returns the number of arena slots recycled.
+    pub fn advance_epoch(&self) -> usize {
+        let current_epoch = self.guard_registry.advance_epoch();
+        self.try_recycle_retired_slots(current_epoch)
+    }
+
+    /// Total arena slots ever allocated.
+    #[must_use]
+    pub fn arena_high_water(&self) -> u64 {
+        self.arena.read().high_water()
+    }
+
+    /// Current arena free-list length.
+    #[must_use]
+    pub fn arena_free_count(&self) -> usize {
+        self.arena.read().free_count()
     }
 
     /// Publish a committed version into the store.
@@ -936,9 +956,9 @@ impl VersionStore {
     /// The pruning phase uses `take_for_retirement()` which extracts versions from
     /// the arena WITHOUT adding slots back to the free_list. This reduces the time
     /// the arena write lock is held. The pruned slot indices are added to an
-    /// `EbrRetireQueue`. After sufficient epoch advancement (min 2 gc_ticks to
-    /// ensure all readers have advanced), `try_recycle_retired_slots()` drains
-    /// the queue and batch-adds slots back to the free_list.
+    /// `EbrRetireQueue` tagged with the current EBR epoch. Once every active
+    /// guard has advanced past that epoch, `try_recycle_retired_slots()` drains
+    /// reclaimable batches and returns the slots to the arena free_list.
     ///
     /// # Arguments
     ///
@@ -951,11 +971,9 @@ impl VersionStore {
     /// A [`GcTickResult`] summarizing what was pruned and whether budgets were exhausted.
     #[allow(clippy::significant_drop_tightening)]
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
-        // Increment epoch BEFORE pruning so retire_batch records the pre-prune epoch.
-        let current_epoch = self.gc_epoch.fetch_add(1, Ordering::Relaxed);
-
-        // Try to recycle slots from previous epochs (at least 2 epochs must pass).
-        // This is done BEFORE the new prune to reduce lock contention.
+        // Legacy incremental-GC path: advance the EBR epoch once per tick, then
+        // attempt to recycle any batches that became reclaimable.
+        let current_epoch = self.guard_registry.advance_epoch();
         self.try_recycle_retired_slots(current_epoch);
 
         // Phase 1: Prune chains (arena write lock held).
@@ -978,7 +996,6 @@ impl VersionStore {
         drop(ranges);
 
         // Phase 3: Queue pruned slots for deferred recycling (EBR).
-        // These will be recycled after epoch advances by at least 2.
         if !result.pruned_indices.is_empty() {
             let retired_slots = result.pruned_indices.len();
             self.retire_queue
@@ -988,7 +1005,7 @@ impl VersionStore {
                 retired_slots,
                 retire_epoch = current_epoch,
                 pending_recycle_count = self.pending_recycle_count(),
-                active_guards = self.guard_registry.active_guard_count(),
+                min_pinned_epoch = self.guard_registry.min_pinned_epoch(),
                 "queued retired arena slots for deferred recycling"
             );
         }
@@ -998,8 +1015,8 @@ impl VersionStore {
 
     /// Try to recycle retired slots from previous epochs.
     ///
-    /// Slots retired at epoch E are safe to recycle when current_epoch >= E + 2,
-    /// ensuring all readers that may have observed the slots have advanced.
+    /// Slots retired at epoch `E` are safe to recycle once every active guard
+    /// has a pinned epoch strictly greater than `E`, or when no guards remain.
     ///
     /// This method is called automatically by `gc_tick()`, but can also be called
     /// manually to reclaim memory without running a full GC pass.
@@ -1008,37 +1025,24 @@ impl VersionStore {
     ///
     /// Number of slots recycled.
     pub fn try_recycle_retired_slots(&self, current_epoch: u64) -> usize {
-        // Minimum epoch gap of 2 ensures all readers have advanced past the
-        // retirement point (standard EBR grace period).
-        const MIN_EPOCH_GAP: u64 = 2;
-
         let pending_recycle_count = self.pending_recycle_count();
         if pending_recycle_count == 0 {
             return 0;
         }
 
-        let active_guards = self.guard_registry.active_guard_count();
-        if active_guards > 0 {
-            tracing::debug!(
-                target: "fsqlite_mvcc::gc",
-                current_epoch,
-                pending_recycle_count,
-                active_guards,
-                "deferred retired arena slot recycling while MVCC guards remain pinned"
-            );
-            return 0;
-        }
+        let observed_epoch = self.guard_registry.advance_epoch_to(current_epoch);
+        let min_pinned_epoch = self.guard_registry.min_pinned_epoch();
 
         let drained = self
             .retire_queue
-            .drain_if_safe(current_epoch, MIN_EPOCH_GAP);
+            .drain_if_safe(observed_epoch, min_pinned_epoch);
         if drained.is_empty() {
             tracing::trace!(
                 target: "fsqlite_mvcc::gc",
-                current_epoch,
+                current_epoch = observed_epoch,
                 pending_recycle_count,
-                min_epoch_gap = MIN_EPOCH_GAP,
-                "retired arena slots remain pending until epoch gap is satisfied"
+                min_pinned_epoch,
+                "retired arena slots remain pending until pinned epochs advance"
             );
             return 0;
         }
@@ -1051,7 +1055,8 @@ impl VersionStore {
         tracing::debug!(
             target: "fsqlite_mvcc::gc",
             recycled = count,
-            current_epoch,
+            current_epoch = observed_epoch,
+            min_pinned_epoch,
             pending_recycle_count_after = self.pending_recycle_count(),
             "recycled retired arena slots"
         );
@@ -1181,7 +1186,7 @@ impl VersionStore {
                 ranges.remove(idx);
             }
 
-            let current_epoch = self.gc_epoch.load(Ordering::Relaxed);
+            let current_epoch = self.current_epoch();
             self.retire_queue
                 .retire_batch(result.pruned_indices.iter().copied(), current_epoch);
         }
@@ -1200,7 +1205,7 @@ impl std::fmt::Debug for VersionStore {
             .field("visibility_range_count", &ranges.len())
             .field("arena_high_water", &arena.high_water())
             .field("pending_recycle_count", &self.pending_recycle_count())
-            .field("gc_epoch", &self.gc_epoch.load(Ordering::Relaxed))
+            .field("ebr_epoch", &self.current_epoch())
             .field("guard_registry", &self.guard_registry)
             .finish_non_exhaustive()
     }
@@ -2299,67 +2304,83 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_page_chain_eager_enqueues_slots_for_ebr_recycling() {
+    fn test_ebr_batch_free_after_epoch_advance() {
         let store = VersionStore::new(PageSize::DEFAULT);
-        let pgno = PageNumber::new(16).unwrap();
+        let pgno_a = PageNumber::new(16).unwrap();
+        let pgno_b = PageNumber::new(17).unwrap();
 
         store.publish(make_version(16, 1, None));
         store.publish(make_version(16, 2, None));
         store.publish(make_version(16, 3, None));
+        store.publish(make_version(17, 10, None));
+        store.publish(make_version(17, 11, None));
+        store.publish(make_version(17, 12, None));
 
-        assert_eq!(store.chain_length(pgno), 3);
+        assert_eq!(store.chain_length(pgno_a), 3);
+        assert_eq!(store.chain_length(pgno_b), 3);
         assert_eq!(store.pending_recycle_count(), 0);
 
-        let freed = store.prune_page_chain_eager(pgno, CommitSeq::new(2));
-        assert_eq!(freed, 1, "horizon=2 should prune only the oldest version");
-        assert_eq!(store.chain_length(pgno), 2);
+        let freed_a = store.prune_page_chain_eager(pgno_a, CommitSeq::new(2));
+        let freed_b = store.prune_page_chain_eager(pgno_b, CommitSeq::new(11));
+        assert_eq!(
+            freed_a, 1,
+            "first page should retire exactly one old version"
+        );
+        assert_eq!(
+            freed_b, 1,
+            "second page should retire exactly one old version"
+        );
+        assert_eq!(store.chain_length(pgno_a), 2);
+        assert_eq!(store.chain_length(pgno_b), 2);
         assert_eq!(
             store.pending_recycle_count(),
-            1,
-            "eager prune must queue retired slots for later EBR recycling"
+            2,
+            "eager prune must queue retired slots for later EBR batch recycling"
         );
 
-        assert_eq!(store.try_recycle_retired_slots(1), 0);
-        assert_eq!(store.try_recycle_retired_slots(2), 1);
+        assert_eq!(store.try_recycle_retired_slots(store.current_epoch()), 0);
+        assert_eq!(store.advance_epoch(), 2);
         assert_eq!(store.pending_recycle_count(), 0);
+        assert_eq!(store.arena_free_count(), 2);
     }
 
     #[test]
-    fn test_try_recycle_retired_slots_waits_for_active_guard_release() {
-        let store = VersionStore::new(PageSize::DEFAULT);
-        let pgno = PageNumber::new(17).unwrap();
-
-        store.publish(make_version(17, 1, None));
-        store.publish(make_version(17, 2, None));
-        store.publish(make_version(17, 3, None));
-
-        let freed = store.prune_page_chain_eager(pgno, CommitSeq::new(2));
-        assert_eq!(freed, 1, "horizon=2 should prune only the oldest version");
-        assert_eq!(store.pending_recycle_count(), 1);
-
-        let guard = VersionGuard::pin(Arc::clone(store.guard_registry()));
-        assert_eq!(store.try_recycle_retired_slots(2), 0);
-        assert_eq!(store.try_recycle_retired_slots(64), 0);
-        assert_eq!(
-            store.pending_recycle_count(),
-            1,
-            "active guards must block slot recycling even after the epoch gap is satisfied"
-        );
-
-        drop(guard);
-
-        assert_eq!(store.try_recycle_retired_slots(64), 1);
-        assert_eq!(store.pending_recycle_count(), 0);
-    }
-
-    #[test]
-    fn test_gc_tick_recycles_retired_slot_for_next_publish_after_guard_release() {
+    fn test_ebr_no_premature_free() {
         let store = VersionStore::new(PageSize::DEFAULT);
         let pgno = PageNumber::new(18).unwrap();
 
         store.publish(make_version(18, 1, None));
         store.publish(make_version(18, 2, None));
         store.publish(make_version(18, 3, None));
+
+        let freed = store.prune_page_chain_eager(pgno, CommitSeq::new(2));
+        assert_eq!(freed, 1, "horizon=2 should prune only the oldest version");
+        assert_eq!(store.pending_recycle_count(), 1);
+
+        let guard = VersionGuard::pin(Arc::clone(store.guard_registry()));
+        assert_eq!(store.try_recycle_retired_slots(store.current_epoch()), 0);
+        assert_eq!(store.advance_epoch(), 0);
+        assert_eq!(store.advance_epoch(), 0);
+        assert_eq!(
+            store.pending_recycle_count(),
+            1,
+            "a pinned reader must block reclamation of its visible versions"
+        );
+
+        drop(guard);
+
+        assert_eq!(store.try_recycle_retired_slots(store.current_epoch()), 1);
+        assert_eq!(store.pending_recycle_count(), 0);
+    }
+
+    #[test]
+    fn test_gc_tick_recycles_retired_slot_for_next_publish_after_guard_release() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(19).unwrap();
+
+        store.publish(make_version(19, 1, None));
+        store.publish(make_version(19, 2, None));
+        store.publish(make_version(19, 3, None));
 
         let mut todo = GcTodo::new();
         todo.enqueue(pgno);
@@ -2390,11 +2411,73 @@ mod tests {
         assert_eq!(fourth.versions_freed, 0);
         assert_eq!(store.pending_recycle_count(), 0);
 
-        let reused_idx = store.publish(make_version(18, 4, None));
+        let reused_idx = store.publish(make_version(19, 4, None));
         assert_eq!(store.chain_length(pgno), 3);
         assert_eq!(reused_idx.chunk(), retired_idx.chunk());
         assert_eq!(reused_idx.offset(), retired_idx.offset());
         assert_ne!(reused_idx.generation(), retired_idx.generation());
+    }
+
+    #[test]
+    fn test_ebr_8t_bounded_memory() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::thread;
+
+        const THREADS: u32 = 8;
+        const WRITES_PER_THREAD: u64 = 96;
+        const LIVE_SLOT_BOUND: u64 = 24;
+
+        let store = Arc::new(VersionStore::new(PageSize::DEFAULT));
+        let max_live_slots = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread_idx| {
+                let store = Arc::clone(&store);
+                let max_live_slots = Arc::clone(&max_live_slots);
+                thread::spawn(move || {
+                    let pgno_raw = 100 + thread_idx;
+                    let pgno = PageNumber::new(pgno_raw).unwrap();
+                    for seq in 1..=WRITES_PER_THREAD {
+                        let commit_seq = u64::from(thread_idx) * WRITES_PER_THREAD + seq + 1;
+                        store.publish(make_version(pgno_raw, commit_seq, None));
+                        let _ = store.prune_page_chain_eager(pgno, CommitSeq::new(commit_seq));
+                        let _ = store.advance_epoch();
+
+                        let free_count =
+                            u64::try_from(store.arena_free_count()).unwrap_or(u64::MAX);
+                        let live_slots = store.arena_high_water().saturating_sub(free_count);
+                        max_live_slots.fetch_max(live_slots, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("writer thread must not panic");
+        }
+
+        let _ = store.advance_epoch();
+
+        for thread_idx in 0..THREADS {
+            let pgno = PageNumber::new(100 + thread_idx).unwrap();
+            assert_eq!(
+                store.chain_length(pgno),
+                1,
+                "per-page eager pruning should keep only the newest committed version",
+            );
+        }
+        assert_eq!(store.pending_recycle_count(), 0);
+
+        let free_count = u64::try_from(store.arena_free_count()).unwrap_or(u64::MAX);
+        let live_slots = store.arena_high_water().saturating_sub(free_count);
+        assert!(
+            live_slots <= LIVE_SLOT_BOUND,
+            "live slot count should remain bounded under sustained 8-thread writes: {live_slots} > {LIVE_SLOT_BOUND}",
+        );
+        assert!(
+            max_live_slots.load(Ordering::Relaxed) <= LIVE_SLOT_BOUND,
+            "peak live slot count should remain bounded under sustained 8-thread writes",
+        );
     }
 
     proptest! {

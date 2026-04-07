@@ -242,6 +242,7 @@ pub struct ReaderPinSnapshot {
 struct ReaderPinState {
     pinned_at: Instant,
     last_warned_at: Option<Instant>,
+    pinned_epoch: u64,
 }
 
 /// Registry for active epoch pins (`VersionGuard`s).
@@ -252,6 +253,7 @@ struct ReaderPinState {
 pub struct VersionGuardRegistry {
     stale_reader: StaleReaderConfig,
     next_guard_id: AtomicU64,
+    global_epoch: AtomicU64,
     active: Mutex<HashMap<u64, ReaderPinState>>,
 }
 
@@ -262,6 +264,7 @@ impl VersionGuardRegistry {
         Self {
             stale_reader,
             next_guard_id: AtomicU64::new(1),
+            global_epoch: AtomicU64::new(0),
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -276,6 +279,44 @@ impl VersionGuardRegistry {
     #[must_use]
     pub fn active_guard_count(&self) -> usize {
         self.active.lock().len()
+    }
+
+    /// Current global EBR epoch.
+    #[must_use]
+    pub fn current_epoch(&self) -> u64 {
+        self.global_epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the global EBR epoch and return the new value.
+    pub fn advance_epoch(&self) -> u64 {
+        self.global_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Ensure the global EBR epoch is at least `target`, returning the observed value.
+    pub fn advance_epoch_to(&self, target: u64) -> u64 {
+        let mut observed = self.current_epoch();
+        while observed < target {
+            match self.global_epoch.compare_exchange_weak(
+                observed,
+                target,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return target,
+                Err(actual) => observed = actual,
+            }
+        }
+        observed
+    }
+
+    /// Minimum pinned epoch among currently active guards.
+    #[must_use]
+    pub fn min_pinned_epoch(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .values()
+            .map(|state| state.pinned_epoch)
+            .min()
     }
 
     /// Snapshot all stale readers as of `now`.
@@ -333,11 +374,14 @@ impl VersionGuardRegistry {
 
     fn register_guard(&self, pinned_at: Instant) -> u64 {
         let guard_id = self.next_guard_id.fetch_add(1, Ordering::Relaxed);
-        self.active.lock().insert(
+        let mut active = self.active.lock();
+        let pinned_epoch = self.current_epoch();
+        active.insert(
             guard_id,
             ReaderPinState {
                 pinned_at,
                 last_warned_at: None,
+                pinned_epoch,
             },
         );
         guard_id
@@ -594,14 +638,18 @@ use crate::core_types::VersionIdx;
 /// contain at most a few thousand entries.
 #[derive(Debug)]
 pub struct EbrRetireQueue {
-    /// Pending slot indices to recycle.
-    pending: Mutex<Vec<VersionIdx>>,
-    /// Epoch when the oldest pending retirement was added.
-    oldest_retire_epoch: AtomicU64,
+    /// Pending retired batches grouped by retire epoch.
+    pending: Mutex<Vec<RetiredBatch>>,
     /// Counter for total slots retired through this queue.
     total_retired: AtomicU64,
     /// Counter for total slots recycled (drained and returned to arena).
     total_recycled: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RetiredBatch {
+    retire_epoch: u64,
+    indices: Vec<VersionIdx>,
 }
 
 impl EbrRetireQueue {
@@ -610,7 +658,6 @@ impl EbrRetireQueue {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(Vec::new()),
-            oldest_retire_epoch: AtomicU64::new(0),
             total_retired: AtomicU64::new(0),
             total_recycled: AtomicU64::new(0),
         }
@@ -622,31 +669,21 @@ impl EbrRetireQueue {
     /// for later recycling. The slot will be recycled when `drain_if_safe()`
     /// is called after epoch advancement.
     pub fn retire(&self, idx: VersionIdx, current_epoch: u64) {
-        let mut pending = self.pending.lock();
-        if pending.is_empty() {
-            self.oldest_retire_epoch
-                .store(current_epoch, Ordering::Relaxed);
-        }
-        pending.push(idx);
-        drop(pending);
-        self.total_retired.fetch_add(1, Ordering::Relaxed);
-        GLOBAL_EBR_METRICS.record_retirement_deferred();
+        self.retire_batch(std::iter::once(idx), current_epoch);
     }
 
     /// Batch-retire multiple slot indices.
     pub fn retire_batch(&self, indices: impl IntoIterator<Item = VersionIdx>, current_epoch: u64) {
-        let mut pending = self.pending.lock();
-        let was_empty = pending.is_empty();
-        let mut count = 0_u64;
-        for idx in indices {
-            pending.push(idx);
-            count += 1;
+        let batch_indices: Vec<_> = indices.into_iter().collect();
+        let count = u64::try_from(batch_indices.len()).unwrap_or(u64::MAX);
+        if batch_indices.is_empty() {
+            return;
         }
-        if was_empty && count > 0 {
-            self.oldest_retire_epoch
-                .store(current_epoch, Ordering::Relaxed);
-        }
-        drop(pending);
+
+        self.pending.lock().push(RetiredBatch {
+            retire_epoch: current_epoch,
+            indices: batch_indices,
+        });
         self.total_retired.fetch_add(count, Ordering::Relaxed);
         for _ in 0..count {
             GLOBAL_EBR_METRICS.record_retirement_deferred();
@@ -655,39 +692,46 @@ impl EbrRetireQueue {
 
     /// Drain all pending retirements if it's safe to recycle them.
     ///
-    /// Returns the drained indices if the current epoch has advanced past the
-    /// oldest retirement epoch (indicating all readers have moved on).
+    /// Returns the drained indices if all active guards have advanced past the
+    /// retired batches being reclaimed.
     /// Returns an empty Vec if not safe yet or if the queue is empty.
     ///
     /// # Arguments
     ///
-    /// * `current_epoch` - The current global epoch (from `crossbeam_epoch`)
-    /// * `min_epoch_gap` - Minimum epochs that must pass before recycling
-    ///   (typically 2 to ensure all readers have advanced)
+    /// * `current_epoch` - Current global epoch after any advancement.
+    /// * `min_pinned_epoch` - Minimum pinned epoch across active guards. `None`
+    ///   means there are no active guards, so the current epoch alone gates reclamation.
     #[must_use]
-    pub fn drain_if_safe(&self, current_epoch: u64, min_epoch_gap: u64) -> Vec<VersionIdx> {
-        // Single lock acquisition for both emptiness check and drain.
-        // We check oldest_retire_epoch first (cheap atomic load) to avoid
-        // acquiring the mutex when the epoch gap is insufficient.
-        let oldest = self.oldest_retire_epoch.load(Ordering::Relaxed);
-
-        // Acquire mutex once for both emptiness check and potential drain.
+    pub fn drain_if_safe(
+        &self,
+        current_epoch: u64,
+        min_pinned_epoch: Option<u64>,
+    ) -> Vec<VersionIdx> {
         let mut pending = self.pending.lock();
         if pending.is_empty() {
             return Vec::new();
         }
 
-        // Now that we know there are pending items, check the epoch gap.
-        // We recheck oldest after confirming non-empty since epoch 0 is valid.
-        if current_epoch.saturating_sub(oldest) < min_epoch_gap {
-            // Not enough epochs have passed
+        let safe_epoch = min_pinned_epoch.map_or(current_epoch, |min_epoch| {
+            std::cmp::min(current_epoch, min_epoch)
+        });
+        let drain_batches = pending
+            .iter()
+            .take_while(|batch| batch.retire_epoch < safe_epoch)
+            .count();
+        if drain_batches == 0 {
             return Vec::new();
         }
 
-        let drained = std::mem::take(&mut *pending);
+        let drained_batches: Vec<_> = pending.drain(..drain_batches).collect();
         drop(pending);
 
-        let count = drained.len() as u64;
+        let mut drained = Vec::new();
+        for batch in drained_batches {
+            drained.extend(batch.indices);
+        }
+
+        let count = u64::try_from(drained.len()).unwrap_or(u64::MAX);
         if count > 0 {
             self.total_recycled.fetch_add(count, Ordering::Relaxed);
             GLOBAL_EBR_METRICS.record_gc_freed(count);
@@ -702,12 +746,16 @@ impl EbrRetireQueue {
     #[must_use]
     pub fn force_drain(&self) -> Vec<VersionIdx> {
         let mut pending = self.pending.lock();
-        let drained = std::mem::take(&mut *pending);
+        let drained_batches = std::mem::take(&mut *pending);
         drop(pending);
 
-        let count = drained.len() as u64;
+        let mut drained = Vec::new();
+        for batch in drained_batches {
+            drained.extend(batch.indices);
+        }
+
+        let count = u64::try_from(drained.len()).unwrap_or(u64::MAX);
         if count > 0 {
-            self.oldest_retire_epoch.store(0, Ordering::Relaxed);
             self.total_recycled.fetch_add(count, Ordering::Relaxed);
             GLOBAL_EBR_METRICS.record_gc_freed(count);
         }
@@ -718,7 +766,11 @@ impl EbrRetireQueue {
     /// Number of slots currently pending recycle.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().len()
+        self.pending
+            .lock()
+            .iter()
+            .map(|batch| batch.indices.len())
+            .sum()
     }
 
     /// Total slots retired through this queue (lifetime counter).
@@ -1162,19 +1214,22 @@ mod tests {
         assert_eq!(queue.pending_count(), 3);
         assert_eq!(queue.total_retired(), 3);
 
-        // Epoch 1: not enough gap (min 2).
-        let drained = queue.drain_if_safe(1, 2);
-        assert!(drained.is_empty(), "should not drain at epoch 1");
+        // A reader pinned at epoch 0 still needs the retired batch.
+        let drained = queue.drain_if_safe(0, Some(0));
+        assert!(
+            drained.is_empty(),
+            "same-epoch reclamation must stay pending"
+        );
         assert_eq!(queue.pending_count(), 3);
 
-        // Epoch 2: sufficient gap.
-        let drained = queue.drain_if_safe(2, 2);
+        // Advance to the next epoch with no active readers: reclaim the whole batch.
+        let drained = queue.drain_if_safe(1, None);
         assert_eq!(drained.len(), 3);
         assert_eq!(queue.pending_count(), 0);
         assert_eq!(queue.total_recycled(), 3);
 
         // Subsequent drain returns empty.
-        let drained = queue.drain_if_safe(10, 2);
+        let drained = queue.drain_if_safe(10, None);
         assert!(drained.is_empty());
     }
 
@@ -1188,8 +1243,8 @@ mod tests {
         assert_eq!(queue.pending_count(), 10);
         assert_eq!(queue.total_retired(), 10);
 
-        // Epoch 7: sufficient gap from epoch 5.
-        let drained = queue.drain_if_safe(7, 2);
+        // A newer reader pinned at epoch 7 is past the retire epoch.
+        let drained = queue.drain_if_safe(7, Some(7));
         assert_eq!(drained.len(), 10);
         assert_eq!(queue.total_recycled(), 10);
     }
@@ -1218,19 +1273,30 @@ mod tests {
         queue.retire(VersionIdx::new(0, 0, 0), 0);
         queue.retire(VersionIdx::new(0, 1, 0), 0);
 
-        // Retire more at epoch 3 (oldest epoch stays at 0).
+        // Retire more at epoch 3.
         queue.retire(VersionIdx::new(0, 2, 0), 3);
 
         assert_eq!(queue.pending_count(), 3);
 
-        // Epoch 1: not enough gap from oldest (epoch 0). Gap = 1 < 2.
-        let drained = queue.drain_if_safe(1, 2);
-        assert!(drained.is_empty(), "epoch 1: gap of 1 is not sufficient");
+        // Reader pinned at epoch 1 can still require the epoch-0 batch.
+        let drained = queue.drain_if_safe(1, Some(1));
+        assert!(
+            drained.is_empty(),
+            "epoch 1 is not past the first retire epoch"
+        );
 
-        // Epoch 2: sufficient gap from oldest (epoch 0). Gap = 2 >= 2.
-        // All pending slots are drained together.
-        let drained = queue.drain_if_safe(2, 2);
-        assert_eq!(drained.len(), 3, "epoch 2: gap of 2 is sufficient");
+        // Reader pinned at epoch 2 is past the epoch-0 batch, but not the epoch-3 batch.
+        let drained = queue.drain_if_safe(2, Some(2));
+        assert_eq!(
+            drained.len(),
+            2,
+            "only the epoch-0 retirements are reclaimable"
+        );
+        assert_eq!(queue.pending_count(), 1);
+
+        // Once no active readers remain, the remaining batch can also drain.
+        let drained = queue.drain_if_safe(4, None);
+        assert_eq!(drained.len(), 1, "the later batch drains separately");
     }
 
     #[test]
@@ -1238,7 +1304,7 @@ mod tests {
         let queue = EbrRetireQueue::new();
 
         // Draining empty queue returns empty vec.
-        let drained = queue.drain_if_safe(100, 2);
+        let drained = queue.drain_if_safe(100, None);
         assert!(drained.is_empty());
 
         // Force drain on empty also returns empty.

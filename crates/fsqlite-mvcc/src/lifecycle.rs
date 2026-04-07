@@ -1567,6 +1567,8 @@ impl TransactionManager {
                 maybe_prune(pgno);
             }
         }
+
+        let _ = self.version_store.advance_epoch();
     }
 
     /// Release all resources held by a transaction.
@@ -1594,6 +1596,9 @@ impl TransactionManager {
         // Unpin the EBR guard — allows epoch advancement so deferred
         // retirements from superseded versions can be reclaimed.
         drop(txn.version_guard.take());
+        let _ = self
+            .version_store
+            .try_recycle_retired_slots(self.version_store.current_epoch());
     }
 
     fn resolve_visible_commit_seq(&self, txn: &Transaction, pgno: PageNumber) -> Option<CommitSeq> {
