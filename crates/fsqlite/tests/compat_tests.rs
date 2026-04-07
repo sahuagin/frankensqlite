@@ -97,7 +97,10 @@ fn param_value_from_u64_valid() {
 #[test]
 fn param_value_from_u64_overflow_preserves_exact_value() {
     let p: ParamValue = u64::MAX.into();
-    assert_eq!(p.into_inner(), SqliteValue::Text(u64::MAX.to_string().into()));
+    assert_eq!(
+        p.into_inner(),
+        SqliteValue::Text(u64::MAX.to_string().into())
+    );
 }
 
 #[test]

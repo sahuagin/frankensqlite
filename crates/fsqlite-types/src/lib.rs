@@ -327,10 +327,7 @@ impl PageData {
     ///
     /// If the data is shared, this clones into a new Vec.
     pub fn into_vec(self) -> Vec<u8> {
-        match std::sync::Arc::try_unwrap(self.data) {
-            Ok(boxed) => boxed.into(),
-            Err(arc) => (*arc).to_vec(),
-        }
+        self.data.as_ref().to_vec()
     }
 }
 
@@ -350,7 +347,7 @@ impl AsRef<[u8]> for PageData {
 
 impl AsMut<[u8]> for PageData {
     fn as_mut(&mut self) -> &mut [u8] {
-        std::sync::Arc::make_mut(&mut self.data).as_mut_slice()
+        std::sync::Arc::make_mut(&mut self.data)
     }
 }
 
