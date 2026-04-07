@@ -27843,6 +27843,47 @@ fn test_conformance_expression_index_s487() {
 }
 
 #[test]
+fn test_conformance_expression_index_mutation_s487b() {
+    // Verifies INSERT, UPDATE, and DELETE properly maintain expression indexes.
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE em(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+        "CREATE INDEX idx_lower_name ON em(LOWER(name))",
+        "CREATE INDEX idx_score_bucket ON em(score / 10)",
+        // Insert after index creation — index must be maintained.
+        "INSERT INTO em VALUES(1,'Alice',95),(2,'Bob',85),(3,'Charlie',75)",
+        // Update a value — old index entry must be removed, new one inserted.
+        "UPDATE em SET name = 'ALICE' WHERE id = 1",
+        "UPDATE em SET score = 55 WHERE id = 3",
+        // Delete a row — index entry must be removed.
+        "DELETE FROM em WHERE id = 2",
+        // Insert more after mutations.
+        "INSERT INTO em VALUES(4,'Diana',92),(5,'eve',42)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT * FROM em ORDER BY id",
+        "SELECT name FROM em WHERE LOWER(name) = 'alice' ORDER BY id",
+        "SELECT name FROM em WHERE LOWER(name) = 'bob'",
+        "SELECT name FROM em WHERE LOWER(name) = 'eve'",
+        "SELECT * FROM em WHERE score / 10 = 9 ORDER BY id",
+        "SELECT * FROM em WHERE score / 10 = 5 ORDER BY id",
+        "SELECT COUNT(*) FROM em",
+        "SELECT score / 10 AS bucket, COUNT(*) FROM em GROUP BY score / 10 ORDER BY bucket",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} expression index mutation mismatches", mismatches.len());
+    }
+}
+
+#[test]
 fn test_conformance_multi_column_primary_key_s488() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
