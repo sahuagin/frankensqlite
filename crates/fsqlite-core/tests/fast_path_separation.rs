@@ -991,11 +991,10 @@ fn test_entry_proof_within_explicit_transaction() {
     );
 }
 
-/// T16: Future B4 coverage — unique secondary-index query_row should flip the
-/// direct indexed-equality counter once the direct query_row fast path lands.
+/// T16: B4 coverage — unique secondary-index query_row should use the direct
+/// indexed-equality counter.
 #[test]
-#[ignore = "enable when bd-wwqen.4 lands direct indexed-equality query_row fast path"]
-fn future_query_row_indexed_equality_uses_direct_counter() {
+fn test_query_row_indexed_equality_uses_direct_counter() {
     let _profile_guard = FastPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, email TEXT NOT NULL, val TEXT NOT NULL)")
@@ -1010,9 +1009,7 @@ fn future_query_row_indexed_equality_uses_direct_counter() {
     )
     .unwrap();
 
-    let stmt = conn
-        .prepare("SELECT id, email, val FROM t WHERE email = ?1")
-        .unwrap();
+    let stmt = conn.prepare("SELECT * FROM t WHERE email = ?1").unwrap();
 
     let before = hot_path_profile_snapshot();
     let row = stmt
@@ -1051,7 +1048,7 @@ fn future_query_row_indexed_equality_uses_direct_counter() {
         .saturating_sub(before.direct_indexed_equality_query_hits);
     assert!(
         direct_delta > 0,
-        "future B4 cut should increment direct indexed equality hits for query_row: before={before:?} after={after:?}"
+        "indexed equality query_row should increment direct indexed equality hits: before={before:?} after={after:?}"
     );
 
     let miss = stmt
@@ -1065,11 +1062,10 @@ fn future_query_row_indexed_equality_uses_direct_counter() {
     );
 }
 
-/// T17: Future B4 coverage — rowid-range query_row should short-circuit after
+/// T17: B4 coverage — rowid-range query_row should short-circuit after
 /// first/second row detection and flip the direct rowid-range counter.
 #[test]
-#[ignore = "enable when bd-wwqen.4 lands direct rowid-range query_row fast path"]
-fn future_query_row_rowid_range_uses_direct_counter() {
+fn test_query_row_rowid_range_uses_direct_counter() {
     let _profile_guard = FastPathProfileTestGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
@@ -1084,7 +1080,7 @@ fn future_query_row_rowid_range_uses_direct_counter() {
     .unwrap();
 
     let stmt = conn
-        .prepare("SELECT id, val FROM t WHERE id >= ?1 AND id < ?2")
+        .prepare("SELECT * FROM t WHERE id >= ?1 AND id < ?2")
         .unwrap();
 
     let before = hot_path_profile_snapshot();
@@ -1122,7 +1118,7 @@ fn future_query_row_rowid_range_uses_direct_counter() {
         .saturating_sub(before.direct_rowid_range_query_hits);
     assert!(
         direct_delta > 0,
-        "future B4 cut should increment direct rowid-range hits for query_row: before={before:?} after={after:?}"
+        "rowid-range query_row should increment direct rowid-range hits: before={before:?} after={after:?}"
     );
 
     let no_rows = stmt

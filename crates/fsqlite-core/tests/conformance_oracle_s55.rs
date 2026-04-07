@@ -21176,7 +21176,8 @@ fn test_conformance_multi_row_values_insert_s75ab() {
 fn test_conformance_empty_table_aggregates_s75ac() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE s75ac(val INTEGER, txt TEXT)"] {
+    {
+        let s = "CREATE TABLE s75ac(val INTEGER, txt TEXT)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }

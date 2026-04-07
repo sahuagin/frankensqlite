@@ -1189,4 +1189,67 @@ mod rusqlite_parity {
             ]
         );
     }
+
+    #[test]
+    fn parity_sqlite_created_cursor_state_vscdb_reads_with_frankensqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.vscdb");
+        let composer_json = r#"{"createdAt":1700000000000,"tabs":[{"bubbles":[{"type":"user","text":"How do I sort a Vec?"},{"type":"ai","text":"Use .sort()."}]}]}"#;
+        let legacy_json = r#"{"kind":"legacy"}"#;
+
+        {
+            let conn = RusqliteConnection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
+                CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                rusqlite::params!["composerData:comp-001", composer_json],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+                rusqlite::params!["workbench.panel.aichat.view.aichat.chatdata", legacy_json],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+        let composer_rows = conn
+            .query_with_params(
+                "SELECT key, value FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 ORDER BY key",
+                &[
+                    SqliteValue::Text("composerData:".into()),
+                    SqliteValue::Text("composerData;".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(composer_rows.len(), 1);
+        assert_eq!(
+            composer_rows[0].values(),
+            vec![
+                SqliteValue::Text("composerData:comp-001".into()),
+                SqliteValue::Text(composer_json.into()),
+            ]
+        );
+
+        let legacy_rows = conn
+            .query(
+                "SELECT key, value FROM ItemTable WHERE key LIKE '%aichat%chatdata%' OR key LIKE '%composer%' ORDER BY key",
+            )
+            .unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert_eq!(
+            legacy_rows[0].values(),
+            vec![
+                SqliteValue::Text("workbench.panel.aichat.view.aichat.chatdata".into()),
+                SqliteValue::Text(legacy_json.into()),
+            ]
+        );
+    }
 }

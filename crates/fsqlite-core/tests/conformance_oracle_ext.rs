@@ -31155,7 +31155,8 @@ fn test_conformance_multicolumn_update_set_arithmetic_s75a() {
 fn test_conformance_insert_returning_expressions_s75b() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE ret_test(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)"] {
+    {
+        let s = "CREATE TABLE ret_test(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -31800,7 +31801,8 @@ fn test_conformance_s75ac() {
 fn test_conformance_s75ad() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE empty_s75ad(v INTEGER)"] {
+    {
+        let s = "CREATE TABLE empty_s75ad(v INTEGER)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -31815,5 +31817,310 @@ fn test_conformance_s75ad() {
             eprintln!("{m}\n");
         }
         panic!("{} s75ad mismatches", mismatches.len());
+    }
+}
+
+// ── Session 76: Five new oracle conformance tests ──────────────────────────
+
+/// s76a: UPSERT with complex ON CONFLICT — multi-column unique, DO UPDATE SET
+/// with excluded refs, WHERE guard, and RETURNING.
+#[test]
+fn test_conformance_upsert_complex_on_conflict_s76a() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE inventory (
+            sku TEXT NOT NULL,
+            warehouse TEXT NOT NULL,
+            qty INTEGER NOT NULL DEFAULT 0,
+            last_updated TEXT DEFAULT 'never',
+            UNIQUE(sku, warehouse)
+        )",
+        "INSERT INTO inventory(sku, warehouse, qty, last_updated) VALUES
+            ('A100', 'east', 10, '2025-01-01'),
+            ('A100', 'west', 5, '2025-01-01'),
+            ('B200', 'east', 20, '2025-01-01')",
+        // UPSERT: conflict on (sku, warehouse) → update qty, touch last_updated
+        "INSERT INTO inventory(sku, warehouse, qty, last_updated) VALUES
+            ('A100', 'east', 3, '2025-06-15'),
+            ('A100', 'west', 7, '2025-06-15'),
+            ('C300', 'east', 50, '2025-06-15')
+         ON CONFLICT(sku, warehouse) DO UPDATE SET
+            qty = inventory.qty + excluded.qty,
+            last_updated = excluded.last_updated
+         WHERE excluded.qty > 0",
+        // UPSERT with DO NOTHING on second unique constraint test
+        "INSERT INTO inventory(sku, warehouse, qty, last_updated) VALUES
+            ('A100', 'east', 0, '2025-07-01')
+         ON CONFLICT(sku, warehouse) DO UPDATE SET
+            qty = inventory.qty + excluded.qty,
+            last_updated = excluded.last_updated
+         WHERE excluded.qty > 0",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT sku, warehouse, qty, last_updated FROM inventory ORDER BY sku, warehouse",
+        "SELECT COUNT(*) FROM inventory",
+        "SELECT SUM(qty) FROM inventory",
+        "SELECT sku, warehouse FROM inventory WHERE last_updated = '2025-06-15' ORDER BY sku, warehouse",
+        // The WHERE guard should have prevented the 0-qty update
+        "SELECT qty, last_updated FROM inventory WHERE sku = 'A100' AND warehouse = 'east'",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} s76a upsert complex mismatches", mismatches.len());
+    }
+}
+
+/// s76b: INSERT OR REPLACE with BEFORE and AFTER triggers — verify trigger
+/// firing order and that REPLACE deletes then inserts (fires DELETE + INSERT triggers).
+#[test]
+fn test_conformance_insert_or_replace_with_triggers_s76b() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE products (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            price REAL,
+            version INTEGER DEFAULT 1
+        )",
+        "CREATE TABLE audit_log (
+            seq INTEGER PRIMARY KEY,
+            action TEXT,
+            product_name TEXT,
+            old_price REAL,
+            new_price REAL
+        )",
+        // BEFORE INSERT trigger
+        "CREATE TRIGGER trg_before_ins BEFORE INSERT ON products
+         BEGIN
+            INSERT INTO audit_log(action, product_name, old_price, new_price)
+            VALUES ('BEFORE_INSERT', NEW.name, NULL, NEW.price);
+         END",
+        // AFTER INSERT trigger
+        "CREATE TRIGGER trg_after_ins AFTER INSERT ON products
+         BEGIN
+            INSERT INTO audit_log(action, product_name, old_price, new_price)
+            VALUES ('AFTER_INSERT', NEW.name, NULL, NEW.price);
+         END",
+        // BEFORE DELETE trigger (fires on REPLACE's implicit delete)
+        "CREATE TRIGGER trg_before_del BEFORE DELETE ON products
+         BEGIN
+            INSERT INTO audit_log(action, product_name, old_price, new_price)
+            VALUES ('BEFORE_DELETE', OLD.name, OLD.price, NULL);
+         END",
+        // Initial data
+        "INSERT INTO products(id, name, price) VALUES (1, 'Widget', 9.99)",
+        "INSERT INTO products(id, name, price) VALUES (2, 'Gadget', 19.99)",
+        // REPLACE: conflicts on UNIQUE(name), deletes old row, inserts new
+        "INSERT OR REPLACE INTO products(id, name, price, version) VALUES (10, 'Widget', 14.99, 2)",
+        // REPLACE via PRIMARY KEY conflict
+        "INSERT OR REPLACE INTO products(id, name, price, version) VALUES (2, 'Gadget-v2', 24.99, 2)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT id, name, price, version FROM products ORDER BY id",
+        "SELECT COUNT(*) FROM products",
+        "SELECT action, product_name, old_price, new_price FROM audit_log ORDER BY seq",
+        "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'BEFORE_DELETE%'",
+        "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'BEFORE_INSERT%'",
+        "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'AFTER_INSERT%'",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} s76b INSERT OR REPLACE trigger mismatches",
+            mismatches.len()
+        );
+    }
+}
+
+/// s76c: FK CASCADE with 3+ levels — grandparent→parent→child→grandchild cascade
+/// DELETE propagation through the entire 4-table chain.
+#[test]
+fn test_conformance_fk_cascade_3_plus_levels_s76c() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE stores (id INTEGER PRIMARY KEY, region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE CASCADE, name TEXT NOT NULL)",
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE, name TEXT NOT NULL)",
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE, amount REAL NOT NULL)",
+        // Seed with single-row inserts to avoid multi-row INSERT issues
+        "INSERT INTO regions VALUES (1, 'North')",
+        "INSERT INTO regions VALUES (2, 'South')",
+        "INSERT INTO stores VALUES (10, 1, 'Store-A')",
+        "INSERT INTO stores VALUES (20, 1, 'Store-B')",
+        "INSERT INTO stores VALUES (30, 2, 'Store-C')",
+        "INSERT INTO employees VALUES (100, 10, 'Alice')",
+        "INSERT INTO employees VALUES (101, 10, 'Bob')",
+        "INSERT INTO employees VALUES (200, 20, 'Carol')",
+        "INSERT INTO employees VALUES (300, 30, 'Dave')",
+        "INSERT INTO employees VALUES (301, 30, 'Eve')",
+        "INSERT INTO sales VALUES (1, 100, 50.0)",
+        "INSERT INTO sales VALUES (2, 100, 75.0)",
+        "INSERT INTO sales VALUES (3, 101, 30.0)",
+        "INSERT INTO sales VALUES (4, 200, 100.0)",
+        "INSERT INTO sales VALUES (5, 300, 200.0)",
+        "INSERT INTO sales VALUES (6, 300, 150.0)",
+        "INSERT INTO sales VALUES (7, 301, 80.0)",
+        "INSERT INTO sales VALUES (8, 301, 90.0)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries_before = [
+        "SELECT COUNT(*) FROM regions",
+        "SELECT COUNT(*) FROM stores",
+        "SELECT COUNT(*) FROM employees",
+        "SELECT COUNT(*) FROM sales",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries_before);
+    assert!(mismatches.is_empty(), "pre-delete mismatch: {mismatches:?}");
+
+    // Delete region 1 → cascades through stores→employees→sales
+    fconn.execute("DELETE FROM regions WHERE id = 1").unwrap();
+    rconn
+        .execute_batch("DELETE FROM regions WHERE id = 1")
+        .unwrap();
+
+    let queries_after = [
+        "SELECT COUNT(*) FROM regions",
+        "SELECT COUNT(*) FROM stores",
+        "SELECT COUNT(*) FROM employees",
+        "SELECT COUNT(*) FROM sales",
+        "SELECT id, name FROM regions ORDER BY id",
+        "SELECT id, name FROM stores ORDER BY id",
+        "SELECT id, name FROM employees ORDER BY id",
+        "SELECT id, amount FROM sales ORDER BY id",
+        // Only region 2 / store 30 / Dave+Eve / their 4 sales should remain
+        "SELECT SUM(amount) FROM sales",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries_after);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} s76c FK cascade 3+ level mismatches", mismatches.len());
+    }
+}
+
+/// s76d: SAVEPOINT with nested RELEASE and ROLLBACK — verify partial rollback
+/// semantics with multiple savepoint nesting levels.
+#[test]
+fn test_conformance_savepoint_nested_release_rollback_s76d() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE sp_test (id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO sp_test VALUES (1, 'initial')",
+        "BEGIN",
+        "INSERT INTO sp_test VALUES (2, 'txn-level')",
+        "SAVEPOINT sp1",
+        "INSERT INTO sp_test VALUES (3, 'sp1-a')",
+        "INSERT INTO sp_test VALUES (4, 'sp1-b')",
+        // Nested savepoint inside sp1
+        "SAVEPOINT sp2",
+        "INSERT INTO sp_test VALUES (5, 'sp2-a')",
+        "UPDATE sp_test SET val = 'sp2-modified' WHERE id = 3",
+        // Rollback sp2 — undoes id=5 and the update to id=3
+        "ROLLBACK TO sp2",
+        // sp1 changes (id=3,4) should still be there with original values
+        "INSERT INTO sp_test VALUES (6, 'after-sp2-rollback')",
+        // Release sp1 — merges sp1 changes into the transaction
+        "RELEASE sp1",
+        // Another savepoint after releasing sp1
+        "SAVEPOINT sp3",
+        "INSERT INTO sp_test VALUES (7, 'sp3-a')",
+        "ROLLBACK TO sp3",
+        // sp3 was rolled back, so id=7 should not exist
+        "RELEASE sp3",
+        "COMMIT",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT id, val FROM sp_test ORDER BY id",
+        "SELECT COUNT(*) FROM sp_test",
+        // id=5 (rolled back with sp2) and id=7 (rolled back with sp3) should not exist
+        "SELECT id FROM sp_test WHERE id IN (5, 7)",
+        // id=3 should have its sp1 value, not the sp2 modification
+        "SELECT val FROM sp_test WHERE id = 3",
+        "SELECT val FROM sp_test WHERE id = 6",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} s76d savepoint nested mismatches", mismatches.len());
+    }
+}
+
+/// s76e: ALTER TABLE ADD COLUMN with various default values — NULL, literals,
+/// expressions, and verify existing rows get the default.
+#[test]
+fn test_conformance_alter_table_add_column_defaults_s76e() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE alter_test (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO alter_test VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+        // Add column with no default → existing rows get NULL
+        "ALTER TABLE alter_test ADD COLUMN age INTEGER",
+        // Add column with literal default
+        "ALTER TABLE alter_test ADD COLUMN country TEXT DEFAULT 'US'",
+        // Add column with numeric default
+        "ALTER TABLE alter_test ADD COLUMN score REAL DEFAULT 0.0",
+        // Add another column with integer default
+        "ALTER TABLE alter_test ADD COLUMN active INTEGER DEFAULT 1",
+        // Insert a new row that uses all columns
+        "INSERT INTO alter_test VALUES (4, 'Dave', 30, 'UK', 95.5, 0)",
+        // Insert using defaults for new columns
+        "INSERT INTO alter_test(id, name) VALUES (5, 'Eve')",
+        // Update one existing row's new columns
+        "UPDATE alter_test SET age = 25, country = 'CA', score = 88.0 WHERE id = 1",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT * FROM alter_test ORDER BY id",
+        // Existing rows (id 2,3) should have NULL age, 'US' country, 0.0 score, 1 active
+        "SELECT id, age, country, score, active FROM alter_test WHERE id IN (2, 3) ORDER BY id",
+        // New row with explicit values
+        "SELECT * FROM alter_test WHERE id = 4",
+        // New row with defaults
+        "SELECT age, country, score, active FROM alter_test WHERE id = 5",
+        // Updated row
+        "SELECT age, country, score FROM alter_test WHERE id = 1",
+        // Aggregates on new columns
+        "SELECT COUNT(age), AVG(COALESCE(score, 0)), SUM(active) FROM alter_test",
+        // WHERE on default column
+        "SELECT name FROM alter_test WHERE country = 'US' ORDER BY id",
+        "SELECT name FROM alter_test WHERE active = 1 ORDER BY id",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} s76e ALTER TABLE ADD COLUMN default mismatches",
+            mismatches.len()
+        );
     }
 }
