@@ -9306,17 +9306,17 @@ mod tests {
     #[test]
     fn test_cursor_next_skips_empty_table_child_subtree_without_restarting_root() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_table(&[(pn(3), 5), (pn(4), 10)], pn(5)),
-        );
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5), (pn(4), 10)], pn(5)));
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"one"), (5, b"five")]));
         store.pages.insert(4, build_leaf_table(&[]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(20, b"twenty"), (25, b"twenty-five")]));
+        store.pages.insert(
+            5,
+            build_leaf_table(&[(20, b"twenty"), (25, b"twenty-five")]),
+        );
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
