@@ -5114,10 +5114,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(None) => {
                 let fallback_result = (|| {
                     if self.try_quick_balance_on_external_rightmost_leaf_hint(
-                        cx,
-                        hint,
-                        rowid,
-                        &cell_data,
+                        cx, hint, rowid, &cell_data,
                     )? {
                         return Ok(true);
                     }
