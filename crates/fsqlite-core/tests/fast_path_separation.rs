@@ -14,12 +14,12 @@
 //!   cargo test -p fsqlite-core --test fast_path_separation \
 //!     -- --test-threads=1 --nocapture
 
+use fsqlite_btree::instrumentation::{
+    btree_leaf_reuse_snapshot, reset_btree_leaf_reuse_profile, set_btree_copy_profile_enabled,
+};
 use fsqlite_core::connection::{
     Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
     set_hot_path_profile_enabled,
-};
-use fsqlite_btree::instrumentation::{
-    btree_leaf_reuse_snapshot, reset_btree_leaf_reuse_profile, set_btree_copy_profile_enabled,
 };
 use std::sync::{Mutex, MutexGuard};
 
@@ -284,7 +284,10 @@ fn manual_profile_bench_shape_prepared_direct_insert_1000() {
     let count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
     let row = count_stmt.query_row().unwrap();
     let count_wall = count_started.elapsed();
-    assert_eq!(row.values()[0], fsqlite_types::SqliteValue::Integer(ROW_COUNT));
+    assert_eq!(
+        row.values()[0],
+        fsqlite_types::SqliteValue::Integer(ROW_COUNT)
+    );
 
     eprintln!(
         concat!(
@@ -430,7 +433,10 @@ fn manual_profile_full_op_batch_insert_1000_lifecycle() {
     let count_started = std::time::Instant::now();
     let row = count_stmt.query_row().unwrap();
     let count_wall = count_started.elapsed();
-    assert_eq!(row.values()[0], fsqlite_types::SqliteValue::Integer(ROW_COUNT));
+    assert_eq!(
+        row.values()[0],
+        fsqlite_types::SqliteValue::Integer(ROW_COUNT)
+    );
 
     eprintln!(
         concat!(

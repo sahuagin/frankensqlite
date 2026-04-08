@@ -1438,46 +1438,8 @@ struct ConcurrentContext {
     busy_timeout_ms: u64,
 }
 
-/// Shared wrapper around a boxed [`TransactionHandle`] so multiple
-/// storage cursors can share one transaction.
-///
-/// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
-/// (bd-kivg / 5E.2).
-#[derive(Clone)]
-struct SharedTxnPageIo {
-    txn: Rc<RefCell<TransactionKind>>,
-    /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
-    /// page-level locking for write operations.
-    concurrent: Option<ConcurrentContext>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConcurrentWriteTier {
-    Tier0AlreadyOwned,
-    Tier1FirstTouch,
-    Tier2CommitSurfaceRare,
-}
-
-impl std::fmt::Debug for SharedTxnPageIo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedTxnPageIo")
-            .field("rc_count", &Rc::strong_count(&self.txn))
-            .field("concurrent", &self.concurrent.is_some())
-            .finish()
-    }
-}
-
-impl SharedTxnPageIo {
-    fn new(txn: impl Into<TransactionKind>) -> Self {
-        Self {
-            txn: Rc::new(RefCell::new(txn.into())),
-            concurrent: None,
-        }
-    }
-
-    /// Create with MVCC concurrent context (bd-kivg / 5E.2).
-    fn with_concurrent(
-        txn: impl Into<TransactionKind>,
+impl ConcurrentContext {
+    fn new(
         session_id: u64,
         handle: SharedConcurrentHandle,
         lock_table: Arc<InProcessPageLockTable>,
@@ -1492,17 +1454,77 @@ impl SharedTxnPageIo {
             )
         };
         Self {
-            txn: Rc::new(RefCell::new(txn.into())),
-            concurrent: Some(ConcurrentContext {
+            session_id,
+            txn_id,
+            snapshot_high,
+            handle,
+            lock_table,
+            commit_index,
+            busy_timeout_ms,
+        }
+    }
+}
+
+/// Shared wrapper around a boxed [`TransactionHandle`] so multiple
+/// storage cursors can share one transaction.
+///
+/// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
+/// (bd-kivg / 5E.2).
+#[derive(Clone)]
+struct SharedTxnPageIo {
+    txn: Rc<RefCell<TransactionKind>>,
+    /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
+    /// page-level locking for write operations.
+    concurrent: Rc<RefCell<Option<ConcurrentContext>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrentWriteTier {
+    Tier0AlreadyOwned,
+    Tier1FirstTouch,
+    Tier2CommitSurfaceRare,
+}
+
+impl std::fmt::Debug for SharedTxnPageIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedTxnPageIo")
+            .field("rc_count", &Rc::strong_count(&self.txn))
+            .field("concurrent", &self.concurrent.borrow().is_some())
+            .finish()
+    }
+}
+
+impl SharedTxnPageIo {
+    fn from_parts(txn: TransactionKind, concurrent: Option<ConcurrentContext>) -> Self {
+        Self {
+            txn: Rc::new(RefCell::new(txn)),
+            concurrent: Rc::new(RefCell::new(concurrent)),
+        }
+    }
+
+    fn new(txn: impl Into<TransactionKind>) -> Self {
+        Self::from_parts(txn.into(), None)
+    }
+
+    /// Create with MVCC concurrent context (bd-kivg / 5E.2).
+    fn with_concurrent(
+        txn: impl Into<TransactionKind>,
+        session_id: u64,
+        handle: SharedConcurrentHandle,
+        lock_table: Arc<InProcessPageLockTable>,
+        commit_index: Arc<CommitIndex>,
+        busy_timeout_ms: u64,
+    ) -> Self {
+        Self::from_parts(
+            txn.into(),
+            Some(ConcurrentContext::new(
                 session_id,
-                txn_id,
-                snapshot_high,
                 handle,
                 lock_table,
                 commit_index,
                 busy_timeout_ms,
-            }),
-        }
+            )),
+        )
     }
 
     /// Unwrap back to the owned transaction handle.
@@ -1520,7 +1542,12 @@ impl SharedTxnPageIo {
     /// bd-perf: Swap the inner transaction without breaking Rc references.
     /// Retained StorageCursors hold clones of the same Rc, so replacing
     /// the inner value keeps them valid. Returns the old transaction.
-    fn refill(&self, txn: TransactionKind) -> TransactionKind {
+    fn refill(
+        &self,
+        txn: TransactionKind,
+        concurrent: Option<ConcurrentContext>,
+    ) -> TransactionKind {
+        self.concurrent.replace(concurrent);
         self.txn.replace(txn)
     }
 
@@ -1532,12 +1559,16 @@ impl SharedTxnPageIo {
         self.txn.replace(TransactionKind::Drained)
     }
 
+    fn concurrent_context(&self) -> Option<ConcurrentContext> {
+        self.concurrent.borrow().clone()
+    }
+
     fn clear_stale_synthetic_pending_commit_surface(
         &self,
         _cx: &Cx,
         operation: &str,
     ) -> Result<()> {
-        let Some(ctx) = &self.concurrent else {
+        let Some(ctx) = self.concurrent_context() else {
             return Ok(());
         };
         // The live engine only synthesizes conflict-only tracking for page 1.
@@ -1588,7 +1619,7 @@ impl SharedTxnPageIo {
     }
 
     fn classify_concurrent_write_tier(&self, page_no: PageNumber) -> Result<ConcurrentWriteTier> {
-        let Some(ctx) = &self.concurrent else {
+        let Some(ctx) = self.concurrent_context() else {
             return Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare);
         };
 
@@ -2072,7 +2103,7 @@ impl SharedTxnPageIo {
         page_no: PageNumber,
         page_data_base: PageData,
     ) -> Result<()> {
-        let Some(ctx) = &self.concurrent else {
+        let Some(ctx) = self.concurrent_context() else {
             return self
                 .txn
                 .borrow_mut()
@@ -2081,13 +2112,13 @@ impl SharedTxnPageIo {
 
         match self.classify_concurrent_write_tier(page_no)? {
             ConcurrentWriteTier::Tier0AlreadyOwned => {
-                self.write_page_tier0_already_owned(cx, ctx, page_no, page_data_base)
+                self.write_page_tier0_already_owned(cx, &ctx, page_no, page_data_base)
             }
             ConcurrentWriteTier::Tier1FirstTouch => {
-                self.write_page_tier1_first_touch(cx, ctx, page_no, page_data_base)
+                self.write_page_tier1_first_touch(cx, &ctx, page_no, page_data_base)
             }
             ConcurrentWriteTier::Tier2CommitSurfaceRare => {
-                self.write_page_tier2_commit_surface_rare(cx, ctx, page_no, page_data_base)
+                self.write_page_tier2_commit_surface_rare(cx, &ctx, page_no, page_data_base)
             }
         }
     }
@@ -2385,7 +2416,7 @@ fn track_concurrent_conflict_only_page(
 
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        if let Some(ctx) = &self.concurrent {
+        if let Some(ctx) = self.concurrent_context() {
             // Read-own-writes visibility: if this txn already wrote the page,
             // return that version first and still record the read for SSI.
             let txn_id = ctx.txn_id;
@@ -2434,7 +2465,7 @@ impl PageReader for SharedTxnPageIo {
     // bd-perf: Override to avoid Vec<u8> round-trip (read_page returns Vec,
     // default read_page_data wraps in PageData — wasteful 4KB alloc+copy).
     fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if let Some(ctx) = &self.concurrent {
+        if let Some(ctx) = self.concurrent_context() {
             let mut handle = ctx.handle.lock();
             if concurrent_page_is_freed(&handle, page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -2455,13 +2486,13 @@ impl PageReader for SharedTxnPageIo {
     }
 
     fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
-        if let Some(ctx) = &self.concurrent {
+        if let Some(ctx) = self.concurrent_context() {
             ctx.handle.lock().record_read_witness(key);
         }
     }
 
     fn is_dirty(&self, page_no: PageNumber) -> bool {
-        if let Some(ctx) = &self.concurrent {
+        if let Some(ctx) = self.concurrent_context() {
             return ctx.handle.lock().tracks_write_conflict_page(page_no);
         }
         false
@@ -2482,8 +2513,9 @@ impl PageWriter for SharedTxnPageIo {
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        let concurrent = self.concurrent_context();
         let page_one_tracking_required = self
-            .concurrent
+            .concurrent_context()
             .as_ref()
             .map(|_| {
                 self.txn
@@ -2492,7 +2524,7 @@ impl PageWriter for SharedTxnPageIo {
             })
             .transpose()?
             .unwrap_or(false);
-        let page_one_state = self.concurrent.as_ref().and_then(|ctx| {
+        let page_one_state = concurrent.as_ref().and_then(|ctx| {
             let handle = ctx.handle.lock();
             if page_one_tracking_required {
                 if !handle.tracks_write_conflict_page(PageNumber::ONE) {
@@ -2504,14 +2536,16 @@ impl PageWriter for SharedTxnPageIo {
                 None
             }
         });
-        if let Some(ctx) = &self.concurrent
+        if let Some(ctx) = concurrent.as_ref()
             && page_one_state.is_some()
         {
             track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "allocate_page")?;
         }
         let allocate_result = self.txn.borrow_mut().allocate_page(cx);
         if let Err(allocate_error) = &allocate_result {
-            if let (Some(ctx), Some(page_one_state)) = (&self.concurrent, page_one_state.as_ref()) {
+            if let (Some(ctx), Some(page_one_state)) =
+                (concurrent.as_ref(), page_one_state.as_ref())
+            {
                 let mut handle = ctx.handle.lock();
                 if let Err(restore_error) = concurrent_restore_page_state(
                     &mut handle,
@@ -2531,8 +2565,9 @@ impl PageWriter for SharedTxnPageIo {
     }
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        let concurrent = self.concurrent_context();
         let page_one_tracking_required = self
-            .concurrent
+            .concurrent_context()
             .as_ref()
             .map(|_| {
                 self.txn
@@ -2541,7 +2576,7 @@ impl PageWriter for SharedTxnPageIo {
             })
             .transpose()?
             .unwrap_or(false);
-        let (prior_page_state, page_one_state) = if let Some(ctx) = &self.concurrent {
+        let (prior_page_state, page_one_state) = if let Some(ctx) = concurrent.as_ref() {
             let handle = ctx.handle.lock();
             let prior_page_state = Some(concurrent_page_state(&handle, page_no));
             let page_one_state = if page_one_tracking_required {
@@ -2557,7 +2592,7 @@ impl PageWriter for SharedTxnPageIo {
         } else {
             (None, None)
         };
-        if let Some(ref ctx) = self.concurrent {
+        if let Some(ctx) = concurrent.as_ref() {
             if page_one_state.is_some() {
                 track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "free_page")?;
             }
@@ -2695,7 +2730,7 @@ impl PageWriter for SharedTxnPageIo {
         let free_result = self.txn.borrow_mut().free_page(cx, page_no);
         if let Err(free_error) = free_result {
             if let (Some(ctx), Some(prior_page_state)) =
-                (&self.concurrent, prior_page_state.as_ref())
+                (concurrent.as_ref(), prior_page_state.as_ref())
             {
                 let mut handle = ctx.handle.lock();
                 if let Err(restore_error) = concurrent_restore_page_state(
@@ -2728,7 +2763,7 @@ impl PageWriter for SharedTxnPageIo {
     }
 
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
-        if let Some(ref ctx) = self.concurrent {
+        if let Some(ctx) = self.concurrent_context() {
             ctx.handle.lock().record_write_witness(key);
             return;
         }
@@ -5919,14 +5954,26 @@ impl VdbeEngine {
         }
     }
 
+    fn attach_transaction_state(
+        &mut self,
+        txn: TransactionKind,
+        concurrent: Option<ConcurrentContext>,
+    ) {
+        if let Some(txn_page_io) = self.txn_page_io.as_ref() {
+            txn_page_io.refill(txn, concurrent);
+        } else {
+            self.txn_page_io = Some(SharedTxnPageIo::from_parts(txn, concurrent));
+        }
+        self.storage_cursors_enabled = true;
+    }
+
     /// Lend a pager transaction to the engine for storage cursor I/O.
     ///
     /// When set, `open_storage_cursor` routes through the real pager/WAL
     /// stack (`SharedTxnPageIo`) instead of building transient `MemPageStore`
     /// snapshots. Also enables storage cursors automatically.
     pub fn set_transaction(&mut self, txn: impl Into<TransactionKind>) {
-        self.txn_page_io = Some(SharedTxnPageIo::new(txn));
-        self.storage_cursors_enabled = true;
+        self.attach_transaction_state(txn.into(), None);
     }
 
     /// Lend a pager transaction with MVCC concurrent context (bd-kivg / 5E.2).
@@ -5945,15 +5992,16 @@ impl VdbeEngine {
         commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
     ) {
-        self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
-            txn,
-            session_id,
-            handle,
-            lock_table,
-            commit_index,
-            busy_timeout_ms,
-        ));
-        self.storage_cursors_enabled = true;
+        self.attach_transaction_state(
+            txn.into(),
+            Some(ConcurrentContext::new(
+                session_id,
+                handle,
+                lock_table,
+                commit_index,
+                busy_timeout_ms,
+            )),
+        );
     }
 
     /// Provide the shared concurrent rowid allocator for implicit inserts.
@@ -6095,7 +6143,9 @@ impl VdbeEngine {
         &mut self,
         txn: impl Into<TransactionKind>,
     ) -> Option<TransactionKind> {
-        self.txn_page_io.as_ref().map(|io| io.refill(txn.into()))
+        self.txn_page_io
+            .as_ref()
+            .map(|io| io.refill(txn.into(), None))
     }
 
     /// bd-perf: Extract the transaction while keeping the Rc alive for
@@ -20032,6 +20082,180 @@ mod tests {
         assert!(recovered.is_some());
         assert!(engine.txn_page_io.is_none());
         assert!(engine.storage_cursors.is_empty());
+    }
+
+    #[test]
+    fn test_set_transaction_concurrent_refills_retained_shared_state() {
+        use fsqlite_mvcc::{CommitIndex, ConcurrentRegistry, InProcessPageLockTable};
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::{CommitSeq, PageNumber, SchemaEpoch, Snapshot, WitnessKey};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn1 = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let txn2 = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let ((session1, handle1), (session2, handle2)) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session1 = guard
+                .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
+                .expect("first session should register");
+            let session2 = guard
+                .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
+                .expect("second session should register");
+            let handle1 = guard
+                .handle(session1)
+                .expect("first session handle should exist");
+            let handle2 = guard
+                .handle(session2)
+                .expect("second session handle should exist");
+            ((session1, handle1), (session2, handle2))
+        };
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction_concurrent(
+            txn1,
+            session1,
+            Arc::clone(&handle1),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        let retained = engine
+            .txn_page_io
+            .as_ref()
+            .expect("engine should install shared txn state")
+            .clone();
+        let _drained = engine
+            .drain_transaction()
+            .expect("drain_transaction should leave retained state behind");
+
+        engine.set_transaction_concurrent(
+            txn2,
+            session2,
+            Arc::clone(&handle2),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        retained
+            .read_page_data(&cx, PageNumber::ONE)
+            .expect("retained clone should see the refilled transaction instead of Drained");
+        retained.record_write_witness(&cx, WitnessKey::Page(PageNumber::ONE));
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = guard
+            .get(session1)
+            .expect("first session should remain registered");
+        let second = guard
+            .get(session2)
+            .expect("second session should remain registered");
+        assert!(
+            !first
+                .read_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "retained clone must stop recording reads against the drained concurrent session"
+        );
+        assert!(
+            !first
+                .write_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "retained clone must stop recording writes against the drained concurrent session"
+        );
+        assert!(
+            second
+                .read_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "retained clone must record reads on the refilled concurrent session"
+        );
+        assert!(
+            second
+                .write_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "retained clone must record writes on the refilled concurrent session"
+        );
+    }
+
+    #[test]
+    fn test_set_transaction_clears_stale_concurrent_context_on_retained_reuse() {
+        use fsqlite_mvcc::{CommitIndex, ConcurrentRegistry, InProcessPageLockTable};
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::{CommitSeq, PageNumber, SchemaEpoch, Snapshot, WitnessKey};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let concurrent_txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let immediate_txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1)))
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle should exist");
+            (session_id, handle)
+        };
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction_concurrent(
+            concurrent_txn,
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        let retained = engine
+            .txn_page_io
+            .as_ref()
+            .expect("engine should install shared txn state")
+            .clone();
+        let _drained = engine
+            .drain_transaction()
+            .expect("drain_transaction should leave retained state behind");
+
+        engine.set_transaction(immediate_txn);
+
+        retained.read_page_data(&cx, PageNumber::ONE).expect(
+            "plain set_transaction should refill the retained clone instead of leaving Drained",
+        );
+        retained.record_write_witness(&cx, WitnessKey::Page(PageNumber::ONE));
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = guard
+            .get(session_id)
+            .expect("original concurrent session should remain registered");
+        assert!(
+            !session
+                .read_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "plain set_transaction must clear stale concurrent read tracking on retained clones"
+        );
+        assert!(
+            !session
+                .write_witness_keys()
+                .contains(&WitnessKey::Page(PageNumber::ONE)),
+            "plain set_transaction must clear stale concurrent write tracking on retained clones"
+        );
     }
 
     #[test]

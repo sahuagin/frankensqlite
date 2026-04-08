@@ -8,6 +8,18 @@ This crate implements the FTS5 full-text search extension, the successor to FTS3
 
 This crate sits at the extension layer of the fsqlite workspace. It depends on `fsqlite-types`, `fsqlite-error`, `fsqlite-func` (for `ScalarFunction` and `VirtualTable` traits), and `tracing`.
 
+## Shadow-Backed FTS5 Work
+
+The current crate still reflects FrankenSQLite's existing in-memory/materialized FTS5 path. The first-class shadow-backed backend work is tracked by the FTS5 epic and starts from the implementation contract in [`SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md`](./SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md).
+
+That matrix is the authoritative spec for:
+
+- stock SQLite `rootpage=0` catalog behavior,
+- shadow-table ownership and defensive restrictions,
+- `%_config` / `%_content` / `%_docsize` / `%_data` / `%_idx` responsibilities,
+- content modes, tokenizer/locale/tokendata semantics, and
+- maintenance/integrity command behavior.
+
 ## Key Types
 
 - `Fts5Config` - Configuration for an FTS5 virtual table: content mode, secure-delete, and contentless-delete settings
