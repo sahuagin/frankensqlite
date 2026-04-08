@@ -10,7 +10,11 @@ This crate sits at the extension layer of the fsqlite workspace. It depends on `
 
 ## Shadow-Backed FTS5 Work
 
-The current crate still reflects FrankenSQLite's existing in-memory/materialized FTS5 path. The first-class shadow-backed backend work is tracked by the FTS5 epic and starts from the implementation contract in [`SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md`](./SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md).
+The current crate still reflects FrankenSQLite's existing in-memory/materialized FTS5 path. The first-class shadow-backed backend work is tracked by the FTS5 epic and starts from:
+
+- the implementation contract in [`SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md`](./SHADOW_BACKED_FTS5_CONTRACT_MATRIX.md), and
+- the target runtime/storage design in [`SHADOW_BACKED_FTS5_TARGET_ARCHITECTURE.md`](./SHADOW_BACKED_FTS5_TARGET_ARCHITECTURE.md), and
+- the verification/logging/evidence contract in [`SHADOW_BACKED_FTS5_PROOF_ARTIFACT_CONTRACT.md`](./SHADOW_BACKED_FTS5_PROOF_ARTIFACT_CONTRACT.md).
 
 That matrix is the authoritative spec for:
 
@@ -19,6 +23,10 @@ That matrix is the authoritative spec for:
 - `%_config` / `%_content` / `%_docsize` / `%_data` / `%_idx` responsibilities,
 - content modes, tokenizer/locale/tokendata semantics, and
 - maintenance/integrity command behavior.
+
+The target-architecture document defines the intended runtime object model, MVCC/savepoint invariants, cutover sequence, and the retirement plan for the current materialized positive-rootpage path.
+
+The proof-artifact contract defines the required unit/integration/e2e coverage shape, structured logging fields, replay requirements, manifest conventions, and artifact-bundle expectations for the whole shadow-backed program.
 
 ## Key Types
 
