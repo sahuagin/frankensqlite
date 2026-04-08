@@ -2825,35 +2825,6 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn store_rightmost_leaf_cache_from_page(
-        &mut self,
-        cx: &Cx,
-        leaf_page_no: PageNumber,
-        rowid: i64,
-        tree_depth: usize,
-    ) -> Result<()> {
-        let page_data = self.pager.read_page_data(cx, leaf_page_no)?;
-        let header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
-        if header.page_type != cell::BtreePageType::LeafTable || header.cell_count == 0 {
-            return Err(FrankenError::internal(format!(
-                "rightmost leaf cache expected non-empty table leaf page {}",
-                leaf_page_no.get()
-            )));
-        }
-        let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-        self.last_known_depth = Some(tree_depth);
-        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
-            page_no: leaf_page_no,
-            rowid,
-            tree_depth,
-            page_data,
-            header,
-            cell_pointers,
-        });
-        Ok(())
-    }
-
     fn write_overflow_chain_for_insert(
         &mut self,
         cx: &Cx,
@@ -3513,6 +3484,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page_no.get()
                 ),
             })?;
+        let mutate_start = std::time::Instant::now();
         {
             let page_bytes = page_data.as_bytes_mut();
             page_bytes[new_content_offset..new_content_offset + cell_data.len()]
@@ -3520,9 +3492,16 @@ impl<P: PageWriter> BtCursor<P> {
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
+        instrumentation::record_fast_table_leaf_full_cell_append_mutate(
+            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
 
         let staged_page = page_data.clone();
+        let stage_start = std::time::Instant::now();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        instrumentation::record_fast_table_leaf_full_cell_append_stage(
+            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -3596,6 +3575,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page_no.get()
                 ),
             })?;
+        let mutate_start = std::time::Instant::now();
         {
             let page_bytes = page_data.as_bytes_mut();
             let mut write_offset = new_content_offset;
@@ -3610,9 +3590,16 @@ impl<P: PageWriter> BtCursor<P> {
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
+        instrumentation::record_fast_table_leaf_payload_append_mutate(
+            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
 
         let staged_page = page_data.clone();
+        let stage_start = std::time::Instant::now();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        instrumentation::record_fast_table_leaf_payload_append_stage(
+            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -3671,26 +3658,56 @@ impl<P: PageWriter> BtCursor<P> {
                     if let Some((rowid, _)) = read_varint(&cell_data[n..]) {
                         #[allow(clippy::cast_possible_wrap)]
                         let rowid = rowid as i64;
-                        match balance::balance_quick(
+                        let divider_rowid = self
+                            .rightmost_leaf_cache
+                            .as_ref()
+                            .filter(|cached| cached.page_no == leaf_entry.page_no)
+                            .map(|cached| cached.rowid)
+                            .unwrap_or_else(|| {
+                                Self::table_leaf_rowid_at(
+                                    leaf_entry,
+                                    leaf_entry.header.cell_count.saturating_sub(1),
+                                )
+                                .unwrap_or_else(|_| rowid.saturating_sub(1))
+                            });
+                        let quick_balance_start = std::time::Instant::now();
+                        match balance::balance_quick_known_divider_rowid(
                             cx,
                             &mut self.pager,
                             parent_page_no,
                             leaf_entry.page_no,
                             cell_data,
-                            rowid,
+                            divider_rowid,
                             self.usable_size,
                             self.page_size,
                         ) {
-                            Ok(Some(new_pgno)) => {
+                            Ok(Some(result)) => {
+                                instrumentation::record_quick_balance_attempt(
+                                    u64::try_from(quick_balance_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                    true,
+                                );
                                 self.note_split_event();
                                 self.stack.clear();
                                 self.at_eof = true;
-                                self.store_rightmost_leaf_cache_from_page(
-                                    cx, new_pgno, rowid, depth,
-                                )?;
+                                self.last_known_depth = Some(depth);
+                                self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                                    page_no: result.new_pgno,
+                                    rowid,
+                                    tree_depth: depth,
+                                    page_data: result.new_page_data,
+                                    header: result.new_header,
+                                    cell_pointers: vec![result.new_cell_ptr],
+                                });
                                 return Ok(());
                             }
-                            Ok(None) => {}
+                            Ok(None) => {
+                                instrumentation::record_quick_balance_attempt(
+                                    u64::try_from(quick_balance_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX),
+                                    false,
+                                );
+                            }
                             Err(err) => return Err(err),
                         }
                     }
@@ -3698,6 +3715,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             let mut outcome = if leaf_entry.header.page_type == cell::BtreePageType::LeafTable {
+                let local_split_start = std::time::Instant::now();
                 match balance::balance_table_leaf_local_split(
                     cx,
                     &mut self.pager,
@@ -3711,23 +3729,41 @@ impl<P: PageWriter> BtCursor<P> {
                     parent_is_root,
                 )? {
                     Some(outcome) => {
+                        instrumentation::record_local_split_attempt(
+                            u64::try_from(local_split_start.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX),
+                            true,
+                        );
                         self.note_split_event();
                         outcome
                     }
-                    None => balance::balance_nonroot(
-                        cx,
-                        &mut self.pager,
-                        parent_page_no,
-                        child_idx,
-                        &[cell_data.to_vec()],
-                        insert_idx as usize,
-                        self.usable_size,
-                        self.page_size,
-                        parent_is_root,
-                    )?,
+                    None => {
+                        instrumentation::record_local_split_attempt(
+                            u64::try_from(local_split_start.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX),
+                            false,
+                        );
+                        let nonroot_start = std::time::Instant::now();
+                        let outcome = balance::balance_nonroot(
+                            cx,
+                            &mut self.pager,
+                            parent_page_no,
+                            child_idx,
+                            &[cell_data.to_vec()],
+                            insert_idx as usize,
+                            self.usable_size,
+                            self.page_size,
+                            parent_is_root,
+                        )?;
+                        instrumentation::record_nonroot_balance(
+                            u64::try_from(nonroot_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                        outcome
+                    }
                 }
             } else {
-                balance::balance_nonroot(
+                let nonroot_start = std::time::Instant::now();
+                let outcome = balance::balance_nonroot(
                     cx,
                     &mut self.pager,
                     parent_page_no,
@@ -3737,7 +3773,11 @@ impl<P: PageWriter> BtCursor<P> {
                     self.usable_size,
                     self.page_size,
                     parent_is_root,
-                )?
+                )?;
+                instrumentation::record_nonroot_balance(
+                    u64::try_from(nonroot_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                outcome
             };
 
             // If balancing split the parent page, propagate the split up the

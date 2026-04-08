@@ -4283,6 +4283,7 @@ impl StagedPage {
             }
         }
     }
+
 }
 
 /// Transaction handle produced by [`SimplePager`].

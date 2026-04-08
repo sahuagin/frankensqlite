@@ -18,6 +18,9 @@ use fsqlite_core::connection::{
     Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
     set_hot_path_profile_enabled,
 };
+use fsqlite_btree::instrumentation::{
+    btree_leaf_reuse_snapshot, reset_btree_leaf_reuse_profile, set_btree_copy_profile_enabled,
+};
 use std::sync::{Mutex, MutexGuard};
 
 static FAST_PATH_PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -35,6 +38,8 @@ impl FastPathProfileTestGuard {
         let previous_enabled = hot_path_profile_enabled();
         set_hot_path_profile_enabled(true);
         reset_hot_path_profile();
+        set_btree_copy_profile_enabled(true);
+        reset_btree_leaf_reuse_profile();
         Self {
             _lock: lock,
             previous_enabled,
@@ -44,6 +49,8 @@ impl FastPathProfileTestGuard {
 
 impl Drop for FastPathProfileTestGuard {
     fn drop(&mut self) {
+        reset_btree_leaf_reuse_profile();
+        set_btree_copy_profile_enabled(false);
         reset_hot_path_profile();
         set_hot_path_profile_enabled(self.previous_enabled);
     }
@@ -209,12 +216,18 @@ fn manual_profile_large_prepared_direct_insert_single_txn_10k() {
     conn.execute("COMMIT").unwrap();
     let wall = started.elapsed();
     let profile = hot_path_profile_snapshot();
+    let leaf_reuse = btree_leaf_reuse_snapshot();
 
     eprintln!(
         concat!(
             "[manual_large_insert_10k] wall_us={} execute_body_us={} ",
             "row_build_us={} cursor_setup_us={} serialize_us={} ",
-            "btree_insert_us={} memdb_apply_us={} direct_execs={} fast_execs={}"
+            "btree_insert_us={} memdb_apply_us={} direct_execs={} fast_execs={} ",
+            "payload_appends={} payload_mutate_us={} payload_stage_us={} ",
+            "full_cell_appends={} full_cell_mutate_us={} full_cell_stage_us={} ",
+            "quick_balance_attempts={} quick_balance_hits={} quick_balance_us={} ",
+            "local_split_attempts={} local_split_hits={} local_split_us={} ",
+            "nonroot_calls={} nonroot_us={}"
         ),
         wall.as_micros(),
         profile.execute_body_time_ns / 1_000,
@@ -225,6 +238,160 @@ fn manual_profile_large_prepared_direct_insert_single_txn_10k() {
         profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
         profile.prepared_direct_insert_executions,
         profile.parser.fast_path_executions,
+        leaf_reuse.fast_table_leaf_payload_appends,
+        leaf_reuse.fast_table_leaf_payload_mutate_time_ns / 1_000,
+        leaf_reuse.fast_table_leaf_payload_stage_time_ns / 1_000,
+        leaf_reuse.fast_table_leaf_full_cell_appends,
+        leaf_reuse.fast_table_leaf_full_cell_mutate_time_ns / 1_000,
+        leaf_reuse.fast_table_leaf_full_cell_stage_time_ns / 1_000,
+        leaf_reuse.quick_balance_attempts,
+        leaf_reuse.quick_balance_hits,
+        leaf_reuse.quick_balance_time_ns / 1_000,
+        leaf_reuse.local_split_attempts,
+        leaf_reuse.local_split_hits,
+        leaf_reuse.local_split_time_ns / 1_000,
+        leaf_reuse.nonroot_balance_calls,
+        leaf_reuse.nonroot_balance_time_ns / 1_000,
+    );
+}
+
+#[test]
+#[ignore = "manual perf probe for operation_baseline_bench batch insert shape"]
+fn manual_profile_bench_shape_prepared_direct_insert_1000() {
+    const ROW_COUNT: i64 = 1_000;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))";
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    conn.execute(CREATE_TABLE).unwrap();
+    conn.execute("BEGIN").unwrap();
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+
+    reset_hot_path_profile();
+    let insert_started = std::time::Instant::now();
+    for i in 1..=ROW_COUNT {
+        stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(i)])
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let insert_wall = insert_started.elapsed();
+    let profile = hot_path_profile_snapshot();
+
+    let count_started = std::time::Instant::now();
+    let count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+    let row = count_stmt.query_row().unwrap();
+    let count_wall = count_started.elapsed();
+    assert_eq!(row.values()[0], fsqlite_types::SqliteValue::Integer(ROW_COUNT));
+
+    eprintln!(
+        concat!(
+            "[manual_bench_shape_insert_1000] insert_wall_us={} count_wall_us={} ",
+            "bg_status_us={} execute_body_us={} schema_validation_us={} ",
+            "row_build_us={} cursor_setup_us={} serialize_us={} ",
+            "btree_insert_us={} memdb_apply_us={} change_tracking_us={} ",
+            "commit_pre_txn_us={} commit_roundtrip_us={} commit_finalize_us={} ",
+            "commit_handle_finalize_us={} commit_post_write_us={} finalize_post_publish_us={} ",
+            "direct_execs={} fast_execs={}"
+        ),
+        insert_wall.as_micros(),
+        count_wall.as_micros(),
+        profile.background_status_time_ns / 1_000,
+        profile.execute_body_time_ns / 1_000,
+        profile.prepared_direct_insert_schema_validation_time_ns / 1_000,
+        profile.prepared_direct_insert_row_build_time_ns / 1_000,
+        profile.prepared_direct_insert_cursor_setup_time_ns / 1_000,
+        profile.prepared_direct_insert_serialize_time_ns / 1_000,
+        profile.prepared_direct_insert_btree_insert_time_ns / 1_000,
+        profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
+        profile.prepared_direct_insert_change_tracking_time_ns / 1_000,
+        profile.commit_pre_txn_time_ns / 1_000,
+        profile.commit_txn_roundtrip_time_ns / 1_000,
+        profile.commit_finalize_seq_time_ns / 1_000,
+        profile.commit_handle_finalize_time_ns / 1_000,
+        profile.commit_post_write_maintenance_time_ns / 1_000,
+        profile.finalize_post_publish_time_ns / 1_000,
+        profile.prepared_direct_insert_executions,
+        profile.parser.fast_path_executions,
+    );
+}
+
+#[test]
+#[ignore = "manual perf probe for full operation_baseline_bench batch insert lifecycle"]
+fn manual_profile_full_op_batch_insert_1000_lifecycle() {
+    const ROW_COUNT: i64 = 1_000;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))";
+
+    let _profile_guard = FastPathProfileTestGuard::new();
+
+    let open_started = std::time::Instant::now();
+    let conn = Connection::open(":memory:").unwrap();
+    let open_wall = open_started.elapsed();
+
+    let pragma_started = std::time::Instant::now();
+    conn.execute("PRAGMA journal_mode = WAL").unwrap();
+    let pragma_wall = pragma_started.elapsed();
+
+    let create_started = std::time::Instant::now();
+    conn.execute(CREATE_TABLE).unwrap();
+    let create_wall = create_started.elapsed();
+
+    let begin_started = std::time::Instant::now();
+    conn.execute("BEGIN").unwrap();
+    let begin_wall = begin_started.elapsed();
+
+    let prepare_insert_started = std::time::Instant::now();
+    let stmt = conn.prepare(INSERT_SQL).unwrap();
+    let prepare_insert_wall = prepare_insert_started.elapsed();
+
+    reset_hot_path_profile();
+    let insert_started = std::time::Instant::now();
+    for i in 1..=ROW_COUNT {
+        stmt.execute_with_params(&[fsqlite_types::SqliteValue::Integer(i)])
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let insert_wall = insert_started.elapsed();
+    let profile = hot_path_profile_snapshot();
+
+    let prepare_count_started = std::time::Instant::now();
+    let count_stmt = conn.prepare("SELECT COUNT(*) FROM bench").unwrap();
+    let prepare_count_wall = prepare_count_started.elapsed();
+
+    let count_started = std::time::Instant::now();
+    let row = count_stmt.query_row().unwrap();
+    let count_wall = count_started.elapsed();
+    assert_eq!(row.values()[0], fsqlite_types::SqliteValue::Integer(ROW_COUNT));
+
+    eprintln!(
+        concat!(
+            "[manual_full_op_batch_insert_1000] open_us={} pragma_us={} create_us={} begin_us={} ",
+            "prepare_insert_us={} insert_plus_commit_us={} prepare_count_us={} count_us={} ",
+            "bg_status_us={} execute_body_us={} schema_validation_us={} row_build_us={} ",
+            "btree_insert_us={} memdb_apply_us={} commit_roundtrip_us={} commit_handle_finalize_us={} ",
+            "finalize_post_publish_us={}"
+        ),
+        open_wall.as_micros(),
+        pragma_wall.as_micros(),
+        create_wall.as_micros(),
+        begin_wall.as_micros(),
+        prepare_insert_wall.as_micros(),
+        insert_wall.as_micros(),
+        prepare_count_wall.as_micros(),
+        count_wall.as_micros(),
+        profile.background_status_time_ns / 1_000,
+        profile.execute_body_time_ns / 1_000,
+        profile.prepared_direct_insert_schema_validation_time_ns / 1_000,
+        profile.prepared_direct_insert_row_build_time_ns / 1_000,
+        profile.prepared_direct_insert_btree_insert_time_ns / 1_000,
+        profile.prepared_direct_insert_memdb_apply_time_ns / 1_000,
+        profile.commit_txn_roundtrip_time_ns / 1_000,
+        profile.commit_handle_finalize_time_ns / 1_000,
+        profile.finalize_post_publish_time_ns / 1_000,
     );
 }
 

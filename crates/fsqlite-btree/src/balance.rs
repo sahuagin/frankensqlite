@@ -59,6 +59,14 @@ struct PreparedLeafTableLocalSplit {
     pending_page_writes: Vec<(PageNumber, Vec<u8>, Option<PageData>)>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct QuickBalanceResult {
+    pub(crate) new_pgno: PageNumber,
+    pub(crate) new_page_data: PageData,
+    pub(crate) new_header: BtreePageHeader,
+    pub(crate) new_cell_ptr: u16,
+}
+
 // ---------------------------------------------------------------------------
 // Gathered cell descriptor
 // ---------------------------------------------------------------------------
@@ -214,10 +222,38 @@ pub fn balance_quick<W: PageWriter>(
     usable_size: u32,
     page_size: u32,
 ) -> Result<Option<PageNumber>> {
-    // Read parent page to check for space.
-    let original_parent_data = writer.read_page_data(cx, parent_page_no)?;
+    let divider_rowid =
+        quick_balance_divider_rowid(cx, writer, leaf_page_no, overflow_rowid, usable_size)?;
+    Ok(balance_quick_known_divider_rowid(
+        cx,
+        writer,
+        parent_page_no,
+        leaf_page_no,
+        overflow_cell,
+        divider_rowid,
+        usable_size,
+        page_size,
+    )?
+    .map(|result| result.new_pgno))
+}
+
+pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    parent_page_no: PageNumber,
+    leaf_page_no: PageNumber,
+    overflow_cell: &[u8],
+    divider_rowid: i64,
+    usable_size: u32,
+    page_size: u32,
+) -> Result<Option<QuickBalanceResult>> {
+    // Read parent page once, then perform the divider append and right-child
+    // update in-memory. This hot path is only used when the split lands on the
+    // rightmost child, so the parent update is always an append, not a general
+    // insertion.
+    let mut parent_data = writer.read_page_data(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
-    let parent_header = parse_page_header(original_parent_data.as_bytes(), parent_page_no)?;
+    let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
     // Calculate required space for the divider cell.
     // Divider: [4-byte child ptr] [rowid varint]
@@ -283,61 +319,11 @@ pub fn balance_quick<W: PageWriter>(
     // Write cell content.
     new_page[content_start..content_start + cell_size].copy_from_slice(overflow_cell);
 
-    if let Err(err) = writer.write_page_data(cx, new_pgno, PageData::from_vec(new_page)) {
+    let new_page_data = PageData::from_vec(new_page);
+    if let Err(err) = writer.write_page_data(cx, new_pgno, new_page_data.clone()) {
         let _ = writer.free_page(cx, new_pgno);
         return Err(err);
     }
-
-    // Read the existing leaf to find the divider key (its rightmost rowid).
-    let leaf_data = match writer.read_page_data(cx, leaf_page_no) {
-        Ok(data) => data,
-        Err(err) => {
-            let _ = writer.free_page(cx, new_pgno);
-            return Err(err);
-        }
-    };
-    let leaf_offset = header_offset_for_page(leaf_page_no);
-    let leaf_header = match parse_page_header(leaf_data.as_bytes(), leaf_page_no) {
-        Ok(header) => header,
-        Err(err) => {
-            let _ = writer.free_page(cx, new_pgno);
-            return Err(err);
-        }
-    };
-    let leaf_ptrs = match read_cell_pointers(leaf_data.as_bytes(), &leaf_header, leaf_offset) {
-        Ok(ptrs) => ptrs,
-        Err(err) => {
-            let _ = writer.free_page(cx, new_pgno);
-            return Err(err);
-        }
-    };
-
-    let divider_rowid = if leaf_header.cell_count > 0 {
-        let last_ptr = leaf_ptrs[leaf_header.cell_count as usize - 1] as usize;
-        let last_cell = match CellRef::parse(
-            leaf_data.as_bytes(),
-            last_ptr,
-            BtreePageType::LeafTable,
-            usable_size,
-        ) {
-            Ok(cell) => cell,
-            Err(err) => {
-                let _ = writer.free_page(cx, new_pgno);
-                return Err(err);
-            }
-        };
-        match last_cell.rowid {
-            Some(rowid) => rowid,
-            None => {
-                let _ = writer.free_page(cx, new_pgno);
-                return Err(FrankenError::internal("leaf table cell missing rowid"));
-            }
-        }
-    } else {
-        // Edge case: leaf is somehow empty before the overflow.
-        // Use the overflow rowid minus 1 (the divider separates left from right).
-        overflow_rowid.saturating_sub(1)
-    };
 
     // Build a divider cell for the parent: [4-byte child ptr] [rowid varint].
     let mut divider = [0u8; 13]; // 4 + up to 9 varint bytes
@@ -347,36 +333,75 @@ pub fn balance_quick<W: PageWriter>(
     let varint_size = write_varint(&mut divider[4..], rowid_u64);
     let divider_size = 4 + varint_size;
 
-    // Insert divider into parent and update right_child.
-    // We already checked for space, so this should succeed unless concurrent modification
-    // (which shouldn't happen with exclusive latching).
-    if let Err(err) = insert_cell_into_page(
-        cx,
-        writer,
-        parent_page_no,
+    let new_parent_content_offset = parent_header
+        .content_offset(usable_size)
+        .checked_sub(divider_size)
+        .ok_or_else(|| FrankenError::internal("divider cell too large for parent content area"))?;
+    let parent_ptr_write_offset = parent_offset
+        + usize::from(parent_header.page_type.header_size())
+        + (usize::from(parent_header.cell_count) * usize::from(CELL_POINTER_SIZE));
+    if parent_ptr_write_offset + usize::from(CELL_POINTER_SIZE) > new_parent_content_offset {
+        let _ = writer.free_page(cx, new_pgno);
+        return Ok(None);
+    }
+
+    {
+        let page_bytes = parent_data.as_bytes_mut();
+        page_bytes[new_parent_content_offset..new_parent_content_offset + divider_size]
+            .copy_from_slice(&divider[..divider_size]);
+        #[allow(clippy::cast_possible_truncation)]
+        let divider_ptr = new_parent_content_offset as u16;
+        page_bytes
+            [parent_ptr_write_offset..parent_ptr_write_offset + usize::from(CELL_POINTER_SIZE)]
+            .copy_from_slice(&divider_ptr.to_be_bytes());
+
+        let mut updated_parent_header = parent_header;
+        updated_parent_header.cell_count += 1;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            updated_parent_header.cell_content_offset = new_parent_content_offset as u32;
+        }
+        updated_parent_header.right_child = Some(new_pgno);
+        updated_parent_header.write(page_bytes, parent_offset);
+    }
+
+    if let Err(err) = writer.write_page_data(cx, parent_page_no, parent_data) {
+        let _ = writer.free_page(cx, new_pgno);
+        return Err(err);
+    }
+
+    Ok(Some(QuickBalanceResult {
+        new_pgno,
+        new_page_data,
+        new_header,
+        new_cell_ptr: cell_ptr,
+    }))
+}
+
+fn quick_balance_divider_rowid<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    leaf_page_no: PageNumber,
+    overflow_rowid: i64,
+    usable_size: u32,
+) -> Result<i64> {
+    let leaf_data = writer.read_page_data(cx, leaf_page_no)?;
+    let leaf_offset = header_offset_for_page(leaf_page_no);
+    let leaf_header = parse_page_header(leaf_data.as_bytes(), leaf_page_no)?;
+    if leaf_header.cell_count == 0 {
+        return Ok(overflow_rowid.saturating_sub(1));
+    }
+    let leaf_ptrs = read_cell_pointers(leaf_data.as_bytes(), &leaf_header, leaf_offset)?;
+    let last_ptr = leaf_ptrs[leaf_header.cell_count as usize - 1] as usize;
+    let last_cell = CellRef::parse(
+        leaf_data.as_bytes(),
+        last_ptr,
+        BtreePageType::LeafTable,
         usable_size,
-        &divider[..divider_size],
-    ) {
-        let _ = writer.free_page(cx, new_pgno);
-        return Err(err);
-    }
-
-    let parent_update_result = (|| -> Result<()> {
-        // Update parent's right_child to point to new sibling.
-        let mut parent_data = writer.read_page_data(cx, parent_page_no)?;
-        let parent_offset = header_offset_for_page(parent_page_no);
-        // Right-child is at header_offset + 8.
-        parent_data.as_bytes_mut()[parent_offset + 8..parent_offset + 12]
-            .copy_from_slice(&new_pgno.get().to_be_bytes());
-        writer.write_page_data(cx, parent_page_no, parent_data)
-    })();
-    if let Err(err) = parent_update_result {
-        let _ = writer.write_page_data(cx, parent_page_no, original_parent_data.clone());
-        let _ = writer.free_page(cx, new_pgno);
-        return Err(err);
-    }
-
-    Ok(Some(new_pgno))
+    )?;
+    last_cell
+        .rowid
+        .ok_or_else(|| FrankenError::internal("leaf table cell missing rowid"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1602,6 +1627,7 @@ fn build_page(
 /// Insert a raw cell into an interior page at the end of the cell array.
 ///
 /// This is used for inserting divider cells into the parent page.
+#[cfg(test)]
 fn insert_cell_into_page<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
@@ -2817,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn test_balance_quick_insert_failure_frees_new_page_and_preserves_parent() {
+    fn test_balance_quick_parent_write_failure_frees_new_page_and_preserves_parent() {
         let cx = Cx::new();
         let mut store = FailingMemPageStore::new(MemPageStore::new(20), 2);
 
@@ -2855,12 +2881,12 @@ mod tests {
     }
 
     #[test]
-    fn test_balance_quick_parent_update_failure_restores_parent_and_frees_new_page() {
+    fn test_balance_quick_writes_parent_once() {
         let cx = Cx::new();
-        let mut store = FailingMemPageStore::new(MemPageStore::new(20), 3);
+        let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
 
         let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
-        store.inner.pages.insert(2, original_parent.clone());
+        store.inner.pages.insert(2, original_parent);
         store
             .inner
             .pages
@@ -2873,7 +2899,7 @@ mod tests {
         overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
         pos += 5;
 
-        let err = balance_quick(
+        let new_pgno = balance_quick(
             &cx,
             &mut store,
             pn(2),
@@ -2883,12 +2909,18 @@ mod tests {
             USABLE,
             USABLE,
         )
-        .expect_err("injected right-child update failure should propagate");
-        assert!(err.to_string().contains("injected write failure"));
-        assert_eq!(store.inner.pages.get(&2), Some(&original_parent));
-        assert!(
-            !store.inner.pages.contains_key(&20),
-            "failed quick balance must not strand the allocated sibling page"
+        .expect("quick balance should succeed")
+        .expect("quick balance should allocate a sibling");
+
+        assert_eq!(
+            store.write_count(pn(2)),
+            1,
+            "quick balance should write the parent once"
+        );
+        assert_eq!(
+            store.write_count(new_pgno),
+            1,
+            "quick balance should write the new sibling once"
         );
     }
 

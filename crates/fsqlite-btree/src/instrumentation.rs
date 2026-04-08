@@ -96,6 +96,34 @@ pub struct BtreeLeafReuseSnapshot {
     pub conservative_reload_fallbacks: u64,
     /// Full header + cell-pointer rebuilds performed via `reload_page_fresh`.
     pub page_header_rebuild_count: u64,
+    /// No-overflow table-leaf append calls that wrote payload bytes directly.
+    pub fast_table_leaf_payload_appends: u64,
+    /// Time spent mutating the in-memory page image for the no-overflow append path.
+    pub fast_table_leaf_payload_mutate_time_ns: u64,
+    /// Time spent handing the no-overflow append image to the pager write-set.
+    pub fast_table_leaf_payload_stage_time_ns: u64,
+    /// Full-cell append calls used when the payload fast path was unavailable.
+    pub fast_table_leaf_full_cell_appends: u64,
+    /// Time spent mutating the in-memory page image for the full-cell append path.
+    pub fast_table_leaf_full_cell_mutate_time_ns: u64,
+    /// Time spent handing the full-cell append image to the pager write-set.
+    pub fast_table_leaf_full_cell_stage_time_ns: u64,
+    /// Attempts to use the right-edge quick-balance split path.
+    pub quick_balance_attempts: u64,
+    /// Successful right-edge quick-balance split path hits.
+    pub quick_balance_hits: u64,
+    /// Time spent in the right-edge quick-balance attempt path.
+    pub quick_balance_time_ns: u64,
+    /// Attempts to use the table-leaf local split path.
+    pub local_split_attempts: u64,
+    /// Successful table-leaf local split path hits.
+    pub local_split_hits: u64,
+    /// Time spent in the table-leaf local split attempt path.
+    pub local_split_time_ns: u64,
+    /// Calls into the generic nonroot rebalance path.
+    pub nonroot_balance_calls: u64,
+    /// Time spent in the generic nonroot rebalance path.
+    pub nonroot_balance_time_ns: u64,
 }
 
 /// Per-operation mutable stats while a `btree_op` span is active.
@@ -159,6 +187,20 @@ static BTREE_INTERIOR_CELL_REBUILD_BYTES: AtomicU64 = AtomicU64::new(0);
 static BTREE_NO_SPLIT_REUSE_HITS: AtomicU64 = AtomicU64::new(0);
 static BTREE_CONSERVATIVE_RELOAD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static BTREE_PAGE_HEADER_REBUILD_COUNT: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_PAYLOAD_APPEND_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_FULL_CELL_APPEND_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_QUICK_BALANCE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static BTREE_QUICK_BALANCE_HITS: AtomicU64 = AtomicU64::new(0);
+static BTREE_QUICK_BALANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_LOCAL_SPLIT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static BTREE_LOCAL_SPLIT_HITS: AtomicU64 = AtomicU64::new(0);
+static BTREE_LOCAL_SPLIT_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static BTREE_NONROOT_BALANCE_CALLS: AtomicU64 = AtomicU64::new(0);
+static BTREE_NONROOT_BALANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn copy_profile_enabled() -> bool {
@@ -247,6 +289,66 @@ pub(crate) fn record_conservative_reload_fallback() {
 
 pub(crate) fn record_page_header_rebuild() {
     BTREE_PAGE_HEADER_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_fast_table_leaf_payload_append_mutate(duration_ns: u64) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_APPEND_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_fast_table_leaf_payload_append_stage(duration_ns: u64) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(duration_ns: u64) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_APPEND_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_fast_table_leaf_full_cell_append_stage(duration_ns: u64) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_quick_balance_attempt(duration_ns: u64, hit: bool) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_QUICK_BALANCE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        BTREE_QUICK_BALANCE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    BTREE_QUICK_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_local_split_attempt(duration_ns: u64, hit: bool) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_LOCAL_SPLIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if hit {
+        BTREE_LOCAL_SPLIT_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    BTREE_LOCAL_SPLIT_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
+}
+
+pub(crate) fn record_nonroot_balance(duration_ns: u64) {
+    if !copy_profile_enabled() {
+        return;
+    }
+    BTREE_NONROOT_BALANCE_CALLS.fetch_add(1, Ordering::Relaxed);
+    BTREE_NONROOT_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
 pub(crate) fn record_split_event() {
@@ -354,6 +456,26 @@ pub fn btree_leaf_reuse_snapshot() -> BtreeLeafReuseSnapshot {
         no_split_reuse_hits: BTREE_NO_SPLIT_REUSE_HITS.load(Ordering::Relaxed),
         conservative_reload_fallbacks: BTREE_CONSERVATIVE_RELOAD_FALLBACKS.load(Ordering::Relaxed),
         page_header_rebuild_count: BTREE_PAGE_HEADER_REBUILD_COUNT.load(Ordering::Relaxed),
+        fast_table_leaf_payload_appends: BTREE_FAST_TABLE_LEAF_PAYLOAD_APPEND_CALLS
+            .load(Ordering::Relaxed),
+        fast_table_leaf_payload_mutate_time_ns: BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS
+            .load(Ordering::Relaxed),
+        fast_table_leaf_payload_stage_time_ns: BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS
+            .load(Ordering::Relaxed),
+        fast_table_leaf_full_cell_appends: BTREE_FAST_TABLE_LEAF_FULL_CELL_APPEND_CALLS
+            .load(Ordering::Relaxed),
+        fast_table_leaf_full_cell_mutate_time_ns: BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS
+            .load(Ordering::Relaxed),
+        fast_table_leaf_full_cell_stage_time_ns: BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS
+            .load(Ordering::Relaxed),
+        quick_balance_attempts: BTREE_QUICK_BALANCE_ATTEMPTS.load(Ordering::Relaxed),
+        quick_balance_hits: BTREE_QUICK_BALANCE_HITS.load(Ordering::Relaxed),
+        quick_balance_time_ns: BTREE_QUICK_BALANCE_TIME_NS.load(Ordering::Relaxed),
+        local_split_attempts: BTREE_LOCAL_SPLIT_ATTEMPTS.load(Ordering::Relaxed),
+        local_split_hits: BTREE_LOCAL_SPLIT_HITS.load(Ordering::Relaxed),
+        local_split_time_ns: BTREE_LOCAL_SPLIT_TIME_NS.load(Ordering::Relaxed),
+        nonroot_balance_calls: BTREE_NONROOT_BALANCE_CALLS.load(Ordering::Relaxed),
+        nonroot_balance_time_ns: BTREE_NONROOT_BALANCE_TIME_NS.load(Ordering::Relaxed),
     }
 }
 
@@ -393,6 +515,20 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_NO_SPLIT_REUSE_HITS.store(0, Ordering::Relaxed);
     BTREE_CONSERVATIVE_RELOAD_FALLBACKS.store(0, Ordering::Relaxed);
     BTREE_PAGE_HEADER_REBUILD_COUNT.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_APPEND_CALLS.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_APPEND_CALLS.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_QUICK_BALANCE_ATTEMPTS.store(0, Ordering::Relaxed);
+    BTREE_QUICK_BALANCE_HITS.store(0, Ordering::Relaxed);
+    BTREE_QUICK_BALANCE_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_LOCAL_SPLIT_ATTEMPTS.store(0, Ordering::Relaxed);
+    BTREE_LOCAL_SPLIT_HITS.store(0, Ordering::Relaxed);
+    BTREE_LOCAL_SPLIT_TIME_NS.store(0, Ordering::Relaxed);
+    BTREE_NONROOT_BALANCE_CALLS.store(0, Ordering::Relaxed);
+    BTREE_NONROOT_BALANCE_TIME_NS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
