@@ -834,6 +834,13 @@ pub enum PrecomputedSerialTypeKind {
     /// INTEGER PRIMARY KEY aliases are stored as the rowid, so the record
     /// payload always contains a NULL placeholder for that column.
     NullPlaceholder,
+    /// Any runtime value whose serial type fits in a single-byte varint.
+    ///
+    /// This covers NULL, all INTEGER encodings, REAL, and short TEXT/BLOB
+    /// values whose serial-type codes stay below 128. It lets hot repeated
+    /// inserts learn a compact header template from the first execution and
+    /// reuse it as long as subsequent rows stay in the same one-byte envelope.
+    AnyOneByteVarintOrNull,
     /// STRICT INTEGER column after `TypeCheck`/`Affinity`: either NULL or an
     /// integer serial type in the 0/1..=9 range (always a one-byte varint).
     IntegerOrNull,
@@ -845,13 +852,17 @@ pub enum PrecomputedSerialTypeKind {
 impl PrecomputedSerialTypeKind {
     fn header_varint_len(self) -> usize {
         match self {
-            Self::NullPlaceholder | Self::IntegerOrNull | Self::RealOrNull => 1,
+            Self::NullPlaceholder
+            | Self::AnyOneByteVarintOrNull
+            | Self::IntegerOrNull
+            | Self::RealOrNull => 1,
         }
     }
 
     const fn max_payload_len(self) -> usize {
         match self {
             Self::NullPlaceholder => 0,
+            Self::AnyOneByteVarintOrNull => 57,
             Self::IntegerOrNull | Self::RealOrNull => 8,
         }
     }
@@ -859,6 +870,11 @@ impl PrecomputedSerialTypeKind {
     fn serial_byte_and_payload_len(self, value: &SqliteValue) -> Option<(u8, usize)> {
         match self {
             Self::NullPlaceholder => Some((0, 0)),
+            Self::AnyOneByteVarintOrNull => {
+                let (serial_type, payload_len) = serialized_value_layout(value);
+                (varint_len(serial_type) == 1)
+                    .then(|| (u8::try_from(serial_type).unwrap_or(0), payload_len))
+            }
             Self::IntegerOrNull => match value {
                 SqliteValue::Null => Some((0, 0)),
                 SqliteValue::Integer(i) => {
@@ -892,7 +908,10 @@ impl PrecomputedSerialTypeKind {
     }
 
     const fn needs_runtime_patch(self) -> bool {
-        matches!(self, Self::IntegerOrNull | Self::RealOrNull)
+        matches!(
+            self,
+            Self::AnyOneByteVarintOrNull | Self::IntegerOrNull | Self::RealOrNull
+        )
     }
 }
 
@@ -1042,6 +1061,25 @@ where
 
     buf.truncate(body_offset);
     true
+}
+
+/// Build a reusable record-header template for value tuples whose serial types
+/// all fit in a single-byte varint.
+#[must_use]
+pub fn try_build_runtime_precomputed_record_header(
+    values: &[SqliteValue],
+) -> Option<PrecomputedRecordHeader> {
+    if values
+        .iter()
+        .any(|value| varint_len(serialized_value_layout(value).0) != 1)
+    {
+        return None;
+    }
+
+    Some(PrecomputedRecordHeader::new(&vec![
+        PrecomputedSerialTypeKind::AnyOneByteVarintOrNull;
+        values.len()
+    ]))
 }
 
 /// Compute the total header size (including the header-size varint itself).

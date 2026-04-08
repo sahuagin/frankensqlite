@@ -305,6 +305,9 @@ fn estimate_make_record_buffer_capacity(program: &VdbeProgram, page_size: PageSi
                         .iter()
                         .map(|slot| match slot.kind {
                             PrecomputedSerialTypeKind::NullPlaceholder => 0,
+                            PrecomputedSerialTypeKind::AnyOneByteVarintOrNull => {
+                                MAKE_RECORD_VARIABLE_WIDTH_RESERVE_MIN
+                            }
                             PrecomputedSerialTypeKind::IntegerOrNull
                             | PrecomputedSerialTypeKind::RealOrNull => {
                                 MAKE_RECORD_FIXED_WIDTH_RESERVE_BYTES
@@ -4610,8 +4613,9 @@ fn hash_program(program: &VdbeProgram) -> u64 {
                 for slot in &value.slots {
                     let kind = match slot.kind {
                         PrecomputedSerialTypeKind::NullPlaceholder => 0_u8,
-                        PrecomputedSerialTypeKind::IntegerOrNull => 1_u8,
-                        PrecomputedSerialTypeKind::RealOrNull => 2_u8,
+                        PrecomputedSerialTypeKind::AnyOneByteVarintOrNull => 1_u8,
+                        PrecomputedSerialTypeKind::IntegerOrNull => 2_u8,
+                        PrecomputedSerialTypeKind::RealOrNull => 3_u8,
                     };
                     mix(hash, &[kind]);
                     mix_len(hash, slot.header_offset);
@@ -20127,7 +20131,7 @@ mod tests {
             0,
         );
 
-        let retained = engine
+        let mut retained = engine
             .txn_page_io
             .as_ref()
             .expect("engine should install shared txn state")
@@ -20222,7 +20226,7 @@ mod tests {
             0,
         );
 
-        let retained = engine
+        let mut retained = engine
             .txn_page_io
             .as_ref()
             .expect("engine should install shared txn state")
