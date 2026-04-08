@@ -270,11 +270,11 @@ fn bench_range_scan(c: &mut Criterion) {
 
 // ─── 4. Single-row insert ──────────────────────────────────────────────
 //
-// This is intentionally a cold operation benchmark. `iter_batched` rebuilds a
-// fresh in-memory connection, reapplies PRAGMAs, recreates the table, runs a
-// single INSERT, and then validates the result with COUNT(*). Use this group
-// for end-to-end "one row from scratch" latency, not for the steady-state
-// prepared INSERT hot path.
+// This is intentionally a cold operation benchmark. `iter_batched` excludes
+// setup from the timed body, but each timed iteration still performs a
+// one-shot INSERT, validates via COUNT(*), and then drops the freshly prepared
+// connection state. Use this group for end-to-end "one row on a fresh
+// database" latency, not for the steady-state prepared INSERT hot path.
 
 fn bench_single_row_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_single_row_insert");
