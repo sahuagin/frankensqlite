@@ -409,6 +409,7 @@ struct RightmostLeafCacheEntry {
     page_no: PageNumber,
     rowid: i64,
     tree_depth: usize,
+    parent_page: Option<PageNumber>,
     page_data: PageData,
     header: BtreePageHeader,
     cell_pointers: Vec<u16>,
@@ -424,6 +425,7 @@ pub struct TableAppendHint {
     leaf_page: PageNumber,
     last_rowid: i64,
     tree_depth: usize,
+    parent_page: Option<PageNumber>,
     page_data: PageData,
     header: BtreePageHeader,
 }
@@ -443,6 +445,11 @@ impl TableAppendHint {
     pub const fn tree_depth(&self) -> usize {
         self.tree_depth
     }
+
+    #[must_use]
+    pub const fn parent_page(&self) -> Option<PageNumber> {
+        self.parent_page
+    }
 }
 
 impl From<&RightmostLeafCacheEntry> for TableAppendHint {
@@ -451,6 +458,7 @@ impl From<&RightmostLeafCacheEntry> for TableAppendHint {
             leaf_page: value.page_no,
             last_rowid: value.rowid,
             tree_depth: value.tree_depth,
+            parent_page: value.parent_page,
             page_data: value.page_data.clone(),
             header: value.header,
         }
@@ -2786,6 +2794,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(());
         }
 
+        let parent_page = self.current_parent_page_hint_from_stack();
         if !self.at_eof
             && let Some(cache_entry) = self.stack.last().and_then(|entry| {
                 (entry.header.page_type == cell::BtreePageType::LeafTable).then(|| {
@@ -2793,6 +2802,7 @@ impl<P: PageWriter> BtCursor<P> {
                         page_no: entry.page_no,
                         rowid,
                         tree_depth: self.current_tree_depth_hint().unwrap_or(1),
+                        parent_page,
                         page_data: entry.page_data.clone(),
                         header: entry.header,
                         cell_pointers: entry.cell_pointers.clone(),
@@ -2812,6 +2822,7 @@ impl<P: PageWriter> BtCursor<P> {
                     page_no: entry.page_no,
                     rowid,
                     tree_depth: self.current_tree_depth_hint().unwrap_or(1),
+                    parent_page: self.current_parent_page_hint_from_stack(),
                     page_data: entry.page_data.clone(),
                     header: entry.header,
                     cell_pointers: entry.cell_pointers.clone(),
@@ -2823,6 +2834,10 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         Ok(())
+    }
+
+    fn current_parent_page_hint_from_stack(&self) -> Option<PageNumber> {
+        (self.stack.len() >= 2).then(|| self.stack[self.stack.len() - 2].page_no)
     }
 
     fn write_overflow_chain_for_insert(
@@ -3695,6 +3710,7 @@ impl<P: PageWriter> BtCursor<P> {
                                     page_no: result.new_pgno,
                                     rowid,
                                     tree_depth: depth,
+                                    parent_page: Some(parent_page_no),
                                     page_data: result.new_page_data,
                                     header: result.new_header,
                                     cell_pointers: vec![result.new_cell_ptr],
@@ -4866,10 +4882,12 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
+                let parent_page = self.current_parent_page_hint_from_stack();
                 if let Some(cache_entry) = self.stack.last().map(|entry| RightmostLeafCacheEntry {
                     page_no: entry.page_no,
                     rowid,
                     tree_depth: hinted_tree_depth,
+                    parent_page,
                     page_data: entry.page_data.clone(),
                     header: entry.header,
                     cell_pointers: entry.cell_pointers.clone(),
@@ -4966,6 +4984,7 @@ impl<P: PageWriter> BtCursor<P> {
                 page_no: hinted_leaf_page,
                 rowid,
                 tree_depth: hinted_tree_depth,
+                parent_page: self.current_parent_page_hint_from_stack(),
                 page_data: page_data.clone(),
                 header,
                 cell_pointers: cell_pointers.clone(),
@@ -4974,6 +4993,7 @@ impl<P: PageWriter> BtCursor<P> {
                 leaf_page: hinted_leaf_page,
                 last_rowid: rowid,
                 tree_depth: hinted_tree_depth,
+                parent_page: self.current_parent_page_hint_from_stack(),
                 page_data,
                 header,
             }));
@@ -5008,6 +5028,7 @@ impl<P: PageWriter> BtCursor<P> {
                     page_no: hinted_leaf_page,
                     rowid,
                     tree_depth: hinted_tree_depth,
+                    parent_page: self.current_parent_page_hint_from_stack(),
                     page_data: page_data.clone(),
                     header,
                     cell_pointers,
@@ -5016,6 +5037,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page: hinted_leaf_page,
                     last_rowid: rowid,
                     tree_depth: hinted_tree_depth,
+                    parent_page: self.current_parent_page_hint_from_stack(),
                     page_data,
                     header,
                 }))
@@ -5091,6 +5113,14 @@ impl<P: PageWriter> BtCursor<P> {
             }
             Ok(None) => {
                 let fallback_result = (|| {
+                    if self.try_quick_balance_on_external_rightmost_leaf_hint(
+                        cx,
+                        hint,
+                        rowid,
+                        &cell_data,
+                    )? {
+                        return Ok(true);
+                    }
                     let has_last = self.last(cx)?;
                     if has_last {
                         let last_rowid = self.rowid(cx)?;
@@ -5151,6 +5181,65 @@ impl<P: PageWriter> BtCursor<P> {
                 }
                 Err(error)
             }
+        }
+    }
+
+    fn try_quick_balance_on_external_rightmost_leaf_hint(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        cell_data: &[u8],
+    ) -> Result<bool> {
+        let Some(parent_page) = hint.parent_page else {
+            return Ok(false);
+        };
+
+        let quick_balance_start = std::time::Instant::now();
+        match balance::balance_quick_known_divider_rowid(
+            cx,
+            &mut self.pager,
+            parent_page,
+            hint.leaf_page,
+            cell_data,
+            hint.last_rowid,
+            self.usable_size,
+            self.page_size,
+        ) {
+            Ok(Some(result)) => {
+                instrumentation::record_quick_balance_attempt(
+                    u64::try_from(quick_balance_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    true,
+                );
+                self.note_split_event();
+                self.stack.clear();
+                self.at_eof = true;
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.leaf_page = result.new_pgno;
+                hint.last_rowid = rowid;
+                hint.parent_page = Some(parent_page);
+                hint.page_data = result.new_page_data.clone();
+                hint.header = result.new_header;
+                self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                    page_no: result.new_pgno,
+                    rowid,
+                    tree_depth: hint.tree_depth,
+                    parent_page: Some(parent_page),
+                    page_data: result.new_page_data,
+                    header: result.new_header,
+                    cell_pointers: vec![result.new_cell_ptr],
+                });
+                Ok(true)
+            }
+            Ok(None) => {
+                instrumentation::record_quick_balance_attempt(
+                    u64::try_from(quick_balance_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    false,
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -9480,6 +9569,62 @@ mod tests {
             }
         }
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_split_reads_only_parent_after_root_split() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        const SMALL_USABLE: u32 = 256;
+
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let payload = vec![b'P'; 120];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, &payload)
+            .expect("seed insert should succeed");
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed insert should capture a retained rightmost-leaf hint");
+        let mut observed_post_root_split = false;
+
+        for rowid in 2..=128_i64 {
+            let previous_leaf = hint.leaf_page();
+            let parent_before = hint.parent_page();
+            cursor.stack.clear();
+            cursor.at_eof = true;
+            cursor.clear_rightmost_leaf_cache();
+            cursor.pager.clear_reads();
+
+            assert!(
+                cursor
+                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, rowid, &payload)
+                    .expect("cached rightmost-leaf helper should handle split fallback"),
+                "helper should not need a second append API when the hinted leaf fills"
+            );
+
+            if parent_before.is_some() && hint.leaf_page() != previous_leaf {
+                observed_post_root_split = true;
+                assert_eq!(
+                    cursor.pager.read_pages(),
+                    vec![parent_before.expect("post-root split should know its parent")],
+                    "cached-hint split should read only the parent page once it has a parent hint"
+                );
+                break;
+            }
+        }
+
+        assert!(
+            observed_post_root_split,
+            "test setup should reach a cached-hint split after the first root split"
+        );
     }
 
     #[test]

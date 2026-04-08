@@ -2953,6 +2953,7 @@ where
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(HashMap::new()),
+                retained_committed_pages_unflushed: false,
             });
         }
 
@@ -3117,6 +3118,7 @@ where
             memory_db_bump_alloc,
             rolled_back_pages: HashSet::new(),
             txn_read_cache: RefCell::new(HashMap::new()),
+            retained_committed_pages_unflushed: false,
         })
     }
 
@@ -4356,6 +4358,9 @@ pub struct SimpleTransaction<V: Vfs> {
     /// Only used in WAL mode where the published snapshot fast path is
     /// defeated by constant commit_seq advancement.
     txn_read_cache: RefCell<HashMap<PageNumber, PageData>>,
+    /// Tracks whether retained `:memory:` metadata-only commits deferred their
+    /// backing-storage flush into `txn_read_cache` for amortized final flush.
+    retained_committed_pages_unflushed: bool,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -4661,16 +4666,39 @@ impl<V: Vfs> SimpleTransaction<V> {
             .publish_single_connection_metadata_update(cx, update, clear_pages);
     }
 
-    fn publish_single_connection_metadata_only_draining_write_set(
-        &mut self,
-        cx: &Cx,
-        update: PublishedPagerUpdate,
-    ) {
-        self.publish_single_connection_metadata_only(cx, update);
-        let committed_cache_pages = self.drain_committed_cache_pages();
-        for (page_no, buf) in committed_cache_pages {
-            self.cache.insert_buffer(page_no, buf);
+    fn retain_committed_pages_in_txn_read_cache(&mut self) {
+        let mut txn_read_cache = self.txn_read_cache.borrow_mut();
+        for (page_no, staged) in self.write_set.drain() {
+            txn_read_cache.insert(page_no, staged.into_published_page());
         }
+        self.write_pages_sorted.clear();
+    }
+
+    fn flush_retained_committed_pages_to_storage(
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        txn_read_cache: &RefCell<HashMap<PageNumber, PageData>>,
+        retained_committed_pages_unflushed: &mut bool,
+    ) -> Result<()> {
+        if !*retained_committed_pages_unflushed {
+            return Ok(());
+        }
+        let page_size_bytes = u64::from(inner.page_size.get());
+        let txn_read_cache = txn_read_cache.borrow();
+        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+            SmallVec::with_capacity(txn_read_cache.len());
+        for (&page_no, page_data) in txn_read_cache.iter() {
+            if page_no.get() > inner.db_size {
+                continue;
+            }
+            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+            batched_writes.push((offset, page_data.as_bytes()));
+        }
+        if !batched_writes.is_empty() {
+            inner.db_file.write_page_batch(cx, batched_writes.as_slice())?;
+        }
+        *retained_committed_pages_unflushed = false;
+        Ok(())
     }
 
     /// Publish a new committed-state snapshot while the pager inner lock is still held.
@@ -5470,6 +5498,16 @@ where
         }
 
         let single_connection_fast_path = self.single_connection_fast_path_enabled();
+        if single_connection_fast_path
+            && let Some(cached) = self.txn_read_cache.borrow().get(&page_no)
+        {
+            // A retained single-connection writer owns the authoritative
+            // committed image for its own pages. Reuse that transaction-local
+            // cache before touching shared publication/cache state so
+            // metadata-only retained commits avoid stale or copy-heavy
+            // shared-cache round-trips on the next statement.
+            return Ok(cached.clone());
+        }
         let read_start = Instant::now();
         let mut published_retry_count = 0_usize;
         while self.published.page_plane_visible_commit_seq()
@@ -5776,6 +5814,14 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            if self.vfs.is_memory() {
+                Self::flush_retained_committed_pages_to_storage(
+                    cx,
+                    &mut inner,
+                    &self.txn_read_cache,
+                    &mut self.retained_committed_pages_unflushed,
+                )?;
+            }
             // Return any unused lease pages.
             return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
@@ -5816,6 +5862,14 @@ where
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         // Return any unused lease pages before computing committed db_size.
         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+        if self.vfs.is_memory() {
+            Self::flush_retained_committed_pages_to_storage(
+                cx,
+                &mut inner,
+                &self.txn_read_cache,
+                &mut self.retained_committed_pages_unflushed,
+            )?;
+        }
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
         // Declared outside the block so it survives to Phase C where freed
@@ -6067,6 +6121,7 @@ where
                     }
                 }
             }
+            self.retained_committed_pages_unflushed = false;
             self.committed = true;
             self.finished = true;
         } else {
@@ -6113,6 +6168,18 @@ where
         // predicted_durable_freelist_pages_with_inner reads self.freed_pages.
         let freelist_dirty_for_retain =
             self.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+        let single_connection_fast_path = self.single_connection_fast_path_enabled();
+        let metadata_only_single_connection_fast_path = single_connection_fast_path
+            && !freelist_dirty_for_retain
+            && !self.write_set.contains_key(&PageNumber::ONE);
+        if !metadata_only_single_connection_fast_path {
+            Self::flush_retained_committed_pages_to_storage(
+                cx,
+                &mut inner,
+                &self.txn_read_cache,
+                &mut self.retained_committed_pages_unflushed,
+            )?;
+        }
         // CRITICAL FIX (beads_rust#138): Drain freed_pages AFTER dirty check
         // but do NOT push into inner.freelist. Pass to serializer as
         // pending_freed so inner.freelist remains untouched until Phase C
@@ -6216,31 +6283,33 @@ where
             } else if self.vfs.is_memory() {
                 // bd-wwqen.3: :memory: retained-commit fast path.
                 // Skip journal creation, pre-image backup, sync, and deletion.
-                // Batch dirty-page flushes through the VFS so MemoryFile can
-                // hold its backing-storage lock once for the whole retained
-                // commit. Keep the staged pages in the write set for the later
-                // publish step so the flush path avoids an eager drain/move of
-                // the whole staging map on every autocommit write.
-                let page_size_bytes = u64::from(inner.page_size.get());
-
-                let mut flushed_db_size = inner.db_size;
-                let write_result = {
-                    let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
-                        SmallVec::with_capacity(self.write_set.len());
-                    for (&page_no, staged) in &self.write_set {
-                        let offset = u64::from(page_no.get() - 1) * page_size_bytes;
-                        batched_writes.push((offset, staged.as_page_bytes()));
-                        flushed_db_size = flushed_db_size.max(page_no.get());
+                // In the isolated metadata-only case, the retained writer is
+                // the sole authority and will keep the committed page image in
+                // txn_read_cache for the next statement. Defer the backing
+                // storage flush until the retained writer is finally released,
+                // amortizing the MemoryVfs page-copy cost across the whole
+                // autocommit burst instead of paying it per statement.
+                if !metadata_only_single_connection_fast_path {
+                    let page_size_bytes = u64::from(inner.page_size.get());
+                    let mut flushed_db_size = inner.db_size;
+                    let write_result = {
+                        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+                            SmallVec::with_capacity(self.write_set.len());
+                        for (&page_no, staged) in &self.write_set {
+                            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+                            batched_writes.push((offset, staged.as_page_bytes()));
+                            flushed_db_size = flushed_db_size.max(page_no.get());
+                        }
+                        inner
+                            .db_file
+                            .write_page_batch(cx, batched_writes.as_slice())
+                    };
+                    if let Err(e) = write_result {
+                        self.freed_pages.extend(pending_freed);
+                        return Err(e);
                     }
-                    inner
-                        .db_file
-                        .write_page_batch(cx, batched_writes.as_slice())
-                };
-                if let Err(e) = write_result {
-                    self.freed_pages.extend(pending_freed);
-                    return Err(e);
+                    inner.db_size = flushed_db_size;
                 }
-                inner.db_size = flushed_db_size;
                 Ok(())
             } else {
                 Self::commit_journal(
@@ -6279,11 +6348,6 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            // Retained :memory: writers must still publish the committed page
-            // plane. Skipping that publish left the parked writer reusable for
-            // throughput, but broke subsequent visibility/cached-writer
-            // invariants in connection-level autocommit paths.
-            let metadata_only_single_connection_fast_path = false;
             // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
             // held — MUST happen before publish_committed_state (same order as
             // `commit()`), so concurrent readers see the immutable snapshot
@@ -6293,7 +6357,8 @@ where
             }
             drop(inner);
             if metadata_only_single_connection_fast_path {
-                self.publish_single_connection_metadata_only_draining_write_set(cx, publish_update);
+                self.publish_single_connection_metadata_only(cx, publish_update);
+                self.retain_committed_pages_in_txn_read_cache();
             } else {
                 self.publish_committed_state_draining_write_set(cx, publish_update);
             }
@@ -6305,7 +6370,11 @@ where
             self.allocated_from_eof.clear();
             self.savepoint_stack.clear();
             self.rolled_back_pages.clear();
-            self.txn_read_cache.borrow_mut().clear();
+            if !metadata_only_single_connection_fast_path {
+                self.txn_read_cache.borrow_mut().clear();
+            }
+            self.retained_committed_pages_unflushed = metadata_only_single_connection_fast_path
+                && self.journal_mode != JournalMode::Wal;
             self.original_db_size = committed_db_size;
             self.published_visible_commit_seq
                 .set(publish_update.visible_commit_seq);
@@ -16008,6 +16077,7 @@ mod tests {
 
         shared_connection_count.store(1, AtomicOrdering::Release);
         let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let published_before_retain = pager.published_snapshot();
         let publication_writes_before_commit = pager.publication_write_count();
         txn.write_page(&cx, p, &vec![0x22; ps]).unwrap();
         assert!(
@@ -16019,13 +16089,35 @@ mod tests {
             publication_writes_before_commit,
             "bead_id={BEAD_ID} case=single_connection_commit_and_retain_skips_publication_write"
         );
+        let published_after_retain = pager.published_snapshot();
+        assert_eq!(
+            published_after_retain.page_set_size, 0,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_keeps_publication_plane_empty"
+        );
+        assert!(
+            published_after_retain.visible_commit_seq > published_before_retain.visible_commit_seq,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_still_advances_visible_commit_seq"
+        );
+        assert!(
+            txn.txn_read_cache.borrow().contains_key(&p),
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_keeps_authoritative_txn_read_cache"
+        );
+        let mut stale_buf = PageBuf::new(PageSize::DEFAULT);
+        stale_buf.fill(0x7F);
+        pager.cache.insert_buffer(p, stale_buf);
         assert_eq!(
             txn.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
-            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_must_not_read_stale_published_page"
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_must_not_read_stale_shared_cache_page"
         );
 
         txn.commit(&cx).unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, p).unwrap().as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=single_connection_commit_and_retain_final_commit_flushes_deferred_page_bytes"
+        );
     }
 
     #[test]
