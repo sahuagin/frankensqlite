@@ -404,10 +404,57 @@ struct TableSeekCacheEntry {
     cell_idx: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RightmostLeafCacheEntry {
     page_no: PageNumber,
     rowid: i64,
+    tree_depth: usize,
+    page_data: PageData,
+    header: BtreePageHeader,
+    cell_pointers: Vec<u16>,
+}
+
+/// Opaque retained append hint for monotonic table inserts.
+///
+/// Short-lived callers can carry this between cursor instances to keep the
+/// rightmost append path hot without re-reading and reparsing the hinted leaf
+/// page on every row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableAppendHint {
+    leaf_page: PageNumber,
+    last_rowid: i64,
+    tree_depth: usize,
+    page_data: PageData,
+    header: BtreePageHeader,
+}
+
+impl TableAppendHint {
+    #[must_use]
+    pub const fn leaf_page(&self) -> PageNumber {
+        self.leaf_page
+    }
+
+    #[must_use]
+    pub const fn last_rowid(&self) -> i64 {
+        self.last_rowid
+    }
+
+    #[must_use]
+    pub const fn tree_depth(&self) -> usize {
+        self.tree_depth
+    }
+}
+
+impl From<&RightmostLeafCacheEntry> for TableAppendHint {
+    fn from(value: &RightmostLeafCacheEntry) -> Self {
+        Self {
+            leaf_page: value.page_no,
+            last_rowid: value.rowid,
+            tree_depth: value.tree_depth,
+            page_data: value.page_data.clone(),
+            header: value.header,
+        }
+    }
 }
 
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
@@ -460,6 +507,9 @@ pub struct BtCursor<P> {
     /// after successful right-edge inserts and cleared conservatively when a
     /// mutating operation could have invalidated the tree's right edge.
     rightmost_leaf_cache: Option<RightmostLeafCacheEntry>,
+    /// Best-known depth for this tree, even when a hot append helper leaves
+    /// the cursor stack empty on purpose.
+    last_known_depth: Option<usize>,
     /// Four-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
@@ -485,6 +535,7 @@ impl<P> BtCursor<P> {
         self.at_eof = true;
         self.stack.clear();
         self.rightmost_leaf_cache = None;
+        self.last_known_depth = None;
         self.seek_cache.fill(None);
     }
 
@@ -550,8 +601,24 @@ impl<P> BtCursor<P> {
         self.rightmost_leaf_cache = None;
     }
 
-    fn remember_rightmost_leaf(&mut self, page_no: PageNumber, rowid: i64) {
-        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry { page_no, rowid });
+    fn is_on_rightmost_insert_edge(&self) -> bool {
+        let Some((leaf, ancestors)) = self.stack.split_last() else {
+            return false;
+        };
+        if !leaf.header.page_type.is_leaf() {
+            return false;
+        }
+        let leaf_on_right_edge = if leaf.header.cell_count == 0 {
+            self.at_eof
+        } else if self.at_eof {
+            leaf.cell_idx == leaf.header.cell_count
+        } else {
+            leaf.cell_idx.saturating_add(1) == leaf.header.cell_count
+        };
+        leaf_on_right_edge
+            && ancestors
+                .iter()
+                .all(|entry| entry.cell_idx == entry.header.cell_count)
     }
 
     fn remember_table_seek(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
@@ -890,13 +957,18 @@ impl<P: PageReader> BtCursor<P> {
             page_size: usable_size,
             is_table,
             index_desc_flags,
-            stack: Vec::with_capacity(BTREE_MAX_DEPTH as usize),
+            // Most cursor lifetimes never approach the theoretical max depth,
+            // and the prepared direct-insert append lane can complete without
+            // ever pushing a stack entry. Avoid paying a heap allocation up
+            // front for every fresh cursor.
+            stack: Vec::new(),
             at_eof: true,
             read_witnesses: Vec::new(),
             active_op_stats: None,
             cell_buf: Vec::new(),
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
+            last_known_depth: None,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
         }
     }
@@ -1198,12 +1270,24 @@ impl<P: PageReader> BtCursor<P> {
 
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
         let depth = if self.stack.is_empty() {
-            self.measure_tree_depth(cx)?
+            match self.last_known_depth {
+                Some(depth) => depth,
+                None => self.measure_tree_depth(cx)?,
+            }
         } else {
             self.stack.len()
         };
+        self.last_known_depth = Some(depth);
         instrumentation::set_depth_gauge(depth);
         Ok(())
+    }
+
+    fn current_tree_depth_hint(&self) -> Option<usize> {
+        if self.stack.is_empty() {
+            self.last_known_depth
+        } else {
+            Some(self.stack.len())
+        }
     }
 
     fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
@@ -2694,20 +2778,79 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
-        if let Some(page_no) = self.current_page() {
-            self.remember_rightmost_leaf(page_no, rowid);
+        if self
+            .rightmost_leaf_cache
+            .as_ref()
+            .is_some_and(|cached| cached.rowid == rowid)
+        {
+            return Ok(());
+        }
+
+        if !self.at_eof
+            && let Some(cache_entry) = self.stack.last().and_then(|entry| {
+                (entry.header.page_type == cell::BtreePageType::LeafTable).then(|| {
+                    RightmostLeafCacheEntry {
+                        page_no: entry.page_no,
+                        rowid,
+                        tree_depth: self.current_tree_depth_hint().unwrap_or(1),
+                        page_data: entry.page_data.clone(),
+                        header: entry.header,
+                        cell_pointers: entry.cell_pointers.clone(),
+                    }
+                })
+            })
+        {
+            self.rightmost_leaf_cache = Some(cache_entry);
             return Ok(());
         }
 
         if self.last(cx)? {
-            let page_no = self
-                .current_page()
+            let cache_entry = self
+                .stack
+                .last()
+                .map(|entry| RightmostLeafCacheEntry {
+                    page_no: entry.page_no,
+                    rowid,
+                    tree_depth: self.current_tree_depth_hint().unwrap_or(1),
+                    page_data: entry.page_data.clone(),
+                    header: entry.header,
+                    cell_pointers: entry.cell_pointers.clone(),
+                })
                 .ok_or_else(|| FrankenError::internal("cursor lost rightmost leaf after insert"))?;
-            self.remember_rightmost_leaf(page_no, rowid);
+            self.rightmost_leaf_cache = Some(cache_entry);
         } else {
             self.clear_rightmost_leaf_cache();
         }
 
+        Ok(())
+    }
+
+    fn store_rightmost_leaf_cache_from_page(
+        &mut self,
+        cx: &Cx,
+        leaf_page_no: PageNumber,
+        rowid: i64,
+        tree_depth: usize,
+    ) -> Result<()> {
+        let page_data = self.pager.read_page_data(cx, leaf_page_no)?;
+        let header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
+        if header.page_type != cell::BtreePageType::LeafTable || header.cell_count == 0 {
+            return Err(FrankenError::internal(format!(
+                "rightmost leaf cache expected non-empty table leaf page {}",
+                leaf_page_no.get()
+            )));
+        }
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        self.last_known_depth = Some(tree_depth);
+        self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+            page_no: leaf_page_no,
+            rowid,
+            tree_depth,
+            page_data,
+            header,
+            cell_pointers,
+        });
         Ok(())
     }
 
@@ -2935,6 +3078,7 @@ impl<P: PageWriter> BtCursor<P> {
         Ok((out, overflow))
     }
 
+    #[allow(dead_code)] // Retained for future compaction-before-balance optimization
     fn current_table_leaf_needs_compaction(&self) -> bool {
         self.stack.last().is_some_and(|entry| {
             entry.header.page_type == cell::BtreePageType::LeafTable
@@ -2942,6 +3086,7 @@ impl<P: PageWriter> BtCursor<P> {
         })
     }
 
+    #[allow(dead_code)] // Retained for future compaction-before-balance optimization
     fn compact_current_table_leaf(&mut self, cx: &Cx) -> Result<bool> {
         if !self.current_table_leaf_needs_compaction() {
             return Ok(false);
@@ -3232,7 +3377,11 @@ impl<P: PageWriter> BtCursor<P> {
                 );
                 return Ok(false);
             };
-            entry.cell_pointers.insert(insert_at, new_cell_offset);
+            if insert_at == entry.cell_pointers.len() {
+                entry.cell_pointers.push(new_cell_offset);
+            } else {
+                entry.cell_pointers.insert(insert_at, new_cell_offset);
+            }
             entry.header.cell_count = u16::try_from(entry.cell_pointers.len()).map_err(|_| {
                 FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -3292,20 +3441,46 @@ impl<P: PageWriter> BtCursor<P> {
             .pop()
             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
         let leaf_page_no = entry.page_no;
-        let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let insert_idx = entry.header.cell_count;
-        let content_offset = entry.header.content_offset(self.usable_size);
-        let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+        let Some((insert_idx, new_cell_offset)) = self.try_append_leaf_page_in_place(
+            cx,
+            leaf_page_no,
+            &mut entry.page_data,
+            &mut entry.header,
+            cell_data,
+        )?
+        else {
             self.stack.push(entry);
             return Ok(false);
         };
 
+        entry.cell_pointers.push(new_cell_offset);
+        entry.cell_idx = insert_idx;
+
+        self.stack.push(entry);
+        self.at_eof = false;
+        Ok(true)
+    }
+
+    fn try_append_leaf_page_in_place(
+        &mut self,
+        cx: &Cx,
+        leaf_page_no: PageNumber,
+        page_data: &mut PageData,
+        header: &mut BtreePageHeader,
+        cell_data: &[u8],
+    ) -> Result<Option<(u16, u16)>> {
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let insert_idx = header.cell_count;
+        let content_offset = header.content_offset(self.usable_size);
+        let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
+            return Ok(None);
+        };
+
         let ptr_array_end = header_offset
-            + usize::from(entry.header.page_type.header_size())
+            + usize::from(header.page_type.header_size())
             + (usize::from(insert_idx) + 1) * 2;
         if ptr_array_end > new_content_offset {
-            self.stack.push(entry);
-            return Ok(false);
+            return Ok(None);
         }
 
         let new_cell_offset =
@@ -3326,11 +3501,11 @@ impl<P: PageWriter> BtCursor<P> {
                     ),
                 })?;
         let ptr_offset = header_offset
-            + usize::from(entry.header.page_type.header_size())
+            + usize::from(header.page_type.header_size())
             + usize::from(insert_idx) * 2;
 
-        entry.header.cell_count = new_cell_count;
-        entry.header.cell_content_offset =
+        header.cell_count = new_cell_count;
+        header.cell_content_offset =
             u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "new leaf content offset {} exceeds u32 range on page {}",
@@ -3339,25 +3514,106 @@ impl<P: PageWriter> BtCursor<P> {
                 ),
             })?;
         {
-            let page_bytes = entry.page_data.as_bytes_mut();
+            let page_bytes = page_data.as_bytes_mut();
             page_bytes[new_content_offset..new_content_offset + cell_data.len()]
                 .copy_from_slice(cell_data);
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
-            entry.header.write(page_bytes, header_offset);
+            header.write(page_bytes, header_offset);
         }
 
-        let staged_page = entry.page_data.clone();
+        let staged_page = page_data.clone();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        Ok(Some((insert_idx, new_cell_offset)))
+    }
 
-        let mut updated_cell_pointers = Vec::with_capacity(entry.cell_pointers.len() + 1);
-        updated_cell_pointers.extend_from_slice(&entry.cell_pointers);
-        updated_cell_pointers.push(new_cell_offset);
-        entry.cell_pointers = updated_cell_pointers;
-        entry.cell_idx = insert_idx;
+    fn try_append_table_leaf_payload_in_place_no_overflow(
+        &mut self,
+        cx: &Cx,
+        leaf_page_no: PageNumber,
+        page_data: &mut PageData,
+        header: &mut BtreePageHeader,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<Option<(u16, u16)>> {
+        let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+        let local_size = cell::local_payload_size(
+            payload_size,
+            self.usable_size,
+            cell::BtreePageType::LeafTable,
+        ) as usize;
+        let local_size = local_size.min(payload.len());
+        if local_size < payload.len() {
+            return Ok(None);
+        }
 
-        self.stack.push(entry);
-        self.at_eof = false;
-        Ok(true)
+        let mut payload_varint = [0u8; 9];
+        let payload_len = write_varint(&mut payload_varint, u64::from(payload_size));
+        let mut rowid_varint = [0u8; 9];
+        let rowid_len = write_varint(&mut rowid_varint, u64::from_ne_bytes(rowid.to_ne_bytes()));
+        let cell_len = payload_len + rowid_len + local_size;
+
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let insert_idx = header.cell_count;
+        let content_offset = header.content_offset(self.usable_size);
+        let Some(new_content_offset) = content_offset.checked_sub(cell_len) else {
+            return Ok(None);
+        };
+
+        let ptr_array_end = header_offset
+            + usize::from(header.page_type.header_size())
+            + (usize::from(insert_idx) + 1) * 2;
+        if ptr_array_end > new_content_offset {
+            return Ok(None);
+        }
+
+        let new_cell_offset =
+            u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf cell offset {} exceeds u16 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        let new_cell_count =
+            insert_idx
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "leaf page {} cell count overflow while appending",
+                        leaf_page_no.get()
+                    ),
+                })?;
+        let ptr_offset = header_offset
+            + usize::from(header.page_type.header_size())
+            + usize::from(insert_idx) * 2;
+
+        header.cell_count = new_cell_count;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            let mut write_offset = new_content_offset;
+            page_bytes[write_offset..write_offset + payload_len]
+                .copy_from_slice(&payload_varint[..payload_len]);
+            write_offset += payload_len;
+            page_bytes[write_offset..write_offset + rowid_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            write_offset += rowid_len;
+            page_bytes[write_offset..write_offset + local_size]
+                .copy_from_slice(&payload[..local_size]);
+            page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
+            header.write(page_bytes, header_offset);
+        }
+
+        let staged_page = page_data.clone();
+        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        Ok(Some((insert_idx, new_cell_offset)))
     }
 
     /// Balance the tree after an insert when the leaf page is full.
@@ -3425,11 +3681,16 @@ impl<P: PageWriter> BtCursor<P> {
                             self.usable_size,
                             self.page_size,
                         ) {
-                            Ok(Some(_new_pgno)) => {
+                            Ok(Some(new_pgno)) => {
                                 self.note_split_event();
-                                // Invalidate cursor stack as tree structure changed.
                                 self.stack.clear();
                                 self.at_eof = true;
+                                self.store_rightmost_leaf_cache_from_page(
+                                    cx,
+                                    new_pgno,
+                                    rowid,
+                                    depth,
+                                )?;
                                 return Ok(());
                             }
                             Ok(None) => {}
@@ -4315,6 +4576,23 @@ impl<P: PageWriter> BtCursor<P> {
         // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        if self.at_eof {
+            match self.try_append_on_current_leaf(cx, &cell_data) {
+                Ok(true) => {
+                    self.cell_buf = cell_data;
+                    self.last_insert_rowid = Some(rowid);
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.cell_buf = cell_data;
+                    if let Some(first) = overflow_head {
+                        let _ = self.free_overflow_chain(cx, first);
+                    }
+                    return Err(error);
+                }
+            }
+        }
         match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
             Ok(true) => {
                 self.cell_buf = cell_data;
@@ -4389,6 +4667,110 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
+    fn try_append_on_cached_rightmost_leaf(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+        let Some(mut cached) = self.rightmost_leaf_cache.take() else {
+            return Ok(false);
+        };
+        if rowid <= cached.rowid {
+            return Ok(false);
+        }
+
+        if let Some((insert_idx, new_cell_offset)) = self
+            .try_append_table_leaf_payload_in_place_no_overflow(
+                cx,
+                cached.page_no,
+                &mut cached.page_data,
+                &mut cached.header,
+                rowid,
+                data,
+            )?
+        {
+            self.last_insert_rowid = Some(rowid);
+            self.last_known_depth = Some(cached.tree_depth);
+            cached.rowid = rowid;
+            cached.cell_pointers.push(new_cell_offset);
+            let stack_page_data = cached.page_data.clone();
+            let stack_cell_pointers = cached.cell_pointers.clone();
+            self.stack.clear();
+            self.stack.push(StackEntry {
+                page_no: cached.page_no,
+                page_data: stack_page_data,
+                header: cached.header,
+                cell_pointers: stack_cell_pointers,
+                cell_idx: insert_idx,
+            });
+            self.at_eof = false;
+            self.rightmost_leaf_cache = Some(cached);
+            return Ok(true);
+        }
+
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        {
+            Ok(overflow_head) => overflow_head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                self.rightmost_leaf_cache = Some(cached);
+                return Err(error);
+            }
+        };
+        let append_result = self.try_append_leaf_page_in_place(
+            cx,
+            cached.page_no,
+            &mut cached.page_data,
+            &mut cached.header,
+            &cell_data,
+        );
+        match append_result {
+            Ok(Some((insert_idx, new_cell_offset))) => {
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(cached.tree_depth);
+                cached.rowid = rowid;
+                cached.cell_pointers.push(new_cell_offset);
+                let stack_page_data = cached.page_data.clone();
+                let stack_cell_pointers = cached.cell_pointers.clone();
+                self.stack.clear();
+                self.stack.push(StackEntry {
+                    page_no: cached.page_no,
+                    page_data: stack_page_data,
+                    header: cached.header,
+                    cell_pointers: stack_cell_pointers,
+                    cell_idx: insert_idx,
+                });
+                self.at_eof = false;
+                self.rightmost_leaf_cache = Some(cached);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    self.free_overflow_chain(cx, first)?;
+                }
+                self.stack.clear();
+                self.at_eof = true;
+                self.clear_rightmost_leaf_cache();
+                Ok(false)
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                self.stack.clear();
+                self.at_eof = true;
+                self.clear_rightmost_leaf_cache();
+                Err(error)
+            }
+        }
+    }
+
     fn try_table_append_on_hinted_leaf(
         &mut self,
         cx: &Cx,
@@ -4397,6 +4779,7 @@ impl<P: PageWriter> BtCursor<P> {
         data: &[u8],
     ) -> Result<bool> {
         observe_cursor_cancellation(cx)?;
+        let hinted_tree_depth = self.last_known_depth.unwrap_or(1);
         self.stack.clear();
         self.at_eof = true;
 
@@ -4422,7 +4805,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         // bd-wwqen.3: use cached rowid if available for this leaf page,
         // avoiding a cell parse just to read the last rowid.
-        let last_rowid = if let Some(cached) = self.rightmost_leaf_cache {
+        let last_rowid = if let Some(cached) = self.rightmost_leaf_cache.as_ref() {
             if cached.page_no == hinted_leaf_page {
                 cached.rowid
             } else {
@@ -4446,7 +4829,18 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
-                self.remember_rightmost_leaf(hinted_leaf_page, rowid);
+                if let Some(cache_entry) = self.stack.last().map(|entry| RightmostLeafCacheEntry {
+                    page_no: entry.page_no,
+                    rowid,
+                    tree_depth: hinted_tree_depth,
+                    page_data: entry.page_data.clone(),
+                    header: entry.header,
+                    cell_pointers: entry.cell_pointers.clone(),
+                }) {
+                    self.rightmost_leaf_cache = Some(cache_entry);
+                } else {
+                    self.clear_rightmost_leaf_cache();
+                }
                 Ok(true)
             }
             Ok(false) => {
@@ -4467,6 +4861,259 @@ impl<P: PageWriter> BtCursor<P> {
                 self.stack.clear();
                 self.at_eof = true;
                 self.clear_rightmost_leaf_cache();
+                Err(error)
+            }
+        }
+    }
+
+    fn try_table_append_on_hinted_leaf_with_known_last_rowid(
+        &mut self,
+        cx: &Cx,
+        hinted_leaf_page: PageNumber,
+        hinted_last_rowid: i64,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<Option<TableAppendHint>> {
+        observe_cursor_cancellation(cx)?;
+        let hinted_tree_depth = self.last_known_depth.unwrap_or(1);
+        self.stack.clear();
+        self.at_eof = true;
+
+        let mut page_data = match self.pager.read_page_data(cx, hinted_leaf_page) {
+            Ok(page_data) => page_data,
+            Err(_) => {
+                self.clear_rightmost_leaf_cache();
+                return Ok(None);
+            }
+        };
+        let mut header = match cell::parse_page_header(page_data.as_bytes(), hinted_leaf_page) {
+            Ok(header) => header,
+            Err(_) => {
+                self.clear_rightmost_leaf_cache();
+                return Ok(None);
+            }
+        };
+        if header.page_type != cell::BtreePageType::LeafTable || header.cell_count == 0 {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
+        }
+
+        self.record_range_page_witness(hinted_leaf_page);
+        if rowid <= hinted_last_rowid {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
+        }
+
+        if let Some((insert_idx, _)) = self.try_append_table_leaf_payload_in_place_no_overflow(
+            cx,
+            hinted_leaf_page,
+            &mut page_data,
+            &mut header,
+            rowid,
+            data,
+        )? {
+            let header_offset = cell::header_offset_for_page(hinted_leaf_page);
+            let cell_pointers =
+                cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+            self.last_insert_rowid = Some(rowid);
+            self.stack.clear();
+            self.stack.push(StackEntry {
+                page_no: hinted_leaf_page,
+                page_data: page_data.clone(),
+                header,
+                cell_pointers: cell_pointers.clone(),
+                cell_idx: insert_idx,
+            });
+            self.at_eof = false;
+            self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                page_no: hinted_leaf_page,
+                rowid,
+                tree_depth: hinted_tree_depth,
+                page_data: page_data.clone(),
+                header,
+                cell_pointers: cell_pointers.clone(),
+            });
+            return Ok(Some(TableAppendHint {
+                leaf_page: hinted_leaf_page,
+                last_rowid: rowid,
+                tree_depth: hinted_tree_depth,
+                page_data,
+                header,
+            }));
+        }
+
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let append_result = self.try_append_leaf_page_in_place(
+            cx,
+            hinted_leaf_page,
+            &mut page_data,
+            &mut header,
+            &cell_data,
+        );
+        match append_result {
+            Ok(Some((insert_idx, _))) => {
+                let header_offset = cell::header_offset_for_page(hinted_leaf_page);
+                let cell_pointers =
+                    cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                self.stack.clear();
+                self.stack.push(StackEntry {
+                    page_no: hinted_leaf_page,
+                    page_data: page_data.clone(),
+                    header,
+                    cell_pointers: cell_pointers.clone(),
+                    cell_idx: insert_idx,
+                });
+                self.at_eof = false;
+                self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+                    page_no: hinted_leaf_page,
+                    rowid,
+                    tree_depth: hinted_tree_depth,
+                    page_data: page_data.clone(),
+                    header,
+                    cell_pointers,
+                });
+                Ok(Some(TableAppendHint {
+                    leaf_page: hinted_leaf_page,
+                    last_rowid: rowid,
+                    tree_depth: hinted_tree_depth,
+                    page_data,
+                    header,
+                }))
+            }
+            Ok(None) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    self.free_overflow_chain(cx, first)?;
+                }
+                self.clear_rightmost_leaf_cache();
+                Ok(None)
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                self.clear_rightmost_leaf_cache();
+                Err(error)
+            }
+        }
+    }
+
+    fn try_append_on_external_rightmost_leaf_hint(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<bool> {
+        observe_cursor_cancellation(cx)?;
+        self.last_known_depth = Some(hint.tree_depth);
+        self.stack.clear();
+        self.at_eof = true;
+
+        if rowid <= hint.last_rowid
+            || hint.header.page_type != cell::BtreePageType::LeafTable
+            || hint.header.cell_count == 0
+        {
+            return Ok(false);
+        }
+
+        self.record_range_page_witness(hint.leaf_page);
+        if let Some(_) = self.try_append_table_leaf_payload_in_place_no_overflow(
+            cx,
+            hint.leaf_page,
+            &mut hint.page_data,
+            &mut hint.header,
+            rowid,
+            data,
+        )? {
+            self.last_insert_rowid = Some(rowid);
+            self.last_known_depth = Some(hint.tree_depth);
+            hint.last_rowid = rowid;
+            return Ok(true);
+        }
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let append_result = self.try_append_leaf_page_in_place(
+            cx,
+            hint.leaf_page,
+            &mut hint.page_data,
+            &mut hint.header,
+            &cell_data,
+        );
+        match append_result {
+            Ok(Some(_)) => {
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.last_rowid = rowid;
+                Ok(true)
+            }
+            Ok(None) => {
+                let fallback_result = (|| {
+                    let has_last = self.last(cx)?;
+                    if has_last {
+                        let last_rowid = self.rowid(cx)?;
+                        if rowid <= last_rowid {
+                            return Ok(false);
+                        }
+                    }
+                    self.at_eof = true;
+                    match self.try_append_on_current_leaf(cx, &cell_data) {
+                        Ok(true) => {
+                            self.last_insert_rowid = Some(rowid);
+                        }
+                        Ok(false) => {
+                            instrumentation::record_conservative_reload_fallback();
+                            let insert_idx = self
+                                .stack
+                                .last()
+                                .ok_or_else(|| {
+                                    FrankenError::internal(
+                                        "cursor lost rightmost leaf during cached-hint fallback",
+                                    )
+                                })?
+                                .header
+                                .cell_count;
+                            self.balance_for_insert(cx, &cell_data, insert_idx)?;
+                            self.last_insert_rowid = Some(rowid);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    self.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
+                    *hint = self.table_cached_rightmost_leaf_hint().ok_or_else(|| {
+                        FrankenError::internal(
+                            "cached rightmost-leaf fallback did not refresh retained hint state",
+                        )
+                    })?;
+                    Ok(true)
+                })();
+                self.cell_buf = cell_data;
+                match fallback_result {
+                    Ok(inserted) => {
+                        if !inserted
+                            && let Some(first) = overflow_head
+                        {
+                            self.free_overflow_chain(cx, first)?;
+                        }
+                        Ok(inserted)
+                    }
+                    Err(error) => {
+                        if let Some(first) = overflow_head {
+                            let _ = self.free_overflow_chain(cx, first);
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
                 Err(error)
             }
         }
@@ -4502,6 +5149,39 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
     ) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
+        })
+    }
+
+    /// Fast append path for callers that already positioned the cursor on the
+    /// rightmost row (for example via `last()` or a previous successful append).
+    ///
+    /// This reuses the current right-edge cursor stack instead of descending
+    /// from the root again.
+    #[doc(hidden)]
+    pub fn table_append_after_last_position(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if !cursor.is_on_rightmost_insert_edge() {
+                let has_last = cursor.last(cx)?;
+                if has_last {
+                    let last_rowid = cursor.rowid(cx)?;
+                    if rowid <= last_rowid {
+                        cursor.clear_rightmost_leaf_cache();
+                        let seek = cursor.table_seek_for_insert(cx, rowid)?;
+                        if seek.is_found() {
+                            return Err(FrankenError::PrimaryKeyViolation);
+                        }
+                        return cursor.table_insert_from_current_position(cx, rowid, data);
+                    }
+                }
+            }
+            cursor.at_eof = true;
+            cursor.table_insert_from_current_position(cx, rowid, data)?;
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         })
     }
@@ -4577,6 +5257,106 @@ impl<P: PageWriter> BtCursor<P> {
             cursor.table_insert_from_current_position(cx, rowid, data)?;
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         })
+    }
+
+    /// Specialized append fast path for external callers that already know the
+    /// last successful rowid associated with `hinted_leaf_page`.
+    ///
+    /// Unlike [`Self::table_insert_rightmost_leaf_hint`], this does not decode
+    /// the leaf cell pointer array or parse the final row just to rediscover
+    /// the same right-edge rowid. It returns `Ok(Some(page))` when the hinted
+    /// leaf accepted the append directly and `Ok(None)` when the caller should
+    /// fall back to the normal insert path.
+    #[doc(hidden)]
+    pub fn table_try_append_rightmost_leaf_hint_known_last_rowid(
+        &mut self,
+        cx: &Cx,
+        hinted_leaf_page: PageNumber,
+        hinted_last_rowid: i64,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<Option<PageNumber>> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
+                cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
+            }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
+            {
+                return Ok(Some(hinted_leaf_page));
+            }
+            let hint = cursor.try_table_append_on_hinted_leaf_with_known_last_rowid(
+                cx,
+                hinted_leaf_page,
+                hinted_last_rowid,
+                rowid,
+                data,
+            )?;
+            Ok(hint.map(|value| value.leaf_page()))
+        })
+    }
+
+    /// Same as [`Self::table_try_append_rightmost_leaf_hint_known_last_rowid`]
+    /// but returns the refreshed retained leaf image on success.
+    #[doc(hidden)]
+    pub fn table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
+        &mut self,
+        cx: &Cx,
+        hinted_leaf_page: PageNumber,
+        hinted_last_rowid: i64,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<Option<TableAppendHint>> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
+                cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
+            }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
+            {
+                return Ok(cursor
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .map(TableAppendHint::from));
+            }
+            cursor.try_table_append_on_hinted_leaf_with_known_last_rowid(
+                cx,
+                hinted_leaf_page,
+                hinted_last_rowid,
+                rowid,
+                data,
+            )
+        })
+    }
+
+    /// Reuse a retained rightmost-leaf image captured by a prior append.
+    #[doc(hidden)]
+    pub fn table_try_append_cached_rightmost_leaf_hint(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<bool> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
+        })
+    }
+
+    /// Snapshot the cursor's current retained rightmost-leaf cache.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn table_cached_rightmost_leaf_hint(&self) -> Option<TableAppendHint> {
+        self.rightmost_leaf_cache
+            .as_ref()
+            .map(TableAppendHint::from)
+    }
+
+    /// Swap in or out an external reusable cell-assembly buffer.
+    ///
+    /// Fresh cursor instances otherwise start with an empty `cell_buf`, which
+    /// forces repeated monotonic insert loops to rebuild allocator state for
+    /// every encoded table leaf cell. Swapping a connection-owned scratch
+    /// buffer through the cursor preserves that capacity across executes.
+    #[doc(hidden)]
+    pub fn swap_cell_scratch(&mut self, scratch: &mut Vec<u8>) {
+        std::mem::swap(&mut self.cell_buf, scratch);
     }
 }
 
@@ -4781,9 +5561,25 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            if let Some(cached) = cursor.rightmost_leaf_cache {
-                if rowid > cached.rowid {
-                    if cursor.try_table_append_on_hinted_leaf(cx, cached.page_no, rowid, data)? {
+            if let Some((cached_page_no, cached_rowid)) = cursor
+                .rightmost_leaf_cache
+                .as_ref()
+                .map(|cached| (cached.page_no, cached.rowid))
+            {
+                if rowid > cached_rowid {
+                    if cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)? {
+                        return Ok(());
+                    }
+                    if cursor
+                        .try_table_append_on_hinted_leaf_with_known_last_rowid(
+                            cx,
+                            cached_page_no,
+                            cached_rowid,
+                            rowid,
+                            data,
+                        )?
+                        .is_some()
+                    {
                         return Ok(());
                     }
                 } else {
@@ -8437,6 +9233,232 @@ mod tests {
     }
 
     #[test]
+    fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_reuses_leaf_and_falls_back() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+
+        let mut hinted_leaf = cursor
+            .current_page()
+            .expect("first append should leave the cursor on a concrete leaf");
+        let mut hinted_last_rowid = 1_i64;
+        for rowid in 2..=256_i64 {
+            let payload = payload_for_rowid(rowid);
+            if let Some(leaf_page) = cursor
+                .table_try_append_rightmost_leaf_hint_known_last_rowid(
+                    &cx,
+                    hinted_leaf,
+                    hinted_last_rowid,
+                    rowid,
+                    payload.as_slice(),
+                )
+                .unwrap()
+            {
+                hinted_leaf = leaf_page;
+                hinted_last_rowid = rowid;
+                assert_eq!(cursor.current_page(), Some(leaf_page));
+                let cached = cursor
+                    .rightmost_leaf_cache
+                    .as_ref()
+                    .expect("successful helper append should refresh the rightmost-leaf cache");
+                assert_eq!(cached.page_no, leaf_page);
+                assert_eq!(cached.rowid, rowid);
+                continue;
+            }
+
+            cursor
+                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .unwrap();
+            hinted_leaf = cursor
+                .current_page()
+                .expect("fallback append should leave the cursor on a concrete leaf");
+            hinted_last_rowid = rowid;
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=256_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_try_append_rightmost_leaf_hint_known_last_rowid_with_state_refreshes_cursor() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+
+        let hinted_leaf = cursor
+            .current_page()
+            .expect("first append should leave the cursor on a concrete leaf");
+        cursor.clear_rightmost_leaf_cache();
+        cursor.stack.clear();
+        cursor.at_eof = true;
+
+        let cached_leaf = cursor
+            .table_try_append_rightmost_leaf_hint_known_last_rowid_with_state(
+                &cx,
+                hinted_leaf,
+                1,
+                2,
+                payload_for_rowid(2).as_slice(),
+            )
+            .unwrap()
+            .expect("known-last-rowid helper should append on a fresh cursor");
+
+        assert_eq!(cached_leaf.leaf_page(), hinted_leaf);
+        assert_eq!(cached_leaf.last_rowid(), 2);
+        assert_eq!(cursor.current_page(), Some(hinted_leaf));
+        let internal_cache = cursor
+            .rightmost_leaf_cache
+            .as_ref()
+            .expect("helper should refresh the internal rightmost-leaf cache");
+        assert_eq!(internal_cache.page_no, hinted_leaf);
+        assert_eq!(internal_cache.rowid, 2);
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_reuses_retained_leaf_image() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("first append should seed a retained rightmost-leaf image");
+        for rowid in 2..=256_i64 {
+            let payload = payload_for_rowid(rowid);
+            let previous_leaf = hint.leaf_page();
+            cursor.pager.clear_reads();
+            if cursor
+                .table_try_append_cached_rightmost_leaf_hint(
+                    &cx,
+                    &mut hint,
+                    rowid,
+                    payload.as_slice(),
+                )
+                .unwrap()
+            {
+                assert_eq!(hint.last_rowid(), rowid);
+                let read_pages = cursor.pager.read_pages();
+                if hint.leaf_page() == previous_leaf {
+                    assert!(
+                        read_pages.is_empty(),
+                        "cached retained-leaf append should not re-read the tree when it stays on the same leaf: {read_pages:?}"
+                    );
+                }
+                continue;
+            }
+
+            cursor
+                .table_insert_rightmost_hint(&cx, rowid, payload.as_slice())
+                .unwrap();
+            hint = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("fallback append should refresh the retained rightmost-leaf image");
+            assert_eq!(hint.last_rowid(), rowid);
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=256_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_splits_with_one_cell_assembly_per_row() {
+        let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse cursor test lock");
+        let _shared_guard = crate::instrumentation::LEAF_REUSE_TEST_LOCK
+            .lock()
+            .expect("leaf-reuse shared test lock");
+        const SMALL_USABLE: u32 = 256;
+
+        crate::instrumentation::reset_btree_copy_profile();
+        crate::instrumentation::set_btree_copy_profile_enabled(true);
+
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, SMALL_USABLE);
+        let payload = vec![b'S'; 120];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, SMALL_USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, &payload)
+            .expect("seed insert should succeed");
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed insert should capture a retained rightmost-leaf hint");
+        let mut observed_split = false;
+
+        for rowid in 2..=32_i64 {
+            let before = crate::instrumentation::btree_copy_profile_snapshot();
+            let previous_leaf = hint.leaf_page();
+            cursor.stack.clear();
+            cursor.at_eof = true;
+            cursor.clear_rightmost_leaf_cache();
+
+            assert!(
+                cursor
+                    .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, rowid, &payload)
+                    .expect("cached rightmost-leaf helper should handle split fallback"),
+                "helper should not need a second append API when the hinted leaf fills"
+            );
+
+            let after = crate::instrumentation::btree_copy_profile_snapshot();
+            if hint.leaf_page() != previous_leaf {
+                observed_split = true;
+                assert_eq!(
+                    after
+                        .table_leaf_cell_assembly_calls
+                        .saturating_sub(before.table_leaf_cell_assembly_calls),
+                    1,
+                    "the split-triggering cached-hint insert should assemble the table leaf cell exactly once"
+                );
+                break;
+            }
+        }
+
+        crate::instrumentation::set_btree_copy_profile_enabled(false);
+        assert!(
+            observed_split,
+            "test setup should force at least one cached-hint leaf split"
+        );
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=32_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 32 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
     fn test_table_insert_reuses_rightmost_leaf_cache_for_sequential_appends() {
         let cx = Cx::new();
         let root = pn(2);
@@ -8456,6 +9478,7 @@ mod tests {
 
         let cached_before = cursor
             .rightmost_leaf_cache
+            .clone()
             .expect("sequential inserts should seed the rightmost-leaf cache");
 
         let mut cell_data = Vec::new();
@@ -8478,13 +9501,63 @@ mod tests {
 
         cursor.pager.clear_reads();
         cursor.table_insert(&cx, 129, &payload).unwrap();
-        assert_eq!(cursor.pager.read_pages(), vec![cached_before.page_no]);
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "cached rightmost-leaf append should not re-read the leaf page"
+        );
 
         let cached_after = cursor
             .rightmost_leaf_cache
+            .clone()
             .expect("successful append should refresh the rightmost-leaf cache");
         assert_eq!(cached_after.page_no, cached_before.page_no);
         assert_eq!(cached_after.rowid, 129);
+    }
+
+    #[test]
+    fn test_table_append_after_last_position_avoids_reseek() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'P'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=128_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        assert!(cursor.last(&cx).unwrap());
+        cursor.pager.clear_reads();
+        cursor
+            .table_append_after_last_position(&cx, 129, &payload)
+            .unwrap();
+
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "append-after-last should reuse the current right-edge cursor state"
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 129);
+    }
+
+    #[test]
+    fn test_table_append_after_last_position_reseeks_when_stack_is_empty() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'Q'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=128_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        cursor.stack.clear();
+        cursor.at_eof = true;
+        cursor
+            .table_append_after_last_position(&cx, 129, &payload)
+            .unwrap();
+
+        assert_eq!(cursor.rowid(&cx).unwrap(), 129);
     }
 
     #[test]
@@ -8501,6 +9574,7 @@ mod tests {
             cursor.table_insert(&cx, next_rowid, &payload).unwrap();
             let cached = cursor
                 .rightmost_leaf_cache
+                .as_ref()
                 .expect("sequential append should maintain a rightmost-leaf cache");
 
             if let Some(previous_page) = previous_cached_page
@@ -8516,14 +9590,56 @@ mod tests {
             );
         };
 
-        let cached_after_split = cursor
+        let _cached_after_split = cursor
             .rightmost_leaf_cache
+            .clone()
             .expect("split should refresh the rightmost-leaf cache");
         cursor.pager.clear_reads();
         cursor
             .table_insert(&cx, split_insert_rowid + 1, &payload)
             .unwrap();
-        assert_eq!(cursor.pager.read_pages(), vec![cached_after_split.page_no]);
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "post-split append should reuse the refreshed cached leaf state"
+        );
+    }
+
+    #[test]
+    fn test_refresh_rightmost_leaf_cache_after_insert_skips_last_when_cache_is_authoritative() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = vec![b'R'; 180];
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        for rowid in 1..=8_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let cached = cursor
+            .rightmost_leaf_cache
+            .clone()
+            .expect("sequential inserts should seed the rightmost-leaf cache");
+        cursor.stack.clear();
+        cursor.at_eof = true;
+        cursor.last_known_depth = Some(cached.tree_depth);
+        cursor.rightmost_leaf_cache = Some(cached.clone());
+
+        cursor.pager.clear_reads();
+        cursor
+            .refresh_rightmost_leaf_cache_after_insert(&cx, cached.rowid)
+            .unwrap();
+
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "refresh should trust an already-authoritative rightmost-leaf cache instead of calling last()"
+        );
+        let refreshed = cursor
+            .rightmost_leaf_cache
+            .as_ref()
+            .expect("refresh should preserve the rightmost-leaf cache");
+        assert_eq!(refreshed.page_no, cached.page_no);
+        assert_eq!(refreshed.rowid, cached.rowid);
     }
 
     #[test]

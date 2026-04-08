@@ -3105,6 +3105,16 @@ impl CursorBackend {
         }
     }
 
+    fn table_append_after_last_position(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.table_append_after_last_position(cx, rowid, data),
+            Self::Txn(c) => c.table_append_after_last_position(cx, rowid, data),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx),
@@ -3192,6 +3202,12 @@ struct StorageCursor {
     cx: Cx,
     /// Whether this cursor was opened for writing (`OpenWrite`).
     writable: bool,
+    /// Stable root page associated with this cursor.
+    root_page: i32,
+    /// Rowid allocation mode for this root page.
+    rowid_mode: RowIdMode,
+    /// AUTOINCREMENT lower bound loaded once per execution for this cursor.
+    autoincrement_high_water: i64,
     /// Highest rowid allocated by `NewRowid` on this cursor (bd-1yi8).
     /// Ensures consecutive allocations return unique values even when
     /// no Insert has been issued between them.
@@ -5936,19 +5952,10 @@ impl VdbeEngine {
         self.concurrent_rowid_schema_epoch = schema_epoch;
     }
 
-    fn storage_cursor_autoincrement_high_water(&self, cursor_id: i32) -> i64 {
-        self.cursor_root_pages
-            .get(&cursor_id)
-            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn storage_cursor_rowid_mode(&self, root_page: i32) -> RowIdMode {
-        if self.autoincrement_seq_by_root_page.contains_key(&root_page) {
-            RowIdMode::AutoIncrement
-        } else {
-            RowIdMode::Normal
+    fn storage_cursor_runtime_meta(&self, root_page: i32) -> (RowIdMode, i64) {
+        match self.autoincrement_seq_by_root_page.get(&root_page).copied() {
+            Some(high_water) => (RowIdMode::AutoIncrement, high_water),
+            None => (RowIdMode::Normal, 0),
         }
     }
 
@@ -7251,6 +7258,9 @@ impl VdbeEngine {
                                 cursor: CursorBackend::Mem(cursor),
                                 cx,
                                 writable: true,
+                                root_page: root_pgno.get() as i32,
+                                rowid_mode: RowIdMode::Normal,
+                                autoincrement_high_water: 0,
                                 last_alloc_rowid: 0,
                                 payload_buf: Vec::new(),
                                 target_vals_buf: Vec::new(),
@@ -8123,26 +8133,28 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let concurrent_mode = op.p3 != 0;
-                    let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-                    let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
-                    let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
-                    let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+                    let concurrent_allocator = if concurrent_mode {
+                        self.concurrent_rowid_allocator.clone()
+                    } else {
+                        None
+                    };
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        let root_page = sc.root_page;
+                        let autoinc_max = sc.autoincrement_high_water;
+                        let rowid_mode = sc.rowid_mode;
                         // Storage NewRowid probes max rowid via `last()`, which
                         // repositions the cursor. Clear any pending delete/next
                         // state so subsequent Next/Prev behavior is consistent
                         // with the new position.
                         self.pending_next_after_delete.remove(&cursor_id);
                         if concurrent_mode {
-                            if let (Some(allocator), Some(root_page), Some(mode)) =
-                                (concurrent_allocator.as_ref(), root_page, rowid_mode)
-                            {
+                            if let Some(allocator) = concurrent_allocator.as_ref() {
                                 Self::allocate_concurrent_storage_rowid(
                                     allocator,
                                     concurrent_schema_epoch,
                                     root_page,
-                                    mode,
+                                    rowid_mode,
                                     autoinc_max,
                                     sc,
                                     "rowid overflow: maximum rowid reached",
@@ -8195,9 +8207,6 @@ impl VdbeEngine {
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let rowid = self.get_reg(rowid_reg).to_integer();
-                    let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-                    let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
-                    let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
                     let concurrent_allocator = self.concurrent_rowid_allocator.clone();
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     // take_reg moves the value out (replacing with Null) instead
@@ -8230,8 +8239,12 @@ impl VdbeEngine {
                     };
                     let mut actually_inserted = false;
                     let mut inserted_via_storage = false;
+                    let mut inserted_root_page = None;
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
+                            let root_page = sc.root_page;
+                            let autoinc_max = sc.autoincrement_high_water;
+                            let rowid_mode = sc.rowid_mode;
                             let blob = if sideband_active {
                                 &sideband_buf[..]
                             } else {
@@ -8290,7 +8303,19 @@ impl VdbeEngine {
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
+                                    if let Some(allocator) = concurrent_allocator.as_ref() {
+                                        Self::bump_concurrent_storage_rowid_floor(
+                                            allocator,
+                                            concurrent_schema_epoch,
+                                            root_page,
+                                            rowid_mode,
+                                            autoinc_max,
+                                            sc2,
+                                            rowid,
+                                        )?;
+                                    }
                                     inserted_via_storage = true;
+                                    inserted_root_page = Some(root_page);
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
@@ -8337,7 +8362,19 @@ impl VdbeEngine {
                                     self.collect_vdbe_metrics,
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
+                                if let Some(allocator) = concurrent_allocator.as_ref() {
+                                    Self::bump_concurrent_storage_rowid_floor(
+                                        allocator,
+                                        concurrent_schema_epoch,
+                                        root_page,
+                                        rowid_mode,
+                                        autoinc_max,
+                                        sc,
+                                        rowid,
+                                    )?;
+                                }
                                 inserted_via_storage = true;
+                                inserted_root_page = Some(root_page);
                                 actually_inserted = true;
                             }
                         }
@@ -8410,22 +8447,7 @@ impl VdbeEngine {
                             }
                         }
                     }
-                    if inserted_via_storage
-                        && let (Some(allocator), Some(root_page), Some(mode)) =
-                            (concurrent_allocator.as_ref(), root_page, rowid_mode)
-                        && let Some(sc) = self.storage_cursors.get_mut(&cursor_id)
-                    {
-                        Self::bump_concurrent_storage_rowid_floor(
-                            allocator,
-                            concurrent_schema_epoch,
-                            root_page,
-                            mode,
-                            autoinc_max,
-                            sc,
-                            rowid,
-                        )?;
-                    }
-                    if inserted_via_storage && let Some(root_page) = root_page {
+                    if inserted_via_storage && let Some(root_page) = inserted_root_page {
                         // Hot INSERT path already knows the table root page, so
                         // avoid another cursor_root_pages lookup when marking
                         // the MemDB mirror stale.
@@ -10657,23 +10679,23 @@ impl VdbeEngine {
                 let cursor_id = op.p1;
                 let first_reg = op.p2;
                 let num_cols = usize::try_from(op.p3).unwrap_or(0);
-                let root_page = self.cursor_root_pages.get(&cursor_id).copied();
-                let autoinc_max = self.storage_cursor_autoincrement_high_water(cursor_id);
-                let rowid_mode = root_page.map(|rp| self.storage_cursor_rowid_mode(rp));
                 let concurrent_allocator = self.concurrent_rowid_allocator.clone();
                 let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+                let previous_last_insert_rowid = self.last_insert_rowid;
+                let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
                 if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                     if sc.writable {
+                        let root_page = sc.root_page;
+                        let autoinc_max = sc.autoincrement_high_water;
+                        let rowid_mode = sc.rowid_mode;
                         // 1. Allocate rowid (same logic as NewRowid).
-                        let rowid = if let (Some(allocator), Some(root_page), Some(mode)) =
-                            (concurrent_allocator.as_ref(), root_page, rowid_mode)
-                        {
+                        let rowid = if let Some(allocator) = concurrent_allocator.as_ref() {
                             Self::allocate_concurrent_storage_rowid(
                                 allocator,
                                 concurrent_schema_epoch,
                                 root_page,
-                                mode,
+                                rowid_mode,
                                 autoinc_max,
                                 sc,
                                 "rowid overflow in FusedAppendInsert",
@@ -10702,7 +10724,8 @@ impl VdbeEngine {
                         let sc = self.storage_cursors.get_mut(&cursor_id).ok_or_else(|| {
                             FrankenError::internal("cursor disappeared in FusedAppendInsert")
                         })?;
-                        sc.cursor.table_insert(&sc.cx, rowid, &rec_buf)?;
+                        sc.cursor
+                            .table_append_after_last_position(&sc.cx, rowid, &rec_buf)?;
                         sc.last_successful_insert_rowid = Some(rowid);
 
                         // Return buffer for reuse
@@ -10715,13 +10738,20 @@ impl VdbeEngine {
                         self.last_insert_rowid_valid = true;
                         self.last_insert_cursor_id = Some(cursor_id);
                         self.conflict_skip_idx = false;
-                        self.pending_insert_rollback = None;
+                        self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
+                        self.pending_insert_rollback = Some(PendingInsertRollback {
+                            cursor_id,
+                            rowid,
+                            previous_last_insert_rowid,
+                            previous_last_insert_rowid_valid,
+                            update_restore: None,
+                        });
                         self.pending_next_after_delete.remove(&cursor_id);
                         // CRITICAL FIX: Mark table dirty so MemDB fast paths
                         // know the data is stale and fall back to pager reads.
                         // Without this, subsequent COUNT(*)/LIKE queries via
                         // MemDB would return stale results.
-                        self.mark_storage_table_dirty(cursor_id);
+                        self.mark_storage_root_page_dirty(root_page);
                     } else {
                         return Err(FrankenError::internal(
                             "FusedAppendInsert: cursor is not writable",
@@ -11109,6 +11139,9 @@ impl VdbeEngine {
                 cursor: CursorBackend::TimeTravel(new_cursor),
                 cx: old_sc.cx,
                 writable: false,
+                root_page,
+                rowid_mode: old_sc.rowid_mode,
+                autoincrement_high_water: old_sc.autoincrement_high_water,
                 last_alloc_rowid: 0,
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
@@ -11830,6 +11863,33 @@ impl VdbeEngine {
         };
 
         let has_txn = self.txn_page_io.is_some();
+        let txn_cx = self.derive_execution_cx();
+        let (rowid_mode, autoincrement_high_water) = self.storage_cursor_runtime_meta(root_page);
+        if self.cursor_root_pages.get(&cursor_id).copied() == Some(root_page)
+            && let Some(existing) = self.storage_cursors.get_mut(&cursor_id)
+        {
+            let backend_matches = if has_txn {
+                existing.cursor.is_txn()
+            } else {
+                existing.cursor.is_mem()
+            };
+            if backend_matches {
+                existing.writable |= writable;
+                existing.cx = txn_cx.clone();
+                existing.root_page = root_page;
+                existing.rowid_mode = rowid_mode;
+                existing.autoincrement_high_water = autoincrement_high_water;
+                tracing::trace!(
+                    cursor_id,
+                    page_id = root_page,
+                    writable,
+                    has_txn,
+                    backend_kind = existing.cursor.kind_str(),
+                    "open_storage_cursor: reused retained cursor"
+                );
+                return true;
+            }
+        }
         let mut mem_decision_reason = "no_pager_transaction";
 
         // Phase 5C.1 (bd-35my): Route through pager when available.
@@ -11846,7 +11906,6 @@ impl VdbeEngine {
         //
         // The only acceptable writable pager "bootstrap" case is a truly
         // zero-initialized root page that we can initialize in-place.
-        let txn_cx = self.derive_execution_cx();
         // Use a labeled block so we can break out to the MemDatabase fallback path
         // when the pager read fails but MemDatabase has the table.
         'pager_block: {
@@ -11955,6 +12014,9 @@ impl VdbeEngine {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
                             writable,
+                            root_page,
+                            rowid_mode,
+                            autoincrement_high_water,
                             last_alloc_rowid: 0,
                             last_successful_insert_rowid: None,
                             payload_buf: Vec::new(),
@@ -12057,6 +12119,9 @@ impl VdbeEngine {
                             cursor: CursorBackend::Txn(cursor),
                             cx: txn_cx,
                             writable,
+                            root_page,
+                            rowid_mode,
+                            autoincrement_high_water,
                             last_alloc_rowid: 0,
                             last_successful_insert_rowid: None,
                             payload_buf: Vec::new(),
@@ -12181,6 +12246,9 @@ impl VdbeEngine {
                 cursor: CursorBackend::Mem(cursor),
                 cx,
                 writable,
+                root_page,
+                rowid_mode,
+                autoincrement_high_water,
                 last_alloc_rowid: 0,
                 last_successful_insert_rowid: None,
                 payload_buf: Vec::new(),

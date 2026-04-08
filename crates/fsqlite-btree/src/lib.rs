@@ -36,7 +36,9 @@ pub use cooling::{
 pub use cracking::{
     CrackedColumn, CrackingMetricsSnapshot, cracking_metrics_snapshot, reset_cracking_metrics,
 };
-pub use cursor::{BtCursor, MemPageStore, PageReader, PageWriter, TransactionPageIo};
+pub use cursor::{
+    BtCursor, MemPageStore, PageReader, PageWriter, TableAppendHint, TransactionPageIo,
+};
 pub use instrumentation::{
     BtreeCopyProfileSnapshot, BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals,
     btree_copy_profile_snapshot, btree_metrics_snapshot, reset_btree_copy_profile,

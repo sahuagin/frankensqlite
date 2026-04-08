@@ -6278,9 +6278,11 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            let single_connection_fast_path = self.single_connection_fast_path_enabled();
-            let metadata_only_single_connection_fast_path =
-                single_connection_fast_path && !self.write_set.contains_key(&PageNumber::ONE);
+            // Retained :memory: writers must still publish the committed page
+            // plane. Skipping that publish left the parked writer reusable for
+            // throughput, but broke subsequent visibility/cached-writer
+            // invariants in connection-level autocommit paths.
+            let metadata_only_single_connection_fast_path = false;
             // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
             // held — MUST happen before publish_committed_state (same order as
             // `commit()`), so concurrent readers see the immutable snapshot
