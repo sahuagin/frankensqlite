@@ -1671,6 +1671,201 @@ pub fn format_sqlite_float(f: f64) -> String {
 mod tests {
     use super::*;
 
+    struct ValuePoolTestGuard;
+
+    impl ValuePoolTestGuard {
+        fn new() -> Self {
+            pool_clear();
+            reset_value_pool_test_stats();
+            Self
+        }
+    }
+
+    impl Drop for ValuePoolTestGuard {
+        fn drop(&mut self) {
+            pool_clear();
+            reset_value_pool_test_stats();
+        }
+    }
+
+    #[test]
+    fn test_slab_basic_alloc_dealloc() {
+        let _guard = ValuePoolTestGuard::new();
+
+        assert_eq!(pool_len(), 0);
+        assert_eq!(pool_acquire(), None);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: 0,
+                slab_return_count: 0,
+                global_alloc_fallback_count: 1,
+                slab_high_water_mark: 0,
+            }
+        );
+
+        reset_value_pool_test_stats();
+        pool_return(SqliteValue::Integer(42));
+        assert_eq!(pool_len(), 1);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: 0,
+                slab_return_count: 1,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: 1,
+            }
+        );
+
+        reset_value_pool_test_stats();
+        assert_eq!(pool_acquire(), Some(SqliteValue::Integer(42)));
+        assert_eq!(pool_len(), 0);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: 1,
+                slab_return_count: 0,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_slab_exhaustion_fallback() {
+        let _guard = ValuePoolTestGuard::new();
+
+        for value in 0..=VALUE_POOL_CAP {
+            pool_return(SqliteValue::Integer(value as i64));
+        }
+        assert_eq!(pool_len(), VALUE_POOL_CAP);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: 0,
+                slab_return_count: VALUE_POOL_CAP,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: VALUE_POOL_CAP,
+            }
+        );
+
+        reset_value_pool_test_stats();
+        for _ in 0..VALUE_POOL_CAP {
+            assert!(pool_acquire().is_some());
+        }
+        assert_eq!(pool_acquire(), None);
+        assert_eq!(pool_len(), 0);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: VALUE_POOL_CAP,
+                slab_return_count: 0,
+                global_alloc_fallback_count: 1,
+                slab_high_water_mark: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_slab_no_leak() {
+        let _guard = ValuePoolTestGuard::new();
+
+        let (weak_tx, weak_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            pool_clear();
+            reset_value_pool_test_stats();
+
+            let payload: Arc<[u8]> = Arc::from([0xAB_u8; 64].as_slice());
+            let weak = Arc::downgrade(&payload);
+            pool_return(SqliteValue::Blob(payload));
+
+            weak_tx.send(weak).expect("send weak blob handle");
+            release_rx.recv().expect("wait for release");
+        });
+
+        let weak = weak_rx.recv().expect("receive weak blob handle");
+        assert!(
+            weak.upgrade().is_some(),
+            "pooled blob should remain alive while the owning thread is running"
+        );
+
+        release_tx.send(()).expect("release worker thread");
+        worker.join().expect("join worker");
+
+        assert!(
+            weak.upgrade().is_none(),
+            "thread-local slab contents must be dropped when the thread exits"
+        );
+    }
+
+    #[test]
+    fn test_slab_thread_local_isolation() {
+        let _guard = ValuePoolTestGuard::new();
+
+        pool_return(SqliteValue::Integer(11));
+        assert_eq!(pool_len(), 1);
+
+        let worker = std::thread::spawn(|| {
+            pool_clear();
+            reset_value_pool_test_stats();
+
+            assert_eq!(pool_len(), 0, "worker thread must start with an empty slab");
+            pool_return(SqliteValue::Integer(22));
+            assert_eq!(pool_len(), 1);
+            assert_eq!(
+                value_pool_test_stats_snapshot(),
+                ValuePoolStats {
+                    slab_alloc_count: 0,
+                    slab_return_count: 1,
+                    global_alloc_fallback_count: 0,
+                    slab_high_water_mark: 1,
+                }
+            );
+            assert_eq!(pool_acquire(), Some(SqliteValue::Integer(22)));
+            assert_eq!(pool_len(), 0);
+        });
+        worker.join().expect("join worker");
+
+        assert_eq!(
+            pool_len(),
+            1,
+            "worker thread slab operations must not affect the caller thread"
+        );
+        assert_eq!(pool_acquire(), Some(SqliteValue::Integer(11)));
+        assert_eq!(pool_len(), 0);
+    }
+
+    #[test]
+    fn test_slab_zero_malloc_steady_state() {
+        let _guard = ValuePoolTestGuard::new();
+        const WARM_POOL_DEPTH: usize = 64;
+        const ITERATIONS: usize = 10_000;
+
+        for value in 0..WARM_POOL_DEPTH {
+            pool_return(SqliteValue::Integer(value as i64));
+        }
+        assert_eq!(pool_len(), WARM_POOL_DEPTH);
+
+        reset_value_pool_test_stats();
+        for value in 0..ITERATIONS {
+            let _reused = pool_acquire().unwrap_or(SqliteValue::Null);
+            pool_return(SqliteValue::Integer(value as i64));
+        }
+
+        assert_eq!(pool_len(), WARM_POOL_DEPTH);
+        assert_eq!(
+            value_pool_test_stats_snapshot(),
+            ValuePoolStats {
+                slab_alloc_count: ITERATIONS,
+                slab_return_count: ITERATIONS,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: WARM_POOL_DEPTH,
+            }
+        );
+    }
+
     #[test]
     fn null_properties() {
         let v = SqliteValue::Null;
