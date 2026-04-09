@@ -1045,6 +1045,10 @@ mod tests {
         let parsed = ReleaseCertificate::from_json(&json).expect("parse");
 
         assert_eq!(parsed.bead_id, cert.bead_id);
+        assert_eq!(
+            parsed.certification_policy_id, cert.certification_policy_id,
+            "bead_id={BEAD_ID} case=policy_roundtrip",
+        );
         assert_eq!(parsed.verdict, cert.verdict);
         assert_eq!(parsed.total_invariants, cert.total_invariants);
         assert_eq!(parsed.passing_invariants, cert.passing_invariants);
@@ -1123,7 +1127,7 @@ mod tests {
             drift_snapshot,
             campaign_result,
             ci_flake_budget: None,
-            artifact_hashes: Vec::new(),
+            artifact_manifest: None,
         };
 
         let cert = build_certificate(&inputs, &config);
@@ -1149,6 +1153,92 @@ mod tests {
         assert!(
             cert.catalog_stats.total_invariants > 0,
             "bead_id={BEAD_ID} case=catalog_stats",
+        );
+    }
+
+    #[test]
+    fn certificate_default_uses_track_g_threshold_units() {
+        let config = CertificateConfig::default();
+        assert_eq!(
+            config.min_verification_pct, 100.0,
+            "bead_id={BEAD_ID} case=min_pct_units",
+        );
+        assert_eq!(
+            config.gate_config.category_min_verification_pct, 100.0,
+            "bead_id={BEAD_ID} case=category_min_pct_units",
+        );
+    }
+
+    #[test]
+    fn triage_line_reports_verification_pct_without_double_scaling() {
+        let cert = ReleaseCertificate {
+            schema_version: CERTIFICATE_SCHEMA_VERSION,
+            bead_id: RELEASE_CERT_BEAD_ID.to_owned(),
+            certification_policy_id: "policy".to_owned(),
+            certification_policy: canonical_certification_policy(),
+            verdict: CertificateVerdict::Conditional,
+            global_posterior_mean: 1.0,
+            global_lower_bound: 1.0,
+            global_verification_pct: 87.5,
+            total_expected_loss: 0.0,
+            gate_decision: GateDecision::Conditional,
+            gate_release_ready: false,
+            total_invariants: 8,
+            passing_invariants: 7,
+            catalog_stats: CatalogStats::default(),
+            any_drift_rejected: false,
+            any_drift_alarm: false,
+            drift_alert_categories: 0,
+            adversarial_passed: true,
+            counterexample_count: 0,
+            high_severity_count: 0,
+            ci_flake_budget_passed: None,
+            artifact_hash_count: 0,
+            certification_evidence: CertificationEvidenceStatus {
+                schema_version: CERTIFICATION_TRACEABILITY_SCHEMA_VERSION,
+                policy_id: "policy".to_owned(),
+                artifact_manifest_present: false,
+                artifact_manifest_gate_passed: None,
+                verification_contract_passed: None,
+                final_gate_passed: None,
+                missing_evidence_beads: 0,
+                invalid_reference_beads: 0,
+                reported_artifact_count: 0,
+                traceability_entry_count: 0,
+                fully_linked_traceability_entry_count: 0,
+                missing_artifact_ref_count: 0,
+            },
+            evidence_chain: Vec::new(),
+            certification_traceability: CertificationTraceabilityReport {
+                schema_version: CERTIFICATION_TRACEABILITY_SCHEMA_VERSION,
+                policy_id: "policy".to_owned(),
+                manifest_present: false,
+                fully_linked_entries: 0,
+                missing_artifact_ref_count: 0,
+                entries: Vec::new(),
+            },
+            unresolved_risks: Vec::new(),
+            evidence_ledger: EvidenceLedger {
+                schema_version: 1,
+                global_decision: GateDecision::Conditional,
+                release_ready: false,
+                global_posterior_mean: 1.0,
+                global_lower_bound: 1.0,
+                global_verification_pct: 87.5,
+                total_expected_loss: 0.0,
+                total_invariants: 8,
+                passing_invariants: 7,
+                top_priority_items: Vec::new(),
+                category_summaries: BTreeMap::new(),
+                verification_contract: None,
+            },
+            summary: "summary".to_owned(),
+        };
+
+        let line = cert.triage_line();
+        assert!(
+            line.contains("verified=87.5%"),
+            "bead_id={BEAD_ID} case=triage_units line={line}",
         );
     }
 }

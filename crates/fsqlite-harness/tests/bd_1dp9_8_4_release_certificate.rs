@@ -146,7 +146,7 @@ fn verdict_rejected_when_gate_fails() {
         drift_snapshot,
         campaign_result,
         ci_flake_budget: None,
-        artifact_hashes: Vec::new(),
+        artifact_manifest: None,
     };
 
     let cert = build_certificate(&inputs, &config);
@@ -178,7 +178,7 @@ fn certificate_includes_unresolved_risks_on_gate_failure() {
         drift_snapshot: drift_monitor.snapshot(),
         campaign_result: run_campaign(&config.adversarial_config),
         ci_flake_budget: None,
-        artifact_hashes: Vec::new(),
+        artifact_manifest: None,
     };
 
     let cert = build_certificate(&inputs, &config);
@@ -203,6 +203,7 @@ fn certificate_json_roundtrip() {
     let parsed = ReleaseCertificate::from_json(&json).expect("parse");
 
     assert_eq!(parsed.bead_id, cert.bead_id);
+    assert_eq!(parsed.certification_policy_id, cert.certification_policy_id);
     assert_eq!(parsed.verdict, cert.verdict);
     assert_eq!(parsed.total_invariants, cert.total_invariants);
     assert_eq!(parsed.passing_invariants, cert.passing_invariants);
@@ -310,10 +311,7 @@ fn full_pipeline_is_deterministic() {
 #[test]
 fn config_default_is_reasonable() {
     let config = CertificateConfig::default();
-    assert!(
-        config.min_verification_pct > 0.0 && config.min_verification_pct <= 1.0,
-        "bead_id={BEAD_ID} case=min_pct"
-    );
+    assert_eq!(config.min_verification_pct, 100.0);
     assert_eq!(
         config.max_high_severity, 0,
         "bead_id={BEAD_ID} case=max_high_zero"
