@@ -13,8 +13,8 @@
 //! the cursor position and page state.
 
 use crate::cell::{
-    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, parse_page_header,
-    read_cell_pointers, write_cell_pointers,
+    header_offset_for_page, parse_page_header, read_cell_pointers, write_cell_pointers,
+    BtreePageHeader, BtreePageType, CellRef,
 };
 use crate::cursor::PageWriter;
 use fsqlite_error::{FrankenError, Result};
@@ -22,6 +22,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::{BTREE_LEAF_HEADER_SIZE, CELL_POINTER_SIZE};
 use fsqlite_types::serial_type::write_varint;
 use fsqlite_types::{PageData, PageNumber};
+use tracing::trace;
 
 /// Maximum number of sibling pages involved in a single balance_nonroot.
 /// SQLite uses NN=1 (1 neighbor each side) → NB = 2*NN+1 = 3.
@@ -84,6 +85,67 @@ struct GatheredCell {
     /// payload, and overflow pointer.
     #[allow(dead_code)]
     size: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeafTableSplitHeat {
+    LeftEdge,
+    Interior,
+    RightEdge,
+}
+
+impl LeafTableSplitHeat {
+    const fn target_left_basis_points(self) -> usize {
+        match self {
+            // Leave extra headroom on the left page when inserts keep landing
+            // near the beginning of the leaf.
+            Self::LeftEdge => 4_500,
+            // Keep a mild structural-conflict bias even when the hot side is
+            // ambiguous, but avoid overcommitting slack to one half.
+            Self::Interior => 5_500,
+            // Right-edge growth is the common sequential-rowid case. Bias more
+            // payload onto the left page so the new right sibling stays roomy.
+            Self::RightEdge => 6_500,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeftEdge => "left_edge",
+            Self::Interior => "interior",
+            Self::RightEdge => "right_edge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeafTableSplitPolicy {
+    heat: LeafTableSplitHeat,
+    target_left_basis_points: usize,
+}
+
+fn leaf_table_split_policy(cell_count: usize, overflow_insert_idx: usize) -> LeafTableSplitPolicy {
+    if cell_count < 2 {
+        return LeafTableSplitPolicy {
+            heat: LeafTableSplitHeat::Interior,
+            target_left_basis_points: LeafTableSplitHeat::Interior.target_left_basis_points(),
+        };
+    }
+
+    let insert_idx = overflow_insert_idx.min(cell_count - 1);
+    let edge_window = cell_count.div_ceil(4);
+    let heat = if insert_idx < edge_window {
+        LeafTableSplitHeat::LeftEdge
+    } else if insert_idx >= cell_count.saturating_sub(edge_window) {
+        LeafTableSplitHeat::RightEdge
+    } else {
+        LeafTableSplitHeat::Interior
+    };
+
+    LeafTableSplitPolicy {
+        heat,
+        target_left_basis_points: heat.target_left_basis_points(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -916,10 +978,10 @@ fn parent_has_room_for_table_leaf_split<R: crate::cursor::PageReader>(
 ///    the frequency of future splits, which in turn reduces parent-page
 ///    modifications — the primary source of MVCC structural conflicts.
 ///
-/// The target split is biased away from a perfectly balanced 50/50
-/// toward ~60/40 (left heavier).  This means the right (new) page
-/// starts with ~40% slack, accommodating more future inserts before
-/// the next split.
+/// The target split is biased toward the side likely to stay hot after
+/// the split. Right-edge growth keeps more slack in the new sibling;
+/// left-edge growth mirrors that for the original page; interior growth
+/// stays near-balanced with only a mild structural-conflict bias.
 ///
 /// Inspired by B-link tree designs (Lehman & Yao, 1981) which prioritize
 /// reducing structural modifications for concurrent access, and by the
@@ -930,6 +992,7 @@ fn choose_leaf_table_split_index(
     left_header_offset: usize,
     right_header_offset: usize,
     usable_size: u32,
+    policy: LeafTableSplitPolicy,
 ) -> Option<usize> {
     if cells.len() < 2 {
         return None;
@@ -947,15 +1010,11 @@ fn choose_leaf_table_split_index(
         cell_costs.push(cost);
     }
 
-    // Target fill: bias left page to ~60% of total payload, leaving
-    // ~40% slack in the right page.  This reduces future split frequency
-    // and therefore reduces structural B-tree page conflicts under MVCC.
-    //
-    // Why 60/40 and not 70/30?  70/30 would leave the left page so full
-    // that the very next insert triggers another split, amplifying the
-    // problem.  60/40 provides a good balance between space utilization
-    // and split avoidance.
-    let target_left = left_base + (total_cost * 3 / 5); // ~60% target
+    // Target fill: bias free space toward the side most likely to stay hot.
+    // Right-edge growth keeps the new sibling roomy; left-edge growth mirrors
+    // that for the original page. Interior inserts stay near-balanced with a
+    // slight left bias to reduce split churn without overcommitting either side.
+    let target_left = left_base + ((total_cost * policy.target_left_basis_points) / 10_000);
 
     let mut left_total = left_base;
     let mut right_total = right_base.checked_add(total_cost)?;
@@ -974,12 +1033,24 @@ fn choose_leaf_table_split_index(
         }
 
         // Distance from the biased target — smaller is better.
-        // On ties, prefer the later (higher) split index which puts more
-        // cells on the left page, consistent with the 60% bias goal.
+        // On ties, prefer the side consistent with the predicted hot page:
+        // later for right/interior heat, earlier for left heat.
         let key = left_total.abs_diff(target_left);
 
-        match &best_split {
-            Some((_, best_key)) if key > *best_key => {}
+        match best_split {
+            Some((_, best_key)) if key > best_key => {}
+            Some((best_idx, best_key)) if key == best_key => {
+                let candidate_idx = idx + 1;
+                let prefer_candidate = match policy.heat {
+                    LeafTableSplitHeat::LeftEdge => candidate_idx < best_idx,
+                    LeafTableSplitHeat::Interior | LeafTableSplitHeat::RightEdge => {
+                        candidate_idx > best_idx
+                    }
+                };
+                if prefer_candidate {
+                    best_split = Some((candidate_idx, key));
+                }
+            }
             _ => best_split = Some((idx + 1, key)),
         }
     }
@@ -1075,10 +1146,23 @@ fn prepare_leaf_table_local_split<W: PageWriter>(
         });
     }
 
-    let Some(split_idx) = choose_leaf_table_split_index(&all_cells, leaf_offset, 0, usable_size)
+    let split_policy = leaf_table_split_policy(all_cells.len(), insert_idx);
+    let Some(split_idx) =
+        choose_leaf_table_split_index(&all_cells, leaf_offset, 0, usable_size, split_policy)
     else {
         return Ok(None);
     };
+
+    trace!(
+        target: "fsqlite.btree",
+        leaf_page = leaf_page_no.get(),
+        overflow_insert_idx = insert_idx,
+        total_cells = all_cells.len(),
+        predicted_hot_side = split_policy.heat.as_str(),
+        target_left_basis_points = split_policy.target_left_basis_points as u32,
+        split_idx,
+        "contention-aware leaf table split policy"
+    );
 
     let new_sibling_pgno = writer.allocate_page(cx)?;
     let rollback_allocation = |writer: &mut W| {
@@ -2426,8 +2510,8 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
 #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
 mod tests {
     use super::*;
-    use fsqlite_types::WitnessKey;
     use fsqlite_types::serial_type::write_varint;
+    use fsqlite_types::WitnessKey;
     use std::collections::HashMap;
 
     const USABLE: u32 = 4096;
@@ -2616,6 +2700,15 @@ mod tests {
         pos += payload.len();
         cell_buf.truncate(pos);
         cell_buf
+    }
+
+    fn fixed_cost_cells(count: usize, payload_len: usize) -> Vec<GatheredCell> {
+        (0..count)
+            .map(|_| GatheredCell {
+                data: vec![0x5A; payload_len],
+                size: u16::try_from(payload_len).unwrap_or(u16::MAX),
+            })
+            .collect()
     }
 
     /// Build an interior table page with divider cells + right_child.
@@ -2923,6 +3016,58 @@ mod tests {
             store.write_count(new_pgno),
             1,
             "quick balance should write the new sibling once"
+        );
+    }
+
+    #[test]
+    fn test_leaf_table_split_policy_tracks_insert_heat() {
+        let left = leaf_table_split_policy(12, 0);
+        let interior = leaf_table_split_policy(12, 5);
+        let right = leaf_table_split_policy(12, 11);
+
+        assert_eq!(left.heat, LeafTableSplitHeat::LeftEdge);
+        assert_eq!(left.target_left_basis_points, 4_500);
+        assert_eq!(interior.heat, LeafTableSplitHeat::Interior);
+        assert_eq!(interior.target_left_basis_points, 5_500);
+        assert_eq!(right.heat, LeafTableSplitHeat::RightEdge);
+        assert_eq!(right.target_left_basis_points, 6_500);
+    }
+
+    #[test]
+    fn test_choose_leaf_table_split_index_biases_space_toward_predicted_hot_side() {
+        let cells = fixed_cost_cells(12, 180);
+        let left = choose_leaf_table_split_index(
+            &cells,
+            0,
+            0,
+            USABLE,
+            leaf_table_split_policy(cells.len(), 0),
+        )
+        .expect("left-edge split");
+        let interior = choose_leaf_table_split_index(
+            &cells,
+            0,
+            0,
+            USABLE,
+            leaf_table_split_policy(cells.len(), cells.len() / 2),
+        )
+        .expect("interior split");
+        let right = choose_leaf_table_split_index(
+            &cells,
+            0,
+            0,
+            USABLE,
+            leaf_table_split_policy(cells.len(), cells.len() - 1),
+        )
+        .expect("right-edge split");
+
+        assert!(
+            left < interior,
+            "left-hot inserts should keep more slack on the left page"
+        );
+        assert!(
+            interior < right,
+            "right-hot inserts should keep more slack on the new right page"
         );
     }
 

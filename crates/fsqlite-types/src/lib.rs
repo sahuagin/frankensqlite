@@ -347,6 +347,14 @@ impl PageData {
         }
     }
 
+    /// Create from an already shared immutable page snapshot.
+    #[must_use]
+    pub fn from_shared(bytes: Arc<[u8]>) -> Self {
+        Self {
+            repr: PageDataRepr::Shared(bytes),
+        }
+    }
+
     /// Get the page data as a byte slice.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {

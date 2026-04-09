@@ -16,6 +16,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_observability::PageCacheEfficiencySnapshot;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
@@ -3644,6 +3645,11 @@ where
         Ok(self.cache.metrics_snapshot())
     }
 
+    /// Capture page-cache efficiency metrics via the shared observability API.
+    pub fn cache_efficiency_snapshot(&self) -> Result<PageCacheEfficiencySnapshot> {
+        Ok(self.cache.metrics_snapshot().efficiency_snapshot())
+    }
+
     /// Reset page-cache counters without altering resident pages.
     pub fn reset_cache_metrics(&self) -> Result<()> {
         self.cache.reset_metrics();
@@ -4480,7 +4486,12 @@ impl StagedPage {
 
     fn published_page(&self) -> PageData {
         self.published
-            .get_or_init(|| PageData::from_vec(self.as_page_bytes().to_vec()))
+            .get_or_init(|| match &self.backing {
+                StagedPageBacking::Buffered(buf) => {
+                    PageData::from_shared(Arc::<[u8]>::from(buf.as_slice()))
+                }
+                StagedPageBacking::Owned(data) => data.clone(),
+            })
             .clone()
     }
 
@@ -4491,7 +4502,9 @@ impl StagedPage {
         }
 
         match backing {
-            StagedPageBacking::Buffered(buf) => PageData::from_vec(buf.as_slice().to_vec()),
+            StagedPageBacking::Buffered(buf) => {
+                PageData::from_shared(Arc::<[u8]>::from(buf.as_slice()))
+            }
             StagedPageBacking::Owned(data) => data,
         }
     }
@@ -16004,6 +16017,45 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_efficiency_snapshot_matches_raw_cache_metrics() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0xAB; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        pager.reset_cache_metrics().unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let _ = reader.get_page(&cx, page).unwrap();
+
+        let raw = pager.cache_metrics_snapshot().unwrap();
+        let efficiency = pager.cache_efficiency_snapshot().unwrap();
+        assert_eq!(
+            efficiency.hits, raw.hits,
+            "bead_id={BEAD_E2E} case=efficiency_snapshot_hits"
+        );
+        assert_eq!(
+            efficiency.misses, raw.misses,
+            "bead_id={BEAD_E2E} case=efficiency_snapshot_misses"
+        );
+        assert_eq!(
+            efficiency.evictions, raw.evictions,
+            "bead_id={BEAD_E2E} case=efficiency_snapshot_evictions"
+        );
+        assert_eq!(
+            efficiency.cached_pages, raw.cached_pages,
+            "bead_id={BEAD_E2E} case=efficiency_snapshot_cached_pages"
+        );
+        assert!(
+            (efficiency.hit_rate_percent() - raw.hit_rate_percent()).abs() < f64::EPSILON,
+            "bead_id={BEAD_E2E} case=efficiency_snapshot_hit_rate"
+        );
+    }
+
+    #[test]
     fn test_e2e_cache_pressure_eviction_telemetry() {
         let (pager, _) = test_pager();
         let cx = Cx::new();
@@ -17520,6 +17572,46 @@ mod tests {
             published.try_get_page(page_no),
             Some(current_page),
             "bead_id={BEAD_ID} case=stale_publication_preserves_page"
+        );
+    }
+
+    #[test]
+    fn test_staged_page_owned_publication_reuses_shared_snapshot() {
+        let expected = sample_page(0x42);
+        let staged = StagedPage::from_page_data(PageData::from_vec(expected.clone()));
+
+        let first = staged.published_page();
+        let second = staged.published_page();
+
+        assert_eq!(
+            first.as_bytes(),
+            expected.as_slice(),
+            "bead_id=bd-db300.10.6 case=owned_publication_keeps_bytes"
+        );
+        assert_eq!(
+            first.as_bytes().as_ptr(),
+            second.as_bytes().as_ptr(),
+            "bead_id=bd-db300.10.6 case=owned_publication_reuses_shared_snapshot"
+        );
+    }
+
+    #[test]
+    fn test_staged_page_buffered_publication_reuses_shared_snapshot() {
+        let mut buf = PageBuf::new(PageSize::DEFAULT);
+        buf.as_mut_slice().fill(0x53);
+        let staged = StagedPage::from_buf(buf);
+
+        let first = staged.published_page();
+        let second = staged.published_page();
+
+        assert!(
+            first.as_bytes().iter().all(|byte| *byte == 0x53),
+            "bead_id=bd-db300.10.6 case=buffered_publication_keeps_bytes"
+        );
+        assert_eq!(
+            first.as_bytes().as_ptr(),
+            second.as_bytes().as_ptr(),
+            "bead_id=bd-db300.10.6 case=buffered_publication_reuses_shared_snapshot"
         );
     }
 

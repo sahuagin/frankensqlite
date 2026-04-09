@@ -457,6 +457,35 @@ struct TableSeekCacheEntry {
     cell_idx: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPositionStamp {
+    page_no: u32,
+    cell_idx: u16,
+    row_image_epoch: u64,
+}
+
+impl CursorPositionStamp {
+    #[must_use]
+    pub const fn page_no(self) -> u32 {
+        self.page_no
+    }
+
+    #[must_use]
+    pub const fn cell_idx(self) -> u16 {
+        self.cell_idx
+    }
+
+    #[must_use]
+    pub const fn row_image_epoch(self) -> u64 {
+        self.row_image_epoch
+    }
+
+    #[must_use]
+    pub const fn same_logical_position(self, other: Self) -> bool {
+        self.page_no == other.page_no && self.cell_idx == other.cell_idx
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RightmostLeafCacheEntry {
     page_no: PageNumber,
@@ -588,6 +617,12 @@ pub struct BtCursor<P> {
     /// where that seek landed. Later seeks probe cached leaves before they
     /// fall back to a full root-to-leaf descent.
     seek_cache: [Option<TableSeekCacheEntry>; TABLE_SEEK_CACHE_SLOTS],
+    /// Monotonic epoch for the current row image visible through this cursor.
+    ///
+    /// `(page_no, cell_idx)` already identifies logical movement. This epoch
+    /// advances when a successful write keeps the cursor on the same slot but
+    /// rewrites the underlying page image.
+    row_image_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -609,6 +644,7 @@ impl<P> BtCursor<P> {
         self.rightmost_leaf_cache = None;
         self.last_known_depth = None;
         self.seek_cache.fill(None);
+        self.bump_row_image_epoch();
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -628,14 +664,16 @@ impl<P> BtCursor<P> {
     /// Used by the VDBE to cache decoded row state while the cursor remains
     /// on the same leaf cell.
     #[must_use]
-    pub fn position_stamp(&self) -> Option<(u32, u16)> {
+    pub fn position_stamp(&self) -> Option<CursorPositionStamp> {
         if self.at_eof {
             return None;
         }
 
-        self.stack
-            .last()
-            .map(|entry| (entry.page_no.get(), entry.cell_idx))
+        self.stack.last().map(|entry| CursorPositionStamp {
+            page_no: entry.page_no.get(),
+            cell_idx: entry.cell_idx,
+            row_image_epoch: self.row_image_epoch,
+        })
     }
 
     /// The usable page size for this cursor's B-tree.
@@ -671,6 +709,10 @@ impl<P> BtCursor<P> {
 
     fn clear_rightmost_leaf_cache(&mut self) {
         self.rightmost_leaf_cache = None;
+    }
+
+    fn bump_row_image_epoch(&mut self) {
+        self.row_image_epoch = self.row_image_epoch.wrapping_add(1);
     }
 
     fn is_on_rightmost_insert_edge(&self) -> bool {
@@ -1042,6 +1084,7 @@ impl<P: PageReader> BtCursor<P> {
             rightmost_leaf_cache: None,
             last_known_depth: None,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
+            row_image_epoch: 0,
         }
     }
 
@@ -5530,9 +5573,13 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.table_insert_from_current_position(cx, rowid, data)
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Refresh the persistent rightmost-leaf hint after a caller reused an
@@ -5563,7 +5610,7 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             if !cursor.is_on_rightmost_insert_edge() {
                 let has_last = cursor.last(cx)?;
                 if has_last {
@@ -5581,7 +5628,11 @@ impl<P: PageWriter> BtCursor<P> {
             cursor.at_eof = true;
             cursor.table_insert_from_current_position(cx, rowid, data)?;
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Fast insert path for callers that already positioned the cursor with
@@ -5591,9 +5642,13 @@ impl<P: PageWriter> BtCursor<P> {
     /// second full B-tree seek before the insert.
     #[doc(hidden)]
     pub fn index_insert_prechecked_absent(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.index_insert_from_current_position(cx, key)
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Fast insert path for callers that expect a monotonically increasing
@@ -5601,7 +5656,7 @@ impl<P: PageWriter> BtCursor<P> {
     /// falling back to a full seek.
     #[doc(hidden)]
     pub fn table_insert_rightmost_hint(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             let has_last = cursor.last(cx)?;
             if has_last {
                 let last_rowid = cursor.rowid(cx)?;
@@ -5617,7 +5672,11 @@ impl<P: PageWriter> BtCursor<P> {
             }
             cursor.table_insert_from_current_position(cx, rowid, data)?;
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Fast append path for repeated monotonic inserts when the caller has a
@@ -5634,7 +5693,7 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             if cursor.try_table_append_on_hinted_leaf(cx, hinted_leaf_page, rowid, data)? {
                 return Ok(());
             }
@@ -5654,7 +5713,11 @@ impl<P: PageWriter> BtCursor<P> {
             }
             cursor.table_insert_from_current_position(cx, rowid, data)?;
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Specialized append fast path for external callers that already know the
@@ -5674,7 +5737,7 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<Option<PageNumber>> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
                 cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
             }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
@@ -5689,7 +5752,11 @@ impl<P: PageWriter> BtCursor<P> {
                 data,
             )?;
             Ok(hint.map(|value| value.leaf_page()))
-        })
+        });
+        if result.as_ref().ok().is_some_and(|page| page.is_some()) {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Same as [`Self::table_try_append_rightmost_leaf_hint_known_last_rowid`]
@@ -5703,7 +5770,7 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<Option<TableAppendHint>> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             if cursor.rightmost_leaf_cache.as_ref().is_some_and(|cached| {
                 cached.page_no == hinted_leaf_page && cached.rowid == hinted_last_rowid
             }) && cursor.try_append_on_cached_rightmost_leaf(cx, rowid, data)?
@@ -5720,7 +5787,11 @@ impl<P: PageWriter> BtCursor<P> {
                 rowid,
                 data,
             )
-        })
+        });
+        if result.as_ref().ok().is_some_and(|hint| hint.is_some()) {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Reuse a retained rightmost-leaf image captured by a prior append.
@@ -5732,9 +5803,13 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         data: &[u8],
     ) -> Result<bool> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
-        })
+        });
+        if matches!(result, Ok(true)) {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     /// Snapshot the cursor's current retained rightmost-leaf cache.
@@ -5797,7 +5872,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             let seek = cursor.index_seek_for_insert(cx, key)?;
             let (is_leaf, cell_idx) = {
                 let top = cursor
@@ -5883,7 +5958,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     Err(error)
                 }
             }
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     fn index_insert_unique(
@@ -5958,7 +6037,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             if let Some((cached_page_no, cached_rowid)) = cursor
                 .rightmost_leaf_cache
                 .as_ref()
@@ -5997,11 +6076,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
             }
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
-        self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+        let result = self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
             cursor.clear_rightmost_leaf_cache();
             // Delete may rebalance and then re-seek internally to restore
             // cursor position. Any cache entries from the caller's prior seek
@@ -6187,7 +6270,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             }
 
             Ok(())
-        })
+        });
+        if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
     }
 
     fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
@@ -7211,6 +7298,30 @@ mod tests {
         assert!(cursor.next(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 30);
         assert_eq!(cursor.payload(&cx).unwrap(), b"thirty");
+    }
+
+    #[test]
+    fn test_position_stamp_changes_when_same_leaf_slot_is_rewritten() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        cursor.table_insert(&cx, 1, b"one").unwrap();
+        cursor.table_insert(&cx, 2, b"two").unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        let before = cursor.position_stamp().expect("cursor should be positioned");
+
+        cursor.delete(&cx).unwrap();
+        let after = cursor.position_stamp().expect("delete should land on successor");
+
+        assert_eq!(before.page_no(), after.page_no());
+        assert_eq!(before.cell_idx(), after.cell_idx());
+        assert_ne!(
+            before, after,
+            "same-slot successor after delete must advance the row-image epoch"
+        );
     }
 
     #[test]

@@ -37,7 +37,8 @@ pub use cracking::{
     CrackedColumn, CrackingMetricsSnapshot, cracking_metrics_snapshot, reset_cracking_metrics,
 };
 pub use cursor::{
-    BtCursor, MemPageStore, PageReader, PageWriter, TableAppendHint, TransactionPageIo,
+    BtCursor, CursorPositionStamp, MemPageStore, PageReader, PageWriter, TableAppendHint,
+    TransactionPageIo,
 };
 pub use instrumentation::{
     BtreeCopyProfileSnapshot, BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals,

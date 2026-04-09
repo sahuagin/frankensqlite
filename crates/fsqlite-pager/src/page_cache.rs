@@ -20,12 +20,14 @@
 //! false sharing between adjacent shards.
 
 use std::cell::Cell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_observability::PageCacheEfficiencySnapshot;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::Mutex;
 use fsqlite_types::{PageData, PageNumber, PageSize};
@@ -135,6 +137,26 @@ impl PageCacheMetricsSnapshot {
             0.0
         } else {
             (self.hits as f64 * 100.0) / total as f64
+        }
+    }
+
+    /// Convert the raw pager counters into the shared observability snapshot.
+    #[must_use]
+    pub fn efficiency_snapshot(self) -> PageCacheEfficiencySnapshot {
+        PageCacheEfficiencySnapshot {
+            hits: self.hits,
+            misses: self.misses,
+            admits: self.admits,
+            evictions: self.evictions,
+            cached_pages: self.cached_pages,
+            pool_capacity: self.pool_capacity,
+            dirty_ratio_pct: self.dirty_ratio_pct,
+            t1_size: self.t1_size,
+            t2_size: self.t2_size,
+            b1_size: self.b1_size,
+            b2_size: self.b2_size,
+            p_target: self.p_target,
+            mvcc_multi_version_pages: self.mvcc_multi_version_pages,
         }
     }
 }
@@ -475,6 +497,47 @@ const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
 /// tail.
 const FLAT_SLOTS_TARGET_CAPACITY: usize = 16_384;
 
+#[derive(Debug)]
+struct CachedPageEntry {
+    buf: PageBuf,
+    shared: Option<Arc<[u8]>>,
+}
+
+impl CachedPageEntry {
+    #[inline]
+    fn new(buf: PageBuf) -> Self {
+        Self { buf, shared: None }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.shared = None;
+        self.buf.as_mut_slice()
+    }
+
+    #[inline]
+    fn shared_page(&mut self) -> PageData {
+        let shared = if let Some(shared) = self.shared.as_ref() {
+            Arc::clone(shared)
+        } else {
+            let shared = Arc::<[u8]>::from(self.buf.as_slice());
+            self.shared = Some(Arc::clone(&shared));
+            shared
+        };
+        PageData::from_shared(shared)
+    }
+
+    #[inline]
+    fn prefetch_hint(&self) {
+        prefetch_l1_read(self.buf.as_slice().as_ptr());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FastPageArray (bd-fzr07)
 // ---------------------------------------------------------------------------
@@ -493,7 +556,7 @@ const FLAT_SLOTS_TARGET_CAPACITY: usize = 16_384;
 /// - **Best for**: Sequential B-tree scans, single-writer :memory: workloads
 struct FastPageArray {
     /// Pages indexed by `(pgno - 1)`. `None` = page not cached.
-    pages: Vec<Option<PageBuf>>,
+    pages: Vec<Option<CachedPageEntry>>,
     /// Number of non-None entries (tracked for O(1) len()).
     count: usize,
     /// Local hit counter.
@@ -542,9 +605,21 @@ impl FastPageArray {
     #[inline]
     fn get(&mut self, page_no: PageNumber) -> Option<&[u8]> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(Some(buf)) = self.pages.get(idx) {
+        if let Some(Some(entry)) = self.pages.get(idx) {
             self.hits = self.hits.saturating_add(1);
-            Some(buf.as_slice())
+            Some(entry.as_slice())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
+    #[inline]
+    fn get_shared(&mut self, page_no: PageNumber) -> Option<PageData> {
+        let idx = Self::pgno_to_idx(page_no);
+        if let Some(Some(entry)) = self.pages.get_mut(idx) {
+            self.hits = self.hits.saturating_add(1);
+            Some(entry.shared_page())
         } else {
             self.misses = self.misses.saturating_add(1);
             None
@@ -555,9 +630,9 @@ impl FastPageArray {
     #[inline]
     fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(Some(buf)) = self.pages.get_mut(idx) {
+        if let Some(Some(entry)) = self.pages.get_mut(idx) {
             self.hits = self.hits.saturating_add(1);
-            Some(buf.as_mut_slice())
+            Some(entry.as_mut_slice())
         } else {
             self.misses = self.misses.saturating_add(1);
             None
@@ -576,7 +651,7 @@ impl FastPageArray {
         self.ensure_capacity(page_no);
         let idx = Self::pgno_to_idx(page_no);
         let is_new = self.pages[idx].is_none();
-        self.pages[idx] = Some(buf);
+        self.pages[idx] = Some(CachedPageEntry::new(buf));
         if is_new {
             self.count += 1;
             self.admits = self.admits.saturating_add(1);
@@ -646,8 +721,8 @@ impl FastPageArray {
         };
 
         prefetch_l1_read(std::ptr::from_ref(slot));
-        if let Some(buf) = slot.as_ref() {
-            prefetch_l1_read(buf.as_slice().as_ptr());
+        if let Some(entry) = slot.as_ref() {
+            entry.prefetch_hint();
         }
     }
 }
@@ -665,7 +740,7 @@ struct PageSlot {
     /// `0` = empty, `u32::MAX` = tombstone, else = occupied page number.
     pgno: AtomicU32,
     /// Page data, locked only after `pgno` confirms a match.
-    data: Mutex<Option<PageBuf>>,
+    data: Mutex<Option<CachedPageEntry>>,
 }
 
 /// Flat hash page cache with CAS-based slot pinning (bd-eorms).
@@ -749,17 +824,15 @@ impl FlatPageSlots {
         let idx = self.find_slot(page_no)?;
         self.hits.fetch_add(1, Ordering::Relaxed);
         let guard = self.slots[idx].data.lock();
-        guard.as_ref().map(|buf| buf.as_slice().to_vec())
+        guard.as_ref().map(|entry| entry.as_slice().to_vec())
     }
 
     /// Get page data as a shared [`PageData`].
     fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
         let idx = self.find_slot(page_no)?;
         self.hits.fetch_add(1, Ordering::Relaxed);
-        let guard = self.slots[idx].data.lock();
-        guard
-            .as_ref()
-            .map(|buf| PageData::from_vec(buf.as_slice().to_vec()))
+        let mut guard = self.slots[idx].data.lock();
+        guard.as_mut().map(CachedPageEntry::shared_page)
     }
 
     #[inline]
@@ -783,9 +856,9 @@ impl FlatPageSlots {
             if slot_pgno == pgno {
                 self.prefetch_slot(idx);
                 if let Some(guard) = slot.data.try_lock()
-                    && let Some(buf) = guard.as_ref()
+                    && let Some(entry) = guard.as_ref()
                 {
-                    prefetch_l1_read(buf.as_slice().as_ptr());
+                    entry.prefetch_hint();
                 }
                 return;
             }
@@ -814,7 +887,7 @@ impl FlatPageSlots {
 
             if slot_pgno == pgno {
                 // Already present — update data.
-                *self.slots[idx].data.lock() = Some(buf);
+                *self.slots[idx].data.lock() = Some(CachedPageEntry::new(buf));
                 return Ok(false);
             }
 
@@ -839,7 +912,7 @@ impl FlatPageSlots {
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                *self.slots[avail_idx].data.lock() = Some(buf);
+                *self.slots[avail_idx].data.lock() = Some(CachedPageEntry::new(buf));
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -953,7 +1026,7 @@ impl std::fmt::Debug for FlatPageSlots {
 /// accessed by different threads.
 #[repr(align(64))]
 struct PageCacheShard {
-    pages: std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
+    pages: std::collections::HashMap<PageNumber, CachedPageEntry, foldhash::fast::FixedState>,
     /// Local hit counter (aggregated on metrics snapshot).
     hits: u64,
     /// Local miss counter.
@@ -1000,6 +1073,17 @@ impl PageCacheShard {
         }
     }
 
+    #[inline]
+    fn get_shared(&mut self, page_no: PageNumber) -> Option<PageData> {
+        if let Some(page) = self.pages.get_mut(&page_no) {
+            self.hits = self.hits.saturating_add(1);
+            Some(page.shared_page())
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            None
+        }
+    }
+
     /// Get a mutable reference to a page in this shard.
     #[inline]
     fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
@@ -1016,11 +1100,11 @@ impl PageCacheShard {
     fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
         let admitted_new = match self.pages.entry(page_no) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(buf);
+                entry.insert(CachedPageEntry::new(buf));
                 false
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(buf);
+                entry.insert(CachedPageEntry::new(buf));
                 true
             }
         };
@@ -1716,17 +1800,14 @@ impl ShardedPageCache {
     }
 
     /// bd-perf (V1.2): Return a shared `PageData` (Arc) instead of copying
-    /// the page bytes. Callers get a cheap Arc refcount bump instead of a
-    /// 4KB memcpy. The PageData is created on first access (OnceLock pattern)
-    /// and cached in the shard entry.
+    /// the page bytes. Each cache entry materializes at most one immutable
+    /// shared snapshot, then hot reads clone that snapshot until a mutation
+    /// invalidates it.
     pub fn get_shared(&self, page_no: PageNumber) -> Option<PageData> {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast
-                    .lock()
-                    .get(page_no)
-                    .map(|data| PageData::from_vec(data.to_vec()));
+                return fast.lock().get_shared(page_no);
             }
         }
         // Flat slots (bd-eorms)
@@ -1736,9 +1817,7 @@ impl ShardedPageCache {
         // Overflow shard
         let idx = Self::shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard
-            .get(page_no)
-            .map(|data| PageData::from_vec(data.to_vec()))
+        shard.get_shared(page_no)
     }
 
     /// Best-effort software prefetch for an upcoming `page_no` lookup.
@@ -1763,9 +1842,9 @@ impl ShardedPageCache {
         let shard = &self.shards[shard_idx];
         prefetch_l1_read(std::ptr::from_ref(shard));
         if let Some(guard) = shard.try_lock()
-            && let Some(buf) = guard.pages.get(&page_no)
+            && let Some(entry) = guard.pages.get(&page_no)
         {
-            prefetch_l1_read(buf.as_slice().as_ptr());
+            entry.prefetch_hint();
         }
     }
 }
@@ -2680,6 +2759,23 @@ mod tests {
         assert!(
             (snapshot.hit_rate_percent() - 50.0).abs() < f64::EPSILON,
             "bead_id={BEAD_ID} case=metrics_hit_rate"
+        );
+        let efficiency = snapshot.efficiency_snapshot();
+        assert_eq!(
+            efficiency.hits, snapshot.hits,
+            "bead_id={BEAD_ID} case=metrics_efficiency_hits"
+        );
+        assert_eq!(
+            efficiency.misses, snapshot.misses,
+            "bead_id={BEAD_ID} case=metrics_efficiency_misses"
+        );
+        assert_eq!(
+            efficiency.evictions, snapshot.evictions,
+            "bead_id={BEAD_ID} case=metrics_efficiency_evictions"
+        );
+        assert!(
+            (efficiency.hit_rate_percent() - snapshot.hit_rate_percent()).abs() < f64::EPSILON,
+            "bead_id={BEAD_ID} case=metrics_efficiency_hit_rate"
         );
 
         cache.reset_metrics();
@@ -3636,6 +3732,7 @@ mod tests {
     // =========================================================================
 
     const BEAD_FZR07: &str = "bd-fzr07";
+    const BEAD_EORMS: &str = "bd-eorms";
 
     // --- FastPageArray unit tests ---
 
@@ -4126,6 +4223,68 @@ mod tests {
             "bead_id={BEAD_FZR07} case=fp_get_copy"
         );
         assert_eq!(data.len(), 4096);
+    }
+
+    #[test]
+    fn test_sharded_cache_fast_path_get_shared_reuses_snapshot_until_mutation() {
+        let cache = ShardedPageCache::new_single_connection(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.insert_fresh(p1, |data| data.fill(0x77)).unwrap();
+
+        let first = cache.get_shared(p1).unwrap();
+        let second = cache.get_shared(p1).unwrap();
+
+        assert_eq!(
+            first.as_bytes().as_ptr(),
+            second.as_bytes().as_ptr(),
+            "bead_id={BEAD_FZR07} case=fp_get_shared_reuses_snapshot"
+        );
+
+        cache.with_page_mut(p1, |data| data[0] = 0x11).unwrap();
+
+        let refreshed = cache.get_shared(p1).unwrap();
+        assert_eq!(
+            refreshed.as_bytes()[0],
+            0x11,
+            "bead_id={BEAD_FZR07} case=fp_get_shared_refreshes_after_mutation"
+        );
+        assert_ne!(
+            second.as_bytes().as_ptr(),
+            refreshed.as_bytes().as_ptr(),
+            "bead_id={BEAD_FZR07} case=fp_get_shared_invalidates_stale_snapshot"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_flat_slots_get_shared_reuses_snapshot_until_mutation() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let p1 = PageNumber::ONE;
+
+        cache.insert_fresh(p1, |data| data.fill(0x5A)).unwrap();
+
+        let first = cache.get_shared(p1).unwrap();
+        let second = cache.get_shared(p1).unwrap();
+
+        assert_eq!(
+            first.as_bytes().as_ptr(),
+            second.as_bytes().as_ptr(),
+            "bead_id={BEAD_EORMS} case=flat_get_shared_reuses_snapshot"
+        );
+
+        cache.with_page_mut(p1, |data| data[0] = 0x22).unwrap();
+
+        let refreshed = cache.get_shared(p1).unwrap();
+        assert_eq!(
+            refreshed.as_bytes()[0],
+            0x22,
+            "bead_id={BEAD_EORMS} case=flat_get_shared_refreshes_after_mutation"
+        );
+        assert_ne!(
+            second.as_bytes().as_ptr(),
+            refreshed.as_bytes().as_ptr(),
+            "bead_id={BEAD_EORMS} case=flat_get_shared_invalidates_stale_snapshot"
+        );
     }
 
     #[test]

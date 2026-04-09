@@ -13,12 +13,16 @@
 //! - **Shared foundation:** Types defined here are reused by downstream
 //!   observability beads (bd-t6sv2.2, .3, .5, .6, .8, .12).
 
+pub mod page_cache;
+
 use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub use page_cache::PageCacheEfficiencySnapshot;
 
 // ---------------------------------------------------------------------------
 // Structured trace metrics (bd-19u.1)
