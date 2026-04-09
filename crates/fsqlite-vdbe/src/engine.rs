@@ -15251,6 +15251,55 @@ mod tests {
     }
 
     #[test]
+    fn test_reusable_table_execution_state_skips_identical_rebinds_after_preserving_reset() {
+        let mut engine = VdbeEngine::new(4);
+        let func_registry = Arc::new(FunctionRegistry::new());
+        let collation_registry = Arc::new(std::sync::Mutex::new(CollationRegistry::new()));
+        let state = ReusableTableExecutionState {
+            func_registry: Arc::clone(&func_registry),
+            collation_registry: Arc::clone(&collation_registry),
+            schema_cookie: 7,
+            autoincrement_seq_by_root_page: HashMap::from([(5, 11)]),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::from([(5, 0)])),
+            table_column_count_by_root_page: Arc::new(HashMap::from([(5, 2)])),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::from([(5, 1)])),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::from([(9, vec![false, true])])),
+            index_collations_by_root_page: Arc::new(HashMap::from([(
+                9,
+                vec![Some("BINARY".to_owned()), None],
+            )])),
+            reject_mem_fallback: false,
+            memdb_rows_loaded: true,
+            storage_cursor_memdb_count_shortcuts_safe: true,
+            version_store: None,
+            collect_result_rows: false,
+            max_collected_result_rows: Some(1),
+        };
+
+        let first_outcome = engine.apply_reusable_table_execution_state(state.clone());
+        assert!(
+            first_outcome.metadata_rebind_count > 0,
+            "fresh engines should bind the reusable execution state"
+        );
+
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        let second_outcome = engine.apply_reusable_table_execution_state(state.clone());
+        assert_eq!(
+            second_outcome.metadata_rebind_count, 0,
+            "preserving reset should let identical reusable table state skip rebinding"
+        );
+
+        engine.reset_for_reuse(4, &reset_cx, PageSize::DEFAULT);
+        let third_outcome = engine.apply_reusable_table_execution_state(state);
+        assert!(
+            third_outcome.metadata_rebind_count > 0,
+            "legacy reset_for_reuse should still clear runtime bindings"
+        );
+    }
+
+    #[test]
     fn test_execute_clears_cold_subtype_state_between_statements() {
         let mut subtype_builder = ProgramBuilder::new();
         let subtype_reg = subtype_builder.alloc_reg();

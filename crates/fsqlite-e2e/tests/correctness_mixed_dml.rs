@@ -431,3 +431,73 @@ fn mixed_dml_delete_then_reinsert() {
     assert_eq!(c_rows[0][0], SqlValue::Text("reinserted".to_owned()));
     assert_eq!(c_rows[0][1], SqlValue::Integer(200));
 }
+
+#[test]
+fn test_lazy_memdb_mixed_dml() {
+    let mut stmts = vec![
+        "CREATE TABLE lazy_memdb_mixed_dml (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)"
+            .to_owned(),
+    ];
+
+    for id in 1..=120_i64 {
+        stmts.push(format!(
+            "INSERT INTO lazy_memdb_mixed_dml VALUES ({id}, 'seed_{id}', {})",
+            id * 5
+        ));
+        if id % 20 == 0 {
+            stmts.push("SELECT COUNT(*) FROM lazy_memdb_mixed_dml".to_owned());
+            stmts.push(format!(
+                "SELECT name, val FROM lazy_memdb_mixed_dml WHERE id = {id}"
+            ));
+        }
+    }
+
+    for id in (3..=120_i64).step_by(3) {
+        stmts.push(format!(
+            "UPDATE lazy_memdb_mixed_dml SET name = 'upd_{id}', val = {} WHERE id = {id}",
+            id * 17
+        ));
+        if id % 15 == 0 {
+            stmts.push(format!(
+                "SELECT name, val FROM lazy_memdb_mixed_dml WHERE id = {id}"
+            ));
+        }
+    }
+
+    for id in (5..=120_i64).step_by(5) {
+        stmts.push(format!("DELETE FROM lazy_memdb_mixed_dml WHERE id = {id}"));
+        if id % 20 == 0 {
+            stmts.push(format!(
+                "SELECT COUNT(*) FROM lazy_memdb_mixed_dml WHERE id = {id}"
+            ));
+            stmts.push("SELECT COUNT(*) FROM lazy_memdb_mixed_dml".to_owned());
+        }
+    }
+
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+    assert_eq!(
+        result.operations_mismatched,
+        0,
+        "lazy MemDB mixed DML mismatches ({} of {}):\n{}",
+        result.operations_mismatched,
+        stmts.len(),
+        result
+            .mismatches
+            .iter()
+            .take(10)
+            .map(|m| format!(
+                "  stmt {}: sql='{}'\n    csqlite={:?}\n    fsqlite={:?}",
+                m.index, m.sql, m.csqlite, m.fsqlite
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let hash = runner.compare_logical_state();
+    assert!(
+        hash.matched,
+        "logical state hash mismatch after lazy MemDB mixed DML:\n  frank={}\n  csqlite={}",
+        hash.frank_sha256, hash.csqlite_sha256
+    );
+}

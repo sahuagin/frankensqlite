@@ -436,3 +436,57 @@ fn strict_mode_rejects_insert_and_update_semantically() {
         "state diverged after STRICT failures:\n  csqlite={c_rows:?}\n  fsqlite={f_rows:?}"
     );
 }
+
+#[test]
+fn test_lazy_memdb_insert_10k_correctness() {
+    let mut stmts = vec![
+        "CREATE TABLE lazy_memdb_insert_10k (id INTEGER PRIMARY KEY, name TEXT NOT NULL, val INTEGER NOT NULL)"
+            .to_owned(),
+    ];
+
+    for i in 1..=10_000_i64 {
+        stmts.push(format!(
+            "INSERT INTO lazy_memdb_insert_10k VALUES ({i}, 'row_{i}', {})",
+            i * 11
+        ));
+        if i % 2_500 == 0 {
+            stmts.push("SELECT COUNT(*) FROM lazy_memdb_insert_10k".to_owned());
+            stmts.push(format!(
+                "SELECT name, val FROM lazy_memdb_insert_10k WHERE id = {i}"
+            ));
+        }
+    }
+
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+    assert_eq!(
+        result.operations_mismatched,
+        0,
+        "lazy MemDB 10k insert mismatches ({} of {}):\n{}",
+        result.operations_mismatched,
+        stmts.len(),
+        result
+            .mismatches
+            .iter()
+            .take(10)
+            .map(|m| format!(
+                "  stmt {}: sql='{}'\n    csqlite={:?}\n    fsqlite={:?}",
+                m.index, m.sql, m.csqlite, m.fsqlite
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let count_sql = "SELECT COUNT(*) FROM lazy_memdb_insert_10k";
+    let c_count = runner.csqlite().query(count_sql).expect("csqlite count");
+    let f_count = runner.frank().query(count_sql).expect("fsqlite count");
+    assert_eq!(c_count, f_count, "row counts differ after 10k lazy inserts");
+    assert_eq!(c_count[0][0], SqlValue::Integer(10_000));
+
+    let hash = runner.compare_logical_state();
+    assert!(
+        hash.matched,
+        "logical state hash mismatch after 10k lazy inserts:\n  frank={}\n  csqlite={}",
+        hash.frank_sha256, hash.csqlite_sha256
+    );
+}
