@@ -1923,9 +1923,10 @@ mod tests {
     }
 
     fn assert_track_q_page(page_no: PageNumber, data: &[u8]) {
+        let header = page_no.get().to_le_bytes();
         assert_eq!(
             &data[..4],
-            page_no.get().to_le_bytes().as_slice(),
+            &header,
             "TRACK_Q page header mismatch for page {}",
             page_no.get()
         );
@@ -4496,7 +4497,11 @@ mod tests {
         let mut chain_walk_count = 0_u64;
         for raw_pgno in 1_u32..=100 {
             let page_no = PageNumber::new(raw_pgno).expect("page number");
-            assert!(slots.contains(page_no), "page {} should be present", page_no.get());
+            assert!(
+                slots.contains(page_no),
+                "page {} should be present",
+                page_no.get()
+            );
             let copy = slots
                 .get_copy(page_no)
                 .expect("inserted page should round-trip through flat slots");
@@ -4540,7 +4545,11 @@ mod tests {
             let inserted = slots
                 .try_insert(page_no, track_q_page_buf(page_no))
                 .expect("forced-collision page should stay in flat slots");
-            assert!(inserted, "collider {} should be newly inserted", page_no.get());
+            assert!(
+                inserted,
+                "collider {} should be newly inserted",
+                page_no.get()
+            );
             assert_eq!(
                 track_q_probe_distance(&slots, page_no),
                 expected_distance,
@@ -4606,13 +4615,18 @@ mod tests {
     fn test_track_q_flat_hash_capacity_growth_uses_overflow_shards_without_resize() {
         let cache = ShardedPageCache::new(PageSize::DEFAULT);
         let target_bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
-        let colliders = track_q_collision_pages(&cache.flat_slots, target_bucket, MAX_PROBE_LENGTH + 4);
+        let colliders =
+            track_q_collision_pages(&cache.flat_slots, target_bucket, MAX_PROBE_LENGTH + 4);
 
         for page_no in colliders.iter().copied() {
             cache.insert_buffer(page_no, track_q_page_buf(page_no));
         }
 
-        let overflow_pages = cache.shards.iter().map(|shard| shard.lock().len()).sum::<usize>();
+        let overflow_pages = cache
+            .shards
+            .iter()
+            .map(|shard| shard.lock().len())
+            .sum::<usize>();
         assert_eq!(
             cache.flat_slots.len(),
             MAX_PROBE_LENGTH,
@@ -4684,14 +4698,21 @@ mod tests {
         let colliders = track_q_collision_pages(&slots, target_bucket, 4);
 
         for page_no in colliders.iter().copied().take(3) {
-            slots.try_insert(page_no, track_q_page_buf(page_no))
+            slots
+                .try_insert(page_no, track_q_page_buf(page_no))
                 .expect("reclaim setup insert should stay in flat slots");
         }
 
         let removed = colliders[1];
-        let removed_slot = slots.find_slot(removed).expect("removed page should be present");
+        let removed_slot = slots
+            .find_slot(removed)
+            .expect("removed page should be present");
         assert!(slots.remove(removed), "middle collider should be removable");
-        assert_eq!(slots.len(), 2, "remove should decrement occupied slot count");
+        assert_eq!(
+            slots.len(),
+            2,
+            "remove should decrement occupied slot count"
+        );
         assert!(
             slots.get_copy(removed).is_none(),
             "removed collider should no longer be visible"
@@ -4725,7 +4746,9 @@ mod tests {
 
         let distances = [colliders[0], colliders[2], replacement]
             .into_iter()
-            .map(|page_no| u64::try_from(track_q_probe_distance(&slots, page_no)).expect("probe distance"))
+            .map(|page_no| {
+                u64::try_from(track_q_probe_distance(&slots, page_no)).expect("probe distance")
+            })
             .collect::<Vec<_>>();
         let chain_walk_count = distances.iter().copied().sum::<u64>();
         let bucket_access_count = chain_walk_count
@@ -4868,7 +4891,8 @@ mod tests {
                 let page_no = hot_pages[(thread_idx + iter) % hot_pages.len()];
                 let distance = u64::try_from(track_q_probe_distance(&slots, page_no))
                     .expect("probe distance fits u64");
-                bucket_access_count = bucket_access_count.saturating_add(distance.saturating_add(1));
+                bucket_access_count =
+                    bucket_access_count.saturating_add(distance.saturating_add(1));
                 chain_walk_count = chain_walk_count.saturating_add(distance);
             }
         }
