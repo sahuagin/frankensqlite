@@ -27,6 +27,64 @@ thread_local! {
     static VALUE_POOL: RefCell<Vec<SqliteValue>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ValuePoolStats {
+    slab_alloc_count: usize,
+    slab_return_count: usize,
+    global_alloc_fallback_count: usize,
+    slab_high_water_mark: usize,
+}
+
+#[cfg(test)]
+impl ValuePoolStats {
+    const fn new() -> Self {
+        Self {
+            slab_alloc_count: 0,
+            slab_return_count: 0,
+            global_alloc_fallback_count: 0,
+            slab_high_water_mark: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALUE_POOL_TEST_STATS: RefCell<ValuePoolStats> =
+        const { RefCell::new(ValuePoolStats::new()) };
+}
+
+#[cfg(test)]
+fn reset_value_pool_test_stats() {
+    VALUE_POOL_TEST_STATS.with(|stats| *stats.borrow_mut() = ValuePoolStats::new());
+}
+
+#[cfg(test)]
+fn value_pool_test_stats_snapshot() -> ValuePoolStats {
+    VALUE_POOL_TEST_STATS.with(|stats| *stats.borrow())
+}
+
+#[cfg(test)]
+fn record_value_pool_acquire(hit: bool) {
+    VALUE_POOL_TEST_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        if hit {
+            stats.slab_alloc_count += 1;
+        } else {
+            stats.global_alloc_fallback_count += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn record_value_pool_return(pool_len: usize) {
+    VALUE_POOL_TEST_STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.slab_return_count += 1;
+        stats.slab_high_water_mark = stats.slab_high_water_mark.max(pool_len);
+    });
+}
+
 /// Acquire a value from the thread-local pool, if available.
 ///
 /// Returns `Some(value)` if a pooled value was available, `None` otherwise.
@@ -41,7 +99,10 @@ thread_local! {
 /// ```
 #[inline]
 pub fn pool_acquire() -> Option<SqliteValue> {
-    VALUE_POOL.with(|pool| pool.borrow_mut().pop())
+    let value = VALUE_POOL.with(|pool| pool.borrow_mut().pop());
+    #[cfg(test)]
+    record_value_pool_acquire(value.is_some());
+    value
 }
 
 /// Return a value to the thread-local pool for reuse.
@@ -57,6 +118,8 @@ pub fn pool_return(value: SqliteValue) {
         let mut pool = pool.borrow_mut();
         if pool.len() < VALUE_POOL_CAP {
             pool.push(value);
+            #[cfg(test)]
+            record_value_pool_return(pool.len());
         }
         // If pool is full, value is dropped normally
     });
