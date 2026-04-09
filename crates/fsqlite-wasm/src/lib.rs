@@ -18,16 +18,17 @@
 //! - `Infinity` and `-Infinity` are rejected
 //! - `Date` inputs are stored as ISO 8601 `TEXT`
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Once;
 
 use fsqlite_core::connection::{
-    Connection as CoreConnection, PreparedStatement as CorePreparedStatement, Row as CoreRow,
+    Connection as CoreConnection, ConnectionEnv, ConnectionMemoryStats,
+    PreparedStatement as CorePreparedStatement, Row as CoreRow,
 };
 use fsqlite_error::FrankenError;
 use fsqlite_types::{SmallText, SqliteValue};
-use js_sys::{Array, BigInt, Date, Number, Object, Reflect, Uint8Array};
+use js_sys::{Array, BigInt, Date, Function, Number, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
@@ -104,11 +105,58 @@ pub struct FrankenDb {
 struct FrankenDbState {
     path: String,
     inner: RefCell<Option<CoreConnection>>,
+    memory_warning_threshold_bytes: Cell<Option<usize>>,
+    memory_warning_above_threshold: Cell<bool>,
+    memory_warning_callback: RefCell<Option<Function>>,
 }
 
 struct PreparedMetadata {
     column_count: usize,
     column_names: Vec<String>,
+}
+
+#[derive(Default, Clone)]
+struct WasmDatabaseOptions {
+    page_buffer_max: Option<usize>,
+    initial_reserve_bytes: Option<usize>,
+    growth_chunk_bytes: Option<usize>,
+    max_bytes: Option<usize>,
+    warning_threshold_bytes: Option<usize>,
+    warning_callback: Option<Function>,
+}
+
+impl WasmDatabaseOptions {
+    fn memory_vfs_config(&self) -> Result<Option<fsqlite_vfs::MemoryVfsConfig>, FrankenError> {
+        let mut config = fsqlite_vfs::MemoryVfsConfig::default();
+        let mut configured = false;
+
+        if let Some(initial_reserve_bytes) = self.initial_reserve_bytes {
+            config.initial_reserve_bytes = initial_reserve_bytes;
+            configured = true;
+        }
+        if let Some(growth_chunk_bytes) = self.growth_chunk_bytes {
+            if growth_chunk_bytes == 0 {
+                return Err(FrankenError::OutOfRange {
+                    what: "memory.growthChunkBytes".to_owned(),
+                    value: growth_chunk_bytes.to_string(),
+                });
+            }
+            config.growth_chunk_bytes = growth_chunk_bytes;
+            configured = true;
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            if max_bytes < config.initial_reserve_bytes {
+                return Err(FrankenError::OutOfRange {
+                    what: "memory.maxBytes".to_owned(),
+                    value: max_bytes.to_string(),
+                });
+            }
+            config.max_bytes = Some(max_bytes);
+            configured = true;
+        }
+
+        Ok(configured.then_some(config))
+    }
 }
 
 #[wasm_bindgen(js_name = FrankenPreparedStatement)]
@@ -125,13 +173,10 @@ impl FrankenDb {
     pub fn new(name: Option<String>) -> Result<Self, JsValue> {
         install_wasm_runtime();
         let path = name.unwrap_or_else(|| ":memory:".to_owned());
-        let conn = open_core_connection(&path).map_err(franken_error_to_js)?;
-        Ok(Self {
-            state: Rc::new(FrankenDbState {
-                path,
-                inner: RefCell::new(Some(conn)),
-            }),
-        })
+        let options = WasmDatabaseOptions::default();
+        let conn =
+            open_core_connection_with_options(&path, &options).map_err(franken_error_to_js)?;
+        Self::from_parts(path, conn, options)
     }
 
     #[wasm_bindgen(js_name = open)]
@@ -139,16 +184,38 @@ impl FrankenDb {
         Self::new(name)
     }
 
+    #[wasm_bindgen(js_name = openWithOptions)]
+    pub fn open_with_options(
+        name: Option<String>,
+        options: Option<JsValue>,
+    ) -> Result<Self, JsValue> {
+        install_wasm_runtime();
+        let path = name.unwrap_or_else(|| ":memory:".to_owned());
+        let options = parse_database_options(options)?;
+        let conn =
+            open_core_connection_with_options(&path, &options).map_err(franken_error_to_js)?;
+        Self::from_parts(path, conn, options)
+    }
+
     #[wasm_bindgen(js_name = import)]
     pub fn import(data: Uint8Array) -> Result<Self, JsValue> {
         install_wasm_runtime();
-        let conn = CoreConnection::import_bytes(&data.to_vec()).map_err(franken_error_to_js)?;
-        Ok(Self {
-            state: Rc::new(FrankenDbState {
-                path: ":memory:".to_owned(),
-                inner: RefCell::new(Some(conn)),
-            }),
-        })
+        let options = WasmDatabaseOptions::default();
+        let conn = import_core_connection_with_options(&data.to_vec(), &options)
+            .map_err(franken_error_to_js)?;
+        Self::from_parts(":memory:".to_owned(), conn, options)
+    }
+
+    #[wasm_bindgen(js_name = importWithOptions)]
+    pub fn import_with_options(
+        data: Uint8Array,
+        options: Option<JsValue>,
+    ) -> Result<Self, JsValue> {
+        install_wasm_runtime();
+        let options = parse_database_options(options)?;
+        let conn = import_core_connection_with_options(&data.to_vec(), &options)
+            .map_err(franken_error_to_js)?;
+        Self::from_parts(":memory:".to_owned(), conn, options)
     }
 
     #[wasm_bindgen(getter)]
@@ -229,9 +296,32 @@ impl FrankenDb {
         let bytes = self.with_connection(|conn| conn.export_bytes())?;
         Ok(Uint8Array::from(bytes.as_slice()))
     }
+
+    #[wasm_bindgen(js_name = memoryStats)]
+    pub fn memory_stats(&self) -> Result<JsValue, JsValue> {
+        self.state.memory_stats_js()
+    }
 }
 
 impl FrankenDb {
+    fn from_parts(
+        path: String,
+        conn: CoreConnection,
+        options: WasmDatabaseOptions,
+    ) -> Result<Self, JsValue> {
+        let db = Self {
+            state: Rc::new(FrankenDbState {
+                path,
+                inner: RefCell::new(Some(conn)),
+                memory_warning_threshold_bytes: Cell::new(options.warning_threshold_bytes),
+                memory_warning_above_threshold: Cell::new(false),
+                memory_warning_callback: RefCell::new(options.warning_callback),
+            }),
+        };
+        db.state.observe_memory_warning();
+        Ok(db)
+    }
+
     fn with_connection<T>(
         &self,
         f: impl FnOnce(&CoreConnection) -> Result<T, FrankenError>,
@@ -250,12 +340,113 @@ impl FrankenDbState {
         let conn = borrow.as_ref().ok_or_else(|| {
             franken_error_to_js(FrankenError::internal("database handle is closed"))
         })?;
-        f(conn).map_err(franken_error_to_js)
+        match f(conn) {
+            Ok(value) => {
+                self.observe_memory_warning();
+                Ok(value)
+            }
+            Err(error) => Err(self.connection_error_to_js(conn, error)),
+        }
+    }
+
+    fn memory_stats_js(&self) -> Result<JsValue, JsValue> {
+        install_wasm_runtime();
+        let borrow = self.inner.borrow();
+        let conn = borrow.as_ref().ok_or_else(|| {
+            franken_error_to_js(FrankenError::internal("database handle is closed"))
+        })?;
+        let stats = conn
+            .memory_stats()
+            .map_err(|error| self.connection_error_to_js(conn, error))?;
+        connection_memory_stats_to_js(conn, stats, self.memory_warning_threshold_bytes.get())
+    }
+
+    fn observe_memory_warning(&self) {
+        let Some(threshold) = self.memory_warning_threshold_bytes.get() else {
+            return;
+        };
+        let Some(callback) = self.memory_warning_callback.borrow().clone() else {
+            return;
+        };
+        let borrow = self.inner.borrow();
+        let Some(conn) = borrow.as_ref() else {
+            return;
+        };
+        let Ok(stats) = conn.memory_stats() else {
+            return;
+        };
+        let above_threshold = stats.estimated_used_bytes() >= threshold;
+        let was_above_threshold = self.memory_warning_above_threshold.replace(above_threshold);
+        if above_threshold
+            && !was_above_threshold
+            && let Ok(payload) = connection_memory_stats_to_js(
+                conn,
+                stats,
+                self.memory_warning_threshold_bytes.get(),
+            )
+        {
+            let _ = callback.call1(&JsValue::NULL, &payload);
+        }
+    }
+
+    fn connection_error_to_js(&self, conn: &CoreConnection, error: FrankenError) -> JsValue {
+        let is_oom = matches!(error, FrankenError::OutOfMemory);
+        let object = Object::from(franken_error_to_js(error));
+        if is_oom {
+            let _ = set_property(
+                &object,
+                "message",
+                &JsValue::from_str(
+                    "FrankenSQLite WASM ran out of memory; adjust memory.maxBytes, memory.growthChunkBytes, or pageBufferMax and remember the browser WebAssembly linear-memory ceiling is 4 GiB",
+                ),
+            );
+            let _ = set_property(&object, "oom", &JsValue::from_bool(true));
+            if let Ok(stats) = conn.memory_stats()
+                && let Ok(stats_js) = connection_memory_stats_to_js(
+                    conn,
+                    stats,
+                    self.memory_warning_threshold_bytes.get(),
+                )
+            {
+                let _ = set_property(&object, "memoryStats", &stats_js);
+            }
+        }
+        object.into()
     }
 }
 
+fn open_core_connection_with_options(
+    path: &str,
+    options: &WasmDatabaseOptions,
+) -> Result<CoreConnection, FrankenError> {
+    let env = connection_env_from_options(options)?;
+    CoreConnection::open_with_env(path, env)
+}
+
+fn import_core_connection_with_options(
+    bytes: &[u8],
+    options: &WasmDatabaseOptions,
+) -> Result<CoreConnection, FrankenError> {
+    let env = connection_env_from_options(options)?;
+    CoreConnection::import_bytes_with_env(bytes, env)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn open_core_connection(path: &str) -> Result<CoreConnection, FrankenError> {
-    CoreConnection::open(path)
+    open_core_connection_with_options(path, &WasmDatabaseOptions::default())
+}
+
+fn connection_env_from_options(
+    options: &WasmDatabaseOptions,
+) -> Result<ConnectionEnv, FrankenError> {
+    let mut env = ConnectionEnv::default();
+    if options.page_buffer_max.is_some() {
+        env.set_page_buffer_max(options.page_buffer_max);
+    }
+    if let Some(memory_vfs_config) = options.memory_vfs_config()? {
+        env.set_memory_vfs_config(Some(memory_vfs_config));
+    }
+    Ok(env)
 }
 
 #[wasm_bindgen(js_class = FrankenPreparedStatement)]
@@ -685,6 +876,318 @@ fn describe_js_value(value: &JsValue) -> String {
         .unwrap_or_else(|| "unknown JavaScript value".to_owned())
 }
 
+fn parse_database_options(options: Option<JsValue>) -> Result<WasmDatabaseOptions, JsValue> {
+    let Some(options) = options.filter(|value| !value.is_null() && !value.is_undefined()) else {
+        return Ok(WasmDatabaseOptions::default());
+    };
+    if !options.is_object() || Array::is_array(&options) {
+        return Err(franken_error_to_js(FrankenError::TypeMismatch {
+            expected: "FrankenDB open options object".to_owned(),
+            actual: describe_js_value(&options),
+        }));
+    }
+
+    let mut parsed = WasmDatabaseOptions {
+        page_buffer_max: parse_optional_usize_property(&options, "pageBufferMax")
+            .map_err(franken_error_to_js)?,
+        ..WasmDatabaseOptions::default()
+    };
+
+    if let Some(memory_options) =
+        get_optional_property(&options, "memory").map_err(franken_error_to_js)?
+    {
+        if !memory_options.is_object() || Array::is_array(&memory_options) {
+            return Err(franken_error_to_js(FrankenError::TypeMismatch {
+                expected: "FrankenDB memory options object".to_owned(),
+                actual: describe_js_value(&memory_options),
+            }));
+        }
+        parsed.initial_reserve_bytes =
+            parse_optional_usize_property(&memory_options, "initialReserveBytes")
+                .map_err(franken_error_to_js)?;
+        parsed.growth_chunk_bytes =
+            parse_optional_usize_property(&memory_options, "growthChunkBytes")
+                .map_err(franken_error_to_js)?;
+        parsed.max_bytes = parse_optional_usize_property(&memory_options, "maxBytes")
+            .map_err(franken_error_to_js)?;
+        parsed.warning_threshold_bytes =
+            parse_optional_usize_property(&memory_options, "warningThresholdBytes")
+                .map_err(franken_error_to_js)?;
+        parsed.warning_callback = parse_optional_function_property(&memory_options, "onWarning")
+            .map_err(franken_error_to_js)?;
+    }
+
+    parsed.memory_vfs_config().map_err(franken_error_to_js)?;
+    Ok(parsed)
+}
+
+fn get_optional_property(object: &JsValue, key: &str) -> Result<Option<JsValue>, FrankenError> {
+    let value = Reflect::get(object, &JsValue::from_str(key)).map_err(|error| {
+        FrankenError::internal(format!(
+            "failed to read JavaScript property `{key}`: {}",
+            js_error_message(&error)
+        ))
+    })?;
+    if value.is_null() || value.is_undefined() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn parse_optional_usize_property(
+    object: &JsValue,
+    key: &str,
+) -> Result<Option<usize>, FrankenError> {
+    let Some(value) = get_optional_property(object, key)? else {
+        return Ok(None);
+    };
+    parse_js_usize(&value, key).map(Some)
+}
+
+fn parse_optional_function_property(
+    object: &JsValue,
+    key: &str,
+) -> Result<Option<Function>, FrankenError> {
+    let Some(value) = get_optional_property(object, key)? else {
+        return Ok(None);
+    };
+    value
+        .dyn_ref::<Function>()
+        .cloned()
+        .ok_or_else(|| FrankenError::TypeMismatch {
+            expected: format!("JavaScript function for `{key}`"),
+            actual: describe_js_value(&value),
+        })
+        .map(Some)
+}
+
+fn parse_js_usize(value: &JsValue, key: &str) -> Result<usize, FrankenError> {
+    let Some(number) = value.as_f64() else {
+        return Err(FrankenError::TypeMismatch {
+            expected: format!("non-negative safe integer for `{key}`"),
+            actual: describe_js_value(value),
+        });
+    };
+    if !number.is_finite()
+        || number < 0.0
+        || number.fract() != 0.0
+        || !Number::is_safe_integer(value)
+    {
+        return Err(FrankenError::TypeMismatch {
+            expected: format!("non-negative safe integer for `{key}`"),
+            actual: number.to_string(),
+        });
+    }
+    usize::try_from(number as u64).map_err(|_| FrankenError::OutOfRange {
+        what: key.to_owned(),
+        value: number.to_string(),
+    })
+}
+
+fn connection_memory_stats_to_js(
+    conn: &CoreConnection,
+    stats: ConnectionMemoryStats,
+    warning_threshold_bytes: Option<usize>,
+) -> Result<JsValue, JsValue> {
+    let object = Object::new();
+    let page_cache_used_bytes = stats.page_cache_used_bytes();
+    let page_cache_capacity_bytes = stats.page_cache_capacity_bytes();
+    let tracked_live_bytes = stats
+        .memory_vfs
+        .map_or(0, fsqlite_vfs::MemoryVfsUsageSnapshot::live_bytes);
+    let tracked_reserved_bytes = stats
+        .memory_vfs
+        .map_or(0, fsqlite_vfs::MemoryVfsUsageSnapshot::reserved_bytes);
+    let tracked_fragmentation_bytes = stats
+        .memory_vfs
+        .map_or(0, fsqlite_vfs::MemoryVfsUsageSnapshot::fragmentation_bytes);
+    let estimated_used_bytes = stats.estimated_used_bytes();
+
+    set_property(
+        &object,
+        "backendKind",
+        &JsValue::from_str(conn.pager_backend_kind()),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageSizeBytes",
+        &JsValue::from_f64(stats.page_size_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCachePages",
+        &JsValue::from_f64(stats.page_cache.cached_pages as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCacheCapacityPages",
+        &JsValue::from_f64(stats.page_cache.pool_capacity as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCacheBytes",
+        &JsValue::from_f64(page_cache_used_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCacheCapacityBytes",
+        &JsValue::from_f64(page_cache_capacity_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "pageCacheDirtyRatioPct",
+        &JsValue::from_f64(stats.page_cache.dirty_ratio_pct as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "trackedLiveBytes",
+        &JsValue::from_f64(tracked_live_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "trackedReservedBytes",
+        &JsValue::from_f64(tracked_reserved_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "trackedFragmentationBytes",
+        &JsValue::from_f64(tracked_fragmentation_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+    set_property(
+        &object,
+        "estimatedUsedBytes",
+        &JsValue::from_f64(estimated_used_bytes as f64),
+    )
+    .map_err(franken_error_to_js)?;
+
+    if let Some(memory_vfs) = stats.memory_vfs {
+        set_property(
+            &object,
+            "fileBytes",
+            &JsValue::from_f64(memory_vfs.file_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "fileReservedBytes",
+            &JsValue::from_f64(memory_vfs.file_reserved_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "shmBytes",
+            &JsValue::from_f64(memory_vfs.shm_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "shmReservedBytes",
+            &JsValue::from_f64(memory_vfs.shm_reserved_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "trackedPeakReservedBytes",
+            &JsValue::from_f64(memory_vfs.peak_reserved_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "growthEvents",
+            &JsValue::from_f64(memory_vfs.growth_events as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "initialReserveBytes",
+            &JsValue::from_f64(memory_vfs.initial_reserve_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        set_property(
+            &object,
+            "growthChunkBytes",
+            &JsValue::from_f64(memory_vfs.growth_chunk_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?;
+        match memory_vfs.max_bytes {
+            Some(max_bytes) => set_property(
+                &object,
+                "trackedMaxBytes",
+                &JsValue::from_f64(max_bytes as f64),
+            )
+            .map_err(franken_error_to_js)?,
+            None => set_property(&object, "trackedMaxBytes", &JsValue::NULL)
+                .map_err(franken_error_to_js)?,
+        }
+    } else {
+        set_property(&object, "trackedMaxBytes", &JsValue::NULL).map_err(franken_error_to_js)?;
+    }
+
+    match warning_threshold_bytes {
+        Some(threshold) => {
+            set_property(
+                &object,
+                "warningThresholdBytes",
+                &JsValue::from_f64(threshold as f64),
+            )
+            .map_err(franken_error_to_js)?;
+            set_property(
+                &object,
+                "warningThresholdExceeded",
+                &JsValue::from_bool(estimated_used_bytes >= threshold),
+            )
+            .map_err(franken_error_to_js)?;
+        }
+        None => {
+            set_property(&object, "warningThresholdBytes", &JsValue::NULL)
+                .map_err(franken_error_to_js)?;
+            set_property(
+                &object,
+                "warningThresholdExceeded",
+                &JsValue::from_bool(false),
+            )
+            .map_err(franken_error_to_js)?;
+        }
+    }
+
+    match wasm_linear_memory_bytes() {
+        Some(linear_memory_bytes) => set_property(
+            &object,
+            "linearMemoryBytes",
+            &JsValue::from_f64(linear_memory_bytes as f64),
+        )
+        .map_err(franken_error_to_js)?,
+        None => set_property(&object, "linearMemoryBytes", &JsValue::NULL)
+            .map_err(franken_error_to_js)?,
+    }
+
+    Ok(object.into())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_linear_memory_bytes() -> Option<usize> {
+    let memory = wasm_bindgen::memory()
+        .dyn_into::<js_sys::WebAssembly::Memory>()
+        .ok()?;
+    usize::try_from(memory.buffer().byte_length()).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wasm_linear_memory_bytes() -> Option<usize> {
+    None
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
@@ -753,6 +1256,52 @@ mod tests {
 
         assert_eq!(stmt.column_count(), 3);
         assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+    }
+
+    #[test]
+    fn core_connection_memory_stats_follow_wasm_memory_options() {
+        let _guard = host_connection_test_guard();
+        let options = WasmDatabaseOptions {
+            page_buffer_max: Some(8),
+            initial_reserve_bytes: Some(64 * 1024),
+            growth_chunk_bytes: Some(16 * 1024),
+            max_bytes: Some(128 * 1024),
+            warning_threshold_bytes: Some(96 * 1024),
+            warning_callback: None,
+        };
+        let conn = open_core_connection_with_options(":memory:", &options)
+            .expect("in-memory connection with explicit memory policy should open");
+        let stats = conn
+            .memory_stats()
+            .expect("memory stats should be available");
+        let memory_vfs = stats
+            .memory_vfs
+            .expect("memory backend should expose MemoryVfs usage");
+
+        assert_eq!(stats.page_cache.pool_capacity, 8);
+        assert_eq!(memory_vfs.initial_reserve_bytes, 64 * 1024);
+        assert_eq!(memory_vfs.growth_chunk_bytes, 16 * 1024);
+        assert_eq!(memory_vfs.max_bytes, Some(128 * 1024));
+        assert_eq!(memory_vfs.file_reserved_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn import_with_wasm_memory_cap_returns_out_of_memory() {
+        let _guard = host_connection_test_guard();
+        let seed = open_core_connection(":memory:").expect("seed connection should open");
+        seed.execute("CREATE TABLE wasm_seed (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("seed schema create should succeed");
+        seed.execute("INSERT INTO wasm_seed (id, name) VALUES (1, 'alpha')")
+            .expect("seed insert should succeed");
+        let image = seed.export_bytes().expect("seed export should succeed");
+
+        let options = WasmDatabaseOptions {
+            max_bytes: Some(1024),
+            ..WasmDatabaseOptions::default()
+        };
+        let error = import_core_connection_with_options(&image, &options)
+            .expect_err("tight memory cap should reject import");
+        assert!(matches!(error, FrankenError::OutOfMemory));
     }
 
     #[test]

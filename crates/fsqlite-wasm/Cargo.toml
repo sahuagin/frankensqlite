@@ -21,6 +21,7 @@ tracing = []
 console_error_panic_hook = "0.1"
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-vfs = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-planner = { workspace = true }

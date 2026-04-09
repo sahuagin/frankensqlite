@@ -45,6 +45,7 @@ tempfile = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 fsqlite-vfs = { workspace = true }
+rusqlite = { workspace = true }
 
 [[bench]]
 name = "vectorized_batch"

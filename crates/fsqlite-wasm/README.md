@@ -54,3 +54,39 @@ db.execute("INSERT INTO users(name) VALUES('Ada')");
 const result = db.query("SELECT id, name FROM users ORDER BY id");
 console.log(result.rows);
 ```
+
+## WASM Memory Management
+
+FrankenSQLite's WASM package runs inside the browser's WebAssembly linear
+memory, so the hard upper bound remains 4 GiB for the whole module. The
+database-specific knobs exposed by `FrankenDB.openWithOptions()` and
+`FrankenDB.importWithOptions()` let you budget FrankenSQLite's own heap usage
+inside that ceiling:
+
+```ts
+const db = FrankenDB.openWithOptions(":memory:", {
+  pageBufferMax: 256,
+  memory: {
+    initialReserveBytes: 256 * 1024,
+    growthChunkBytes: 64 * 1024,
+    maxBytes: 32 * 1024 * 1024,
+    warningThresholdBytes: 24 * 1024 * 1024,
+    onWarning(stats) {
+      console.warn("FrankenSQLite memory pressure", stats);
+    },
+  },
+});
+```
+
+- `pageBufferMax` caps the pager's page-buffer pool in pages.
+- `memory.initialReserveBytes` reserves the initial main-database heap backing.
+- `memory.growthChunkBytes` controls how aggressively the in-memory VFS grows.
+- `memory.maxBytes` is a hard cap for tracked `MemoryVfs` heap usage. When the
+  engine crosses that cap, operations fail with a structured out-of-memory
+  error instead of trapping through an `unreachable`.
+- `memory.warningThresholdBytes` plus `memory.onWarning` let applications react
+  before the hard cap is hit.
+
+Call `db.memoryStats()` at any point to inspect tracked heap bytes, page-cache
+resident bytes, page-cache capacity, and current linear-memory size (when
+running under `wasm32`).
