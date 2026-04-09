@@ -2167,7 +2167,9 @@ mod tests {
         builder.emit_op(Opcode::Jump, 0, 1, 42, P4::None, 0);
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
-        let err = builder.finish().expect_err("invalid branch target must fail");
+        let err = builder
+            .finish()
+            .expect_err("invalid branch target must fail");
         match err {
             FrankenError::Internal(message) => {
                 assert!(message.contains("Jump"));

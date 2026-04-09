@@ -975,7 +975,9 @@ pub fn evaluate_writer_routing_synthetic_workload(
 
     let mut candidate_lanes = (0..lane_count)
         .map(|lane_index| WriterRoutingLaneSnapshot {
-            lane: Some(WriterRoutingLaneId::new(u16::try_from(lane_index + 1).unwrap_or(u16::MAX))),
+            lane: Some(WriterRoutingLaneId::new(
+                u16::try_from(lane_index + 1).unwrap_or(u16::MAX),
+            )),
             node: Some(WriterRoutingNodeId::new(
                 u16::try_from(lane_index % 2).unwrap_or(u16::MAX),
             )),
@@ -1023,17 +1025,28 @@ pub fn evaluate_writer_routing_synthetic_workload(
             conflict_history: WriterConflictHistoryTelemetry::default(),
             ownership_lineage: WriterOwnershipLineageTelemetry::default(),
         };
-        input.touch_surface.write_set_pages.extend_from_slice(&pages);
-        if matches!(config.workload, WriterRoutingSyntheticWorkload::DisjointPages) {
+        input
+            .touch_surface
+            .write_set_pages
+            .extend_from_slice(&pages);
+        if matches!(
+            config.workload,
+            WriterRoutingSyntheticWorkload::DisjointPages
+        ) {
             input.touch_surface.read_pages.push(pages[0]);
         }
 
         let shared_pages = synthetic_shared_pages(config.workload, writer_index);
         for &shared_page in &shared_pages {
             if let Some(owner) = page_owners.get(&shared_page).copied() {
-                input.touch_surface.same_page_conflict_pages.push(shared_page);
-                input.conflict_history.same_page_conflict_count =
-                    input.conflict_history.same_page_conflict_count.saturating_add(1);
+                input
+                    .touch_surface
+                    .same_page_conflict_pages
+                    .push(shared_page);
+                input.conflict_history.same_page_conflict_count = input
+                    .conflict_history
+                    .same_page_conflict_count
+                    .saturating_add(1);
                 input
                     .ownership_lineage
                     .lock_holder_clues
@@ -1041,7 +1054,11 @@ pub fn evaluate_writer_routing_synthetic_workload(
                         page: shared_page,
                         holder: owner.txn.id,
                     });
-                if !input.ownership_lineage.conflicting_txns.contains(&owner.txn) {
+                if !input
+                    .ownership_lineage
+                    .conflicting_txns
+                    .contains(&owner.txn)
+                {
                     input.ownership_lineage.conflicting_txns.push(owner.txn);
                 }
                 input
@@ -1088,7 +1105,8 @@ pub fn evaluate_writer_routing_synthetic_workload(
             .position(|lane| lane.lane == Some(selected_lane))
             .expect("selected synthetic lane must exist");
 
-        let outcome = evaluate_synthetic_selection(config.workload, &pages, selected_lane, &page_owners);
+        let outcome =
+            evaluate_synthetic_selection(config.workload, &pages, selected_lane, &page_owners);
         total_writers = total_writers.saturating_add(1);
         total_runtime_nanos = total_runtime_nanos.saturating_add(outcome.latency_nanos);
         latency_nanos.push(outcome.latency_nanos);
@@ -1096,14 +1114,14 @@ pub fn evaluate_writer_routing_synthetic_workload(
         retries_total = retries_total.saturating_add(outcome.retries);
         fallback_decisions_total =
             fallback_decisions_total.saturating_add(u64::from(outcome.fallback || fallback));
-        remote_ownership_events = remote_ownership_events
-            .saturating_add(outcome.remote_ownership_events);
+        remote_ownership_events =
+            remote_ownership_events.saturating_add(outcome.remote_ownership_events);
         publication_retry_total =
             publication_retry_total.saturating_add(outcome.publication_retries);
-        visibility_handoff_nanos_total = visibility_handoff_nanos_total
-            .saturating_add(outcome.visibility_handoff_nanos);
-        stale_snapshot_rejects_total = stale_snapshot_rejects_total
-            .saturating_add(outcome.stale_snapshot_rejects);
+        visibility_handoff_nanos_total =
+            visibility_handoff_nanos_total.saturating_add(outcome.visibility_handoff_nanos);
+        stale_snapshot_rejects_total =
+            stale_snapshot_rejects_total.saturating_add(outcome.stale_snapshot_rejects);
         lane_writer_counts[selected_index] = lane_writer_counts[selected_index].saturating_add(1);
 
         update_synthetic_lane_snapshot(
@@ -1192,9 +1210,10 @@ fn synthetic_workload_pages(
                 .expect("synthetic disjoint page should be valid"),
         ]),
         WriterRoutingSyntheticWorkload::OverlappingPages => {
-            let shared_page =
-                PageNumber::new(64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)))
-                    .expect("synthetic overlap page should be valid");
+            let shared_page = PageNumber::new(
+                64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)),
+            )
+            .expect("synthetic overlap page should be valid");
             let unique_page = PageNumber::new(
                 2_000_u32
                     .saturating_add(u32::try_from(natural_lane_index).unwrap_or(u32::MAX))
@@ -1218,11 +1237,15 @@ fn synthetic_shared_pages(
 ) -> SmallVec<[PageNumber; 2]> {
     match workload {
         WriterRoutingSyntheticWorkload::DisjointPages => SmallVec::new(),
-        WriterRoutingSyntheticWorkload::OverlappingPages => SmallVec::from_slice(&[
-            PageNumber::new(64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)))
-                .expect("synthetic overlap page should be valid"),
-        ]),
-        WriterRoutingSyntheticWorkload::HotPageContention => SmallVec::from_slice(&[PageNumber::ONE]),
+        WriterRoutingSyntheticWorkload::OverlappingPages => {
+            SmallVec::from_slice(&[PageNumber::new(
+                64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)),
+            )
+            .expect("synthetic overlap page should be valid")])
+        }
+        WriterRoutingSyntheticWorkload::HotPageContention => {
+            SmallVec::from_slice(&[PageNumber::ONE])
+        }
     }
 }
 
@@ -1318,27 +1341,27 @@ fn evaluate_synthetic_selection(
         outcome.conflicts = outcome.conflicts.saturating_add(1);
         outcome.remote_ownership_events = outcome.remote_ownership_events.saturating_add(1);
         outcome.publication_retries = outcome.publication_retries.saturating_add(1);
-        outcome.visibility_handoff_nanos = outcome
-            .visibility_handoff_nanos
-            .saturating_add(match workload {
-                WriterRoutingSyntheticWorkload::DisjointPages => 0,
-                WriterRoutingSyntheticWorkload::OverlappingPages => 14_000,
-                WriterRoutingSyntheticWorkload::HotPageContention => 26_000,
-            });
-        outcome.retries = outcome
-            .retries
-            .saturating_add(match workload {
-                WriterRoutingSyntheticWorkload::DisjointPages => 0,
-                WriterRoutingSyntheticWorkload::OverlappingPages => 1,
-                WriterRoutingSyntheticWorkload::HotPageContention => 2,
-            });
-        outcome.stale_snapshot_rejects = outcome
-            .stale_snapshot_rejects
-            .saturating_add(match workload {
-                WriterRoutingSyntheticWorkload::DisjointPages => 0,
-                WriterRoutingSyntheticWorkload::OverlappingPages => 1,
-                WriterRoutingSyntheticWorkload::HotPageContention => 1,
-            });
+        outcome.visibility_handoff_nanos =
+            outcome
+                .visibility_handoff_nanos
+                .saturating_add(match workload {
+                    WriterRoutingSyntheticWorkload::DisjointPages => 0,
+                    WriterRoutingSyntheticWorkload::OverlappingPages => 14_000,
+                    WriterRoutingSyntheticWorkload::HotPageContention => 26_000,
+                });
+        outcome.retries = outcome.retries.saturating_add(match workload {
+            WriterRoutingSyntheticWorkload::DisjointPages => 0,
+            WriterRoutingSyntheticWorkload::OverlappingPages => 1,
+            WriterRoutingSyntheticWorkload::HotPageContention => 2,
+        });
+        outcome.stale_snapshot_rejects =
+            outcome
+                .stale_snapshot_rejects
+                .saturating_add(match workload {
+                    WriterRoutingSyntheticWorkload::DisjointPages => 0,
+                    WriterRoutingSyntheticWorkload::OverlappingPages => 1,
+                    WriterRoutingSyntheticWorkload::HotPageContention => 1,
+                });
     }
 
     outcome.latency_nanos = outcome
@@ -1372,9 +1395,7 @@ fn update_synthetic_lane_snapshot(
         lane.recent_same_page_conflicts = lane
             .recent_same_page_conflicts
             .saturating_add(outcome.conflicts);
-        lane.recent_busy_retries = lane
-            .recent_busy_retries
-            .saturating_add(outcome.retries);
+        lane.recent_busy_retries = lane.recent_busy_retries.saturating_add(outcome.retries);
         lane.recent_stale_snapshot_rejects = lane
             .recent_stale_snapshot_rejects
             .saturating_add(outcome.stale_snapshot_rejects);
@@ -1644,9 +1665,9 @@ mod tests {
         WriterRoutingLaneId, WriterRoutingLaneSnapshot, WriterRoutingNodeId,
         WriterRoutingPlacementProfile, WriterRoutingSyntheticConfig,
         WriterRoutingSyntheticWorkload, WriterRoutingTelemetryCaptureCost,
-        WriterRoutingTelemetryClass, WriterRoutingTelemetryInput,
-        WriterRoutingTelemetrySignal, WriterTouchSurfaceTelemetry,
-        compare_writer_routing_synthetic_workload, decide_writer_routing_target,
+        WriterRoutingTelemetryClass, WriterRoutingTelemetryInput, WriterRoutingTelemetrySignal,
+        WriterTouchSurfaceTelemetry, compare_writer_routing_synthetic_workload,
+        decide_writer_routing_target,
     };
     use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
 
@@ -2054,12 +2075,10 @@ mod tests {
         assert!(comparison.routed.conflicts_total < comparison.baseline.conflicts_total);
         assert!(comparison.routed.retries_total < comparison.baseline.retries_total);
         assert!(
-            comparison.routed.remote_ownership_events
-                < comparison.baseline.remote_ownership_events
+            comparison.routed.remote_ownership_events < comparison.baseline.remote_ownership_events
         );
         assert!(
-            comparison.routed.publication_retry_total
-                < comparison.baseline.publication_retry_total
+            comparison.routed.publication_retry_total < comparison.baseline.publication_retry_total
         );
         assert!(comparison.conflict_rate_delta() < 0.0);
         assert!(comparison.retry_rate_delta() < 0.0);
@@ -2079,8 +2098,7 @@ mod tests {
         assert!(comparison.routed.conflicts_total < comparison.baseline.conflicts_total);
         assert!(comparison.routed.retries_total < comparison.baseline.retries_total);
         assert!(
-            comparison.routed.publication_retry_total
-                < comparison.baseline.publication_retry_total
+            comparison.routed.publication_retry_total < comparison.baseline.publication_retry_total
         );
         assert!(
             comparison.routed.visibility_handoff_nanos_total

@@ -151,9 +151,18 @@ mod tests {
             .query("SELECT COUNT(*), MIN(id), MAX(id) FROM t;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], fsqlite_types::value::SqliteValue::Integer(20));
-        assert_eq!(rows[0].values()[1], fsqlite_types::value::SqliteValue::Integer(101));
-        assert_eq!(rows[0].values()[2], fsqlite_types::value::SqliteValue::Integer(120));
+        assert_eq!(
+            rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(20)
+        );
+        assert_eq!(
+            rows[0].values()[1],
+            fsqlite_types::value::SqliteValue::Integer(101)
+        );
+        assert_eq!(
+            rows[0].values()[2],
+            fsqlite_types::value::SqliteValue::Integer(120)
+        );
         drop(conn);
 
         let oracle_after = rusqlite::Connection::open(&db_path).unwrap();
@@ -198,7 +207,9 @@ mod tests {
         conn.execute("DELETE FROM t WHERE id = 2;").unwrap();
         conn.execute_with_params(
             "VACUUM INTO ?1;",
-            &[fsqlite_types::value::SqliteValue::Text(target.clone().into())],
+            &[fsqlite_types::value::SqliteValue::Text(
+                target.clone().into(),
+            )],
         )
         .unwrap();
         drop(conn);
@@ -262,7 +273,10 @@ mod tests {
             .query("SELECT id, payload FROM live_t ORDER BY id;")
             .unwrap();
         assert_eq!(live_rows.len(), 1);
-        assert_eq!(live_rows[0].values()[0], fsqlite_types::value::SqliteValue::Integer(1));
+        assert_eq!(
+            live_rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(1)
+        );
         assert_eq!(
             live_rows[0].values()[1],
             fsqlite_types::value::SqliteValue::Text("alpha".into())
@@ -272,8 +286,14 @@ mod tests {
             .unwrap();
         let audit_rows = conn.query("SELECT id FROM audit ORDER BY id;").unwrap();
         assert_eq!(audit_rows.len(), 2);
-        assert_eq!(audit_rows[0].values()[0], fsqlite_types::value::SqliteValue::Integer(1));
-        assert_eq!(audit_rows[1].values()[0], fsqlite_types::value::SqliteValue::Integer(2));
+        assert_eq!(
+            audit_rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            audit_rows[1].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(2)
+        );
         drop(conn);
 
         let sqlite = rusqlite::Connection::open(&db_path).unwrap();

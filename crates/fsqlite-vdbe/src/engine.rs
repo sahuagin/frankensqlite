@@ -5591,8 +5591,9 @@ impl VdbeEngine {
 
     #[inline]
     fn take_pending_idx_entries(&mut self) -> Vec<(i32, Vec<u8>)> {
-        self.cold_state_mut()
-            .map_or_else(Vec::new, |cold_state| std::mem::take(&mut cold_state.pending_idx_entries))
+        self.cold_state_mut().map_or_else(Vec::new, |cold_state| {
+            std::mem::take(&mut cold_state.pending_idx_entries)
+        })
     }
 
     #[inline]
@@ -6073,7 +6074,7 @@ impl VdbeEngine {
     }
 
     fn rollback_pending_insert_after_index_conflict(&mut self) -> Result<()> {
-        let entries = std::mem::take(&mut self.pending_idx_entries);
+        let entries = self.take_pending_idx_entries();
         for (idx_cid, idx_key) in entries {
             if let Some(isc) = self.storage_cursors.get_mut(&idx_cid)
                 && isc.cursor.index_move_to(&isc.cx, &idx_key)?.is_found()
@@ -6087,7 +6088,7 @@ impl VdbeEngine {
             }
         }
 
-        let rollback = self.pending_insert_rollback.take().ok_or_else(|| {
+        let rollback = self.take_pending_insert_rollback().ok_or_else(|| {
             FrankenError::internal("secondary-index conflict without pending table insert")
         })?;
         let tsc = self
@@ -6278,8 +6279,8 @@ impl VdbeEngine {
 
     /// Register a type-erased virtual table cursor for opcode execution.
     pub fn register_vtab_cursor(&mut self, cursor_id: i32, cursor: Box<dyn ErasedVtabCursor>) {
-        self.mark_statement_cold_state(StatementColdState::VTAB_CURSORS);
-        self.vtab_cursors
+        self.ensure_cold_state_for(StatementColdState::VTAB_CURSORS)
+            .vtab_cursors
             .insert(cursor_id, VtabCursorState { cursor });
     }
 
@@ -7812,7 +7813,9 @@ impl VdbeEngine {
                     self.cursors.remove(&op.p1);
                     self.storage_cursors.remove(&op.p1);
                     self.sorters.remove(&op.p1);
-                    self.vtab_cursors.remove(&op.p1);
+                    if let Some(cold_state) = self.cold_state_mut() {
+                        cold_state.vtab_cursors.remove(&op.p1);
+                    }
                     self.pending_next_after_delete.remove(&op.p1);
                     pc += 1;
                 }
@@ -8673,9 +8676,9 @@ impl VdbeEngine {
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
                     let pending_update_restore = if is_update {
-                        self.pending_update_restore.take()
+                        self.take_pending_update_restore()
                     } else {
-                        self.pending_update_restore = None;
+                        self.set_pending_update_restore(None);
                         None
                     };
 
@@ -8693,9 +8696,7 @@ impl VdbeEngine {
                     // eagerly materialize the sideband into an Arc-backed blob
                     // and defeat the INSERT hot-path optimization.
                     let record_val = if sideband_active {
-                        if self.has_subtypes {
-                            self.register_subtypes.remove(&record_reg);
-                        }
+                        self.clear_register_subtype(record_reg);
                         SqliteValue::Null
                     } else {
                         // take_reg moves the value out (replacing with Null)
@@ -8947,29 +8948,27 @@ impl VdbeEngine {
                             self.last_insert_rowid = rowid;
                             self.last_insert_rowid_valid = true;
                         }
-                        self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
-                        self.pending_insert_rollback = Some(PendingInsertRollback {
+                        self.set_pending_insert_rollback(Some(PendingInsertRollback {
                             cursor_id,
                             rowid,
                             previous_last_insert_rowid,
                             previous_last_insert_rowid_valid,
                             update_restore: pending_update_restore,
-                        });
+                        }));
                     } else {
-                        self.pending_insert_rollback = None;
+                        self.set_pending_insert_rollback(None);
                         // When OE_IGNORE skips the insert (unique or rowid
                         // conflict handled internally), tell subsequent
                         // IdxInsert opcodes to skip this row's index entries.
                         if oe_flag == 4 {
-                            self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
-                            self.conflict_skip_idx = true;
+                            self.set_conflict_skip_idx(true);
                         }
                     }
                     self.last_insert_cursor_id = Some(cursor_id);
                     if actually_inserted {
-                        self.conflict_skip_idx = false;
+                        self.set_conflict_skip_idx(false);
                     }
-                    self.pending_idx_entries.clear();
+                    self.clear_pending_idx_entries();
 
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
@@ -9048,7 +9047,7 @@ impl VdbeEngine {
                         if is_update && update_restore.is_some() {
                             self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
                         }
-                        self.pending_update_restore = if is_update { update_restore } else { None };
+                        self.set_pending_update_restore(if is_update { update_restore } else { None });
                         // P5 bit 0 = OPFLAG_NCHANGE: only count standalone
                         // DELETE changes. UPDATE's internal Delete uses P5=0
                         // so only the subsequent Insert counts.
@@ -9057,7 +9056,7 @@ impl VdbeEngine {
                         }
                         self.pending_next_after_delete.insert(cursor_id);
                     } else if is_update {
-                        self.pending_update_restore = None;
+                        self.set_pending_update_restore(None);
                     }
                     pc += 1;
                 }
@@ -9086,7 +9085,7 @@ impl VdbeEngine {
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row.
-                    if self.conflict_skip_idx {
+                    if self.conflict_skip_idx() {
                         pc += 1;
                         continue;
                     }
@@ -9112,11 +9111,7 @@ impl VdbeEngine {
                                             self.collect_vdbe_metrics,
                                             DecodeCacheInvalidationReason::WriteMutation,
                                         );
-                                        self.mark_statement_cold_state(
-                                            StatementColdState::CONFLICT_TRACKING,
-                                        );
-                                        self.pending_idx_entries
-                                            .push((cursor_id, key_bytes.to_vec()));
+                                        self.push_pending_idx_entry(cursor_id, key_bytes.to_vec());
                                     }
                                     Err(FrankenError::UniqueViolation { .. }) => {
                                         match oe_flag {
@@ -9126,10 +9121,7 @@ impl VdbeEngine {
                                             4 => {
                                                 self.rollback_pending_insert_after_index_conflict(
                                                 )?;
-                                                self.mark_statement_cold_state(
-                                                    StatementColdState::CONFLICT_TRACKING,
-                                                );
-                                                self.conflict_skip_idx = true;
+                                                self.set_conflict_skip_idx(true);
                                                 pc += 1;
                                                 continue;
                                             }
@@ -9171,11 +9163,10 @@ impl VdbeEngine {
                                                     self.collect_vdbe_metrics,
                                                     DecodeCacheInvalidationReason::WriteMutation,
                                                 );
-                                                self.mark_statement_cold_state(
-                                                    StatementColdState::CONFLICT_TRACKING,
+                                                self.push_pending_idx_entry(
+                                                    cursor_id,
+                                                    key_blob.clone(),
                                                 );
-                                                self.pending_idx_entries
-                                                    .push((cursor_id, key_blob.clone()));
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -9197,10 +9188,7 @@ impl VdbeEngine {
                                     self.collect_vdbe_metrics,
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
-                                self.mark_statement_cold_state(
-                                    StatementColdState::CONFLICT_TRACKING,
-                                );
-                                self.pending_idx_entries.push((cursor_id, key_blob.clone()));
+                                self.push_pending_idx_entry(cursor_id, key_blob.clone());
                             }
                         }
                     }
@@ -9449,8 +9437,11 @@ impl VdbeEngine {
                 }
 
                 Opcode::Sequence => {
-                    self.mark_statement_cold_state(StatementColdState::SEQUENCE_COUNTERS);
-                    let counter = self.sequence_counters.entry(op.p1).or_insert(0);
+                    let counter = self
+                        .ensure_cold_state_for(StatementColdState::SEQUENCE_COUNTERS)
+                        .sequence_counters
+                        .entry(op.p1)
+                        .or_insert(0);
                     let val = *counter;
                     *counter += 1;
                     self.set_reg_int(op.p2, val);
@@ -9536,7 +9527,9 @@ impl VdbeEngine {
                     // Jump to p2 if cursor p1 is not open.
                     if self.cursors.contains_key(&op.p1)
                         || self.storage_cursors.contains_key(&op.p1)
-                        || self.vtab_cursors.contains_key(&op.p1)
+                        || self
+                            .cold_state()
+                            .is_some_and(|cold_state| cold_state.vtab_cursors.contains_key(&op.p1))
                         || self.sorters.contains_key(&op.p1)
                     {
                         pc += 1;
@@ -10089,14 +10082,12 @@ impl VdbeEngine {
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
-                    self.mark_statement_cold_state(StatementColdState::AGGREGATES);
-                    let start_idx = usize::try_from(op.p2).unwrap_or(0);
-                    let count = usize::from(op.p5);
-                    let end_idx = start_idx.saturating_add(count);
-                    let limit = self.registers.len();
-                    let clamped_start = start_idx.min(limit);
-                    let args = &self.registers[clamped_start..end_idx.min(limit)];
-                    let ctx = self.aggregates.entry_or_insert_with(accum_reg, || {
+                    let args = self.collect_reg_range(op.p2, usize::from(op.p5));
+                    let execution_cx = self.execution_cx.clone();
+                    let ctx = self
+                        .ensure_cold_state_for(StatementColdState::AGGREGATES)
+                        .aggregates
+                        .entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         AggregateContext {
                             func: func.clone(),
@@ -10122,17 +10113,17 @@ impl VdbeEngine {
                         if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
                             false
                         } else {
-                            seen.insert(distinct_key_collated(args, agg_collation))
+                            seen.insert(distinct_key_collated(&args, agg_collation))
                         }
                     } else {
                         true
                     };
 
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&execution_cx)?;
                     if should_step {
-                        ctx.func.step(&mut ctx.state, args)?;
+                        ctx.func.step(&mut ctx.state, &args)?;
                     }
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&execution_cx)?;
                     pc += 1;
                 }
 
@@ -10171,7 +10162,10 @@ impl VdbeEngine {
 
                     let accum_reg = op.p1;
                     observe_execution_cancellation(&self.execution_cx)?;
-                    let result = match self.aggregates.remove(&accum_reg) {
+                    let result = match self
+                        .cold_state_mut()
+                        .and_then(|cold_state| cold_state.aggregates.remove(&accum_reg))
+                    {
                         Some(ctx) => {
                             if !Arc::ptr_eq(&ctx.func, &func) {
                                 return Err(FrankenError::Internal(
@@ -10217,14 +10211,12 @@ impl VdbeEngine {
                     })?;
 
                     let accum_reg = op.p3;
-                    self.mark_statement_cold_state(StatementColdState::WINDOW_CONTEXTS);
-                    let start_idx = usize::try_from(op.p2).unwrap_or(0);
-                    let count = usize::from(op.p5);
-                    let end_idx = start_idx.saturating_add(count);
-                    let limit = self.registers.len();
-                    let clamped_start = start_idx.min(limit);
-                    let args = &self.registers[clamped_start..end_idx.min(limit)];
-                    let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {
+                    let args = self.collect_reg_range(op.p2, usize::from(op.p5));
+                    let execution_cx = self.execution_cx.clone();
+                    let ctx = self
+                        .ensure_cold_state_for(StatementColdState::WINDOW_CONTEXTS)
+                        .window_contexts
+                        .entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         WindowContext {
                             func: func.clone(),
@@ -10232,9 +10224,9 @@ impl VdbeEngine {
                         }
                     });
 
-                    observe_execution_cancellation(&self.execution_cx)?;
-                    ctx.func.inverse(&mut ctx.state, args)?;
-                    observe_execution_cancellation(&self.execution_cx)?;
+                    observe_execution_cancellation(&execution_cx)?;
+                    ctx.func.inverse(&mut ctx.state, &args)?;
+                    observe_execution_cancellation(&execution_cx)?;
                     pc += 1;
                 }
 
@@ -10269,7 +10261,10 @@ impl VdbeEngine {
 
                     let accum_reg = op.p1;
                     observe_execution_cancellation(&self.execution_cx)?;
-                    let result = match self.window_contexts.get(&accum_reg) {
+                    let result = match self
+                        .cold_state()
+                        .and_then(|cold_state| cold_state.window_contexts.get(&accum_reg))
+                    {
                         Some(ctx) => ctx.func.value(&ctx.state)?,
                         None => func.value(&func.initial_state())?,
                     };
@@ -10444,8 +10439,8 @@ impl VdbeEngine {
                     // Add integer P2 to rowset in register P1.
                     let rowset_reg = op.p1;
                     let val = self.get_reg(op.p2).to_integer();
-                    self.mark_statement_cold_state(StatementColdState::ROWSETS);
-                    self.rowsets
+                    self.ensure_cold_state_for(StatementColdState::ROWSETS)
+                        .rowsets
                         .entry_or_insert_with(rowset_reg, RowSet::new)
                         .add(val);
                     pc += 1;
@@ -10456,8 +10451,8 @@ impl VdbeEngine {
                     // jump to P2 when exhausted.
                     let rowset_reg = op.p1;
                     let next_val = self
-                        .rowsets
-                        .get_mut(&rowset_reg)
+                        .cold_state_mut()
+                        .and_then(|cold_state| cold_state.rowsets.get_mut(&rowset_reg))
                         .and_then(|rs| rs.read_next());
                     match next_val {
                         Some(val) => {
@@ -10476,14 +10471,14 @@ impl VdbeEngine {
                     let rowset_reg = op.p1;
                     let val = self.get_reg(op.p3).to_integer();
                     let found = self
-                        .rowsets
-                        .get(&rowset_reg)
+                        .cold_state()
+                        .and_then(|cold_state| cold_state.rowsets.get(&rowset_reg))
                         .is_some_and(|rs| rs.contains(val));
                     if found {
                         pc = op.p2 as usize;
                     } else {
-                        self.mark_statement_cold_state(StatementColdState::ROWSETS);
-                        self.rowsets
+                        self.ensure_cold_state_for(StatementColdState::ROWSETS)
+                            .rowsets
                             .entry_or_insert_with(rowset_reg, RowSet::new)
                             .add(val);
                         pc += 1;
@@ -10608,14 +10603,14 @@ impl VdbeEngine {
                 // subtype 74/'J') without changing the stored value.
                 Opcode::ClrSubtype => {
                     // Clear subtype flag on register P1.
-                    self.register_subtypes.remove(&op.p1);
+                    self.clear_register_subtype(op.p1);
                     pc += 1;
                 }
 
                 Opcode::GetSubtype => {
                     // Store the subtype of register P1 into register P2.
                     // Returns 0 if no subtype is set.
-                    let st = self.register_subtypes.get(&op.p1).copied().unwrap_or(0);
+                    let st = self.register_subtype(op.p1).unwrap_or(0);
                     #[allow(clippy::cast_possible_wrap)]
                     self.set_reg(op.p2, SqliteValue::Integer(st as i64));
                     pc += 1;
@@ -10630,13 +10625,7 @@ impl VdbeEngine {
                         SqliteValue::Integer(i) => *i as u32,
                         _ => 0,
                     };
-                    if st == 0 {
-                        self.register_subtypes.remove(&op.p2);
-                    } else {
-                        self.mark_statement_cold_state(StatementColdState::REGISTER_SUBTYPES);
-                        self.register_subtypes.insert(op.p2, st);
-                        self.has_subtypes = true;
-                    }
+                    self.set_register_subtype(op.p2, st);
                     pc += 1;
                 }
 
@@ -10648,8 +10637,8 @@ impl VdbeEngine {
                     // Add hash of register P3 to the Bloom filter
                     // identified by P1.
                     let hash = bloom_hash(self.get_reg(op.p3));
-                    self.mark_statement_cold_state(StatementColdState::BLOOM_FILTERS);
                     let filter = self
+                        .ensure_cold_state_for(StatementColdState::BLOOM_FILTERS)
                         .bloom_filters
                         .entry(op.p1)
                         .or_insert_with(|| vec![0u64; BLOOM_FILTER_WORDS]);
@@ -10661,7 +10650,10 @@ impl VdbeEngine {
                 Opcode::Filter => {
                     // Test Bloom filter P1 for register P3's hash.
                     // Jump to P2 if definitely not present.
-                    if let Some(filter) = self.bloom_filters.get(&op.p1) {
+                    if let Some(filter) = self
+                        .cold_state()
+                        .and_then(|cold_state| cold_state.bloom_filters.get(&op.p1))
+                    {
                         let hash = bloom_hash(self.get_reg(op.p3));
                         let bit = (hash as usize) % (filter.len() * 64);
                         let present = (filter[bit / 64] >> (bit % 64)) & 1 == 1;
@@ -10688,7 +10680,10 @@ impl VdbeEngine {
                     // P1 = cursor number.
                     // If a vtab instance is registered, call open_cursor().
                     let cursor_id = op.p1;
-                    if !self.vtab_cursors.contains_key(&cursor_id) {
+                    if !self
+                        .cold_state()
+                        .is_some_and(|cold_state| cold_state.vtab_cursors.contains_key(&cursor_id))
+                    {
                         if let Some(vtab) = self.vtab_instances.get(&cursor_id) {
                             match vtab.open_cursor() {
                                 Ok(cursor) => {
@@ -10712,23 +10707,26 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let jump_if_empty = op.p2;
                     let cx = self.derive_execution_cx();
+                    let n_args = match &op.p4 {
+                        P4::Int(n) => *n as usize,
+                        _ => 0,
+                    };
+                    let args: Vec<SqliteValue> = (0..n_args)
+                        .map(|i| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            self.registers
+                                .get((op.p3 + i as i32) as usize)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null)
+                        })
+                        .collect();
+                    let idx_num = op.p5 as i32;
 
-                    if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                    if let Some(state) = self
+                        .cold_state_mut()
+                        .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&cursor_id))
+                    {
                         observe_execution_cancellation(&cx)?;
-                        let n_args = match &op.p4 {
-                            P4::Int(n) => *n as usize,
-                            _ => 0,
-                        };
-                        let args: Vec<SqliteValue> = (0..n_args)
-                            .map(|i| {
-                                #[allow(clippy::cast_possible_wrap)]
-                                self.registers
-                                    .get((op.p3 + i as i32) as usize)
-                                    .cloned()
-                                    .unwrap_or(SqliteValue::Null)
-                            })
-                            .collect();
-                        let idx_num = op.p5 as i32;
                         if let Err(e) = state.cursor.filter(&cx, idx_num, None, &args) {
                             break vtab_exec_outcome("VFilter", e)?;
                         }
@@ -10753,19 +10751,22 @@ impl VdbeEngine {
                     let col = op.p2;
                     let dest = op.p3;
 
-                    if let Some(state) = self.vtab_cursors.get(&cursor_id) {
+                    let column_value = if let Some(state) = self
+                        .cold_state()
+                        .and_then(|cold_state| cold_state.vtab_cursors.get(&cursor_id))
+                    {
                         observe_execution_cancellation(&self.execution_cx)?;
                         let mut ctx = ColumnContext::new();
                         if let Err(e) = state.cursor.column(&mut ctx, col) {
                             break vtab_exec_outcome("VColumn", e)?;
                         }
                         observe_execution_cancellation(&self.execution_cx)?;
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            if let Some(reg) = self.registers.get_mut(dest as usize) {
-                                *reg = ctx.take_value().unwrap_or(SqliteValue::Null);
-                            }
-                        }
+                        Some(ctx.take_value().unwrap_or(SqliteValue::Null))
+                    } else {
+                        None
+                    };
+                    if let Some(column_value) = column_value {
+                        self.set_reg(dest, column_value);
                     }
                     pc += 1;
                 }
@@ -10778,7 +10779,10 @@ impl VdbeEngine {
                     let jump_if_more = op.p2;
                     let cx = self.derive_execution_cx();
 
-                    if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                    if let Some(state) = self
+                        .cold_state_mut()
+                        .and_then(|cold_state| cold_state.vtab_cursors.get_mut(&cursor_id))
+                    {
                         observe_execution_cancellation(&cx)?;
                         if let Err(e) = state.cursor.next(&cx) {
                             break vtab_exec_outcome("VNext", e)?;
@@ -11069,9 +11073,7 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
-        if self.has_subtypes {
-            self.register_subtypes.remove(&r);
-        }
+        self.clear_register_subtype(r);
         #[cfg(test)]
         FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -11220,15 +11222,14 @@ impl VdbeEngine {
                         self.last_insert_rowid = rowid;
                         self.last_insert_rowid_valid = true;
                         self.last_insert_cursor_id = Some(cursor_id);
-                        self.conflict_skip_idx = false;
-                        self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
-                        self.pending_insert_rollback = Some(PendingInsertRollback {
+                        self.set_conflict_skip_idx(false);
+                        self.set_pending_insert_rollback(Some(PendingInsertRollback {
                             cursor_id,
                             rowid,
                             previous_last_insert_rowid,
                             previous_last_insert_rowid_valid,
                             update_restore: None,
-                        });
+                        }));
                         self.pending_next_after_delete.remove(&cursor_id);
                         // CRITICAL FIX: Mark table dirty so MemDB fast paths
                         // know the data is stale and fall back to pager reads.
@@ -11744,9 +11745,7 @@ impl VdbeEngine {
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
             self.materialize_make_record_sideband(r);
-            if self.has_subtypes {
-                self.register_subtypes.remove(&r);
-            }
+            self.clear_register_subtype(r);
             std::mem::replace(&mut self.registers[r as usize], SqliteValue::Null)
         } else {
             SqliteValue::Null
@@ -11775,9 +11774,7 @@ impl VdbeEngine {
         // metadata must be discarded as well.  Guard with is_empty() to
         // avoid a HashMap probe on every register write — subtypes are
         // rare (only JSON/pointer types).
-        if self.has_subtypes {
-            self.register_subtypes.remove(&r);
-        }
+        self.clear_register_subtype(r);
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
@@ -11802,9 +11799,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if self.has_subtypes {
-            self.register_subtypes.remove(&r);
-        }
+        self.clear_register_subtype(r);
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
@@ -11828,9 +11823,7 @@ impl VdbeEngine {
         );
         if idx < self.registers.len() {
             self.invalidate_make_record_sideband_if_overwritten(r);
-            if self.has_subtypes {
-                self.register_subtypes.remove(&r);
-            }
+            self.clear_register_subtype(r);
             self.registers[idx] = SqliteValue::Integer(val);
         }
     }
@@ -11850,9 +11843,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if self.has_subtypes {
-            self.register_subtypes.remove(&r);
-        }
+        self.clear_register_subtype(r);
         self.registers[idx] = SqliteValue::Text(SmallText::new(text));
     }
 
@@ -11871,9 +11862,7 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.invalidate_make_record_sideband_if_overwritten(r);
-        if self.has_subtypes {
-            self.register_subtypes.remove(&r);
-        }
+        self.clear_register_subtype(r);
         self.registers[idx] = SqliteValue::Blob(Arc::from(blob));
     }
 
@@ -11984,10 +11973,9 @@ impl VdbeEngine {
                         if reg_idx >= self.registers.len() {
                             self.registers.resize(reg_idx + 1, SqliteValue::Null);
                         }
-                        self.make_record_lookaside.clear_sideband_for_register(target);
-                        if self.has_subtypes {
-                            self.register_subtypes.remove(&target);
-                        }
+                        self.make_record_lookaside
+                            .clear_sideband_for_register(target);
+                        self.clear_register_subtype(target);
                         match cached {
                             // NaN → Null normalization (matches set_reg behavior).
                             SqliteValue::Float(f) if f.is_nan() => {
@@ -16554,7 +16542,7 @@ mod tests {
             engine.execute(&subtype_program).expect("subtype execution"),
             ExecOutcome::Done
         );
-        assert_eq!(engine.register_subtypes.get(&tagged_value_reg), Some(&74));
+        assert_eq!(engine.register_subtype(tagged_value_reg), Some(74));
         assert!(
             engine
                 .statement_cold_state
@@ -16565,7 +16553,7 @@ mod tests {
             engine.execute(&probe_program).expect("probe execution"),
             ExecOutcome::Done
         );
-        assert!(engine.register_subtypes.is_empty());
+        assert!(engine.register_subtype(tagged_value_reg).is_none());
         assert!(engine.statement_cold_state.is_empty());
         assert_eq!(
             engine
@@ -16624,14 +16612,14 @@ mod tests {
         }
 
         engine.changes = 1;
-        engine.pending_insert_rollback = Some(PendingInsertRollback {
+        engine.set_pending_insert_rollback(Some(PendingInsertRollback {
             cursor_id: 0,
             rowid: 2,
             previous_last_insert_rowid: 0,
             previous_last_insert_rowid_valid: false,
             update_restore: None,
-        });
-        engine.pending_idx_entries.push((1, index_key.clone()));
+        }));
+        engine.push_pending_idx_entry(1, index_key.clone());
 
         engine
             .rollback_pending_insert_after_index_conflict()
@@ -27306,12 +27294,12 @@ mod tests {
     fn test_take_reg_clears_subtype_metadata() {
         let mut engine = VdbeEngine::new(4);
         engine.set_reg(1, SqliteValue::Text("payload".into()));
-        engine.register_subtypes.insert(1, 74);
+        engine.set_register_subtype(1, 74);
 
         assert_eq!(engine.take_reg(1), SqliteValue::Text("payload".into()));
         assert_eq!(engine.get_reg(1), &SqliteValue::Null);
         assert!(
-            !engine.register_subtypes.contains_key(&1),
+            engine.register_subtype(1).is_none(),
             "moving a register value out must clear any stale subtype metadata"
         );
     }

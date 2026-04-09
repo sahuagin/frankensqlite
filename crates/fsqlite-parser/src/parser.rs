@@ -2193,7 +2193,9 @@ pub fn parse_single_statement_with_scratch(
 ) -> Result<Statement, ParseError> {
     let statements = parse_statements_with_scratch(sql, scratch)?;
     let mut iter = statements.into_iter();
-    let statement = iter.next().ok_or_else(|| ParseError::at("no SQL statement provided", None))?;
+    let statement = iter
+        .next()
+        .ok_or_else(|| ParseError::at("no SQL statement provided", None))?;
     if iter.next().is_some() {
         return Err(ParseError::at(
             "multiple statements are not supported in this API path",
@@ -7970,16 +7972,16 @@ mod tests {
 
         // Property 3: Fuzz safety — random byte strings never panic the parser.
         proptest::proptest! {
-            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+                #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
 
-            #[test]
-    fn test_parser_fuzz_no_panic(input in prop::collection::vec(any::<u8>(), 0..256)) {
-        let sql = String::from_utf8_lossy(&input);
-        // Must not panic — errors are fine, panics are not.
-        let mut p = Parser::from_sql(&sql);
-        let _ = p.parse_all();
+                #[test]
+        fn test_parser_fuzz_no_panic(input in prop::collection::vec(any::<u8>(), 0..256)) {
+            let sql = String::from_utf8_lossy(&input);
+            // Must not panic — errors are fine, panics are not.
+            let mut p = Parser::from_sql(&sql);
+            let _ = p.parse_all();
+                }
             }
-        }
 
         // Property 3b: Fuzz safety with near-valid SQL (more likely to trigger edge cases).
         proptest::proptest! {
@@ -8102,8 +8104,14 @@ mod tests {
         );
         let warmed_token_capacity = scratch.token_capacity();
         let warmed_error_capacity = scratch.error_capacity();
-        assert!(warmed_token_capacity > 0, "parse scratch should warm token storage");
-        assert!(warmed_error_capacity > 0, "parse scratch should warm error storage");
+        assert!(
+            warmed_token_capacity > 0,
+            "parse scratch should warm token storage"
+        );
+        assert!(
+            warmed_error_capacity > 0,
+            "parse scratch should warm error storage"
+        );
 
         let statements = parse_statements_with_scratch("SELECT 1;", &mut scratch)
             .expect("follow-up parse should succeed");

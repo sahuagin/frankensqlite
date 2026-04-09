@@ -183,10 +183,8 @@ impl ActiveTxnSnapshotSlot {
             self.session_ids[idx].store(entry.session_id, Ordering::Release);
             self.snapshot_highs[idx].store(entry.snapshot_high.get(), Ordering::Release);
         }
-        self.gc_horizon.store(
-            gc_horizon.map_or(0, CommitSeq::get),
-            Ordering::Release,
-        );
+        self.gc_horizon
+            .store(gc_horizon.map_or(0, CommitSeq::get), Ordering::Release);
         self.count.store(entries.len() as u64, Ordering::Release);
         self.generation.store(generation, Ordering::Release);
     }
@@ -203,9 +201,7 @@ impl ActiveTxnSnapshotSlot {
         for idx in 0..count {
             entries.push(ActiveTxnSnapshotEntry {
                 session_id: self.session_ids[idx].load(Ordering::Acquire),
-                snapshot_high: CommitSeq::new(
-                    self.snapshot_highs[idx].load(Ordering::Acquire),
-                ),
+                snapshot_high: CommitSeq::new(self.snapshot_highs[idx].load(Ordering::Acquire)),
             });
         }
         ActiveTxnSnapshotImage {

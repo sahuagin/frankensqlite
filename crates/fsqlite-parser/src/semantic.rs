@@ -640,13 +640,10 @@ impl<'a> Resolver<'a> {
                             let mut upsert_scope = Scope::child(scope.clone());
                             let alias_name = insert.alias.as_deref().unwrap_or(&insert.table.name);
                             let target_lookup_key = table_lookup_key(&insert.table);
-                            if let Some(table_def) = self
-                                .schema
-                                .find_table_in_schema(
-                                    insert.table.schema.as_deref(),
-                                    &insert.table.name,
-                                )
-                            {
+                            if let Some(table_def) = self.schema.find_table_in_schema(
+                                insert.table.schema.as_deref(),
+                                &insert.table.name,
+                            ) {
                                 let col_set: HashSet<String> = table_def
                                     .columns
                                     .iter()
@@ -1680,7 +1677,11 @@ mod tests {
         assert!(schema.find_table_in_schema(Some("main"), "users").is_some());
         assert!(schema.find_table_in_schema(Some("aux"), "users").is_some());
         assert!(schema.find_table_in_schema(Some("AUX"), "USERS").is_some());
-        assert!(schema.find_table_in_schema(Some("missing"), "users").is_none());
+        assert!(
+            schema
+                .find_table_in_schema(Some("missing"), "users")
+                .is_none()
+        );
     }
 
     #[test]

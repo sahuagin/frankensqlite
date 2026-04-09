@@ -995,7 +995,10 @@ mod tests {
             &mut scratch,
         );
         let warmed_capacity = scratch.capacity();
-        assert!(warmed_capacity > 0, "warm parse should allocate token scratch");
+        assert!(
+            warmed_capacity > 0,
+            "warm parse should allocate token scratch"
+        );
 
         Lexer::tokenize_into("SELECT 1;", &mut scratch);
         assert_eq!(

@@ -10,7 +10,7 @@ use fsqlite_ast::{
     SelectCore, SelectStatement, Span, UnaryOp as AstUnaryOp, UpdateStatement,
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
-use fsqlite_types::opcode::{Label, Opcode, ProgramBuilder, P4};
+use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
 // ---------------------------------------------------------------------------
 // INSERT conflict-mode p5 flags (must match fsqlite-vdbe/src/codegen.rs)
@@ -2258,10 +2258,11 @@ mod tests {
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        assert!(prog
-            .ops()
-            .iter()
-            .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("pending".to_owned())));
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("pending".to_owned()))
+        );
     }
 
     #[test]
@@ -2321,14 +2322,16 @@ mod tests {
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        assert!(prog
-            .ops()
-            .iter()
-            .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("active".to_owned())));
-        assert!(prog
-            .ops()
-            .iter()
-            .any(|op| op.opcode == Opcode::Integer && op.p1 == 42));
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("active".to_owned()))
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Integer && op.p1 == 42)
+        );
     }
 
     #[test]

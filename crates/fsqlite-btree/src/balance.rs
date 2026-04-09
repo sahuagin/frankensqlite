@@ -13,8 +13,8 @@
 //! the cursor position and page state.
 
 use crate::cell::{
-    header_offset_for_page, parse_page_header, read_cell_pointers, write_cell_pointers,
-    BtreePageHeader, BtreePageType, CellRef,
+    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, parse_page_header,
+    read_cell_pointers, write_cell_pointers,
 };
 use crate::cursor::PageWriter;
 use fsqlite_error::{FrankenError, Result};
@@ -2510,8 +2510,8 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
 #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
 mod tests {
     use super::*;
-    use fsqlite_types::serial_type::write_varint;
     use fsqlite_types::WitnessKey;
+    use fsqlite_types::serial_type::write_varint;
     use std::collections::HashMap;
 
     const USABLE: u32 = 4096;

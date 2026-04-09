@@ -7311,10 +7311,14 @@ mod tests {
         cursor.table_insert(&cx, 2, b"two").unwrap();
 
         assert!(cursor.first(&cx).unwrap());
-        let before = cursor.position_stamp().expect("cursor should be positioned");
+        let before = cursor
+            .position_stamp()
+            .expect("cursor should be positioned");
 
         cursor.delete(&cx).unwrap();
-        let after = cursor.position_stamp().expect("delete should land on successor");
+        let after = cursor
+            .position_stamp()
+            .expect("delete should land on successor");
 
         assert_eq!(before.page_no(), after.page_no());
         assert_eq!(before.cell_idx(), after.cell_idx());

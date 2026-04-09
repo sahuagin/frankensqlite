@@ -168,14 +168,7 @@ pub fn persist_to_sqlite_with_header(
     db: &MemDatabase,
     header_template: &DatabaseHeader,
 ) -> Result<()> {
-    persist_to_sqlite_with_header_and_master_entries(
-        cx,
-        path,
-        schema,
-        db,
-        header_template,
-        &[],
-    )
+    persist_to_sqlite_with_header_and_master_entries(cx, path, schema, db, header_template, &[])
 }
 
 /// Persist `schema` + `db` plus additional sqlite_master rows using the
@@ -222,13 +215,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
         let root_page = txn.allocate_page(cx)?;
 
         // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(
-            cx,
-            &mut txn,
-            root_page,
-            page_size_usize,
-            usable_size,
-        )?;
+        init_leaf_table_page(cx, &mut txn, root_page, page_size_usize, usable_size)?;
 
         // Insert all rows.
         {
@@ -268,13 +255,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             }
             // Allocate and initialize root page as leaf index page (0x0A).
             let idx_root = txn.allocate_page(cx)?;
-            init_leaf_index_page(
-                cx,
-                &mut txn,
-                idx_root,
-                page_size_usize,
-                usable_size,
-            )?;
+            init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
 
             // Populate the index B-tree from table rows.
             {
@@ -428,9 +409,9 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
         final_header.schema_cookie = final_header.schema_cookie.max(1);
         final_header.version_valid_for = final_header.change_counter;
 
-        let encoded_header = final_header
-            .to_bytes()
-            .map_err(|err| FrankenError::internal(format!("failed to encode database header: {err}")))?;
+        let encoded_header = final_header.to_bytes().map_err(|err| {
+            FrankenError::internal(format!("failed to encode database header: {err}"))
+        })?;
         hdr_page[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded_header);
 
         txn.write_page(cx, PageNumber::ONE, &hdr_page)?;
