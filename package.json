@@ -1,15 +1,22 @@
 {
   "name": "frankensqlite",
   "version": "1.0.0",
+  "private": true,
   "description": "<div align=\"center\">   <img src=\"frankensqlite_illustration.webp\" alt=\"FrankenSQLite — a Frankenstein monster building a database engine at his workbench\"> </div>",
   "main": "index.js",
+  "workspaces": [
+    "packages/*"
+  ],
   "directories": {
     "doc": "docs",
     "test": "tests"
   },
   "scripts": {
     "build": "mkdir -p dist && cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html && cp frankentui.css spec_evolution_v1.sqlite3 spec_evolution_v1.sqlite3.config.json og-image.png twitter-image.png frankensqlite_illustration.webp frankensqlite_diagram.webp dist/",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build:wasm-browser": "npm run build --workspace @frankensqlite/worker && npm run build --workspace @frankensqlite/sdk",
+    "typecheck:wasm-browser": "npm run typecheck --workspace @frankensqlite/worker && npm run typecheck --workspace @frankensqlite/sdk",
+    "test": "npm run test:wasm-browser",
+    "test:wasm-browser": "npm run test --workspace @frankensqlite/worker && npm run test --workspace @frankensqlite/sdk"
   },
   "repository": {
     "type": "git",
@@ -24,6 +31,8 @@
   },
   "homepage": "https://github.com/Dicklesworthstone/frankensqlite#readme",
   "devDependencies": {
-    "@playwright/test": "^1.58.2"
+    "@playwright/test": "^1.58.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
   }
 }
