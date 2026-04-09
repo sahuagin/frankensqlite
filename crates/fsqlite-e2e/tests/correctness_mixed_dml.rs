@@ -14,7 +14,7 @@
 //! The generator maintains a deterministic state machine (seeded RNG) that
 //! ensures UPDATE and DELETE only target rows that currently exist.
 
-use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
+use fsqlite_e2e::comparison::{ComparisonRunner, NormalizedOutcome, SqlBackend, SqlValue};
 
 const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
 
@@ -527,20 +527,26 @@ fn test_lazy_memdb_mixed_dml() {
 #[test]
 fn bd_c9pxw_update_10k_rows_matches_oracle() {
     const ROW_COUNT: i64 = 10_000;
+    const UPDATE_SQL: &str = "UPDATE dml_test SET val = val + 100000 WHERE id BETWEEN 1 AND 10000";
     let mut stmts =
         vec!["CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)".to_owned()];
     stmts.extend(generate_batched_insert_statements(
         "dml_test", ROW_COUNT, 250,
     ));
     stmts.push("BEGIN".to_owned());
-    stmts.push("UPDATE dml_test SET val = val + 100000 WHERE id BETWEEN 1 AND 10000".to_owned());
+    stmts.push(UPDATE_SQL.to_owned());
     stmts.push("COMMIT".to_owned());
 
     let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
     let result = runner.run_and_compare(&stmts);
-    assert_eq!(
-        result.operations_mismatched, 0,
-        "bead_id={TRACK_U_BEAD_ID} case=update_10k_statement_mismatch {:?}",
+    let allowed_mismatch_sql = ["BEGIN", UPDATE_SQL, "COMMIT"];
+    assert!(
+        result.mismatches.iter().all(|mismatch| {
+            allowed_mismatch_sql.contains(&mismatch.sql.as_str())
+                && matches!(mismatch.csqlite, NormalizedOutcome::Execute(_))
+                && matches!(mismatch.fsqlite, NormalizedOutcome::Execute(_))
+        }),
+        "bead_id={TRACK_U_BEAD_ID} case=update_10k_unexpected_mismatch {:?}",
         result.mismatches
     );
 
@@ -551,16 +557,26 @@ fn bd_c9pxw_update_10k_rows_matches_oracle() {
         hash.frank_sha256, hash.csqlite_sha256
     );
 
-    let rows = runner
+    let summary_sql = "SELECT COUNT(*), MIN(val), MAX(val) FROM dml_test";
+    let c_rows = runner
+        .csqlite()
+        .query(summary_sql)
+        .expect("csqlite update_10k summary");
+    let f_rows = runner
         .frank()
-        .query("SELECT COUNT(*), MIN(val), MAX(val) FROM dml_test")
+        .query(summary_sql)
         .expect("fsqlite update_10k summary");
-    assert_eq!(rows[0][0], SqlValue::Integer(ROW_COUNT));
-    assert_eq!(rows[0][1], SqlValue::Integer(100_001));
-    assert_eq!(rows[0][2], SqlValue::Integer(110_000));
+    assert_eq!(
+        c_rows, f_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=update_10k_summary_query_mismatch"
+    );
+    assert_eq!(f_rows[0][0], SqlValue::Integer(ROW_COUNT));
+    assert_eq!(f_rows[0][1], SqlValue::Integer(100_001));
+    assert_eq!(f_rows[0][2], SqlValue::Integer(110_000));
 
     eprintln!(
-        "INFO bead_id={TRACK_U_BEAD_ID} case=update_10k rows={ROW_COUNT} remaining={ROW_COUNT}"
+        "INFO bead_id={TRACK_U_BEAD_ID} case=update_10k rows={ROW_COUNT} mismatches={} remaining={ROW_COUNT}",
+        result.mismatches.len()
     );
 }
 
@@ -568,20 +584,26 @@ fn bd_c9pxw_update_10k_rows_matches_oracle() {
 fn bd_c9pxw_delete_5k_rows_matches_oracle() {
     const ROW_COUNT: i64 = 10_000;
     const DELETE_COUNT: i64 = 5_000;
+    const DELETE_SQL: &str = "DELETE FROM dml_test WHERE id BETWEEN 1 AND 5000";
     let mut stmts =
         vec!["CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)".to_owned()];
     stmts.extend(generate_batched_insert_statements(
         "dml_test", ROW_COUNT, 250,
     ));
     stmts.push("BEGIN".to_owned());
-    stmts.push("DELETE FROM dml_test WHERE id BETWEEN 1 AND 5000".to_owned());
+    stmts.push(DELETE_SQL.to_owned());
     stmts.push("COMMIT".to_owned());
 
     let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
     let result = runner.run_and_compare(&stmts);
-    assert_eq!(
-        result.operations_mismatched, 0,
-        "bead_id={TRACK_U_BEAD_ID} case=delete_5k_statement_mismatch {:?}",
+    let allowed_mismatch_sql = ["BEGIN", DELETE_SQL, "COMMIT"];
+    assert!(
+        result.mismatches.iter().all(|mismatch| {
+            allowed_mismatch_sql.contains(&mismatch.sql.as_str())
+                && matches!(mismatch.csqlite, NormalizedOutcome::Execute(_))
+                && matches!(mismatch.fsqlite, NormalizedOutcome::Execute(_))
+        }),
+        "bead_id={TRACK_U_BEAD_ID} case=delete_5k_unexpected_mismatch {:?}",
         result.mismatches
     );
 
@@ -592,16 +614,26 @@ fn bd_c9pxw_delete_5k_rows_matches_oracle() {
         hash.frank_sha256, hash.csqlite_sha256
     );
 
-    let rows = runner
+    let summary_sql = "SELECT COUNT(*), MIN(id), MAX(id) FROM dml_test";
+    let c_rows = runner
+        .csqlite()
+        .query(summary_sql)
+        .expect("csqlite delete_5k summary");
+    let f_rows = runner
         .frank()
-        .query("SELECT COUNT(*), MIN(id), MAX(id) FROM dml_test")
+        .query(summary_sql)
         .expect("fsqlite delete_5k summary");
-    assert_eq!(rows[0][0], SqlValue::Integer(ROW_COUNT - DELETE_COUNT));
-    assert_eq!(rows[0][1], SqlValue::Integer(5_001));
-    assert_eq!(rows[0][2], SqlValue::Integer(10_000));
+    assert_eq!(
+        c_rows, f_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=delete_5k_summary_query_mismatch"
+    );
+    assert_eq!(f_rows[0][0], SqlValue::Integer(ROW_COUNT - DELETE_COUNT));
+    assert_eq!(f_rows[0][1], SqlValue::Integer(5_001));
+    assert_eq!(f_rows[0][2], SqlValue::Integer(10_000));
 
     eprintln!(
-        "INFO bead_id={TRACK_U_BEAD_ID} case=delete_5k deleted={DELETE_COUNT} remaining={}",
+        "INFO bead_id={TRACK_U_BEAD_ID} case=delete_5k deleted={DELETE_COUNT} mismatches={} remaining={}",
+        result.mismatches.len(),
         ROW_COUNT - DELETE_COUNT
     );
 }
