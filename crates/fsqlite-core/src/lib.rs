@@ -21,6 +21,7 @@ pub mod lrc;
 pub mod native_index;
 pub mod permeation_map;
 pub mod por;
+pub mod quiescence;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod raptorq_codec;
 pub mod raptorq_integration;

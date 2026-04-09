@@ -16,6 +16,8 @@ use fsqlite_types::Region;
 use fsqlite_types::cx::{self, Cx};
 use tracing::debug;
 
+use crate::quiescence::{ChildRegionQuiescence, RegionQuiescenceSnapshot};
+
 // ── Types ──────────────────────────────────────────────────────────────
 
 /// Normative region kinds from §4.11.
@@ -381,16 +383,37 @@ impl RegionTree {
     /// - active obligation count is zero.
     #[must_use]
     pub fn is_quiescent(&self, id: Region) -> bool {
-        let Some(node) = self.nodes.get(&id) else {
-            return false;
-        };
-        let children_closed = node
+        self.quiescence_snapshot(id)
+            .is_some_and(|snapshot| snapshot.is_quiescent())
+    }
+
+    /// Capture a deterministic quiescence snapshot for diagnostics and tests.
+    #[must_use]
+    pub fn quiescence_snapshot(&self, id: Region) -> Option<RegionQuiescenceSnapshot> {
+        let node = self.nodes.get(&id)?;
+        let non_closed_children = node
             .children
             .iter()
-            .all(|child| self.state(*child) == Some(RegionState::Closed));
-        children_closed
-            && node.active_tasks.load(Ordering::Acquire) == 0
-            && node.active_obligations.load(Ordering::Acquire) == 0
+            .filter_map(|child| {
+                let state = self.state(*child);
+                if state == Some(RegionState::Closed) {
+                    None
+                } else {
+                    Some(ChildRegionQuiescence {
+                        region: *child,
+                        state,
+                    })
+                }
+            })
+            .collect();
+
+        Some(RegionQuiescenceSnapshot {
+            region: id,
+            state: node.state,
+            active_tasks: node.active_tasks.load(Ordering::Acquire),
+            active_obligations: node.active_obligations.load(Ordering::Acquire),
+            non_closed_children,
+        })
     }
 
     /// Complete region close: run finalizers and mark as [`RegionState::Closed`].
@@ -410,10 +433,16 @@ impl RegionTree {
                 "region must be in Closing state before complete_close".to_owned(),
             ));
         }
-        if !self.is_quiescent(id) {
-            return Err(FrankenError::Internal(
-                "region not quiescent; cannot complete close".to_owned(),
-            ));
+        let snapshot = self
+            .quiescence_snapshot(id)
+            .ok_or_else(|| FrankenError::Internal(format!("region {} not found", id.get())))?;
+        if !snapshot.is_quiescent() {
+            return Err(FrankenError::Internal(format!(
+                "region not quiescent; children_open={} active_tasks={} active_obligations={}",
+                snapshot.non_closed_children.len(),
+                snapshot.active_tasks,
+                snapshot.active_obligations
+            )));
         }
         let node = self
             .nodes
@@ -664,6 +693,71 @@ mod tests {
             "bead_id={BEAD_ID} case=quiescent_after_all_obligations_resolved"
         );
         tree.complete_close(region).expect("complete close");
+    }
+
+    #[test]
+    fn test_quiescence_snapshot_reports_precise_blockers() {
+        let mut tree = RegionTree::new();
+        let root = tree
+            .create_root(RegionKind::DbRoot, Cx::new())
+            .expect("root");
+        let parent = tree
+            .create_child(root, RegionKind::WriteCoordinator, Cx::new())
+            .expect("parent");
+        let child = tree
+            .create_child(parent, RegionKind::PerConnection, Cx::new())
+            .expect("child");
+        let _task = tree.register_task(parent).expect("task");
+        let _obligation = tree.register_obligation(parent).expect("obligation");
+
+        tree.begin_close(parent).expect("begin close");
+        let snapshot = tree
+            .quiescence_snapshot(parent)
+            .expect("snapshot for existing region");
+        assert_eq!(snapshot.region, parent);
+        assert_eq!(snapshot.state, RegionState::Closing);
+        assert_eq!(snapshot.active_tasks, 1);
+        assert_eq!(snapshot.active_obligations, 1);
+        assert_eq!(snapshot.non_closed_children.len(), 1);
+        assert_eq!(snapshot.non_closed_children[0].region, child);
+        assert_eq!(
+            snapshot.non_closed_children[0].state,
+            Some(RegionState::Closing)
+        );
+        assert_eq!(snapshot.blocker_count(), 3);
+        assert!(!snapshot.is_quiescent());
+    }
+
+    #[test]
+    fn test_complete_close_error_includes_quiescence_counts() {
+        let mut tree = RegionTree::new();
+        let root = tree
+            .create_root(RegionKind::DbRoot, Cx::new())
+            .expect("root");
+        let child = tree
+            .create_child(root, RegionKind::WriteCoordinator, Cx::new())
+            .expect("child");
+        let _task = tree.register_task(child).expect("task");
+
+        tree.begin_close(child).expect("begin close");
+        let err = tree
+            .complete_close(child)
+            .expect_err("active task must block close");
+        let FrankenError::Internal(message) = err else {
+            panic!("expected internal error for non-quiescent close");
+        };
+        assert!(
+            message.contains("children_open=0"),
+            "bead_id={BEAD_ID} case=quiescence_error_children_count message={message}"
+        );
+        assert!(
+            message.contains("active_tasks=1"),
+            "bead_id={BEAD_ID} case=quiescence_error_task_count message={message}"
+        );
+        assert!(
+            message.contains("active_obligations=0"),
+            "bead_id={BEAD_ID} case=quiescence_error_obligation_count message={message}"
+        );
     }
 
     #[test]
