@@ -15433,7 +15433,9 @@ mod tests {
         track_r_log_metrics(
             "test_track_r_two_pass_matches_three_pass_proptest_10k_random",
             alloc_count.get(),
-            scratch_capacity_bytes.get().max(two_pass.borrow().capacity()),
+            scratch_capacity_bytes
+                .get()
+                .max(two_pass.borrow().capacity()),
             encode_time_ns.get(),
         );
     }

@@ -348,17 +348,27 @@ mod tests {
         assert!(has_signal(WriterRoutingTelemetrySignal::TieredWriteCounts));
         assert!(has_signal(WriterRoutingTelemetrySignal::PageLockWait));
         assert!(has_signal(WriterRoutingTelemetrySignal::BusyRetry));
-        assert!(has_signal(WriterRoutingTelemetrySignal::StaleSnapshotReject));
-        assert!(has_signal(WriterRoutingTelemetrySignal::PageOneConflictOnly));
-        assert!(has_signal(WriterRoutingTelemetrySignal::PendingSurfaceClear));
+        assert!(has_signal(
+            WriterRoutingTelemetrySignal::StaleSnapshotReject
+        ));
+        assert!(has_signal(
+            WriterRoutingTelemetrySignal::PageOneConflictOnly
+        ));
+        assert!(has_signal(
+            WriterRoutingTelemetrySignal::PendingSurfaceClear
+        ));
     }
 
     #[test]
     fn test_writer_routing_sources_cover_same_page_conflicts_and_ownership() {
         assert!(has_signal(WriterRoutingTelemetrySignal::WriteSetPages));
-        assert!(has_signal(WriterRoutingTelemetrySignal::SamePageConflictPages));
+        assert!(has_signal(
+            WriterRoutingTelemetrySignal::SamePageConflictPages
+        ));
         assert!(has_signal(WriterRoutingTelemetrySignal::LockHolderClues));
-        assert!(has_signal(WriterRoutingTelemetrySignal::SerializableConflictEdges));
+        assert!(has_signal(
+            WriterRoutingTelemetrySignal::SerializableConflictEdges
+        ));
     }
 
     #[test]
@@ -376,9 +386,9 @@ mod tests {
             "routing telemetry must only reuse existing hot-path state or fold it after the fact"
         );
         assert!(
-            WRITER_ROUTING_TELEMETRY_SOURCES.iter().any(
-                |source| source.class == WriterRoutingTelemetryClass::OwnershipLineage
-            ),
+            WRITER_ROUTING_TELEMETRY_SOURCES
+                .iter()
+                .any(|source| source.class == WriterRoutingTelemetryClass::OwnershipLineage),
             "routing contract must include ownership lineage, not just counters"
         );
     }

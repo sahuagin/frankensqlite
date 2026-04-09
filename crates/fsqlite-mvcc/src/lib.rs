@@ -53,8 +53,8 @@ pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
 pub mod witness_refinement;
-pub mod writer_routing_telemetry;
 pub mod write_coordinator;
+pub mod writer_routing_telemetry;
 pub mod xor_delta;
 
 /// Reader-visible MVCC metadata classes that participate in Track E3's
@@ -386,18 +386,17 @@ pub use witness_refinement::{
     RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
     refine_edges,
 };
-pub use writer_routing_telemetry::{
-    WRITER_ROUTING_TELEMETRY_SOURCES, WriterConflictHistoryTelemetry, WriterLockHolderClue,
-    WriterOwnershipLineageTelemetry, WriterRetryAttribution, WriterRetryCause,
-    WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass,
-    WriterRoutingTelemetryInput, WriterRoutingTelemetryPhase, WriterRoutingTelemetryShape,
-    WriterRoutingTelemetrySignal, WriterRoutingTelemetrySourceSpec, WriterTierSurfaceCounts,
-    WriterTouchSurfaceTelemetry,
-};
 pub use write_coordinator::{
     CommitWriteSet, CompatCommitRequest, CompatCommitResponse, CoordinatorLease, CoordinatorMode,
     DEFAULT_MAX_BATCH_SIZE, DEFAULT_SPILL_THRESHOLD, NativePublishRequest, NativePublishResponse,
     SpillHandle, SpillLoc, SpilledWriteSet, WriteCoordinator,
+};
+pub use writer_routing_telemetry::{
+    WRITER_ROUTING_TELEMETRY_SOURCES, WriterConflictHistoryTelemetry, WriterLockHolderClue,
+    WriterOwnershipLineageTelemetry, WriterRetryAttribution, WriterRetryCause,
+    WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass, WriterRoutingTelemetryInput,
+    WriterRoutingTelemetryPhase, WriterRoutingTelemetryShape, WriterRoutingTelemetrySignal,
+    WriterRoutingTelemetrySourceSpec, WriterTierSurfaceCounts, WriterTouchSurfaceTelemetry,
 };
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
