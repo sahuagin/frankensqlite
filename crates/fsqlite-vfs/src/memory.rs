@@ -15,6 +15,8 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
+const WASM_LINEAR_MEMORY_PAGE_BYTES: usize = 64 * 1024;
+
 /// Shared storage for all files in the memory VFS.
 ///
 /// Each file is stored as a named byte vector. Multiple `MemoryFile` handles
@@ -24,12 +26,143 @@ struct FileStorage {
     data: Vec<u8>,
 }
 
+impl FileStorage {
+    fn with_reserved_capacity(bytes: usize) -> Result<Self> {
+        let mut data = Vec::new();
+        if bytes > 0 {
+            data.try_reserve_exact(bytes)
+                .map_err(|_| FrankenError::OutOfMemory)?;
+        }
+        Ok(Self { data })
+    }
+}
+
+/// Configuration for heap growth inside [`MemoryVfs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryVfsConfig {
+    /// Bytes to reserve for a newly created main database file.
+    pub initial_reserve_bytes: usize,
+    /// Bytes to grow allocations by when reserving additional capacity.
+    pub growth_chunk_bytes: usize,
+    /// Hard cap for tracked heap bytes inside this VFS.
+    pub max_bytes: Option<usize>,
+}
+
+impl Default for MemoryVfsConfig {
+    fn default() -> Self {
+        Self {
+            initial_reserve_bytes: 0,
+            growth_chunk_bytes: WASM_LINEAR_MEMORY_PAGE_BYTES,
+            max_bytes: None,
+        }
+    }
+}
+
+/// Point-in-time tracked heap usage for [`MemoryVfs`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryVfsUsageSnapshot {
+    pub file_bytes: usize,
+    pub file_reserved_bytes: usize,
+    pub shm_bytes: usize,
+    pub shm_reserved_bytes: usize,
+    pub peak_reserved_bytes: usize,
+    pub growth_events: u64,
+    pub file_count: usize,
+    pub shm_region_count: usize,
+    pub initial_reserve_bytes: usize,
+    pub growth_chunk_bytes: usize,
+    pub max_bytes: Option<usize>,
+}
+
+impl MemoryVfsUsageSnapshot {
+    #[must_use]
+    pub const fn live_bytes(self) -> usize {
+        self.file_bytes.saturating_add(self.shm_bytes)
+    }
+
+    #[must_use]
+    pub const fn reserved_bytes(self) -> usize {
+        self.file_reserved_bytes
+            .saturating_add(self.shm_reserved_bytes)
+    }
+
+    #[must_use]
+    pub const fn fragmentation_bytes(self) -> usize {
+        self.reserved_bytes().saturating_sub(self.live_bytes())
+    }
+}
+
+#[derive(Debug, Default)]
+struct MemoryVfsUsageState {
+    file_bytes: usize,
+    file_reserved_bytes: usize,
+    shm_bytes: usize,
+    shm_reserved_bytes: usize,
+    peak_reserved_bytes: usize,
+    growth_events: u64,
+}
+
+impl MemoryVfsUsageState {
+    fn total_reserved_bytes(&self) -> usize {
+        self.file_reserved_bytes
+            .saturating_add(self.shm_reserved_bytes)
+    }
+
+    fn refresh_peak(&mut self) {
+        self.peak_reserved_bytes = self.peak_reserved_bytes.max(self.total_reserved_bytes());
+    }
+
+    fn apply_file_change(
+        &mut self,
+        old_len: usize,
+        old_reserved: usize,
+        new_len: usize,
+        new_reserved: usize,
+    ) {
+        self.file_bytes = self
+            .file_bytes
+            .saturating_sub(old_len)
+            .saturating_add(new_len);
+        self.file_reserved_bytes = self
+            .file_reserved_bytes
+            .saturating_sub(old_reserved)
+            .saturating_add(new_reserved);
+        if new_reserved > old_reserved {
+            self.growth_events = self.growth_events.saturating_add(1);
+        }
+        self.refresh_peak();
+    }
+
+    fn apply_shm_change(
+        &mut self,
+        old_len: usize,
+        old_reserved: usize,
+        new_len: usize,
+        new_reserved: usize,
+    ) {
+        self.shm_bytes = self
+            .shm_bytes
+            .saturating_sub(old_len)
+            .saturating_add(new_len);
+        self.shm_reserved_bytes = self
+            .shm_reserved_bytes
+            .saturating_sub(old_reserved)
+            .saturating_add(new_reserved);
+        if new_reserved > old_reserved {
+            self.growth_events = self.growth_events.saturating_add(1);
+        }
+        self.refresh_peak();
+    }
+}
+
 /// Shared state for the entire memory VFS.
 #[derive(Debug, Default)]
 struct MemoryVfsInner {
     files: HashMap<PathBuf, Arc<Mutex<FileStorage>>>,
     shm: HashMap<PathBuf, Arc<Mutex<MemoryShmInfo>>>,
     next_temp_id: u64,
+    config: MemoryVfsConfig,
+    usage: MemoryVfsUsageState,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +224,44 @@ impl MemoryVfs {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Create a new empty in-memory VFS with explicit growth limits.
+    pub fn new_with_config(config: MemoryVfsConfig) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MemoryVfsInner {
+                files: HashMap::new(),
+                shm: HashMap::new(),
+                next_temp_id: 0,
+                config,
+                usage: MemoryVfsUsageState::default(),
+            })),
+        }
+    }
+
+    /// Return the configured growth policy.
+    pub fn config(&self) -> Result<MemoryVfsConfig> {
+        Ok(self.inner.lock().map_err(|_| lock_err())?.config)
+    }
+
+    /// Snapshot tracked heap usage.
+    pub fn usage_snapshot(&self) -> Result<MemoryVfsUsageSnapshot> {
+        let inner = self.inner.lock().map_err(|_| lock_err())?;
+        Ok(MemoryVfsUsageSnapshot {
+            file_bytes: inner.usage.file_bytes,
+            file_reserved_bytes: inner.usage.file_reserved_bytes,
+            shm_bytes: inner.usage.shm_bytes,
+            shm_reserved_bytes: inner.usage.shm_reserved_bytes,
+            peak_reserved_bytes: inner.usage.peak_reserved_bytes,
+            growth_events: inner.usage.growth_events,
+            file_count: inner.files.len(),
+            shm_region_count: inner.shm.values().fold(0, |count, info_arc| {
+                count.saturating_add(info_arc.lock().map_or(0, |info| info.regions.len()))
+            }),
+            initial_reserve_bytes: inner.config.initial_reserve_bytes,
+            growth_chunk_bytes: inner.config.growth_chunk_bytes,
+            max_bytes: inner.config.max_bytes,
+        })
+    }
 }
 
 fn lock_err() -> FrankenError {
@@ -106,6 +277,60 @@ fn u64_to_usize(value: u64, what: &str) -> Result<usize> {
         what: what.to_string(),
         value: value.to_string(),
     })
+}
+
+fn round_up_to_chunk(required: usize, chunk: usize) -> usize {
+    if chunk <= 1 {
+        return required;
+    }
+    let remainder = required % chunk;
+    if remainder == 0 {
+        required
+    } else {
+        required.saturating_add(chunk - remainder)
+    }
+}
+
+fn next_growth_target(
+    current_reserved: usize,
+    required_len: usize,
+    initial_reserve_bytes: usize,
+    growth_chunk_bytes: usize,
+) -> usize {
+    let chunk = growth_chunk_bytes.max(1);
+    let rounded_required = round_up_to_chunk(required_len, chunk);
+    let doubled = current_reserved.saturating_mul(2).max(chunk);
+    rounded_required.max(doubled).max(initial_reserve_bytes)
+}
+
+fn ensure_total_reserved_within_limit(
+    usage: &MemoryVfsUsageState,
+    current_reserved: usize,
+    proposed_reserved: usize,
+    max_bytes: Option<usize>,
+) -> Result<()> {
+    let Some(max_bytes) = max_bytes else {
+        return Ok(());
+    };
+    let total_without_current = usage
+        .total_reserved_bytes()
+        .saturating_sub(current_reserved);
+    let proposed_total = total_without_current.saturating_add(proposed_reserved);
+    if proposed_total > max_bytes {
+        return Err(FrankenError::OutOfMemory);
+    }
+    Ok(())
+}
+
+fn shm_region_accounting(info: &MemoryShmInfo) -> (usize, usize) {
+    info.regions
+        .values()
+        .fold((0, 0), |(live, reserved), region| {
+            match region.heap_len_and_capacity() {
+                Some((len, cap)) => (live.saturating_add(len), reserved.saturating_add(cap)),
+                None => (live, reserved),
+            }
+        })
 }
 
 impl Vfs for MemoryVfs {
@@ -139,10 +364,28 @@ impl Vfs for MemoryVfs {
         let storage = if let Some(existing) = inner.files.get(&resolved_path) {
             Arc::clone(existing)
         } else if is_create {
-            let storage = Arc::new(Mutex::new(FileStorage::default()));
+            let initial_reserve_bytes = if flags.contains(VfsOpenFlags::MAIN_DB)
+                && !flags.contains(VfsOpenFlags::TEMP_DB)
+            {
+                inner.config.initial_reserve_bytes
+            } else {
+                0
+            };
+            ensure_total_reserved_within_limit(
+                &inner.usage,
+                0,
+                initial_reserve_bytes,
+                inner.config.max_bytes,
+            )?;
+            let storage = Arc::new(Mutex::new(FileStorage::with_reserved_capacity(
+                initial_reserve_bytes,
+            )?));
             inner
                 .files
                 .insert(resolved_path.clone(), Arc::clone(&storage));
+            inner
+                .usage
+                .apply_file_change(0, 0, 0, initial_reserve_bytes);
             storage
         } else {
             return Err(FrankenError::CannotOpen {
@@ -177,12 +420,24 @@ impl Vfs for MemoryVfs {
 
     fn delete(&self, _cx: &Cx, path: &Path, _sync_dir: bool) -> Result<()> {
         let mut inner = self.inner.lock().map_err(|_| lock_err())?;
-        inner.files.remove(path);
+        if let Some(storage) = inner.files.remove(path) {
+            let storage = storage.lock().map_err(|_| lock_err())?;
+            inner
+                .usage
+                .apply_file_change(storage.data.len(), storage.data.capacity(), 0, 0);
+        }
         // `xDelete` may target either the main database path or the explicit
         // `*-shm` sidecar. Clear both the exact path and the derived SHM sidecar
         // key so delete/recreate cycles do not inherit stale SHM regions/locks.
-        inner.shm.remove(path);
-        inner.shm.remove(&sqlite_shm_path(path));
+        for shm_path in [path.to_path_buf(), sqlite_shm_path(path)] {
+            if let Some(info_arc) = inner.shm.remove(&shm_path) {
+                let info = info_arc.lock().map_err(|_| lock_err())?;
+                let (live_bytes, reserved_bytes) = shm_region_accounting(&info);
+                inner
+                    .usage
+                    .apply_shm_change(live_bytes, reserved_bytes, 0, 0);
+            }
+        }
         Ok(())
     }
 
@@ -224,23 +479,55 @@ pub struct MemoryFile {
 }
 
 impl MemoryFile {
-    fn write_into_storage(storage: &mut FileStorage, buf: &[u8], offset: u64) -> Result<()> {
+    fn write_into_storage(
+        inner: &mut MemoryVfsInner,
+        storage: &mut FileStorage,
+        buf: &[u8],
+        offset: u64,
+    ) -> Result<()> {
         let offset = u64_to_usize(offset, "write offset")?;
         let end = offset.checked_add(buf.len()).ok_or_else(|| {
             FrankenError::Io(std::io::Error::other("write offset + length overflow"))
         })?;
 
+        let old_len = storage.data.len();
+        let old_reserved = storage.data.capacity();
+        if end > old_reserved {
+            let proposed_reserved = next_growth_target(
+                old_reserved,
+                end,
+                inner.config.initial_reserve_bytes,
+                inner.config.growth_chunk_bytes,
+            );
+            ensure_total_reserved_within_limit(
+                &inner.usage,
+                old_reserved,
+                proposed_reserved,
+                inner.config.max_bytes,
+            )?;
+            storage
+                .data
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .map_err(|_| FrankenError::OutOfMemory)?;
+        }
+
         if offset == storage.data.len() {
             // Fast path: appending exactly at the end. Skips zero-initialization.
             storage.data.extend_from_slice(buf);
-            return Ok(());
+        } else {
+            if end > storage.data.len() {
+                storage.data.resize(end, 0);
+            }
+
+            storage.data[offset..end].copy_from_slice(buf);
         }
 
-        if end > storage.data.len() {
-            storage.data.resize(end, 0);
-        }
-
-        storage.data[offset..end].copy_from_slice(buf);
+        inner.usage.apply_file_change(
+            old_len,
+            old_reserved,
+            storage.data.len(),
+            storage.data.capacity(),
+        );
         Ok(())
     }
 
@@ -443,11 +730,13 @@ impl VfsFile for MemoryFile {
 
         self.release_shm_owner_state(self.delete_on_close)?;
         if self.delete_on_close {
-            self.vfs
-                .lock()
-                .map_err(|_| lock_err())?
-                .files
-                .remove(&self.path);
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            if let Some(storage) = inner.files.remove(&self.path) {
+                let storage = storage.lock().map_err(|_| lock_err())?;
+                inner
+                    .usage
+                    .apply_file_change(storage.data.len(), storage.data.capacity(), 0, 0);
+            }
         }
         Ok(())
     }
@@ -481,8 +770,9 @@ impl VfsFile for MemoryFile {
     #[allow(clippy::significant_drop_tightening)]
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-        Self::write_into_storage(&mut storage, buf, offset)
+        Self::write_into_storage(&mut inner, &mut storage, buf, offset)
     }
 
     #[allow(clippy::significant_drop_tightening)]
@@ -491,11 +781,12 @@ impl VfsFile for MemoryFile {
         if writes.is_empty() {
             return Ok(());
         }
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
         if writes.len() == 1 {
             let (offset, data) = writes[0];
-            return Self::write_into_storage(&mut storage, data, offset);
+            return Self::write_into_storage(&mut inner, &mut storage, data, offset);
         }
 
         let mut normalized_writes = Vec::with_capacity(writes.len());
@@ -507,6 +798,27 @@ impl VfsFile for MemoryFile {
             })?;
             required_len = required_len.max(end);
             normalized_writes.push((offset, data));
+        }
+
+        let old_len = storage.data.len();
+        let old_reserved = storage.data.capacity();
+        if required_len > old_reserved {
+            let proposed_reserved = next_growth_target(
+                old_reserved,
+                required_len,
+                inner.config.initial_reserve_bytes,
+                inner.config.growth_chunk_bytes,
+            );
+            ensure_total_reserved_within_limit(
+                &inner.usage,
+                old_reserved,
+                proposed_reserved,
+                inner.config.max_bytes,
+            )?;
+            storage
+                .data
+                .try_reserve_exact(proposed_reserved.saturating_sub(old_reserved))
+                .map_err(|_| FrankenError::OutOfMemory)?;
         }
 
         if required_len > storage.data.len() {
@@ -521,12 +833,21 @@ impl VfsFile for MemoryFile {
                 storage.data[offset..end].copy_from_slice(data);
             }
         }
+        inner.usage.apply_file_change(
+            old_len,
+            old_reserved,
+            storage.data.len(),
+            storage.data.capacity(),
+        );
         Ok(())
     }
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         let size = u64_to_usize(size, "truncate size")?;
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        let old_len = storage.data.len();
+        let old_reserved = storage.data.capacity();
         // SQLite xTruncate semantics: only shrink, never extend.
         if size < storage.data.len() {
             storage.data.truncate(size);
@@ -536,6 +857,12 @@ impl VfsFile for MemoryFile {
                 storage.data.shrink_to_fit();
             }
         }
+        inner.usage.apply_file_change(
+            old_len,
+            old_reserved,
+            storage.data.len(),
+            storage.data.capacity(),
+        );
         drop(storage);
         Ok(())
     }

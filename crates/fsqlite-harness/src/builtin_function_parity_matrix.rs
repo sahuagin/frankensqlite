@@ -702,6 +702,26 @@ impl BuiltinFunctionParityMatrix {
         );
         add(
             FunctionFamily::Meta,
+            "sqlite_compileoption_used() / sqlite_compileoption_get()",
+            "compile_option_introspection_contract",
+            VerificationStatus::Passing,
+            &[
+                "SELECT sqlite_compileoption_used('THREADSAFE')",
+                "SELECT sqlite_compileoption_used('SQLITE_ENABLE_ICU')",
+                "SELECT sqlite_compileoption_get(0)",
+                "PRAGMA compile_options",
+            ],
+            &[(
+                "crates/fsqlite-harness/tests/bd_2yqp6_5_1_function_parity_matrix.rs",
+                "test_sqlite_meta_functions",
+                VerificationOracle::MetadataAssertion,
+            )],
+            "Verifies the exposed compile-option surface, including optional SQLITE_-prefix handling and alignment with PRAGMA compile_options.",
+            None,
+            &["meta", "introspection"],
+        );
+        add(
+            FunctionFamily::Meta,
             "changes() / total_changes()",
             "stateful_change_counters",
             VerificationStatus::Passing,

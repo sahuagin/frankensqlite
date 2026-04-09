@@ -1,9 +1,9 @@
 //! Built-in core scalar functions (§13.1).
 //!
 //! Implements 60+ SQLite scalar functions with exact NULL-propagation
-//! semantics. Functions that need connection state (changes, total_changes,
-//! last_insert_rowid, sqlite_offset) are registered as stubs that will be
-//! wired to connection context when the VDBE is integrated.
+//! semantics. The connection-state helpers `changes()`, `total_changes()`,
+//! and `last_insert_rowid()` are projected through thread-local connection
+//! state. `sqlite_offset()` remains unwired.
 #![allow(
     clippy::unnecessary_literal_bound,
     clippy::too_many_lines,
@@ -101,6 +101,58 @@ pub fn get_total_changes() -> i64 {
 /// Reset the cumulative total changes counter (called on new connection open).
 pub fn reset_total_changes() {
     TOTAL_CHANGES.set(0);
+}
+
+const SQLITE_COMPILE_OPTIONS: &[&str] = &[
+    "COMPILER=rustc",
+    "ENABLE_FTS5",
+    "ENABLE_GEOPOLY",
+    "ENABLE_ICU",
+    "ENABLE_JSON1",
+    "ENABLE_RTREE",
+    "FRANKENSQLITE",
+    "OMIT_LOAD_EXTENSION",
+    "THREADSAFE=1",
+];
+
+/// Return the canonical compile-option surface exposed by FrankenSQLite.
+#[must_use]
+pub fn sqlite_compile_options() -> &'static [&'static str] {
+    SQLITE_COMPILE_OPTIONS
+}
+
+fn is_sqlite_compile_option_match(query: &str, option: &str) -> bool {
+    let trimmed = query.trim();
+    let normalized = if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SQLITE_"))
+    {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
+    if normalized.is_empty() {
+        return false;
+    }
+    if option.eq_ignore_ascii_case(normalized) {
+        return true;
+    }
+    option
+        .get(..normalized.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(normalized))
+        && option
+            .as_bytes()
+            .get(normalized.len())
+            .is_none_or(|next| !next.is_ascii_alphanumeric() && *next != b'_')
+}
+
+/// Report whether the given SQLite-style compile-option query matches the
+/// current FrankenSQLite build surface.
+#[must_use]
+pub fn sqlite_compileoption_used(query: &str) -> bool {
+    sqlite_compile_options()
+        .iter()
+        .any(|option| is_sqlite_compile_option_match(query, option))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1481,13 +1533,9 @@ impl ScalarFunction for SqliteCompileoptionUsedFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let opt = args[0].to_text().to_ascii_uppercase();
-        // Report our known compile options
-        let known = matches!(
-            opt.as_str(),
-            "THREADSAFE" | "ENABLE_FTS5" | "ENABLE_JSON1" | "ENABLE_RTREE"
-        );
-        Ok(SqliteValue::Integer(i64::from(known)))
+        Ok(SqliteValue::Integer(i64::from(sqlite_compileoption_used(
+            &args[0].to_text(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1509,14 +1557,8 @@ impl ScalarFunction for SqliteCompileoptionGetFunc {
             return Ok(SqliteValue::Null);
         }
         let n = args[0].to_integer();
-        let options = [
-            "THREADSAFE=1",
-            "ENABLE_FTS5",
-            "ENABLE_JSON1",
-            "ENABLE_RTREE",
-        ];
         #[allow(clippy::cast_sign_loss)]
-        match options.get(n as usize) {
+        match sqlite_compile_options().get(n as usize) {
             Some(opt) => Ok(SqliteValue::Text(SmallText::new(opt))),
             None => Ok(SqliteValue::Null),
         }
@@ -1741,10 +1783,9 @@ impl ScalarFunction for UnistrFunc {
     }
 }
 
-// ── Connection-state stubs ──────────────────────────────────────────────
-// These functions need database connection context. They are registered
-// as placeholders that return NotImplemented until the VDBE integration
-// provides the connection state.
+// ── Connection-state helpers ────────────────────────────────────────────
+// These functions reflect connection-local counters projected into this
+// thread by the connection layer around statement execution.
 
 pub struct ChangesFunc;
 
@@ -3450,6 +3491,78 @@ mod tests {
             }
             other => unreachable!("expected text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_sqlite_compileoption_used_matches_sqlite_prefix_and_value_options() {
+        let func = SqliteCompileoptionUsedFunc;
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Text(SmallText::from_string("THREADSAFE"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Text(SmallText::from_string("SQLITE_ENABLE_ICU"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Text(SmallText::from_string("sqlite_enable_icu"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Text(SmallText::from_string("OMIT_LOAD_EXTENSION"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Text(SmallText::from_string("ENABLE_FTS3"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            invoke1(&func, SqliteValue::Null).unwrap(),
+            SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn test_sqlite_compileoption_get_enumerates_canonical_option_list() {
+        let func = SqliteCompileoptionGetFunc;
+        for (index, option) in sqlite_compile_options().iter().enumerate() {
+            assert_eq!(
+                invoke1(&func, SqliteValue::Integer(index as i64)).unwrap(),
+                SqliteValue::Text(SmallText::new(option))
+            );
+        }
+        assert_eq!(
+            invoke1(&func, SqliteValue::Integer(-1)).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            invoke1(
+                &func,
+                SqliteValue::Integer(sqlite_compile_options().len() as i64)
+            )
+            .unwrap(),
+            SqliteValue::Null
+        );
     }
 
     // ── register_builtins ────────────────────────────────────────────────

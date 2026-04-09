@@ -42,20 +42,8 @@ fn oracle_compare(
                 .map_err(|e| format!("row: {e}"))?;
             Ok(rows)
         })();
-        let csql_result = match csql_result {
-            Ok(r) => r,
-            Err(csql_err) => {
-                if frank_result.is_ok() {
-                    mismatches.push(format!(
-                        "DIVERGE: {query}\n  frank: OK\n  csql:  ERROR({csql_err})"
-                    ));
-                }
-                continue;
-            }
-        };
-
-        match frank_result {
-            Ok(rows) => {
+        match (frank_result, csql_result) {
+            (Ok(rows), Ok(csql_rows)) => {
                 let frank_strs: Vec<Vec<String>> = rows
                     .iter()
                     .map(|row| {
@@ -77,20 +65,40 @@ fn oracle_compare(
                     })
                     .collect();
 
-                if frank_strs != csql_result {
+                if frank_strs != csql_rows {
                     mismatches.push(format!(
-                        "MISMATCH: {query}\n  frank: {frank_strs:?}\n  csql:  {csql_result:?}"
+                        "MISMATCH: {query}\n  frank: {frank_strs:?}\n  csql:  {csql_rows:?}"
                     ));
                 }
             }
-            Err(e) => {
+            (Ok(_), Err(csql_err)) => {
                 mismatches.push(format!(
-                    "FRANK_ERR: {query}\n  frank: {e}\n  csql:  {csql_result:?}"
+                    "DIVERGE: {query}\n  frank: OK\n  csql:  ERROR({csql_err})"
+                ));
+            }
+            (Err(e), Ok(csql_rows)) => {
+                mismatches.push(format!(
+                    "FRANK_ERR: {query}\n  frank: {e}\n  csql:  {csql_rows:?}"
+                ));
+            }
+            (Err(frank_err), Err(csql_err)) => {
+                mismatches.push(format!(
+                    "BOTH_ERROR: {query}\n  frank: ERROR({frank_err})\n  csql:  ERROR({csql_err})"
                 ));
             }
         }
     }
     mismatches
+}
+
+#[test]
+fn test_oracle_compare_flags_dual_error_cases() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let mismatches = oracle_compare(&fconn, &rconn, &["SELECT * FROM missing_oracle_s55_table"]);
+    assert_eq!(mismatches.len(), 1);
+    assert!(mismatches[0].contains("BOTH_ERROR"));
 }
 
 #[test]

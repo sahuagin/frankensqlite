@@ -1577,14 +1577,45 @@ fn test_sqlite_meta_functions() {
         SqliteValue::Text("text".to_string().into())
     );
 
-    // sqlite_compileoption_used should return 0 or 1
+    // sqlite_compileoption_used should expose the configured feature surface
     let rows = conn
-        .query("SELECT sqlite_compileoption_used('THREADSAFE')")
+        .query(
+            "SELECT \
+             sqlite_compileoption_used('THREADSAFE'), \
+             sqlite_compileoption_used('SQLITE_ENABLE_ICU'), \
+             sqlite_compileoption_used('ENABLE_FTS3')",
+        )
         .unwrap();
-    match &rows[0].values()[0] {
-        SqliteValue::Integer(v) => assert!(*v == 0 || *v == 1),
-        other => panic!("expected integer, got {other:?}"),
+    assert_eq!(
+        rows[0].values(),
+        &[
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(0),
+        ]
+    );
+
+    let pragma_rows = conn.query("PRAGMA compile_options").unwrap();
+    let pragma_options: Vec<String> = pragma_rows
+        .iter()
+        .map(|row| match &row.values()[0] {
+            SqliteValue::Text(s) => s.to_string(),
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect();
+
+    let mut get_options = Vec::new();
+    for index in 0_i64.. {
+        let rows = conn
+            .query(&format!("SELECT sqlite_compileoption_get({index})"))
+            .unwrap();
+        match &rows[0].values()[0] {
+            SqliteValue::Text(option) => get_options.push(option.to_string()),
+            SqliteValue::Null => break,
+            other => panic!("expected text or null, got {other:?}"),
+        }
     }
+    assert_eq!(pragma_options, get_options);
 
     println!("[meta_functions] all assertions passed");
 }
