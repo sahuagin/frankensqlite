@@ -589,17 +589,29 @@ impl Default for WriterRoutingSyntheticConfig {
 impl WriterRoutingSyntheticConfig {
     #[must_use]
     pub const fn effective_lane_count(&self) -> u16 {
-        self.lane_count.max(1)
+        if self.lane_count == 0 {
+            1
+        } else {
+            self.lane_count
+        }
     }
 
     #[must_use]
     pub const fn effective_iterations(&self) -> u32 {
-        self.iterations.max(1)
+        if self.iterations == 0 {
+            1
+        } else {
+            self.iterations
+        }
     }
 
     #[must_use]
     pub const fn effective_writers_per_iteration(&self) -> u16 {
-        self.writers_per_iteration.max(1)
+        if self.writers_per_iteration == 0 {
+            1
+        } else {
+            self.writers_per_iteration
+        }
     }
 }
 
@@ -1017,7 +1029,7 @@ pub fn evaluate_writer_routing_synthetic_workload(
         }
 
         let shared_pages = synthetic_shared_pages(config.workload, writer_index);
-        for shared_page in shared_pages {
+        for &shared_page in &shared_pages {
             if let Some(owner) = page_owners.get(&shared_page).copied() {
                 input.touch_surface.same_page_conflict_pages.push(shared_page);
                 input.conflict_history.same_page_conflict_count =
@@ -1615,8 +1627,12 @@ fn percentile_u64(values: &[u64], p: f64) -> u64 {
     let lo_value = sorted[lo] as f64;
     #[allow(clippy::cast_precision_loss)]
     let hi_value = sorted[hi] as f64;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    lo_value.mul_add(1.0 - frac, hi_value * frac).round() as u64
+    round_percentile_value(lo_value.mul_add(1.0 - frac, hi_value * frac))
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn round_percentile_value(value: f64) -> u64 {
+    value.round() as u64
 }
 
 #[cfg(test)]
@@ -1626,9 +1642,11 @@ mod tests {
         WriterHomeHintDisposition, WriterOwnershipLineageTelemetry, WriterRoutingDecisionConfig,
         WriterRoutingDecisionError, WriterRoutingDecisionReason, WriterRoutingHintDegradation,
         WriterRoutingLaneId, WriterRoutingLaneSnapshot, WriterRoutingNodeId,
-        WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass,
-        WriterRoutingTelemetryInput, WriterRoutingTelemetrySignal, WriterTouchSurfaceTelemetry,
-        decide_writer_routing_target,
+        WriterRoutingPlacementProfile, WriterRoutingSyntheticConfig,
+        WriterRoutingSyntheticWorkload, WriterRoutingTelemetryCaptureCost,
+        WriterRoutingTelemetryClass, WriterRoutingTelemetryInput,
+        WriterRoutingTelemetrySignal, WriterTouchSurfaceTelemetry,
+        compare_writer_routing_synthetic_workload, decide_writer_routing_target,
     };
     use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
 
@@ -1985,5 +2003,93 @@ mod tests {
             decision.reason,
             WriterRoutingDecisionReason::StableHashFallback
         );
+    }
+
+    fn synthetic_config(
+        scenario_id: &str,
+        workload: WriterRoutingSyntheticWorkload,
+        placement_profile: WriterRoutingPlacementProfile,
+    ) -> WriterRoutingSyntheticConfig {
+        WriterRoutingSyntheticConfig {
+            scenario_id: scenario_id.to_owned(),
+            workload,
+            placement_profile,
+            lane_count: 4,
+            iterations: 12,
+            writers_per_iteration: 4,
+        }
+    }
+
+    #[test]
+    fn test_writer_routing_synthetic_disjoint_workload_stays_conflict_free() {
+        let comparison = compare_writer_routing_synthetic_workload(
+            &synthetic_config(
+                "writer_routing.synthetic.disjoint",
+                WriterRoutingSyntheticWorkload::DisjointPages,
+                WriterRoutingPlacementProfile::HomeLanePinned,
+            ),
+            WriterRoutingDecisionConfig::default(),
+        );
+
+        assert_eq!(comparison.baseline.conflicts_total, 0);
+        assert_eq!(comparison.baseline.retries_total, 0);
+        assert_eq!(comparison.routed.conflicts_total, 0);
+        assert_eq!(comparison.routed.retries_total, 0);
+        assert_eq!(comparison.baseline.publication_retry_total, 0);
+        assert_eq!(comparison.routed.publication_retry_total, 0);
+        assert!(comparison.routed.p99_latency_ns() <= comparison.baseline.p99_latency_ns());
+    }
+
+    #[test]
+    fn test_writer_routing_synthetic_overlapping_workload_reduces_conflicts_vs_baseline() {
+        let comparison = compare_writer_routing_synthetic_workload(
+            &synthetic_config(
+                "writer_routing.synthetic.overlap",
+                WriterRoutingSyntheticWorkload::OverlappingPages,
+                WriterRoutingPlacementProfile::HomeLanePinned,
+            ),
+            WriterRoutingDecisionConfig::default(),
+        );
+
+        assert!(comparison.routed.conflicts_total < comparison.baseline.conflicts_total);
+        assert!(comparison.routed.retries_total < comparison.baseline.retries_total);
+        assert!(
+            comparison.routed.remote_ownership_events
+                < comparison.baseline.remote_ownership_events
+        );
+        assert!(
+            comparison.routed.publication_retry_total
+                < comparison.baseline.publication_retry_total
+        );
+        assert!(comparison.conflict_rate_delta() < 0.0);
+        assert!(comparison.retry_rate_delta() < 0.0);
+    }
+
+    #[test]
+    fn test_writer_routing_synthetic_hot_page_workload_reduces_publication_handoffs() {
+        let comparison = compare_writer_routing_synthetic_workload(
+            &synthetic_config(
+                "writer_routing.synthetic.hot_page",
+                WriterRoutingSyntheticWorkload::HotPageContention,
+                WriterRoutingPlacementProfile::HomeNodePinned,
+            ),
+            WriterRoutingDecisionConfig::default(),
+        );
+
+        assert!(comparison.routed.conflicts_total < comparison.baseline.conflicts_total);
+        assert!(comparison.routed.retries_total < comparison.baseline.retries_total);
+        assert!(
+            comparison.routed.publication_retry_total
+                < comparison.baseline.publication_retry_total
+        );
+        assert!(
+            comparison.routed.visibility_handoff_nanos_total
+                < comparison.baseline.visibility_handoff_nanos_total
+        );
+        assert!(
+            comparison.routed.stale_snapshot_rejects_total
+                < comparison.baseline.stale_snapshot_rejects_total
+        );
+        assert!(comparison.publication_retry_rate_delta() < 0.0);
     }
 }
