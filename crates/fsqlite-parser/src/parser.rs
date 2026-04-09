@@ -123,6 +123,35 @@ impl fmt::Display for ParseError {
 
 impl Error for ParseError {}
 
+/// Caller-owned statement parse scratch.
+///
+/// The parser still allocates AST nodes normally, but repeated statement-cache
+/// misses can now keep token/error vectors hot and reset them wholesale at the
+/// statement boundary instead of rebuilding fresh `Vec`s on every parse.
+#[derive(Debug, Default)]
+pub struct StatementParseScratch {
+    tokens: Vec<Token>,
+    errors: Vec<ParseError>,
+}
+
+impl StatementParseScratch {
+    /// Clear logical contents while retaining backing allocations for reuse.
+    pub fn reset(&mut self) {
+        self.tokens.clear();
+        self.errors.clear();
+    }
+
+    #[must_use]
+    pub fn token_capacity(&self) -> usize {
+        self.tokens.capacity()
+    }
+
+    #[must_use]
+    pub fn error_capacity(&self) -> usize {
+        self.errors.capacity()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -2120,6 +2149,58 @@ impl Parser {
             }
         }
     }
+}
+
+fn parse_statements_with_scratch_inner(
+    sql: &str,
+    scratch: &mut StatementParseScratch,
+) -> (Vec<Statement>, Option<ParseError>) {
+    Lexer::tokenize_into(sql, &mut scratch.tokens);
+    let mut parser = Parser {
+        tokens: std::mem::take(&mut scratch.tokens),
+        pos: 0,
+        errors: std::mem::take(&mut scratch.errors),
+        depth: 0,
+    };
+    let (statements, errors) = parser.parse_all();
+    scratch.tokens = parser.tokens;
+    scratch.tokens.clear();
+    scratch.errors = errors;
+    let first_error = scratch.errors.first().cloned();
+    scratch.errors.clear();
+    (statements, first_error)
+}
+
+/// Parse all statements from `sql` using caller-owned token/error lookaside.
+pub fn parse_statements_with_scratch(
+    sql: &str,
+    scratch: &mut StatementParseScratch,
+) -> Result<Vec<Statement>, ParseError> {
+    let (statements, first_error) = parse_statements_with_scratch_inner(sql, scratch);
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if statements.is_empty() {
+        return Err(ParseError::at("no SQL statement provided", None));
+    }
+    Ok(statements)
+}
+
+/// Parse exactly one statement from `sql` using caller-owned lookaside.
+pub fn parse_single_statement_with_scratch(
+    sql: &str,
+    scratch: &mut StatementParseScratch,
+) -> Result<Statement, ParseError> {
+    let statements = parse_statements_with_scratch(sql, scratch)?;
+    let mut iter = statements.into_iter();
+    let statement = iter.next().ok_or_else(|| ParseError::at("no SQL statement provided", None))?;
+    if iter.next().is_some() {
+        return Err(ParseError::at(
+            "multiple statements are not supported in this API path",
+            None,
+        ));
+    }
+    Ok(statement)
 }
 
 /// Parse only the first top-level SQL statement from `sql` and report the byte
@@ -7892,11 +7973,11 @@ mod tests {
             #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
 
             #[test]
-            fn test_parser_fuzz_no_panic(input in prop::collection::vec(any::<u8>(), 0..256)) {
-                let sql = String::from_utf8_lossy(&input);
-                // Must not panic — errors are fine, panics are not.
-                let mut p = Parser::from_sql(&sql);
-                let _ = p.parse_all();
+    fn test_parser_fuzz_no_panic(input in prop::collection::vec(any::<u8>(), 0..256)) {
+        let sql = String::from_utf8_lossy(&input);
+        // Must not panic — errors are fine, panics are not.
+        let mut p = Parser::from_sql(&sql);
+        let _ = p.parse_all();
             }
         }
 
@@ -8008,6 +8089,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_parse_statements_with_scratch_reuses_token_and_error_capacity() {
+        let mut scratch = StatementParseScratch::default();
+        let err = parse_statements_with_scratch("SELECT FROM", &mut scratch)
+            .expect_err("malformed SQL should surface a parse error");
+        assert!(
+            err.message.contains("expected"),
+            "malformed parse should preserve its diagnostic detail",
+        );
+        let warmed_token_capacity = scratch.token_capacity();
+        let warmed_error_capacity = scratch.error_capacity();
+        assert!(warmed_token_capacity > 0, "parse scratch should warm token storage");
+        assert!(warmed_error_capacity > 0, "parse scratch should warm error storage");
+
+        let statements = parse_statements_with_scratch("SELECT 1;", &mut scratch)
+            .expect("follow-up parse should succeed");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            scratch.token_capacity(),
+            warmed_token_capacity,
+            "successful parse should reuse token scratch capacity",
+        );
+        assert_eq!(
+            scratch.error_capacity(),
+            warmed_error_capacity,
+            "successful parse should preserve error scratch capacity for the next recovery path",
+        );
     }
 
     // ── bd-1702 repro tests ─────────────────────────────────────────────

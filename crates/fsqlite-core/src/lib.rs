@@ -37,6 +37,7 @@ pub mod symbol_log;
 pub mod symbol_size_policy;
 pub mod tiered_storage;
 pub mod transaction;
+pub mod vacuum;
 pub mod wal_adapter;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod wal_fec_adapter;

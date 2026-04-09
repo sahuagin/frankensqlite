@@ -4,7 +4,7 @@
 // label resolution, register allocation, coroutine mechanism, and disassembly.
 // The foundational types (Opcode, VdbeOp, P4) live in fsqlite-types.
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
@@ -70,6 +70,45 @@ fn register_range(start: i32, len: i32) -> (i32, i32) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpTargetBounds {
+    Instruction,
+    InitEntry,
+}
+
+fn verify_jump_target_operand(
+    pc: usize,
+    opcode: Opcode,
+    operand_name: &'static str,
+    target: i32,
+    op_count: usize,
+    bounds: JumpTargetBounds,
+) -> Result<()> {
+    let Ok(target_usize) = usize::try_from(target) else {
+        return Err(FrankenError::Internal(format!(
+            "bytecode verification failed at pc {pc}: {} {operand_name} target {target} is negative",
+            opcode.name()
+        )));
+    };
+
+    let in_bounds = match bounds {
+        JumpTargetBounds::Instruction => target_usize < op_count,
+        JumpTargetBounds::InitEntry => target_usize <= op_count,
+    };
+    if in_bounds {
+        return Ok(());
+    }
+
+    let allowed_range = match bounds {
+        JumpTargetBounds::Instruction => format!("0..{op_count}"),
+        JumpTargetBounds::InitEntry => format!("0..={op_count}"),
+    };
+    Err(FrankenError::Internal(format!(
+        "bytecode verification failed at pc {pc}: {} {operand_name} target {target} is outside {allowed_range}",
+        opcode.name()
+    )))
+}
+
 pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
     let (read_start, read_len, write_start, write_len) = match op.opcode {
         Opcode::Integer
@@ -129,21 +168,25 @@ pub(crate) fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
             (read_start, read_len, write_start, write_len)
         }
         Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
-            let (read_start, read_len) = register_range(op.p1, 1);
+            let (lhs_start, lhs_len) = register_range(op.p1, 1);
             let (rhs_start, rhs_len) = register_range(op.p3, 1);
-            let normalized_start = if read_start > 0 && rhs_start > 0 {
-                read_start.min(rhs_start)
-            } else if read_start > 0 {
-                read_start
+            let (normalized_start, normalized_len) = if lhs_start > 0 && rhs_start > 0 {
+                let start = lhs_start.min(rhs_start);
+                let end = (lhs_start + lhs_len - 1).max(rhs_start + rhs_len - 1);
+                (start, end - start + 1)
+            } else if lhs_start > 0 {
+                (lhs_start, lhs_len)
+            } else if rhs_start > 0 {
+                (rhs_start, rhs_len)
             } else {
-                rhs_start
+                (-1, 0)
             };
-            let normalized_len = if read_start > 0 && rhs_start > 0 && read_start != rhs_start {
-                2
+            let (write_start, write_len) = if (op.p5 & 0x20) != 0 {
+                register_range(op.p2, 1)
             } else {
-                read_len.max(rhs_len)
+                (-1, 0)
             };
-            (normalized_start, normalized_len, -1, 0)
+            (normalized_start, normalized_len, write_start, write_len)
         }
         Opcode::If | Opcode::IfNot | Opcode::IsNull | Opcode::NotNull | Opcode::IsTrue => {
             let (read_start, read_len) = register_range(op.p1, 1);
@@ -586,13 +629,17 @@ impl ProgramBuilder {
                 ops.last().map(|op| op.opcode)
             );
         }
-        Ok(VdbeProgram {
+        let requires_attached_memdb = compute_requires_attached_memdb(&ops);
+        let program = VdbeProgram {
             ops,
             register_count: self.regs.count().max(inferred_register_count),
             bind_parameter_requirement,
             table_index_meta: Arc::new(table_index_meta),
             has_insert,
-        })
+            requires_attached_memdb,
+        };
+        program.verify_control_flow_targets()?;
+        Ok(program)
     }
 }
 
@@ -671,6 +718,92 @@ fn peephole_fuse_append_insert(ops: &mut smallvec::SmallVec<[VdbeOp; 64]>) {
     // the correctness risk. Keep opcode defined for future proper implementation.
 }
 
+/// Returns `true` when a finalized program still needs an attached
+/// `MemDatabase` to preserve its current semantics.
+///
+/// This is intentionally conservative. It only returns `false` for programs
+/// that stay on storage cursors plus pure register/control-flow opcodes, which
+/// lets hot prepared table executions skip the `MemDatabase` handoff entirely.
+fn compute_requires_attached_memdb(ops: &[VdbeOp]) -> bool {
+    let mut storage_cursor_ids = HashSet::new();
+
+    for op in ops {
+        match op.opcode {
+            Opcode::OpenRead | Opcode::OpenWrite | Opcode::FusedOpenWriteLast => {
+                storage_cursor_ids.insert(op.p1);
+            }
+            Opcode::Close => {
+                storage_cursor_ids.remove(&op.p1);
+            }
+            Opcode::OpenEphemeral
+            | Opcode::OpenAutoindex
+            | Opcode::OpenPseudo
+            | Opcode::OpenDup
+            | Opcode::ReopenIdx
+            | Opcode::SorterOpen
+            | Opcode::CreateBtree
+            | Opcode::Clear
+            | Opcode::Destroy
+            | Opcode::Pagecount
+            | Opcode::Program
+            | Opcode::VBegin
+            | Opcode::VCreate
+            | Opcode::VDestroy
+            | Opcode::VOpen
+            | Opcode::VCheck
+            | Opcode::VInitIn
+            | Opcode::VFilter
+            | Opcode::VColumn
+            | Opcode::VNext
+            | Opcode::VRename
+            | Opcode::VUpdate => return true,
+            Opcode::Rewind
+            | Opcode::Last
+            | Opcode::Next
+            | Opcode::Prev
+            | Opcode::Column
+            | Opcode::Count
+            | Opcode::SeekLT
+            | Opcode::SeekLE
+            | Opcode::SeekGE
+            | Opcode::SeekGT
+            | Opcode::IfNoHope
+            | Opcode::NoConflict
+            | Opcode::NotFound
+            | Opcode::Found
+            | Opcode::SeekRowid
+            | Opcode::NotExists
+            | Opcode::Insert
+            | Opcode::Delete
+            | Opcode::RowData
+            | Opcode::Rowid
+            | Opcode::NullRow
+            | Opcode::IfNullRow
+            | Opcode::IfEmpty
+            | Opcode::IfSizeBetween
+            | Opcode::IdxInsert
+            | Opcode::IdxDelete
+            | Opcode::DeferredSeek
+            | Opcode::IdxRowid
+            | Opcode::FinishSeek
+            | Opcode::IdxLE
+            | Opcode::IdxGT
+            | Opcode::IdxLT
+            | Opcode::IdxGE
+            | Opcode::SetSnapshot
+            | Opcode::CountIndexEqRun
+            | Opcode::FusedAppendInsert => {
+                if !storage_cursor_ids.contains(&op.p1) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 // ── VDBE Program ────────────────────────────────────────────────────────────
 
 pub(crate) type TableIndexMetaMap = HashMap<i32, Box<[fsqlite_types::opcode::IndexCursorMeta]>>;
@@ -692,9 +825,132 @@ pub struct VdbeProgram {
     /// Precomputed flag: true when the program contains at least one Insert
     /// opcode, meaning column defaults may be needed during execution.
     has_insert: bool,
+    /// Precomputed flag: true when execution still needs an attached
+    /// `MemDatabase` to preserve current opcode semantics.
+    requires_attached_memdb: bool,
 }
 
 impl VdbeProgram {
+    fn verify_control_flow_targets(&self) -> Result<()> {
+        let op_count = self.ops.len();
+        for (pc, op) in self.ops.iter().enumerate() {
+            match op.opcode {
+                Opcode::Init => verify_jump_target_operand(
+                    pc,
+                    op.opcode,
+                    "p2",
+                    op.p2,
+                    op_count,
+                    JumpTargetBounds::InitEntry,
+                )?,
+                Opcode::Goto
+                | Opcode::Gosub
+                | Opcode::Once
+                | Opcode::If
+                | Opcode::IfNot
+                | Opcode::IsNull
+                | Opcode::NotNull
+                | Opcode::Rewind
+                | Opcode::Sort
+                | Opcode::SorterSort
+                | Opcode::Last
+                | Opcode::Next
+                | Opcode::SorterNext
+                | Opcode::Prev
+                | Opcode::SeekRowid
+                | Opcode::SeekGE
+                | Opcode::SeekGT
+                | Opcode::SeekLE
+                | Opcode::SeekLT
+                | Opcode::NotFound
+                | Opcode::NotExists
+                | Opcode::IfNoHope
+                | Opcode::Found
+                | Opcode::NoConflict
+                | Opcode::SorterCompare
+                | Opcode::IfNullRow
+                | Opcode::IfNotOpen
+                | Opcode::IsType
+                | Opcode::IfEmpty
+                | Opcode::IfSizeBetween
+                | Opcode::IdxRowid
+                | Opcode::IdxLE
+                | Opcode::IdxGT
+                | Opcode::IdxLT
+                | Opcode::IdxGE
+                | Opcode::DecrJumpZero
+                | Opcode::IfPos
+                | Opcode::RowSetRead
+                | Opcode::RowSetTest
+                | Opcode::FkIfZero
+                | Opcode::IfNotZero
+                | Opcode::IncrVacuum
+                | Opcode::Filter
+                | Opcode::VFilter
+                | Opcode::VNext => verify_jump_target_operand(
+                    pc,
+                    op.opcode,
+                    "p2",
+                    op.p2,
+                    op_count,
+                    JumpTargetBounds::Instruction,
+                )?,
+                Opcode::MustBeInt | Opcode::InitCoroutine => {
+                    if op.p2 > 0 {
+                        verify_jump_target_operand(
+                            pc,
+                            op.opcode,
+                            "p2",
+                            op.p2,
+                            op_count,
+                            JumpTargetBounds::Instruction,
+                        )?;
+                    }
+                }
+                Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
+                    if (op.p5 & 0x20) == 0 {
+                        verify_jump_target_operand(
+                            pc,
+                            op.opcode,
+                            "p2",
+                            op.p2,
+                            op_count,
+                            JumpTargetBounds::Instruction,
+                        )?;
+                    }
+                }
+                Opcode::Jump => {
+                    verify_jump_target_operand(
+                        pc,
+                        op.opcode,
+                        "p1",
+                        op.p1,
+                        op_count,
+                        JumpTargetBounds::Instruction,
+                    )?;
+                    verify_jump_target_operand(
+                        pc,
+                        op.opcode,
+                        "p2",
+                        op.p2,
+                        op_count,
+                        JumpTargetBounds::Instruction,
+                    )?;
+                    verify_jump_target_operand(
+                        pc,
+                        op.opcode,
+                        "p3",
+                        op.p3,
+                        op_count,
+                        JumpTargetBounds::Instruction,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// The instruction sequence.
     pub fn ops(&self) -> &[VdbeOp] {
         &self.ops
@@ -743,6 +999,12 @@ impl VdbeProgram {
     /// Precomputed at build time — O(1) at call time.
     pub fn has_insert_ops(&self) -> bool {
         self.has_insert
+    }
+
+    /// Returns `true` when this program still requires an attached
+    /// `MemDatabase` for opcode semantics.
+    pub fn requires_attached_memdb(&self) -> bool {
+        self.requires_attached_memdb
     }
 
     /// Disassemble the program to a human-readable string.
@@ -1855,6 +2117,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_program_builder_infers_register_count_for_non_contiguous_comparison_operands() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Eq, 2, 0, 7, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder.finish().expect("program should build");
+        assert_eq!(
+            program.register_count(),
+            7,
+            "comparison opcodes must account for both read registers even when they are not contiguous",
+        );
+    }
+
+    #[test]
+    fn test_program_builder_infers_register_count_for_store_p2_comparisons() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Eq, 2, 9, 7, P4::None, 0x20);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = builder.finish().expect("program should build");
+        assert_eq!(
+            program.register_count(),
+            9,
+            "SQLITE_STOREP2 comparisons must reserve the destination register in the pre-sized register file",
+        );
+    }
+
+    #[test]
+    fn test_program_builder_rejects_out_of_bounds_goto_target() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Goto, 0, 99, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let err = builder.finish().expect_err("invalid jump target must fail");
+        match err {
+            FrankenError::Internal(message) => {
+                assert!(message.contains("Goto"));
+                assert!(message.contains("p2"));
+            }
+            other => panic!("expected internal verifier error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_program_builder_rejects_out_of_bounds_jump_branch_target() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Jump, 0, 1, 42, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let err = builder.finish().expect_err("invalid branch target must fail");
+        match err {
+            FrankenError::Internal(message) => {
+                assert!(message.contains("Jump"));
+                assert!(message.contains("p3"));
+            }
+            other => panic!("expected internal verifier error, got {other:?}"),
+        }
+    }
+
     // ── test_all_opcode_dispatch_coverage ────────────────────────────────
     #[test]
     fn test_all_opcode_dispatch_coverage() {
@@ -1940,6 +2262,44 @@ mod tests {
         b.emit_op(Opcode::Variable, 0, 1, 0, P4::None, 0);
         let prog = b.finish().unwrap();
         assert_eq!(prog.max_bind_parameter_index(), Err(0));
+    }
+
+    #[test]
+    fn test_program_storage_only_hot_path_does_not_require_attached_memdb() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, 256, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_op(Opcode::Count, 0, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            !prog.requires_attached_memdb(),
+            "storage-only table hot paths should not force a MemDatabase handoff"
+        );
+    }
+
+    #[test]
+    fn test_program_with_ephemeral_cursor_requires_attached_memdb() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenEphemeral, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            prog.requires_attached_memdb(),
+            "ephemeral table programs still depend on the attached MemDatabase"
+        );
     }
 
     #[test]

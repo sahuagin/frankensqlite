@@ -1046,24 +1046,7 @@ pub struct QuoteFunc;
 
 impl ScalarFunction for QuoteFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        let result = match &args[0] {
-            SqliteValue::Null => "NULL".to_owned(),
-            SqliteValue::Integer(i) => i.to_string(),
-            SqliteValue::Float(f) => format_sqlite_float(*f),
-            SqliteValue::Text(s) => {
-                let escaped = s.replace('\'', "''");
-                format!("'{escaped}'")
-            }
-            SqliteValue::Blob(b) => {
-                let mut hex = String::with_capacity(3 + b.len() * 2);
-                hex.push_str("X'");
-                for byte in b.iter() {
-                    let _ = write!(hex, "{byte:02X}");
-                }
-                hex.push('\'');
-                hex
-            }
-        };
+        let result = quote_sql_value(&args[0], false);
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
 
@@ -1074,6 +1057,87 @@ impl ScalarFunction for QuoteFunc {
     fn name(&self) -> &str {
         "quote"
     }
+}
+
+// ── unistr_quote(X) ───────────────────────────────────────────────────────
+
+pub struct UnistrQuoteFunc;
+
+impl ScalarFunction for UnistrQuoteFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        let result = quote_sql_value(&args[0], true);
+        Ok(SqliteValue::Text(SmallText::from_string(result)))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "unistr_quote"
+    }
+}
+
+fn quote_sql_value(value: &SqliteValue, use_unistr_quote: bool) -> String {
+    match value {
+        SqliteValue::Null => "NULL".to_owned(),
+        SqliteValue::Integer(i) => i.to_string(),
+        SqliteValue::Float(f) => format_sqlite_float(*f),
+        SqliteValue::Text(s) => quote_sql_text_literal(s.as_str(), use_unistr_quote),
+        SqliteValue::Blob(b) => {
+            let mut hex = String::with_capacity(3 + b.len() * 2);
+            hex.push_str("X'");
+            for byte in b.iter() {
+                let _ = write!(hex, "{byte:02X}");
+            }
+            hex.push('\'');
+            hex
+        }
+    }
+}
+
+fn quote_sql_text_literal(text: &str, use_unistr_quote: bool) -> String {
+    let text = text.split_once('\0').map_or(text, |(prefix, _)| prefix);
+    if use_unistr_quote && text.chars().any(is_unistr_control_char) {
+        return unistr_quote_sql_text_literal(text);
+    }
+
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    append_sql_string_literal_body(&mut quoted, text);
+    quoted.push('\'');
+    quoted
+}
+
+fn unistr_quote_sql_text_literal(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 12);
+    quoted.push_str("unistr('");
+    for ch in text.chars() {
+        match ch {
+            '\'' => quoted.push_str("''"),
+            '\\' => quoted.push_str("\\\\"),
+            _ if is_unistr_control_char(ch) => {
+                let _ = write!(quoted, "\\u{:04x}", ch as u32);
+            }
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push_str("')");
+    quoted
+}
+
+fn append_sql_string_literal_body(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+fn is_unistr_control_char(ch: char) -> bool {
+    matches!(ch, '\u{0001}'..='\u{001F}')
 }
 
 // ── unhex(X [, Y]) ──────────────────────────────────────────────────────
@@ -1877,6 +1941,7 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
     registry.register_scalar(HexFunc);
     registry.register_scalar(UnhexFunc);
     registry.register_scalar(QuoteFunc);
+    registry.register_scalar(UnistrQuoteFunc);
     registry.register_scalar(SoundexFunc);
 
     // Type
@@ -3162,6 +3227,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_quote_text_truncates_at_first_nul() {
+        assert_eq!(
+            invoke1(
+                &QuoteFunc,
+                SqliteValue::Text(SmallText::from_string("A\0B"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("'A'"))
+        );
+    }
+
+    #[test]
+    fn test_unistr_quote_plain_text_matches_quote() {
+        assert_eq!(
+            invoke1(
+                &UnistrQuoteFunc,
+                SqliteValue::Text(SmallText::from_string("it's"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("'it''s'"))
+        );
+    }
+
+    #[test]
+    fn test_unistr_quote_escapes_control_chars_and_backslashes() {
+        assert_eq!(
+            invoke1(
+                &UnistrQuoteFunc,
+                SqliteValue::Text(SmallText::from_string("a\nb\\c\x01d"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("unistr('a\\u000ab\\\\c\\u0001d')"))
+        );
+    }
+
+    #[test]
+    fn test_unistr_quote_truncates_at_first_nul_before_wrapping() {
+        assert_eq!(
+            invoke1(
+                &UnistrQuoteFunc,
+                SqliteValue::Text(SmallText::from_string("A\0\nB"))
+            )
+            .unwrap(),
+            SqliteValue::Text(SmallText::from_string("'A'"))
+        );
+    }
+
     // ── random ───────────────────────────────────────────────────────────
 
     #[test]
@@ -3602,6 +3715,7 @@ mod tests {
         assert!(registry.find_scalar("unhex", 1).is_some());
         assert!(registry.find_scalar("timediff", 2).is_some());
         assert!(registry.find_scalar("unistr", 1).is_some());
+        assert!(registry.find_scalar("unistr_quote", 1).is_some());
 
         // Percentile family enabled by default.
         assert!(registry.find_aggregate("median", 1).is_some());

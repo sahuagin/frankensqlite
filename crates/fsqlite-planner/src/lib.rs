@@ -1222,27 +1222,47 @@ fn best_access_path_internal(
             }
             IndexUsability::MultiColumnEquality {
                 eq_columns,
-                has_trailing_range,
+                trailing_constraint,
             } => {
                 // Multi-column equality narrows selectivity geometrically.
-                // Each additional equality column reduces rows by ~1/10.
+                // Each additional constrained column reduces rows by ~1/10.
+                let equality_width = eq_columns
+                    + usize::from(matches!(
+                        trailing_constraint,
+                        MultiColumnTrailingConstraint::InExpansion { .. }
+                    ));
                 #[allow(clippy::cast_precision_loss)]
-                let base_rows = if idx.unique && eq_columns == idx.columns.len() {
+                let per_probe_rows = if idx.unique
+                    && equality_width == idx.columns.len()
+                    && !matches!(trailing_constraint, MultiColumnTrailingConstraint::Range)
+                {
                     1.0
                 } else {
-                    let divisor = 10.0_f64.powi(i32::try_from(eq_columns).unwrap_or(i32::MAX));
+                    let divisor = 10.0_f64.powi(i32::try_from(equality_width).unwrap_or(i32::MAX));
                     (table.n_rows as f64 / divisor).max(1.0)
                 };
-                let (rows, sel) = if has_trailing_range {
-                    let range_factor = DEFAULT_RANGE_SELECTIVITY;
-                    let r = (base_rows * range_factor).max(1.0);
-                    (r, range_factor * base_rows / table.n_rows.max(1) as f64)
-                } else {
-                    (base_rows, base_rows / table.n_rows.max(1) as f64)
+                let (rows, sel) = match trailing_constraint {
+                    MultiColumnTrailingConstraint::Range => {
+                        let range_factor = DEFAULT_RANGE_SELECTIVITY;
+                        let r = (per_probe_rows * range_factor).max(1.0);
+                        (
+                            r,
+                            range_factor * per_probe_rows / table.n_rows.max(1) as f64,
+                        )
+                    }
+                    MultiColumnTrailingConstraint::InExpansion { probe_count } => {
+                        cost_multiplier = probe_count as f64;
+                        let r =
+                            (per_probe_rows * probe_count as f64).min(table.n_rows.max(1) as f64);
+                        (r, r / table.n_rows.max(1) as f64)
+                    }
+                    MultiColumnTrailingConstraint::None => {
+                        (per_probe_rows, per_probe_rows / table.n_rows.max(1) as f64)
+                    }
                 };
                 if is_covering {
                     (AccessPathKind::CoveringIndexScan { selectivity: sel }, rows)
-                } else if has_trailing_range {
+                } else if matches!(trailing_constraint, MultiColumnTrailingConstraint::Range) {
                     (AccessPathKind::IndexScanRange { selectivity: sel }, rows)
                 } else {
                     (AccessPathKind::IndexScanEquality, rows)
@@ -1259,7 +1279,7 @@ fn best_access_path_internal(
             IndexUsability::InExpansion { probe_count } => {
                 // Each probe is like an equality lookup; total cost
                 // and rows are scaled by the number of probes.
-                let per_probe_rows = if idx.unique {
+                let per_probe_rows: f64 = if idx.unique {
                     1.0
                 } else {
                     (table.n_rows as f64 / 10.0).max(1.0)
@@ -1621,12 +1641,13 @@ pub enum IndexUsability {
     /// Index can satisfy an equality constraint on its leftmost column.
     Equality,
     /// Multi-column equality prefix: equality on the first `eq_columns` index
-    /// columns, optionally followed by a range constraint on the next column.
+    /// columns, optionally followed by an additional constraint on the next
+    /// column.
     MultiColumnEquality {
         /// Number of leading columns with equality constraints.
         eq_columns: usize,
-        /// Whether the column after the equality prefix has a range constraint.
-        has_trailing_range: bool,
+        /// Constraint on the column immediately after the equality prefix.
+        trailing_constraint: MultiColumnTrailingConstraint,
     },
     /// Index can satisfy a range constraint (rightmost usable position).
     Range { selectivity: f64 },
@@ -1637,6 +1658,13 @@ pub enum IndexUsability {
     LikePrefix { low: String, high: Option<String> },
     /// The term cannot use this index.
     NotUsable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiColumnTrailingConstraint {
+    None,
+    Range,
+    InExpansion { probe_count: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2114,7 +2142,8 @@ fn like_prefix_upper_bound(prefix: &str) -> Option<String> {
 /// - Walk the index columns left-to-right; for each column, check if the WHERE
 ///   has an equality constraint. The equality prefix can be extended as long as
 ///   consecutive leading columns have equality terms.
-/// - After the equality prefix, check for a range/BETWEEN on the next column.
+/// - After the equality prefix, check for a range/BETWEEN or IN-list probe on
+///   the next column.
 /// - For single-column leftmost matches, also check IN and LIKE prefix.
 /// - For expression indexes, match query expressions structurally against the
 ///   index's expression columns.
@@ -2161,24 +2190,44 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
         }
     }
 
-    // If we have equality on 2+ columns, return MultiColumnEquality.
-    if eq_columns >= 2 {
-        // Check for trailing range on the next column after the prefix.
-        let has_trailing_range = if eq_columns < index.columns.len() {
+    // Preserve the composite shape when we have either:
+    // - equality on 2+ consecutive index columns, or
+    // - equality on a leading prefix plus an IN/range constraint on the next
+    //   column.
+    if eq_columns >= 1 {
+        let trailing_constraint = if eq_columns < index.columns.len() {
             let next_col = &index.columns[eq_columns];
-            terms.iter().any(|t| {
+            if let Some(probe_count) = terms.iter().find_map(|t| {
+                let matches_next = t
+                    .column
+                    .as_ref()
+                    .is_some_and(|wc| col_matches(wc, next_col));
+                match (matches_next, &t.kind) {
+                    (true, WhereTermKind::InList { count }) => Some(*count),
+                    _ => None,
+                }
+            }) {
+                MultiColumnTrailingConstraint::InExpansion { probe_count }
+            } else if terms.iter().any(|t| {
                 t.column.as_ref().is_some_and(|wc| {
                     col_matches(wc, next_col)
                         && matches!(t.kind, WhereTermKind::Range | WhereTermKind::Between)
                 })
-            })
+            }) {
+                MultiColumnTrailingConstraint::Range
+            } else {
+                MultiColumnTrailingConstraint::None
+            }
         } else {
-            false
+            MultiColumnTrailingConstraint::None
         };
-        return IndexUsability::MultiColumnEquality {
-            eq_columns,
-            has_trailing_range,
-        };
+
+        if eq_columns >= 2 || !matches!(trailing_constraint, MultiColumnTrailingConstraint::None) {
+            return IndexUsability::MultiColumnEquality {
+                eq_columns,
+                trailing_constraint,
+            };
+        }
     }
 
     // --- Single leftmost column checks (original logic) ---
@@ -4806,6 +4855,20 @@ mod tests {
     }
 
     #[test]
+    fn test_index_usability_multicolumn_trailing_in_expansion() {
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 50);
+        let terms = [eq_term("a"), in_term("b", 3)];
+        let result = analyze_index_usability(&idx, &terms);
+        assert!(matches!(
+            result,
+            IndexUsability::MultiColumnEquality {
+                eq_columns: 1,
+                trailing_constraint: MultiColumnTrailingConstraint::InExpansion { probe_count: 3 }
+            }
+        ));
+    }
+
+    #[test]
     fn test_in_expansion_cost_scales_by_probe_count() {
         // Regression: IN (v1, v2, v3) should cost ~3x a single equality
         // probe, not the same as a single probe.
@@ -4838,6 +4901,49 @@ mod tests {
         let ap = best_access_path(&table, &[idx], &[term], None);
         assert_eq!(ap.index.as_deref(), Some("idx_a"));
         assert!(matches!(ap.kind, AccessPathKind::IndexScanEquality));
+    }
+
+    #[test]
+    fn test_best_access_path_multicolumn_trailing_in_refines_row_estimate() {
+        let table = table_stats("t1", 1_000, 1_000_000);
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        let equality_only = [eq_term("a")];
+        let trailing_in = [eq_term("a"), in_term("b", 3)];
+
+        let ap_eq = best_access_path(&table, std::slice::from_ref(&idx), &equality_only, None);
+        let ap_in = best_access_path(&table, &[idx], &trailing_in, None);
+
+        assert_eq!(ap_in.index.as_deref(), Some("idx_ab"));
+        assert!(matches!(ap_in.kind, AccessPathKind::IndexScanEquality));
+        assert!(
+            ap_in.estimated_rows < ap_eq.estimated_rows,
+            "composite IN should narrow row estimates: eq_only={} trailing_in={}",
+            ap_eq.estimated_rows,
+            ap_in.estimated_rows
+        );
+        assert!(
+            (ap_in.estimated_rows - 30_000.0).abs() < f64::EPSILON,
+            "expected 1e6 / 10^2 * 3 = 30000 rows, got {}",
+            ap_in.estimated_rows
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_multicolumn_or_disjunction_reuses_composite_in_expansion() {
+        let table = table_stats("t1", 1_000, 1_000_000);
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        let term = or_eq_term("b", &[1, 2, 3, 4]);
+        assert!(matches!(term.kind, WhereTermKind::InList { count: 4 }));
+
+        let ap = best_access_path(&table, &[idx], &[eq_term("a"), term], None);
+
+        assert_eq!(ap.index.as_deref(), Some("idx_ab"));
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanEquality));
+        assert!(
+            (ap.estimated_rows - 40_000.0).abs() < f64::EPSILON,
+            "expected 1e6 / 10^2 * 4 = 40000 rows, got {}",
+            ap.estimated_rows
+        );
     }
 
     #[test]
@@ -5009,8 +5115,8 @@ mod tests {
         let cost_if_only_last = 1.0_f64 // small full scan cost
             + 10.0 * 10.0 // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
-        // The plan's total cost should be larger than this naive estimate
-        // because large is actually scanned 10*100=1000 times.
+                             // The plan's total cost should be larger than this naive estimate
+                             // because large is actually scanned 10*100=1000 times.
         assert!(
             plan_sml.total_cost > cost_if_only_last,
             "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
@@ -7311,7 +7417,7 @@ mod tests {
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
-        // Small table should be chosen first (lower cost).
+                            // Small table should be chosen first (lower cost).
         assert_eq!(order[0], 0); // "x" has fewest pages.
     }
 

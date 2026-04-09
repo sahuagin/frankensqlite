@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_ast::{
-    ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, ResultColumn,
-    SelectCore, SelectStatement, Statement, TableOrSubquery, WithClause,
+    ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, QualifiedName,
+    ResultColumn, SelectCore, SelectStatement, Statement, TableOrSubquery, WithClause,
 };
 use fsqlite_types::TypeAffinity;
 
@@ -121,6 +121,8 @@ fn is_hidden_rowid_alias_name(name: &str) -> bool {
 pub struct Schema {
     /// Tables by lowercase name.
     tables: HashMap<String, TableDef>,
+    /// Non-main schema tables by lowercase schema name then lowercase table name.
+    namespaced_tables: HashMap<String, HashMap<String, TableDef>>,
 }
 
 impl Schema {
@@ -135,16 +137,71 @@ impl Schema {
         self.tables.insert(table.name.to_ascii_lowercase(), table);
     }
 
+    /// Add a table definition to a specific schema namespace.
+    pub fn add_table_in_schema(&mut self, schema_name: &str, table: TableDef) {
+        if schema_name.eq_ignore_ascii_case("main") {
+            self.add_table(table);
+            return;
+        }
+
+        self.namespaced_tables
+            .entry(schema_name.to_ascii_lowercase())
+            .or_default()
+            .insert(table.name.to_ascii_lowercase(), table);
+    }
+
     /// Look up a table by name (case-insensitive).
     #[must_use]
     pub fn find_table(&self, name: &str) -> Option<&TableDef> {
         self.tables.get(&name.to_ascii_lowercase())
     }
 
+    /// Look up a table by optional schema-qualified name.
+    #[must_use]
+    pub fn find_table_in_schema(&self, schema: Option<&str>, name: &str) -> Option<&TableDef> {
+        match schema {
+            None => self.find_table(name),
+            Some(schema_name) if schema_name.eq_ignore_ascii_case("main") => self.find_table(name),
+            Some(schema_name) => self
+                .namespaced_tables
+                .get(&schema_name.to_ascii_lowercase())
+                .and_then(|tables| tables.get(&name.to_ascii_lowercase())),
+        }
+    }
+
+    /// Look up a table by a scope lookup key produced by [`table_lookup_key`].
+    #[must_use]
+    pub fn find_table_by_lookup_key(&self, lookup_key: &str) -> Option<&TableDef> {
+        if let Some((schema_name, table_name)) = lookup_key.split_once('\0') {
+            self.find_table_in_schema(Some(schema_name), table_name)
+        } else {
+            self.find_table(lookup_key)
+        }
+    }
+
     /// Number of tables in the schema.
     #[must_use]
     pub fn table_count(&self) -> usize {
         self.tables.len()
+            + self
+                .namespaced_tables
+                .values()
+                .map(std::collections::HashMap::len)
+                .sum::<usize>()
+    }
+}
+
+fn table_lookup_key(name: &QualifiedName) -> String {
+    match name.schema.as_deref() {
+        None => name.name.to_ascii_lowercase(),
+        Some(schema_name) if schema_name.eq_ignore_ascii_case("main") => {
+            name.name.to_ascii_lowercase()
+        }
+        Some(schema_name) => format!(
+            "{}\0{}",
+            schema_name.to_ascii_lowercase(),
+            name.name.to_ascii_lowercase()
+        ),
     }
 }
 
@@ -276,7 +333,7 @@ impl Scope {
                     return ResolveResult::Resolved(key);
                 }
                 if let Some(table_name) = self.aliases.get(&key) {
-                    if let Some(table_def) = schema.find_table(table_name) {
+                    if let Some(table_def) = schema.find_table_by_lookup_key(table_name) {
                         if table_def.is_rowid_alias(&col_lower) {
                             return ResolveResult::Resolved(key);
                         }
@@ -307,7 +364,7 @@ impl Scope {
                     c.contains(&col_lower) || {
                         self.aliases
                             .get(alias)
-                            .and_then(|t| schema.find_table(t))
+                            .and_then(|t| schema.find_table_by_lookup_key(t))
                             .is_some_and(|td| td.is_rowid_alias(&col_lower))
                     }
                 }
@@ -539,19 +596,26 @@ impl<'a> Resolver<'a> {
                 }
 
                 // Bind the target table so RETURNING or UPSERT can reference it.
-                self.bind_table_to_scope(&insert.table.name, None, scope);
+                self.bind_table_to_scope(&insert.table, None, scope);
 
                 // Scope strictly for target column checks
                 let mut target_scope = Scope::root();
-                if scope.has_cte(&insert.table.name) {
+                if insert.table.schema.is_none() && scope.has_cte(&insert.table.name) {
                     target_scope.add_alias(&insert.table.name, &insert.table.name, None);
-                } else if let Some(table_def) = self.schema.find_table(&insert.table.name) {
+                } else if let Some(table_def) = self
+                    .schema
+                    .find_table_in_schema(insert.table.schema.as_deref(), &insert.table.name)
+                {
                     let col_set: HashSet<String> = table_def
                         .columns
                         .iter()
                         .map(|c| c.name.to_ascii_lowercase())
                         .collect();
-                    target_scope.add_alias(&insert.table.name, &insert.table.name, Some(col_set));
+                    target_scope.add_alias(
+                        &insert.table.name,
+                        &table_lookup_key(&insert.table),
+                        Some(col_set),
+                    );
                 }
 
                 for col in &insert.columns {
@@ -575,7 +639,14 @@ impl<'a> Resolver<'a> {
                         } => {
                             let mut upsert_scope = Scope::child(scope.clone());
                             let alias_name = insert.alias.as_deref().unwrap_or(&insert.table.name);
-                            if let Some(table_def) = self.schema.find_table(&insert.table.name) {
+                            let target_lookup_key = table_lookup_key(&insert.table);
+                            if let Some(table_def) = self
+                                .schema
+                                .find_table_in_schema(
+                                    insert.table.schema.as_deref(),
+                                    &insert.table.name,
+                                )
+                            {
                                 let col_set: HashSet<String> = table_def
                                     .columns
                                     .iter()
@@ -583,12 +654,12 @@ impl<'a> Resolver<'a> {
                                     .collect();
                                 upsert_scope.add_qualified_only_alias(
                                     "excluded",
-                                    &insert.table.name,
+                                    &target_lookup_key,
                                     Some(col_set.clone()),
                                 );
                                 upsert_scope.add_alias(
                                     alias_name,
-                                    &insert.table.name,
+                                    &target_lookup_key,
                                     Some(col_set),
                                 );
                             } else {
@@ -633,16 +704,12 @@ impl<'a> Resolver<'a> {
                 // LIMIT and OFFSET cannot reference target or FROM tables.
                 let limit_scope = scope.clone();
 
-                self.bind_table_to_scope(
-                    &update.table.name.name,
-                    update.table.alias.as_deref(),
-                    scope,
-                );
+                self.bind_table_to_scope(&update.table.name, update.table.alias.as_deref(), scope);
 
                 // Scope strictly for target column checks
                 let mut target_scope = Scope::root();
                 self.bind_table_to_scope(
-                    &update.table.name.name,
+                    &update.table.name,
                     update.table.alias.as_deref(),
                     &mut target_scope,
                 );
@@ -694,11 +761,7 @@ impl<'a> Resolver<'a> {
                 // LIMIT and OFFSET cannot reference the target table.
                 let limit_scope = scope.clone();
 
-                self.bind_table_to_scope(
-                    &delete.table.name.name,
-                    delete.table.alias.as_deref(),
-                    scope,
-                );
+                self.bind_table_to_scope(&delete.table.name, delete.table.alias.as_deref(), scope);
                 if let Some(where_clause) = &delete.where_clause {
                     self.resolve_expr(where_clause, scope);
                 }
@@ -927,21 +990,24 @@ impl<'a> Resolver<'a> {
                 }
 
                 // Resolve table name against schema or CTEs.
-                if scope.has_cte(table_name) {
+                if name.schema.is_none() && scope.has_cte(table_name) {
                     // CTE reference — columns are unknown at this stage.
                     scope.add_alias(alias_name, table_name, None);
                     self.tables_resolved += 1;
-                } else if let Some(table_def) = self.schema.find_table(table_name) {
+                } else if let Some(table_def) = self
+                    .schema
+                    .find_table_in_schema(name.schema.as_deref(), table_name)
+                {
                     let col_set: HashSet<String> = table_def
                         .columns
                         .iter()
                         .map(|c| c.name.to_ascii_lowercase())
                         .collect();
-                    scope.add_alias(alias_name, table_name, Some(col_set));
+                    scope.add_alias(alias_name, &table_lookup_key(name), Some(col_set));
                     self.tables_resolved += 1;
                 } else {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
-                        name: table_name.clone(),
+                        name: name.to_string(),
                     });
                 }
             }
@@ -1167,9 +1233,7 @@ impl<'a> Resolver<'a> {
                         let mut child = Scope::child(scope.clone());
                         self.resolve_select(select, &mut child);
                     }
-                    InSet::Table(name) => {
-                        self.resolve_table_name(&name.name, scope);
-                    }
+                    InSet::Table(name) => self.resolve_table_name(name, scope),
                 }
             }
             Expr::Like {
@@ -1345,32 +1409,44 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn bind_table_to_scope(&mut self, name: &str, alias: Option<&str>, scope: &mut Scope) {
-        let alias_name = alias.unwrap_or(name);
-        if scope.has_cte(name) {
-            scope.add_alias(alias_name, name, None);
+    fn bind_table_to_scope(
+        &mut self,
+        name: &QualifiedName,
+        alias: Option<&str>,
+        scope: &mut Scope,
+    ) {
+        let alias_name = alias.unwrap_or(&name.name);
+        if name.schema.is_none() && scope.has_cte(&name.name) {
+            scope.add_alias(alias_name, &name.name, None);
             self.tables_resolved += 1;
-        } else if let Some(table_def) = self.schema.find_table(name) {
+        } else if let Some(table_def) = self
+            .schema
+            .find_table_in_schema(name.schema.as_deref(), &name.name)
+        {
             let col_set: HashSet<String> = table_def
                 .columns
                 .iter()
                 .map(|c| c.name.to_ascii_lowercase())
                 .collect();
-            scope.add_alias(alias_name, name, Some(col_set));
+            scope.add_alias(alias_name, &table_lookup_key(name), Some(col_set));
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {
-                name: name.to_owned(),
+                name: name.to_string(),
             });
         }
     }
 
-    fn resolve_table_name(&mut self, name: &str, _scope: &Scope) {
-        if self.schema.find_table(name).is_some() {
+    fn resolve_table_name(&mut self, name: &QualifiedName, _scope: &Scope) {
+        if self
+            .schema
+            .find_table_in_schema(name.schema.as_deref(), &name.name)
+            .is_some()
+        {
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {
-                name: name.to_owned(),
+                name: name.to_string(),
             });
         }
     }
@@ -1584,6 +1660,30 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_find_table_in_named_namespace() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "aux",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![ColumnDef {
+                    name: "nickname".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                }],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        assert!(schema.find_table_in_schema(Some("main"), "users").is_some());
+        assert!(schema.find_table_in_schema(Some("aux"), "users").is_some());
+        assert!(schema.find_table_in_schema(Some("AUX"), "USERS").is_some());
+        assert!(schema.find_table_in_schema(Some("missing"), "users").is_none());
+    }
+
+    #[test]
     fn test_table_find_column() {
         let schema = make_schema();
         let users = schema.find_table("users").unwrap();
@@ -1778,6 +1878,76 @@ mod tests {
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(resolver.tables_resolved, 1);
         assert_eq!(resolver.columns_bound, 2);
+    }
+
+    #[test]
+    fn test_resolve_select_from_named_namespace() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "aux",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: true,
+                        not_null: true,
+                    },
+                    ColumnDef {
+                        name: "nickname".to_owned(),
+                        affinity: TypeAffinity::Text,
+                        is_ipk: false,
+                        not_null: false,
+                    },
+                ],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one("SELECT nickname FROM aux.users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(resolver.tables_resolved, 1);
+        assert_eq!(resolver.columns_bound, 1);
+    }
+
+    #[test]
+    fn test_resolve_named_namespace_does_not_fall_back_to_main_schema() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "aux",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: true,
+                        not_null: true,
+                    },
+                    ColumnDef {
+                        name: "nickname".to_owned(),
+                        affinity: TypeAffinity::Text,
+                        is_ipk: false,
+                        not_null: false,
+                    },
+                ],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one("SELECT name FROM aux.users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1, "expected unresolved aux.users.name");
+        assert!(matches!(
+            errors[0].kind,
+            SemanticErrorKind::UnresolvedColumn { .. }
+        ));
     }
 
     #[test]

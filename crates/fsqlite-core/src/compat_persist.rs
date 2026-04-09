@@ -53,6 +53,10 @@ const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 #[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 
+/// Owned sqlite_master row payload used when persistence must preserve
+/// non-table entries such as views and triggers during file rebuilds.
+pub type SqliteMasterEntry = (String, String, String, u32, Option<String>);
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_sqlite_cursor_sizes_from_page1(page1_bytes: &[u8]) -> Result<(u32, u32)> {
     let header_bytes: &[u8; DATABASE_HEADER_SIZE] = page1_bytes
@@ -138,6 +142,54 @@ pub fn persist_to_sqlite(
     schema_cookie: u32,
     change_counter: u32,
 ) -> Result<()> {
+    let mut header = DatabaseHeader {
+        page_size: DEFAULT_PAGE_SIZE,
+        schema_cookie,
+        change_counter,
+        ..DatabaseHeader::default()
+    };
+    let effective_counter = header.change_counter.max(1);
+    header.change_counter = effective_counter;
+    header.schema_cookie = header.schema_cookie.max(1);
+    header.version_valid_for = effective_counter;
+    persist_to_sqlite_with_header(cx, path, schema, db, &header)
+}
+
+/// Persist `schema` + `db` using the provided database header template.
+///
+/// The supplied `header` controls page-size-sensitive layout plus header
+/// metadata that must survive rebuild flows like `VACUUM`.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_to_sqlite_with_header(
+    cx: &Cx,
+    path: &Path,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+) -> Result<()> {
+    persist_to_sqlite_with_header_and_master_entries(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        &[],
+    )
+}
+
+/// Persist `schema` + `db` plus additional sqlite_master rows using the
+/// provided database header template.
+#[allow(clippy::too_many_lines)]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn persist_to_sqlite_with_header_and_master_entries(
+    cx: &Cx,
+    path: &Path,
+    schema: &[TableSchema],
+    db: &MemDatabase,
+    header_template: &DatabaseHeader,
+    extra_master_entries: &[SqliteMasterEntry],
+) -> Result<()> {
     // Remove existing file so the pager creates a fresh one.
     if path.exists() {
         // Truncate to empty so the pager treats it as a fresh DB, without
@@ -146,18 +198,19 @@ pub fn persist_to_sqlite(
     }
 
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
+    let pager = SimplePager::open_with_cx(cx, vfs, path, header_template.page_size)?;
     let mut txn = pager.begin(cx, TransactionMode::Immediate)?;
 
-    let ps = DEFAULT_PAGE_SIZE.as_usize();
-    let usable_size =
-        u32::try_from(ps).map_err(|_| FrankenError::internal("page size exceeds u32"))?;
+    let page_size = header_template.page_size;
+    let page_size_usize = page_size.as_usize();
+    let usable_size = page_size.usable(header_template.reserved_per_page);
+    let full_page_size = page_size.get();
 
     // Track (type, name, tbl_name, root_page, create_sql) for sqlite_master entries.
     // Extended from just tables to also include indexes, views, and triggers.
     // The sql column is Option<String> because autoindex entries (sqlite_autoindex_*)
     // must have NULL sql, matching stock SQLite behavior.
-    let mut master_entries: Vec<(&str, String, String, u32, Option<String>)> = Vec::new();
+    let mut master_entries: Vec<SqliteMasterEntry> = Vec::new();
 
     // Write each table's data into its own B-tree.
     for table in schema {
@@ -169,7 +222,13 @@ pub fn persist_to_sqlite(
         let root_page = txn.allocate_page(cx)?;
 
         // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(cx, &mut txn, root_page, ps)?;
+        init_leaf_table_page(
+            cx,
+            &mut txn,
+            root_page,
+            page_size_usize,
+            usable_size,
+        )?;
 
         // Insert all rows.
         {
@@ -179,6 +238,7 @@ pub fn persist_to_sqlite(
                 usable_size,
                 true,
             );
+            configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
             for (rowid, values) in mem_table.iter_rows() {
                 let payload = serialize_record(values);
                 cursor.table_insert(cx, rowid, &payload)?;
@@ -189,7 +249,7 @@ pub fn persist_to_sqlite(
         let create_sql = build_create_table_sql(table);
         let table_name = table.name.clone();
         master_entries.push((
-            "table",
+            "table".to_owned(),
             table_name.clone(),
             table_name.clone(),
             root_page.get(),
@@ -208,7 +268,13 @@ pub fn persist_to_sqlite(
             }
             // Allocate and initialize root page as leaf index page (0x0A).
             let idx_root = txn.allocate_page(cx)?;
-            init_leaf_index_page(cx, &mut txn, idx_root, ps)?;
+            init_leaf_index_page(
+                cx,
+                &mut txn,
+                idx_root,
+                page_size_usize,
+                usable_size,
+            )?;
 
             // Populate the index B-tree from table rows.
             {
@@ -218,6 +284,7 @@ pub fn persist_to_sqlite(
                     usable_size,
                     true,
                 );
+                configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     for (rowid, values) in mem_table.iter_rows() {
                         // Build index key: (indexed_column_values..., rowid).
@@ -274,7 +341,7 @@ pub fn persist_to_sqlite(
                 })
             };
             master_entries.push((
-                "index",
+                "index".to_owned(),
                 index.name.clone(),
                 table_name.clone(),
                 idx_root.get(),
@@ -283,9 +350,34 @@ pub fn persist_to_sqlite(
         }
     }
 
+    master_entries.extend(extra_master_entries.iter().cloned());
+
     // Write sqlite_master entries into page 1's B-tree.
     // sqlite_master columns: type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT
     {
+        let mut page1 = txn.get_page(cx, PageNumber::ONE)?.into_vec();
+        if page1.len() < DATABASE_HEADER_SIZE + 8 {
+            return Err(FrankenError::internal(format!(
+                "page 1 too short for sqlite_master root header: {} bytes",
+                page1.len()
+            )));
+        }
+        page1[DATABASE_HEADER_SIZE] = 0x0D;
+        page1[DATABASE_HEADER_SIZE + 3..DATABASE_HEADER_SIZE + 5]
+            .copy_from_slice(&0u16.to_be_bytes());
+        let master_content_start: u16 = if usable_size == 65536 {
+            0
+        } else {
+            u16::try_from(usable_size).map_err(|_| {
+                FrankenError::internal(format!(
+                    "usable_size {usable_size} does not fit in u16 and is not 65536"
+                ))
+            })?
+        };
+        page1[DATABASE_HEADER_SIZE + 5..DATABASE_HEADER_SIZE + 7]
+            .copy_from_slice(&master_content_start.to_be_bytes());
+        txn.write_page(cx, PageNumber::ONE, &page1)?;
+
         let master_root = PageNumber::ONE;
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(&mut txn),
@@ -293,6 +385,7 @@ pub fn persist_to_sqlite(
             usable_size,
             true,
         );
+        configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
 
         for (rowid, (entry_type, name, tbl_name, root_page_num, create_sql)) in
             master_entries.iter().enumerate()
@@ -302,7 +395,7 @@ pub fn persist_to_sqlite(
                 None => SqliteValue::Null,
             };
             let record = serialize_record(&[
-                SqliteValue::Text((*entry_type).into()),
+                SqliteValue::Text(entry_type.clone().into()),
                 SqliteValue::Text(name.clone().into()),
                 SqliteValue::Text(tbl_name.clone().into()),
                 SqliteValue::Integer(i64::from(*root_page_num)),
@@ -327,21 +420,18 @@ pub fn persist_to_sqlite(
         let next_page = txn.allocate_page(cx)?.get();
         let max_page = next_page.saturating_sub(1).max(1);
 
-        // page_count at offset 28 (4 bytes, big-endian)
-        hdr_page[28..32].copy_from_slice(&max_page.to_be_bytes());
+        let mut final_header = header_template.clone();
+        final_header.page_count = max_page;
+        final_header.freelist_trunk = 0;
+        final_header.freelist_count = 0;
+        final_header.change_counter = final_header.change_counter.max(1);
+        final_header.schema_cookie = final_header.schema_cookie.max(1);
+        final_header.version_valid_for = final_header.change_counter;
 
-        // change_counter at offset 24 — tracked by Connection, must be
-        // non-zero for sqlite3 to trust the header.  Use at least 1.
-        let effective_counter = change_counter.max(1);
-        hdr_page[24..28].copy_from_slice(&effective_counter.to_be_bytes());
-
-        // schema_cookie at offset 40 — tracked by Connection, incremented
-        // on every DDL operation.  Non-zero so sqlite3 re-reads schema.
-        let effective_cookie = schema_cookie.max(1);
-        hdr_page[40..44].copy_from_slice(&effective_cookie.to_be_bytes());
-
-        // version-valid-for at offset 92 (must match change_counter)
-        hdr_page[92..96].copy_from_slice(&effective_counter.to_be_bytes());
+        let encoded_header = final_header
+            .to_bytes()
+            .map_err(|err| FrankenError::internal(format!("failed to encode database header: {err}")))?;
+        hdr_page[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded_header);
 
         txn.write_page(cx, PageNumber::ONE, &hdr_page)?;
     }
@@ -687,21 +777,22 @@ fn init_leaf_table_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
-    page_size: usize,
+    full_page_size: usize,
+    usable_size: u32,
 ) -> Result<()> {
-    let mut page = vec![0u8; page_size];
+    let mut page = vec![0u8; full_page_size];
     page[0] = 0x0D; // Leaf table
     // cell_count = 0 (bytes 3..5)
     page[3..5].copy_from_slice(&0u16.to_be_bytes());
     // cell content area starts at end of page
     // SQLite encodes a content offset of 65536 as 0 in the 2-byte header field.
     // For all other valid page sizes (512..=32768), the value fits in u16 directly.
-    let content_start: u16 = if page_size == 65536 {
+    let content_start: u16 = if usable_size == 65536 {
         0
     } else {
-        u16::try_from(page_size).map_err(|_| {
+        u16::try_from(usable_size).map_err(|_| {
             FrankenError::internal(format!(
-                "page_size {page_size} does not fit in u16 and is not 65536"
+                "usable_size {usable_size} does not fit in u16 and is not 65536"
             ))
         })?
     };
@@ -713,17 +804,18 @@ fn init_leaf_index_page(
     cx: &Cx,
     txn: &mut impl TransactionHandle,
     page_no: PageNumber,
-    page_size: usize,
+    full_page_size: usize,
+    usable_size: u32,
 ) -> Result<()> {
-    let mut page = vec![0u8; page_size];
+    let mut page = vec![0u8; full_page_size];
     page[0] = 0x0A; // Leaf index (vs 0x0D for leaf table)
     page[3..5].copy_from_slice(&0u16.to_be_bytes());
-    let content_start: u16 = if page_size == 65536 {
+    let content_start: u16 = if usable_size == 65536 {
         0
     } else {
-        u16::try_from(page_size).map_err(|_| {
+        u16::try_from(usable_size).map_err(|_| {
             FrankenError::internal(format!(
-                "page_size {page_size} does not fit in u16 and is not 65536"
+                "usable_size {usable_size} does not fit in u16 and is not 65536"
             ))
         })?
     };

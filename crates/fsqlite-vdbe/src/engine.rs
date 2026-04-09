@@ -137,7 +137,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use fsqlite_btree::cursor::FirstIndexKeyIntegerLocalRunSegment;
+use fsqlite_btree::cursor::{CursorPositionStamp, FirstIndexKeyIntegerLocalRunSegment};
 use fsqlite_btree::{
     BtCursor, BtreeCursorOps, BtreePageHeader, BtreePageType, MemPageStore, PageReader, PageWriter,
     SeekResult, header_offset_for_page,
@@ -3251,7 +3251,7 @@ impl CursorBackend {
     }
 
     #[must_use]
-    fn position_stamp(&self) -> Option<(u32, u16)> {
+    fn position_stamp(&self) -> Option<CursorPositionStamp> {
         match self {
             Self::Mem(c) => c.position_stamp(),
             Self::Txn(c) => c.position_stamp(),
@@ -3297,7 +3297,7 @@ struct StorageCursor {
     /// Cursor-owned decode/materialization scratch for the current row image.
     row_decode: RowDecodeScratch,
     /// Cache the cursor's physical position to avoid redundant payload reads.
-    last_position_stamp: Option<(u32, u16)>,
+    last_position_stamp: Option<CursorPositionStamp>,
     /// Last rowid known to have been inserted on the right edge via this cursor.
     ///
     /// This is intentionally stricter than "last inserted rowid". We only keep
@@ -4825,6 +4825,71 @@ type BindingStorage = smallvec::SmallVec<[SqliteValue; 8]>;
 /// Buffered result-row storage retained by the engine when row collection is on.
 type ResultRowStorage = Vec<smallvec::SmallVec<[SqliteValue; 16]>>;
 
+#[derive(Debug, Default)]
+struct MakeRecordStatementLookaside {
+    buf: Vec<u8>,
+    sideband_reg: i32,
+}
+
+impl MakeRecordStatementLookaside {
+    fn prepare_for_statement(&mut self, estimated_capacity: usize) {
+        if estimated_capacity > self.buf.capacity() {
+            self.buf.reserve(estimated_capacity - self.buf.capacity());
+        }
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.sideband_reg = 0;
+    }
+
+    fn clear_sideband_for_register(&mut self, register: i32) {
+        if self.sideband_reg == register {
+            self.reset();
+        }
+    }
+
+    #[must_use]
+    fn sideband_is_armed_for(&self, register: i32) -> bool {
+        self.sideband_reg == register && !self.buf.is_empty()
+    }
+
+    fn disarm(&mut self) {
+        self.sideband_reg = 0;
+    }
+
+    fn replace_buf(&mut self, buf: Vec<u8>) {
+        self.buf = buf;
+    }
+
+    fn arm_sideband(&mut self, register: i32) {
+        self.sideband_reg = register;
+    }
+
+    fn take_buf(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn as_slice(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+}
+
 /// The VDBE bytecode interpreter.
 ///
 /// Executes a program produced by the code generator, maintaining a register
@@ -4884,8 +4949,8 @@ pub struct VdbeEngine {
     aggregate_function_cache: HashMap<usize, Arc<ErasedAggregateFunction>>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
     collation_registry: Arc<Mutex<CollationRegistry>>,
-    /// Aggregate accumulators keyed by accumulator register.
-    aggregates: SwissIndex<i32, AggregateContext>,
+    /// Lazily allocated feature state kept off the hot interpreter footprint.
+    cold_state: Option<Box<ColdVdbeState>>,
     /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Used by `ReadCookie` (p3=1) and `SetCookie` opcodes, and
@@ -4902,23 +4967,6 @@ pub struct VdbeEngine {
     /// Cursor ID used by the last Insert opcode (for conflict resolution in
     /// `IdxInsert`: allows the index handler to undo or replace the table row).
     last_insert_cursor_id: Option<i32>,
-    /// Deleted-row state for UPDATE's delete+insert rewrite. When the
-    /// replacement row later conflicts, we must restore the original row.
-    pending_update_restore: Option<PendingUpdateRestore>,
-    /// Provisional table insert metadata kept until later `IdxInsert`
-    /// opcodes either succeed or roll the row back after a secondary-index
-    /// conflict.
-    pending_insert_rollback: Option<PendingInsertRollback>,
-    /// When true, a UNIQUE conflict with IGNORE was detected during an
-    /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
-    /// skipped.
-    conflict_skip_idx: bool,
-    /// Index entries inserted for the current row (cursor_id, key_bytes).
-    /// On secondary-index conflict rollback, these entries must be deleted to
-    /// avoid phantom index entries blocking future inserts.
-    pending_idx_entries: Vec<(i32, Vec<u8>)>,
-    /// RowSet data structures for OR-optimized queries (keyed by register).
-    rowsets: SwissIndex<i32, RowSet>,
     /// Foreign key constraint violation counter (deferred FK enforcement).
     fk_counter: i64,
     /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
@@ -4936,8 +4984,6 @@ pub struct VdbeEngine {
     table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
     /// Earliest non-IPK NOT NULL column keyed by root page number.
     first_not_null_non_ipk_col_by_root_page: Arc<HashMap<i32, usize>>,
-    /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
-    sequence_counters: HashMap<i32, i64>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
     /// When a row has fewer columns than the schema expects, defaults from this
     /// map are applied instead of returning NULL.
@@ -4948,8 +4994,6 @@ pub struct VdbeEngine {
     index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
-    /// Open virtual table cursors keyed by cursor number.
-    vtab_cursors: SwissIndex<i32, VtabCursorState>,
     /// Virtual table instances keyed by cursor number (for transaction ops).
     vtab_instances: SwissIndex<i32, Box<dyn VtabInstance>>,
     /// Cursors with time-travel snapshots (SQL:2011 temporal queries).
@@ -4968,26 +5012,8 @@ pub struct VdbeEngine {
     /// and column indices. Used by `native_replace_row` to clean up secondary
     /// index entries during REPLACE conflict resolution.
     table_index_meta: Arc<TableIndexMetaMap>,
-    /// Window function accumulators keyed by accumulator register.
-    window_contexts: SwissIndex<i32, WindowContext>,
-    /// Register subtype tags (register index → subtype value).
-    /// Used by JSON functions to distinguish JSON text (subtype 74/'J')
-    /// from regular text. Cleared on each register write.
-    register_subtypes: HashMap<i32, u32>,
-    /// bd-perf (V1.4): Fast check — avoids HashMap::is_empty() on every register write.
-    has_subtypes: bool,
-    /// Bloom filters keyed by cursor/filter register.
-    /// Each entry is a fixed-size bit array used for early rejection
-    /// during index lookups.
-    bloom_filters: HashMap<i32, Vec<u64>>,
-    /// Reusable buffer for `MakeRecord` serialization.
-    /// Avoids allocating a new `Vec<u8>` for every row during INSERT/UPDATE.
-    make_record_buf: Vec<u8>,
-    /// bd-perf: When non-zero, Insert/IdxInsert should read record bytes from
-    /// `make_record_buf` instead of the register blob. Set by MakeRecord hot
-    /// path to avoid Arc<[u8]> allocation per row. Stores the target register
-    /// number; cleared after Insert consumes the sideband.
-    make_record_sideband_reg: i32,
+    /// Statement-local lookaside for `MakeRecord` serialization sideband.
+    make_record_lookaside: MakeRecordStatementLookaside,
     /// Whether `OP_ResultRow` should materialize and retain result rows.
     /// DML-only execution lanes can disable this to avoid row-buffer work.
     collect_result_rows: bool,
@@ -5254,6 +5280,63 @@ struct WindowContext {
     state: Box<dyn Any + Send>,
 }
 
+struct ColdVdbeState {
+    /// Aggregate accumulators keyed by accumulator register.
+    aggregates: SwissIndex<i32, AggregateContext>,
+    /// Deleted-row state for UPDATE's delete+insert rewrite. When the
+    /// replacement row later conflicts, we must restore the original row.
+    pending_update_restore: Option<PendingUpdateRestore>,
+    /// Provisional table insert metadata kept until later `IdxInsert`
+    /// opcodes either succeed or roll the row back after a secondary-index
+    /// conflict.
+    pending_insert_rollback: Option<PendingInsertRollback>,
+    /// When true, a UNIQUE conflict with IGNORE was detected during an
+    /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
+    /// skipped.
+    conflict_skip_idx: bool,
+    /// Index entries inserted for the current row (cursor_id, key_bytes).
+    /// On secondary-index conflict rollback, these entries must be deleted to
+    /// avoid phantom index entries blocking future inserts.
+    pending_idx_entries: Vec<(i32, Vec<u8>)>,
+    /// RowSet data structures for OR-optimized queries (keyed by register).
+    rowsets: SwissIndex<i32, RowSet>,
+    /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
+    sequence_counters: HashMap<i32, i64>,
+    /// Open virtual table cursors keyed by cursor number.
+    vtab_cursors: SwissIndex<i32, VtabCursorState>,
+    /// Window function accumulators keyed by accumulator register.
+    window_contexts: SwissIndex<i32, WindowContext>,
+    /// Register subtype tags (register index → subtype value).
+    /// Used by JSON functions to distinguish JSON text (subtype 74/'J')
+    /// from regular text. Cleared on each register write.
+    register_subtypes: HashMap<i32, u32>,
+    /// Fast check to avoid a hash probe on every register write.
+    has_subtypes: bool,
+    /// Bloom filters keyed by cursor/filter register.
+    /// Each entry is a fixed-size bit array used for early rejection
+    /// during index lookups.
+    bloom_filters: HashMap<i32, Vec<u64>>,
+}
+
+impl ColdVdbeState {
+    fn new() -> Self {
+        Self {
+            aggregates: SwissIndex::new(),
+            pending_update_restore: None,
+            pending_insert_rollback: None,
+            conflict_skip_idx: false,
+            pending_idx_entries: Vec::new(),
+            rowsets: SwissIndex::new(),
+            sequence_counters: HashMap::new(),
+            vtab_cursors: SwissIndex::new(),
+            window_contexts: SwissIndex::new(),
+            register_subtypes: HashMap::new(),
+            has_subtypes: false,
+            bloom_filters: HashMap::new(),
+        }
+    }
+}
+
 /// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication,
 /// applying collation when specified.
 ///
@@ -5372,18 +5455,13 @@ impl VdbeEngine {
             scalar_function_cache: HashMap::new(),
             aggregate_function_cache: HashMap::new(),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
-            aggregates: SwissIndex::new(),
+            cold_state: None,
             schema_cookie: 0,
             last_compare_result: None,
             changes: 0,
             last_insert_rowid: 0,
             last_insert_rowid_valid: false,
             last_insert_cursor_id: None,
-            pending_update_restore: None,
-            pending_insert_rollback: None,
-            conflict_skip_idx: false,
-            pending_idx_entries: Vec::new(),
-            rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
             concurrent_rowid_allocator: None,
@@ -5391,24 +5469,17 @@ impl VdbeEngine {
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
-            sequence_counters: HashMap::new(),
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
-            vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
             version_store: None,
             time_travel_commit_log: None,
             time_travel_gc_horizon: None,
             table_index_meta: Arc::new(HashMap::new()),
-            window_contexts: SwissIndex::new(),
-            register_subtypes: HashMap::new(),
-            has_subtypes: false,
-            bloom_filters: HashMap::new(),
-            make_record_buf: Vec::new(),
-            make_record_sideband_reg: 0,
+            make_record_lookaside: MakeRecordStatementLookaside::default(),
             collect_result_rows: true,
             max_collected_result_rows: None,
             statement_state_clean: true,
@@ -5422,62 +5493,143 @@ impl VdbeEngine {
         self.statement_cold_state.insert(state);
     }
 
-    fn clear_statement_cold_state(&mut self) {
-        if self.statement_cold_state.is_empty() {
+    #[inline]
+    fn cold_state(&self) -> Option<&ColdVdbeState> {
+        self.cold_state.as_deref()
+    }
+
+    #[inline]
+    fn cold_state_mut(&mut self) -> Option<&mut ColdVdbeState> {
+        self.cold_state.as_deref_mut()
+    }
+
+    #[inline]
+    fn ensure_cold_state(&mut self) -> &mut ColdVdbeState {
+        self.cold_state
+            .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
+            .as_mut()
+    }
+
+    #[inline]
+    fn ensure_cold_state_for(&mut self, state: StatementColdState) -> &mut ColdVdbeState {
+        self.mark_statement_cold_state(state);
+        self.ensure_cold_state()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn has_cold_state_allocated(&self) -> bool {
+        self.cold_state.is_some()
+    }
+
+    #[inline]
+    fn clear_register_subtype(&mut self, r: i32) {
+        if let Some(cold_state) = self.cold_state_mut()
+            && cold_state.has_subtypes
+        {
+            cold_state.register_subtypes.remove(&r);
+            if cold_state.register_subtypes.is_empty() {
+                cold_state.has_subtypes = false;
+            }
+        }
+    }
+
+    #[inline]
+    fn register_subtype(&self, r: i32) -> Option<u32> {
+        self.cold_state()
+            .and_then(|cold_state| cold_state.register_subtypes.get(&r).copied())
+    }
+
+    #[inline]
+    fn set_register_subtype(&mut self, r: i32, subtype: u32) {
+        if subtype == 0 {
+            self.clear_register_subtype(r);
             return;
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::AGGREGATES)
-        {
-            self.aggregates.clear();
+        let cold_state = self.ensure_cold_state_for(StatementColdState::REGISTER_SUBTYPES);
+        cold_state.register_subtypes.insert(r, subtype);
+        cold_state.has_subtypes = true;
+    }
+
+    #[inline]
+    fn has_register_subtypes(&self) -> bool {
+        self.cold_state()
+            .is_some_and(|cold_state| cold_state.has_subtypes)
+    }
+
+    #[inline]
+    fn take_pending_update_restore(&mut self) -> Option<PendingUpdateRestore> {
+        self.cold_state_mut()
+            .and_then(|cold_state| cold_state.pending_update_restore.take())
+    }
+
+    #[inline]
+    fn set_pending_update_restore(&mut self, restore: Option<PendingUpdateRestore>) {
+        if let Some(restore) = restore {
+            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                .pending_update_restore = Some(restore);
+        } else if let Some(cold_state) = self.cold_state_mut() {
+            cold_state.pending_update_restore = None;
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::CONFLICT_TRACKING)
-        {
-            self.pending_update_restore = None;
-            self.pending_insert_rollback = None;
-            self.conflict_skip_idx = false;
-            self.pending_idx_entries.clear();
+    }
+
+    #[inline]
+    fn take_pending_insert_rollback(&mut self) -> Option<PendingInsertRollback> {
+        self.cold_state_mut()
+            .and_then(|cold_state| cold_state.pending_insert_rollback.take())
+    }
+
+    #[inline]
+    fn set_pending_insert_rollback(&mut self, rollback: Option<PendingInsertRollback>) {
+        if let Some(rollback) = rollback {
+            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                .pending_insert_rollback = Some(rollback);
+        } else if let Some(cold_state) = self.cold_state_mut() {
+            cold_state.pending_insert_rollback = None;
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::ROWSETS)
-        {
-            self.rowsets.clear();
+    }
+
+    #[inline]
+    fn take_pending_idx_entries(&mut self) -> Vec<(i32, Vec<u8>)> {
+        self.cold_state_mut()
+            .map_or_else(Vec::new, |cold_state| std::mem::take(&mut cold_state.pending_idx_entries))
+    }
+
+    #[inline]
+    fn clear_pending_idx_entries(&mut self) {
+        if let Some(cold_state) = self.cold_state_mut() {
+            cold_state.pending_idx_entries.clear();
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::SEQUENCE_COUNTERS)
-        {
-            self.sequence_counters.clear();
+    }
+
+    #[inline]
+    fn push_pending_idx_entry(&mut self, cursor_id: i32, key_bytes: Vec<u8>) {
+        self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+            .pending_idx_entries
+            .push((cursor_id, key_bytes));
+    }
+
+    #[inline]
+    fn conflict_skip_idx(&self) -> bool {
+        self.cold_state()
+            .is_some_and(|cold_state| cold_state.conflict_skip_idx)
+    }
+
+    #[inline]
+    fn set_conflict_skip_idx(&mut self, skip: bool) {
+        if skip {
+            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                .conflict_skip_idx = true;
+        } else if let Some(cold_state) = self.cold_state_mut() {
+            cold_state.conflict_skip_idx = false;
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::VTAB_CURSORS)
-        {
-            self.vtab_cursors.clear();
+    }
+
+    fn clear_statement_cold_state(&mut self) {
+        if self.statement_cold_state.is_empty() && self.cold_state.is_none() {
+            return;
         }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::WINDOW_CONTEXTS)
-        {
-            self.window_contexts.clear();
-        }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::REGISTER_SUBTYPES)
-        {
-            self.register_subtypes.clear();
-            self.has_subtypes = false;
-        }
-        if self
-            .statement_cold_state
-            .contains(StatementColdState::BLOOM_FILTERS)
-        {
-            self.bloom_filters.clear();
-        }
+        self.cold_state = None;
         self.statement_cold_state.clear();
     }
 
@@ -5548,8 +5700,7 @@ impl VdbeEngine {
         }
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
-        self.make_record_buf.truncate(0);
-        self.make_record_sideband_reg = 0;
+        self.make_record_lookaside.reset();
         if !preserve_runtime_setup {
             self.reject_mem_fallback = true;
             self.memdb_rows_loaded = false;
@@ -6596,12 +6747,8 @@ impl VdbeEngine {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
         let estimated_make_record_capacity =
             estimate_make_record_buffer_capacity(program, self.page_size);
-        if estimated_make_record_capacity > self.make_record_buf.capacity() {
-            self.make_record_buf
-                .reserve(estimated_make_record_capacity - self.make_record_buf.capacity());
-        }
-        self.make_record_buf.truncate(0);
-        self.make_record_sideband_reg = 0;
+        self.make_record_lookaside
+            .prepare_for_statement(estimated_make_record_capacity);
         if !self.statement_state_clean {
             self.clear_statement_cold_state();
             self.results.clear();
@@ -8537,10 +8684,10 @@ impl VdbeEngine {
                     // only for legacy Phase 4 cursors.
                     //
                     // bd-perf: Sideband buffer — if MakeRecord stored bytes in
-                    // make_record_buf (sideband), take ownership here to avoid
+                    // the MakeRecord sideband lookaside, take ownership here to avoid
                     // Arc allocation. Otherwise fall back to register blob.
-                    let sideband_active = self.make_record_sideband_reg == record_reg
-                        && !self.make_record_buf.is_empty();
+                    let sideband_active =
+                        self.make_record_lookaside.sideband_is_armed_for(record_reg);
                     // Only move the register value out when there is no active
                     // MakeRecord sideband. Doing `take_reg()` first would
                     // eagerly materialize the sideband into an Arc-backed blob
@@ -8557,8 +8704,8 @@ impl VdbeEngine {
                         self.take_reg(record_reg)
                     };
                     let sideband_buf = if sideband_active {
-                        self.make_record_sideband_reg = 0;
-                        std::mem::take(&mut self.make_record_buf)
+                        self.make_record_lookaside.disarm();
+                        self.make_record_lookaside.take_buf()
                     } else {
                         Vec::new()
                     };
@@ -8832,7 +8979,7 @@ impl VdbeEngine {
                     if sideband_active {
                         let mut buf = sideband_buf;
                         buf.clear();
-                        self.make_record_buf = buf;
+                        self.make_record_lookaside.replace_buf(buf);
                     }
 
                     pc += 1;
@@ -8929,11 +9076,10 @@ impl VdbeEngine {
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
                     let key_val = self.get_reg(key_reg).clone();
-                    let sideband_active = self.make_record_sideband_reg == key_reg
-                        && !self.make_record_buf.is_empty();
+                    let sideband_active = self.make_record_lookaside.sideband_is_armed_for(key_reg);
                     let key_blob = if sideband_active {
-                        self.make_record_sideband_reg = 0;
-                        std::mem::take(&mut self.make_record_buf)
+                        self.make_record_lookaside.disarm();
+                        self.make_record_lookaside.take_buf()
                     } else {
                         record_blob_bytes(&key_val).to_vec()
                     };
@@ -9074,11 +9220,11 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let record = self.take_reg(op.p2);
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let sideband_active = self.make_record_sideband_reg == op.p2
-                            && !self.make_record_buf.is_empty();
+                        let sideband_active =
+                            self.make_record_lookaside.sideband_is_armed_for(op.p2);
                         let blob = if sideband_active {
-                            self.make_record_sideband_reg = 0;
-                            std::mem::take(&mut self.make_record_buf)
+                            self.make_record_lookaside.disarm();
+                            self.make_record_lookaside.take_buf()
                         } else {
                             record_blob_bytes(&record).to_vec()
                         };
@@ -10906,21 +11052,17 @@ impl VdbeEngine {
 
     #[inline]
     fn invalidate_make_record_sideband_if_overwritten(&mut self, r: i32) {
-        if self.make_record_sideband_reg == r {
-            self.make_record_sideband_reg = 0;
-            self.make_record_buf.clear();
-        }
+        self.make_record_lookaside.clear_sideband_for_register(r);
     }
 
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn materialize_make_record_sideband(&mut self, r: i32) {
-        if self.make_record_sideband_reg != r || self.make_record_buf.is_empty() {
+        if !self.make_record_lookaside.sideband_is_armed_for(r) {
             return;
         }
         if !(0..=65535).contains(&r) {
-            self.make_record_sideband_reg = 0;
-            self.make_record_buf.clear();
+            self.make_record_lookaside.reset();
             return;
         }
         let idx = r as usize;
@@ -10934,8 +11076,8 @@ impl VdbeEngine {
         FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
             .fetch_add(1, AtomicOrdering::Relaxed);
         self.registers[idx] =
-            SqliteValue::Blob(Arc::<[u8]>::from(std::mem::take(&mut self.make_record_buf)));
-        self.make_record_sideband_reg = 0;
+            SqliteValue::Blob(Arc::<[u8]>::from(self.make_record_lookaside.take_buf()));
+        self.make_record_lookaside.disarm();
     }
 
     /// Materialize an owned copy of a register while preserving the source.
@@ -11050,7 +11192,7 @@ impl VdbeEngine {
                         };
 
                         // 2. Serialize record from registers into sideband buf
-                        let mut rec_buf = std::mem::take(&mut self.make_record_buf);
+                        let mut rec_buf = self.make_record_lookaside.take_buf();
                         {
                             let this = &*self;
                             let iter = (0..num_cols).map(move |i| {
@@ -11071,7 +11213,7 @@ impl VdbeEngine {
 
                         // Return buffer for reuse
                         rec_buf.clear();
-                        self.make_record_buf = rec_buf;
+                        self.make_record_lookaside.replace_buf(rec_buf);
 
                         // 4. Bookkeeping (same as Insert opcode)
                         self.changes += 1;
@@ -11291,7 +11433,7 @@ impl VdbeEngine {
     fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
         let target = op.p3;
         let n_cols = usize::try_from(op.p2).unwrap_or(0);
-        let mut rec_buf = std::mem::take(&mut self.make_record_buf);
+        let mut rec_buf = self.make_record_lookaside.take_buf();
         {
             let this = &*self;
             match &op.p4 {
@@ -11402,12 +11544,12 @@ impl VdbeEngine {
         // state attached to this register is cleared before arming the new
         // sideband payload below.
         self.set_reg(target, SqliteValue::Null);
-        // bd-perf: Sideband buffer — keep record bytes in make_record_buf
+        // bd-perf: Sideband buffer — keep record bytes in the statement lookaside
         // and let Insert/IdxInsert read from there directly, avoiding the
         // Arc<[u8]> heap allocation + memcpy per row. The sideband register
         // number tells Insert which register to intercept.
-        self.make_record_buf = rec_buf; // keep bytes (don't clear!)
-        self.make_record_sideband_reg = target;
+        self.make_record_lookaside.replace_buf(rec_buf); // keep bytes (don't clear!)
+        self.make_record_lookaside.arm_sideband(target);
     }
 
     #[cold]
@@ -11842,10 +11984,7 @@ impl VdbeEngine {
                         if reg_idx >= self.registers.len() {
                             self.registers.resize(reg_idx + 1, SqliteValue::Null);
                         }
-                        if self.make_record_sideband_reg == target {
-                            self.make_record_sideband_reg = 0;
-                            self.make_record_buf.clear();
-                        }
+                        self.make_record_lookaside.clear_sideband_for_register(target);
                         if self.has_subtypes {
                             self.register_subtypes.remove(&target);
                         }
@@ -13047,7 +13186,14 @@ fn refresh_storage_cursor_first_key_state(cursor: &mut StorageCursor, collect_vd
         return;
     }
 
-    if cursor.last_position_stamp.is_some() {
+    if let Some(previous_stamp) = cursor.last_position_stamp
+        && let Some(current_stamp) = position_stamp
+    {
+        note_decode_cache_invalidation(
+            collect_vdbe_metrics,
+            decode_cache_invalidation_reason_from_stamps(previous_stamp, current_stamp),
+        );
+    } else if cursor.last_position_stamp.is_some() {
         note_decode_cache_invalidation(
             collect_vdbe_metrics,
             DecodeCacheInvalidationReason::PositionChange,
@@ -13677,6 +13823,17 @@ struct DecodeCacheRefreshState {
     eager_values_ready: bool,
 }
 
+fn decode_cache_invalidation_reason_from_stamps(
+    previous: CursorPositionStamp,
+    current: CursorPositionStamp,
+) -> DecodeCacheInvalidationReason {
+    if previous.same_logical_position(current) {
+        DecodeCacheInvalidationReason::WriteMutation
+    } else {
+        DecodeCacheInvalidationReason::PositionChange
+    }
+}
+
 fn ensure_storage_cursor_payload_prefix(
     cursor: &mut StorageCursor,
     min_payload_bytes: usize,
@@ -13697,7 +13854,14 @@ fn ensure_storage_cursor_row_layout(
     let position_stamp = cursor.cursor.position_stamp();
     let mut refreshed = false;
     if cursor.last_position_stamp != position_stamp {
-        if cursor.last_position_stamp.is_some() {
+        if let Some(previous_stamp) = cursor.last_position_stamp
+            && let Some(current_stamp) = position_stamp
+        {
+            note_decode_cache_invalidation(
+                collect_vdbe_metrics,
+                decode_cache_invalidation_reason_from_stamps(previous_stamp, current_stamp),
+            );
+        } else if cursor.last_position_stamp.is_some() {
             note_decode_cache_invalidation(
                 collect_vdbe_metrics,
                 DecodeCacheInvalidationReason::PositionChange,
@@ -15274,7 +15438,8 @@ mod tests {
     }
 
     fn track_r_decode_make_record_buf(engine: &VdbeEngine) -> Vec<SqliteValue> {
-        parse_record(&engine.make_record_buf).expect("MakeRecord sideband should decode")
+        parse_record(engine.make_record_lookaside.as_slice())
+            .expect("MakeRecord sideband should decode")
     }
 
     fn track_r_emit_value(builder: &mut ProgramBuilder, reg: i32, value: &SqliteValue) {
@@ -15362,7 +15527,7 @@ mod tests {
 
             engine.execute_make_record_hot(&op, false);
 
-            let observed_capacity = engine.make_record_buf.capacity();
+            let observed_capacity = engine.make_record_lookaside.capacity();
             if let Some(expected_capacity) = scratch_capacity {
                 assert_eq!(
                     observed_capacity, expected_capacity,
@@ -15468,7 +15633,7 @@ mod tests {
         track_r_log_metrics(
             "test_track_r_make_record_all_sqlite_types",
             1,
-            engine.make_record_buf.capacity(),
+            engine.make_record_lookaside.capacity(),
             start.elapsed().as_nanos(),
         );
     }
@@ -15489,7 +15654,7 @@ mod tests {
         track_r_log_metrics(
             "test_track_r_make_record_empty_record",
             1,
-            engine.make_record_buf.capacity(),
+            engine.make_record_lookaside.capacity(),
             start.elapsed().as_nanos(),
         );
     }
@@ -15519,7 +15684,7 @@ mod tests {
         track_r_log_metrics(
             "test_track_r_make_record_max_columns",
             1,
-            engine.make_record_buf.capacity(),
+            engine.make_record_lookaside.capacity(),
             start.elapsed().as_nanos(),
         );
     }
@@ -15956,6 +16121,91 @@ mod tests {
             after.decode_cache_invalidations_pseudo_total
                 - before.decode_cache_invalidations_pseudo_total,
             0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_storage_cursor_same_slot_write_mutation_invalidates_cached_text() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Text("alpha-track-j".into())]);
+        table.insert(2, vec![SqliteValue::Text("beta-track-j".into())]);
+
+        let mut engine = VdbeEngine::new(2);
+        engine.collect_vdbe_metrics = true;
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, root, true));
+        engine.cursor_root_pages.insert(0, root);
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            assert!(sc.cursor.first(&sc.cx).expect("cursor should rewind"));
+        }
+
+        let before = vdbe_metrics_snapshot();
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("first text decode should succeed"),
+            SqliteValue::Text("alpha-track-j".into())
+        );
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            sc.cursor
+                .delete(&sc.cx)
+                .expect("direct delete should succeed without helper invalidation");
+        }
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("same-slot successor should force a fresh decode"),
+            SqliteValue::Text("beta-track-j".into())
+        );
+        let after = vdbe_metrics_snapshot();
+        let sc = engine
+            .storage_cursors
+            .get(&0)
+            .expect("storage cursor should exist");
+
+        assert!(sc.row_decode.cached_value_ready(0));
+        assert_eq!(
+            sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
+            Some("beta-track-j")
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
         );
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
@@ -19900,11 +20150,11 @@ mod tests {
         let outcome = engine.execute(&program).expect("program should execute");
         assert!(matches!(outcome, ExecOutcome::Done));
         assert!(
-            engine.make_record_buf.capacity() >= expected_capacity,
+            engine.make_record_lookaside.capacity() >= expected_capacity,
             "MakeRecord scratch should retain its pre-sized capacity across the statement"
         );
         assert!(
-            engine.make_record_buf.is_empty(),
+            engine.make_record_lookaside.is_empty(),
             "statement scratch should be length-reset after the final MakeRecord"
         );
         let decoded = decode_record(engine.get_reg(r_record)).expect("record should decode");
@@ -24431,6 +24681,56 @@ mod tests {
         engine.set_transaction(txn);
         assert!(engine.storage_cursors_enabled);
         assert!(engine.txn_page_io.is_some());
+    }
+
+    #[test]
+    fn test_storage_only_table_program_executes_without_attached_memdb() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let root = 256;
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_op(Opcode::Count, 0, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        assert!(
+            !prog.requires_attached_memdb(),
+            "storage-only table bytecode should not require an attached MemDatabase"
+        );
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_transaction(txn);
+        engine.set_reject_mem_fallback(true);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert!(
+            engine.all_cursors_are_txn_backed(),
+            "storage-only hot path must stay on txn-backed cursors"
+        );
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+        assert!(
+            engine.take_database().is_none(),
+            "the engine should not need an attached MemDatabase for this hot path"
+        );
     }
 
     #[test]

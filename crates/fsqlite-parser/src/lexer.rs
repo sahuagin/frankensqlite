@@ -152,6 +152,17 @@ impl<'a> Lexer<'a> {
     /// Tokenize the entire input into a Vec of tokens.
     #[must_use]
     pub fn tokenize(source: &'a str) -> Vec<Token> {
+        let mut tokens = Vec::new();
+        Self::tokenize_into(source, &mut tokens);
+        tokens
+    }
+
+    /// Tokenize the entire input into a caller-owned buffer.
+    ///
+    /// This preserves the buffer's existing heap allocation across repeated
+    /// parses so statement-level callers can treat token storage as lookaside
+    /// scratch instead of rebuilding a fresh `Vec<Token>` on every miss.
+    pub fn tokenize_into(source: &'a str, tokens: &mut Vec<Token>) {
         let input_bytes = source.len();
         let span = tracing::span!(
             target: "fsqlite.parse",
@@ -165,7 +176,11 @@ impl<'a> Lexer<'a> {
         let started = Instant::now();
 
         let mut lexer = Self::new(source);
-        let mut tokens = Vec::with_capacity(input_bytes / 4 + 1);
+        let target_capacity = input_bytes / 4 + 1;
+        tokens.clear();
+        if target_capacity > tokens.capacity() {
+            tokens.reserve(target_capacity - tokens.capacity());
+        }
         loop {
             let tok = lexer.next_token();
             let is_eof = tok.kind == TokenKind::Eof;
@@ -180,7 +195,6 @@ impl<'a> Lexer<'a> {
         span.record("token_count", saturating_u64_from_usize(tokens.len()));
         span.record("elapsed_us", elapsed_us);
         record_tokenize_metrics(tokens.len(), elapsed_us);
-        tokens
     }
 
     /// Expose tokenize metrics as a snapshot.
@@ -970,6 +984,29 @@ mod tests {
                 TokenKind::Integer(255),
                 TokenKind::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_into_reuses_caller_owned_capacity() {
+        let mut scratch = Vec::new();
+        Lexer::tokenize_into(
+            "SELECT 'abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz';",
+            &mut scratch,
+        );
+        let warmed_capacity = scratch.capacity();
+        assert!(warmed_capacity > 0, "warm parse should allocate token scratch");
+
+        Lexer::tokenize_into("SELECT 1;", &mut scratch);
+        assert_eq!(
+            scratch.capacity(),
+            warmed_capacity,
+            "smaller follow-up parse should reuse the warmed token buffer",
+        );
+        assert_eq!(
+            scratch.last().map(|token| &token.kind),
+            Some(&TokenKind::Eof),
+            "tokenize_into should still terminate with EOF in reused scratch",
         );
     }
 
