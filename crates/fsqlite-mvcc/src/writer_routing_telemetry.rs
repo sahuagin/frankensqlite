@@ -5,7 +5,9 @@
 //! routing beads can consume the same hot-path evidence without reopening the
 //! capture design.
 
-use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};
+use std::collections::HashMap;
+
+use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
 use smallvec::SmallVec;
 
 use crate::ssi_validation::DiscoveredEdge;
@@ -505,6 +507,248 @@ pub enum WriterRoutingDecisionError {
     NoCandidateLanes,
 }
 
+/// Baseline vs routed placement mode for synthetic writer-routing evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterRoutingMode {
+    BaselineStableHash,
+    ConflictTopologyHints,
+}
+
+impl WriterRoutingMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BaselineStableHash => "baseline_stable_hash",
+            Self::ConflictTopologyHints => "conflict_topology_hints",
+        }
+    }
+}
+
+/// Canonical synthetic workload shapes for routing evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterRoutingSyntheticWorkload {
+    DisjointPages,
+    OverlappingPages,
+    HotPageContention,
+}
+
+impl WriterRoutingSyntheticWorkload {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DisjointPages => "disjoint_pages",
+            Self::OverlappingPages => "overlapping_pages",
+            Self::HotPageContention => "hot_page_contention",
+        }
+    }
+}
+
+/// Placement profile used when producing synthetic home hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterRoutingPlacementProfile {
+    BaselineUnpinned,
+    HomeLanePinned,
+    HomeNodePinned,
+}
+
+impl WriterRoutingPlacementProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BaselineUnpinned => "baseline_unpinned",
+            Self::HomeLanePinned => "home_lane_pinned",
+            Self::HomeNodePinned => "home_node_pinned",
+        }
+    }
+}
+
+/// Deterministic synthetic workload configuration for routing evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterRoutingSyntheticConfig {
+    pub scenario_id: String,
+    pub workload: WriterRoutingSyntheticWorkload,
+    pub placement_profile: WriterRoutingPlacementProfile,
+    pub lane_count: u16,
+    pub iterations: u32,
+    pub writers_per_iteration: u16,
+}
+
+impl Default for WriterRoutingSyntheticConfig {
+    fn default() -> Self {
+        Self {
+            scenario_id: "writer_routing.synthetic".to_owned(),
+            workload: WriterRoutingSyntheticWorkload::OverlappingPages,
+            placement_profile: WriterRoutingPlacementProfile::HomeLanePinned,
+            lane_count: 4,
+            iterations: 16,
+            writers_per_iteration: 4,
+        }
+    }
+}
+
+impl WriterRoutingSyntheticConfig {
+    #[must_use]
+    pub const fn effective_lane_count(&self) -> u16 {
+        self.lane_count.max(1)
+    }
+
+    #[must_use]
+    pub const fn effective_iterations(&self) -> u32 {
+        self.iterations.max(1)
+    }
+
+    #[must_use]
+    pub const fn effective_writers_per_iteration(&self) -> u16 {
+        self.writers_per_iteration.max(1)
+    }
+}
+
+/// Lane-distribution evidence for the synthetic routing protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriterRoutingSyntheticFairnessSummary {
+    pub lane_writer_counts: Vec<u64>,
+    pub max_minus_min_assignments: u64,
+}
+
+impl WriterRoutingSyntheticFairnessSummary {
+    /// Jain fairness index over `lane_writer_counts`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn jain_fairness_index(&self) -> f64 {
+        if self.lane_writer_counts.is_empty() {
+            return 0.0;
+        }
+        let sum = self.lane_writer_counts.iter().sum::<u64>() as f64;
+        let squared_sum = self
+            .lane_writer_counts
+            .iter()
+            .map(|count| {
+                let value = *count as f64;
+                value * value
+            })
+            .sum::<f64>();
+        if squared_sum == 0.0 {
+            return 0.0;
+        }
+        (sum * sum) / (self.lane_writer_counts.len() as f64 * squared_sum)
+    }
+}
+
+/// One deterministic synthetic run for a routing mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterRoutingSyntheticSummary {
+    pub scenario_id: String,
+    pub workload: WriterRoutingSyntheticWorkload,
+    pub placement_profile: WriterRoutingPlacementProfile,
+    pub routing_mode: WriterRoutingMode,
+    pub total_writers: u64,
+    pub total_runtime_nanos: u64,
+    pub latency_nanos: Vec<u64>,
+    pub conflicts_total: u64,
+    pub retries_total: u64,
+    pub fallback_decisions_total: u64,
+    pub remote_ownership_events: u64,
+    pub publication_retry_total: u64,
+    pub visibility_handoff_nanos_total: u64,
+    pub stale_snapshot_rejects_total: u64,
+    pub fairness: WriterRoutingSyntheticFairnessSummary,
+}
+
+impl WriterRoutingSyntheticSummary {
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn conflict_rate(&self) -> f64 {
+        if self.total_writers == 0 {
+            return 0.0;
+        }
+        self.conflicts_total as f64 / self.total_writers as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn retry_rate(&self) -> f64 {
+        if self.total_writers == 0 {
+            return 0.0;
+        }
+        self.retries_total as f64 / self.total_writers as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn fallback_rate(&self) -> f64 {
+        if self.total_writers == 0 {
+            return 0.0;
+        }
+        self.fallback_decisions_total as f64 / self.total_writers as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn publication_retry_rate(&self) -> f64 {
+        if self.total_writers == 0 {
+            return 0.0;
+        }
+        self.publication_retry_total as f64 / self.total_writers as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn stale_snapshot_rate(&self) -> f64 {
+        if self.total_writers == 0 {
+            return 0.0;
+        }
+        self.stale_snapshot_rejects_total as f64 / self.total_writers as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn ops_per_sec(&self) -> f64 {
+        if self.total_runtime_nanos == 0 {
+            return 0.0;
+        }
+        self.total_writers as f64 / (self.total_runtime_nanos as f64 / 1_000_000_000.0)
+    }
+
+    #[must_use]
+    pub fn p50_latency_ns(&self) -> u64 {
+        percentile_u64(&self.latency_nanos, 0.50)
+    }
+
+    #[must_use]
+    pub fn p95_latency_ns(&self) -> u64 {
+        percentile_u64(&self.latency_nanos, 0.95)
+    }
+
+    #[must_use]
+    pub fn p99_latency_ns(&self) -> u64 {
+        percentile_u64(&self.latency_nanos, 0.99)
+    }
+}
+
+/// Baseline-versus-routed synthetic comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterRoutingSyntheticComparison {
+    pub baseline: WriterRoutingSyntheticSummary,
+    pub routed: WriterRoutingSyntheticSummary,
+}
+
+impl WriterRoutingSyntheticComparison {
+    #[must_use]
+    pub fn conflict_rate_delta(&self) -> f64 {
+        self.routed.conflict_rate() - self.baseline.conflict_rate()
+    }
+
+    #[must_use]
+    pub fn retry_rate_delta(&self) -> f64 {
+        self.routed.retry_rate() - self.baseline.retry_rate()
+    }
+
+    #[must_use]
+    pub fn publication_retry_rate_delta(&self) -> f64 {
+        self.routed.publication_retry_rate() - self.baseline.publication_retry_rate()
+    }
+}
+
 /// Decide which lane or partition should receive a new writer.
 ///
 /// The function is intentionally pure and advisory:
@@ -688,6 +932,446 @@ pub fn decide_writer_routing_target(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SyntheticPageOwner {
+    lane: WriterRoutingLaneId,
+    txn: TxnToken,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SyntheticOperationOutcome {
+    latency_nanos: u64,
+    conflicts: u64,
+    retries: u64,
+    fallback: bool,
+    remote_ownership_events: u64,
+    publication_retries: u64,
+    visibility_handoff_nanos: u64,
+    stale_snapshot_rejects: u64,
+}
+
+/// Run one deterministic synthetic workload for one routing mode.
+#[must_use]
+pub fn evaluate_writer_routing_synthetic_workload(
+    config: &WriterRoutingSyntheticConfig,
+    routing_mode: WriterRoutingMode,
+    decision_config: WriterRoutingDecisionConfig,
+) -> WriterRoutingSyntheticSummary {
+    let lane_count = usize::from(config.effective_lane_count());
+    let iterations = config.effective_iterations();
+    let writers_per_iteration = config.effective_writers_per_iteration();
+
+    let mut candidate_lanes = (0..lane_count)
+        .map(|lane_index| WriterRoutingLaneSnapshot {
+            lane: Some(WriterRoutingLaneId::new(u16::try_from(lane_index + 1).unwrap_or(u16::MAX))),
+            node: Some(WriterRoutingNodeId::new(
+                u16::try_from(lane_index % 2).unwrap_or(u16::MAX),
+            )),
+            ..WriterRoutingLaneSnapshot::default()
+        })
+        .collect::<Vec<_>>();
+    let mut page_owners = HashMap::<PageNumber, SyntheticPageOwner>::new();
+    let mut lane_writer_counts = vec![0_u64; lane_count];
+
+    let mut total_writers = 0_u64;
+    let mut total_runtime_nanos = 0_u64;
+    let mut latency_nanos = Vec::with_capacity(
+        usize::try_from(iterations)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(usize::from(writers_per_iteration)),
+    );
+    let mut conflicts_total = 0_u64;
+    let mut retries_total = 0_u64;
+    let mut fallback_decisions_total = 0_u64;
+    let mut remote_ownership_events = 0_u64;
+    let mut publication_retry_total = 0_u64;
+    let mut visibility_handoff_nanos_total = 0_u64;
+    let mut stale_snapshot_rejects_total = 0_u64;
+
+    for writer_index in 0..u64::from(iterations) * u64::from(writers_per_iteration) {
+        for lane in &mut candidate_lanes {
+            lane.in_flight_writers = lane.in_flight_writers.saturating_sub(1);
+        }
+
+        let txn_token = synthetic_txn_token(writer_index.saturating_add(1));
+        let session_id = writer_index.saturating_add(1);
+        let begin_seq = CommitSeq::new(session_id.saturating_mul(2).saturating_sub(1));
+        let planned_commit_seq = CommitSeq::new(session_id.saturating_mul(2));
+        let natural_lane_index = usize::try_from(writer_index).unwrap_or(usize::MAX) % lane_count;
+        let natural_lane = candidate_lanes[natural_lane_index]
+            .lane
+            .expect("synthetic lane must exist");
+        let pages = synthetic_workload_pages(config.workload, writer_index, natural_lane_index);
+        let mut input = WriterRoutingTelemetryInput {
+            session_id: Some(session_id),
+            txn_token,
+            begin_seq,
+            planned_commit_seq: Some(planned_commit_seq),
+            touch_surface: WriterTouchSurfaceTelemetry::default(),
+            conflict_history: WriterConflictHistoryTelemetry::default(),
+            ownership_lineage: WriterOwnershipLineageTelemetry::default(),
+        };
+        input.touch_surface.write_set_pages.extend_from_slice(&pages);
+        if matches!(config.workload, WriterRoutingSyntheticWorkload::DisjointPages) {
+            input.touch_surface.read_pages.push(pages[0]);
+        }
+
+        let shared_pages = synthetic_shared_pages(config.workload, writer_index);
+        for shared_page in shared_pages {
+            if let Some(owner) = page_owners.get(&shared_page).copied() {
+                input.touch_surface.same_page_conflict_pages.push(shared_page);
+                input.conflict_history.same_page_conflict_count =
+                    input.conflict_history.same_page_conflict_count.saturating_add(1);
+                input
+                    .ownership_lineage
+                    .lock_holder_clues
+                    .push(WriterLockHolderClue {
+                        page: shared_page,
+                        holder: owner.txn.id,
+                    });
+                if !input.ownership_lineage.conflicting_txns.contains(&owner.txn) {
+                    input.ownership_lineage.conflicting_txns.push(owner.txn);
+                }
+                input
+                    .conflict_history
+                    .retry_attributions
+                    .push(WriterRetryAttribution {
+                        cause: WriterRetryCause::PublicationAdvance,
+                        count: 1,
+                        wait_nanos: synthetic_wait_nanos(config.workload),
+                        pages: SmallVec::from_slice(&[shared_page]),
+                    });
+            }
+        }
+
+        let home_hint = synthetic_home_hint(
+            config.placement_profile,
+            &candidate_lanes,
+            &page_owners,
+            &pages,
+            natural_lane,
+            planned_commit_seq,
+        );
+
+        let (selected_lane, fallback) = match routing_mode {
+            WriterRoutingMode::BaselineStableHash => {
+                (synthetic_baseline_lane(&candidate_lanes, session_id), true)
+            }
+            WriterRoutingMode::ConflictTopologyHints => {
+                let decision = decide_writer_routing_target(
+                    &input,
+                    &candidate_lanes,
+                    home_hint,
+                    decision_config,
+                )
+                .expect("synthetic candidate lanes must be non-empty");
+                (
+                    decision.selected_lane,
+                    decision.reason == WriterRoutingDecisionReason::StableHashFallback,
+                )
+            }
+        };
+        let selected_index = candidate_lanes
+            .iter()
+            .position(|lane| lane.lane == Some(selected_lane))
+            .expect("selected synthetic lane must exist");
+
+        let outcome = evaluate_synthetic_selection(config.workload, &pages, selected_lane, &page_owners);
+        total_writers = total_writers.saturating_add(1);
+        total_runtime_nanos = total_runtime_nanos.saturating_add(outcome.latency_nanos);
+        latency_nanos.push(outcome.latency_nanos);
+        conflicts_total = conflicts_total.saturating_add(outcome.conflicts);
+        retries_total = retries_total.saturating_add(outcome.retries);
+        fallback_decisions_total =
+            fallback_decisions_total.saturating_add(u64::from(outcome.fallback || fallback));
+        remote_ownership_events = remote_ownership_events
+            .saturating_add(outcome.remote_ownership_events);
+        publication_retry_total =
+            publication_retry_total.saturating_add(outcome.publication_retries);
+        visibility_handoff_nanos_total = visibility_handoff_nanos_total
+            .saturating_add(outcome.visibility_handoff_nanos);
+        stale_snapshot_rejects_total = stale_snapshot_rejects_total
+            .saturating_add(outcome.stale_snapshot_rejects);
+        lane_writer_counts[selected_index] = lane_writer_counts[selected_index].saturating_add(1);
+
+        update_synthetic_lane_snapshot(
+            &mut candidate_lanes[selected_index],
+            txn_token,
+            &pages,
+            &shared_pages,
+            &outcome,
+        );
+
+        for page in pages {
+            page_owners.insert(
+                page,
+                SyntheticPageOwner {
+                    lane: selected_lane,
+                    txn: txn_token,
+                },
+            );
+        }
+    }
+
+    let max_assignments = lane_writer_counts.iter().copied().max().unwrap_or(0);
+    let min_assignments = lane_writer_counts.iter().copied().min().unwrap_or(0);
+
+    WriterRoutingSyntheticSummary {
+        scenario_id: config.scenario_id.clone(),
+        workload: config.workload,
+        placement_profile: config.placement_profile,
+        routing_mode,
+        total_writers,
+        total_runtime_nanos,
+        latency_nanos,
+        conflicts_total,
+        retries_total,
+        fallback_decisions_total,
+        remote_ownership_events,
+        publication_retry_total,
+        visibility_handoff_nanos_total,
+        stale_snapshot_rejects_total,
+        fairness: WriterRoutingSyntheticFairnessSummary {
+            lane_writer_counts,
+            max_minus_min_assignments: max_assignments.saturating_sub(min_assignments),
+        },
+    }
+}
+
+/// Compare baseline stable hashing against the routing decision function on the
+/// same synthetic workload.
+#[must_use]
+pub fn compare_writer_routing_synthetic_workload(
+    config: &WriterRoutingSyntheticConfig,
+    decision_config: WriterRoutingDecisionConfig,
+) -> WriterRoutingSyntheticComparison {
+    WriterRoutingSyntheticComparison {
+        baseline: evaluate_writer_routing_synthetic_workload(
+            config,
+            WriterRoutingMode::BaselineStableHash,
+            decision_config,
+        ),
+        routed: evaluate_writer_routing_synthetic_workload(
+            config,
+            WriterRoutingMode::ConflictTopologyHints,
+            decision_config,
+        ),
+    }
+}
+
+fn synthetic_txn_token(raw: u64) -> TxnToken {
+    TxnToken::new(
+        TxnId::new(raw.max(1)).expect("synthetic txn id must be valid"),
+        TxnEpoch::new(1),
+    )
+}
+
+fn synthetic_workload_pages(
+    workload: WriterRoutingSyntheticWorkload,
+    writer_index: u64,
+    natural_lane_index: usize,
+) -> SmallVec<[PageNumber; 4]> {
+    let unique_base =
+        u32::try_from(1_000_u64.saturating_add(writer_index.saturating_mul(8))).unwrap_or(u32::MAX);
+    match workload {
+        WriterRoutingSyntheticWorkload::DisjointPages => SmallVec::from_slice(&[
+            PageNumber::new(unique_base).expect("synthetic disjoint page should be valid"),
+            PageNumber::new(unique_base.saturating_add(1))
+                .expect("synthetic disjoint page should be valid"),
+        ]),
+        WriterRoutingSyntheticWorkload::OverlappingPages => {
+            let shared_page =
+                PageNumber::new(64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)))
+                    .expect("synthetic overlap page should be valid");
+            let unique_page = PageNumber::new(
+                2_000_u32
+                    .saturating_add(u32::try_from(natural_lane_index).unwrap_or(u32::MAX))
+                    .saturating_mul(16)
+                    .saturating_add(u32::try_from(writer_index / 3).unwrap_or(0)),
+            )
+            .expect("synthetic overlap unique page should be valid");
+            SmallVec::from_slice(&[shared_page, unique_page])
+        }
+        WriterRoutingSyntheticWorkload::HotPageContention => SmallVec::from_slice(&[
+            PageNumber::ONE,
+            PageNumber::new(unique_base.saturating_add(2))
+                .expect("synthetic hot-page unique page should be valid"),
+        ]),
+    }
+}
+
+fn synthetic_shared_pages(
+    workload: WriterRoutingSyntheticWorkload,
+    writer_index: u64,
+) -> SmallVec<[PageNumber; 2]> {
+    match workload {
+        WriterRoutingSyntheticWorkload::DisjointPages => SmallVec::new(),
+        WriterRoutingSyntheticWorkload::OverlappingPages => SmallVec::from_slice(&[
+            PageNumber::new(64_u32.saturating_add(u32::try_from(writer_index % 3).unwrap_or(0)))
+                .expect("synthetic overlap page should be valid"),
+        ]),
+        WriterRoutingSyntheticWorkload::HotPageContention => SmallVec::from_slice(&[PageNumber::ONE]),
+    }
+}
+
+fn synthetic_home_hint(
+    placement_profile: WriterRoutingPlacementProfile,
+    candidate_lanes: &[WriterRoutingLaneSnapshot],
+    page_owners: &HashMap<PageNumber, SyntheticPageOwner>,
+    pages: &[PageNumber],
+    natural_lane: WriterRoutingLaneId,
+    current_commit_seq: CommitSeq,
+) -> Option<WriterHomeHint> {
+    match placement_profile {
+        WriterRoutingPlacementProfile::BaselineUnpinned => None,
+        WriterRoutingPlacementProfile::HomeLanePinned => {
+            let hinted_lane = pages
+                .iter()
+                .find_map(|page| page_owners.get(page).map(|owner| owner.lane))
+                .unwrap_or(natural_lane);
+            Some(WriterHomeHint {
+                home_lane: Some(hinted_lane),
+                home_node: synthetic_lane_node(candidate_lanes, hinted_lane),
+                observed_commit_seq: current_commit_seq,
+            })
+        }
+        WriterRoutingPlacementProfile::HomeNodePinned => {
+            let hinted_lane = pages
+                .iter()
+                .find_map(|page| page_owners.get(page).map(|owner| owner.lane));
+            let home_node = hinted_lane
+                .and_then(|lane| synthetic_lane_node(candidate_lanes, lane))
+                .or_else(|| synthetic_lane_node(candidate_lanes, natural_lane));
+            Some(WriterHomeHint {
+                home_lane: None,
+                home_node,
+                observed_commit_seq: current_commit_seq,
+            })
+        }
+    }
+}
+
+fn synthetic_baseline_lane(
+    candidate_lanes: &[WriterRoutingLaneSnapshot],
+    session_id: u64,
+) -> WriterRoutingLaneId {
+    let valid_lanes = candidate_lanes
+        .iter()
+        .filter_map(|lane| lane.lane)
+        .collect::<Vec<_>>();
+    let index = usize::try_from(session_id).unwrap_or(usize::MAX) % valid_lanes.len().max(1);
+    valid_lanes[index]
+}
+
+fn synthetic_lane_node(
+    candidate_lanes: &[WriterRoutingLaneSnapshot],
+    lane_id: WriterRoutingLaneId,
+) -> Option<WriterRoutingNodeId> {
+    candidate_lanes
+        .iter()
+        .find(|lane| lane.lane == Some(lane_id))
+        .and_then(|lane| lane.node)
+}
+
+fn synthetic_wait_nanos(workload: WriterRoutingSyntheticWorkload) -> u64 {
+    match workload {
+        WriterRoutingSyntheticWorkload::DisjointPages => 0,
+        WriterRoutingSyntheticWorkload::OverlappingPages => 18_000,
+        WriterRoutingSyntheticWorkload::HotPageContention => 32_000,
+    }
+}
+
+fn evaluate_synthetic_selection(
+    workload: WriterRoutingSyntheticWorkload,
+    pages: &[PageNumber],
+    selected_lane: WriterRoutingLaneId,
+    page_owners: &HashMap<PageNumber, SyntheticPageOwner>,
+) -> SyntheticOperationOutcome {
+    let mut outcome = SyntheticOperationOutcome {
+        latency_nanos: match workload {
+            WriterRoutingSyntheticWorkload::DisjointPages => 12_000,
+            WriterRoutingSyntheticWorkload::OverlappingPages => 18_000,
+            WriterRoutingSyntheticWorkload::HotPageContention => 24_000,
+        },
+        ..SyntheticOperationOutcome::default()
+    };
+
+    for page in pages {
+        let Some(owner) = page_owners.get(page) else {
+            continue;
+        };
+        if owner.lane == selected_lane {
+            continue;
+        }
+        outcome.conflicts = outcome.conflicts.saturating_add(1);
+        outcome.remote_ownership_events = outcome.remote_ownership_events.saturating_add(1);
+        outcome.publication_retries = outcome.publication_retries.saturating_add(1);
+        outcome.visibility_handoff_nanos = outcome
+            .visibility_handoff_nanos
+            .saturating_add(match workload {
+                WriterRoutingSyntheticWorkload::DisjointPages => 0,
+                WriterRoutingSyntheticWorkload::OverlappingPages => 14_000,
+                WriterRoutingSyntheticWorkload::HotPageContention => 26_000,
+            });
+        outcome.retries = outcome
+            .retries
+            .saturating_add(match workload {
+                WriterRoutingSyntheticWorkload::DisjointPages => 0,
+                WriterRoutingSyntheticWorkload::OverlappingPages => 1,
+                WriterRoutingSyntheticWorkload::HotPageContention => 2,
+            });
+        outcome.stale_snapshot_rejects = outcome
+            .stale_snapshot_rejects
+            .saturating_add(match workload {
+                WriterRoutingSyntheticWorkload::DisjointPages => 0,
+                WriterRoutingSyntheticWorkload::OverlappingPages => 1,
+                WriterRoutingSyntheticWorkload::HotPageContention => 1,
+            });
+    }
+
+    outcome.latency_nanos = outcome
+        .latency_nanos
+        .saturating_add(outcome.conflicts.saturating_mul(48_000))
+        .saturating_add(outcome.retries.saturating_mul(22_000))
+        .saturating_add(outcome.remote_ownership_events.saturating_mul(11_000))
+        .saturating_add(outcome.visibility_handoff_nanos)
+        .saturating_add(outcome.stale_snapshot_rejects.saturating_mul(17_000));
+    outcome
+}
+
+fn update_synthetic_lane_snapshot(
+    lane: &mut WriterRoutingLaneSnapshot,
+    txn_token: TxnToken,
+    pages: &[PageNumber],
+    shared_pages: &[PageNumber],
+    outcome: &SyntheticOperationOutcome,
+) {
+    lane.in_flight_writers = lane.in_flight_writers.saturating_add(1);
+    push_unique_txnid_capped(&mut lane.lock_holder_txns, txn_token.id, 8);
+    push_unique_txn_token_capped(&mut lane.conflicting_txns, txn_token, 8);
+
+    for page in pages {
+        push_unique_page_capped(&mut lane.home_pages, *page, 16);
+    }
+    if outcome.conflicts > 0 {
+        for page in shared_pages {
+            push_unique_page_capped(&mut lane.conflict_pages, *page, 16);
+        }
+        lane.recent_same_page_conflicts = lane
+            .recent_same_page_conflicts
+            .saturating_add(outcome.conflicts);
+        lane.recent_busy_retries = lane
+            .recent_busy_retries
+            .saturating_add(outcome.retries);
+        lane.recent_stale_snapshot_rejects = lane
+            .recent_stale_snapshot_rejects
+            .saturating_add(outcome.stale_snapshot_rejects);
+        lane.recent_page_lock_wait_nanos = lane
+            .recent_page_lock_wait_nanos
+            .saturating_add(outcome.visibility_handoff_nanos);
+    }
+}
+
 fn evaluate_home_hint(
     home_hint: Option<WriterHomeHint>,
     candidate_lanes: &[WriterRoutingLaneSnapshot],
@@ -817,6 +1501,36 @@ fn push_unique_page(into: &mut SmallVec<[PageNumber; 16]>, page: PageNumber) {
     }
 }
 
+fn push_unique_page_capped(into: &mut SmallVec<[PageNumber; 16]>, page: PageNumber, cap: usize) {
+    if into.contains(&page) {
+        return;
+    }
+    if into.len() == cap {
+        into.remove(0);
+    }
+    into.push(page);
+}
+
+fn push_unique_txnid_capped(into: &mut SmallVec<[TxnId; 8]>, txn: TxnId, cap: usize) {
+    if into.contains(&txn) {
+        return;
+    }
+    if into.len() == cap {
+        into.remove(0);
+    }
+    into.push(txn);
+}
+
+fn push_unique_txn_token_capped(into: &mut SmallVec<[TxnToken; 8]>, txn: TxnToken, cap: usize) {
+    if into.contains(&txn) {
+        return;
+    }
+    if into.len() == cap {
+        into.remove(0);
+    }
+    into.push(txn);
+}
+
 fn count_page_overlap(lhs: &[PageNumber], rhs: &[PageNumber]) -> usize {
     lhs.iter().filter(|page| rhs.contains(page)).count()
 }
@@ -879,6 +1593,30 @@ fn candidate_score_better(
 
 fn cyclic_distance(index: usize, anchor: usize) -> usize {
     index.abs_diff(anchor)
+}
+
+fn percentile_u64(values: &[u64], p: f64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    if values.len() == 1 {
+        return values[0];
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    #[allow(clippy::cast_precision_loss)]
+    let idx = p * (sorted.len() - 1) as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let lo = idx.floor() as usize;
+    let hi = lo.saturating_add(1).min(sorted.len() - 1);
+    #[allow(clippy::cast_precision_loss)]
+    let frac = idx - lo as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let lo_value = sorted[lo] as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let hi_value = sorted[hi] as f64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    lo_value.mul_add(1.0 - frac, hi_value * frac).round() as u64
 }
 
 #[cfg(test)]
