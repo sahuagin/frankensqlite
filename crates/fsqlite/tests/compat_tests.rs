@@ -611,6 +611,40 @@ fn open_with_flags_read_only_supports_datetime_builtin() {
     );
 }
 
+#[test]
+fn open_with_flags_accepts_common_sqlite_ancillary_flags_like_rusqlite() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("ancillary_compat.db");
+    let path_str = path.to_str().unwrap();
+
+    let oracle = RusqliteConnection::open_with_flags(
+        path_str,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .unwrap();
+    oracle.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
+    drop(oracle);
+
+    let conn = open_with_flags(
+        path_str,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_PRIVATE_CACHE,
+    )
+    .unwrap();
+    let row = conn
+        .query_row("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 't'")
+        .unwrap();
+    let table_name: String = row.get_typed(0).unwrap();
+    assert_eq!(table_name, "t");
+}
+
 // ===========================================================================
 // 9. PARAMS_FROM_ITER
 // ===========================================================================

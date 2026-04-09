@@ -597,7 +597,11 @@ impl ShmRegion {
 }
 
 #[cfg(unix)]
+#[allow(clippy::cast_ptr_alignment)]
 unsafe fn atomic_u64_at<'a>(ptr: *mut u8, offset: usize) -> &'a AtomicU64 {
+    // SAFETY: callers only use this on MAP_SHARED mmap regions. mmap returns
+    // page-aligned base addresses, and `assert_aligned_u64_offset()` ensures the
+    // final byte offset stays 8-byte aligned and in-bounds.
     unsafe { &*ptr.add(offset).cast::<AtomicU64>() }
 }
 

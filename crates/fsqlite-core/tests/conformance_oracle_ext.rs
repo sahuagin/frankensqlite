@@ -7,6 +7,199 @@
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
 
+const CONFORMANCE_ORACLE_SOURCES: &[&str] = &[
+    include_str!("conformance_oracle_ext.rs"),
+    include_str!("conformance_oracle_s55.rs"),
+    include_str!("conformance_oracle_s74b.rs"),
+];
+
+struct CoverageBucket {
+    category: &'static str,
+    patterns: &'static [&'static str],
+    minimum_tests: usize,
+}
+
+const CONFORMANCE_COVERAGE_BUCKETS: &[CoverageBucket] = &[
+    CoverageBucket {
+        category: "core_sql_and_expressions",
+        patterns: &[
+            "string", "math", "numeric", "case", "where", "having", "order", "between", "like",
+            "glob", "printf", "datetime", "expr", "boolean",
+        ],
+        minimum_tests: 100,
+    },
+    CoverageBucket {
+        category: "ddl_schema_pragmas",
+        patterns: &[
+            "alter_table",
+            "create_table_as_select",
+            "view",
+            "pragma",
+            "index",
+            "sqlite_master",
+            "schema",
+            "constraint",
+            "autoincrement",
+            "default",
+            "primary_key",
+            "unique",
+        ],
+        minimum_tests: 40,
+    },
+    CoverageBucket {
+        category: "dml_and_returning",
+        patterns: &[
+            "insert",
+            "update",
+            "delete",
+            "replace",
+            "upsert",
+            "returning",
+            "last_insert_rowid",
+            "dml",
+        ],
+        minimum_tests: 120,
+    },
+    CoverageBucket {
+        category: "joins_and_set_ops",
+        patterns: &[
+            "join",
+            "union",
+            "intersect",
+            "except",
+            "compound",
+            "cross_join",
+            "natural_join",
+        ],
+        minimum_tests: 50,
+    },
+    CoverageBucket {
+        category: "windows",
+        patterns: &[
+            "window",
+            "row_number",
+            "rank",
+            "ntile",
+            "lag",
+            "lead",
+            "first_last",
+            "cume_dist",
+            "percent_rank",
+        ],
+        minimum_tests: 30,
+    },
+    CoverageBucket {
+        category: "ctes",
+        patterns: &["cte", "recursive"],
+        minimum_tests: 30,
+    },
+    CoverageBucket {
+        category: "triggers_and_savepoints",
+        patterns: &["trigger", "savepoint"],
+        minimum_tests: 20,
+    },
+    CoverageBucket {
+        category: "typing_collation_and_nulls",
+        patterns: &[
+            "cast", "typeof", "collat", "affinity", "coercion", "nullif", "coalesce", "between",
+            "in_list", "type",
+        ],
+        minimum_tests: 50,
+    },
+    CoverageBucket {
+        category: "error_paths",
+        patterns: &["error", "check_constraint", "fk_", "constraint"],
+        minimum_tests: 8,
+    },
+];
+
+fn conformance_test_names() -> Vec<&'static str> {
+    let mut names = Vec::new();
+    for source in CONFORMANCE_ORACLE_SOURCES {
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("fn test_conformance_") else {
+                continue;
+            };
+            let Some(name_suffix) = rest.split('(').next() else {
+                continue;
+            };
+            names.push(Box::leak(
+                format!("test_conformance_{name_suffix}").into_boxed_str(),
+            ));
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn bucket_matches(name: &str, bucket: &CoverageBucket) -> bool {
+    let lower = name.to_ascii_lowercase();
+    bucket
+        .patterns
+        .iter()
+        .any(|pattern| lower.contains(&pattern.to_ascii_lowercase()))
+}
+
+fn bucket_match_names<'a>(names: &'a [&'static str], bucket: &CoverageBucket) -> Vec<&'a str> {
+    names
+        .iter()
+        .copied()
+        .filter(|name| bucket_matches(name, bucket))
+        .collect()
+}
+
+fn coverage_snapshot_json(names: &[&'static str]) -> String {
+    let mut entries = Vec::new();
+    for bucket in CONFORMANCE_COVERAGE_BUCKETS {
+        let matched = bucket_match_names(names, bucket);
+        let sample_tests = matched
+            .iter()
+            .take(5)
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let patterns = bucket
+            .patterns
+            .iter()
+            .map(|pattern| format!("\"{pattern}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        entries.push(format!(
+            "{{\"category\":\"{}\",\"minimum_tests\":{},\"matched_tests\":{},\"patterns\":[{}],\"sample_tests\":[{}]}}",
+            bucket.category,
+            bucket.minimum_tests,
+            matched.len(),
+            patterns,
+            sample_tests
+        ));
+    }
+    format!(
+        "{{\"total_tests\":{},\"buckets\":[{}]}}",
+        names.len(),
+        entries.join(",")
+    )
+}
+
+fn assert_both_execute_error(
+    fconn: &Connection,
+    rconn: &rusqlite::Connection,
+    sql: &str,
+    label: &str,
+) {
+    let frank = fconn.execute(sql);
+    let csqlite = rconn.execute_batch(sql);
+    assert!(
+        frank.is_err(),
+        "[{label}] FrankenSQLite unexpectedly accepted invalid SQL: {sql}"
+    );
+    assert!(
+        csqlite.is_err(),
+        "[{label}] C SQLite unexpectedly accepted invalid SQL: {sql}"
+    );
+}
+
 /// Run queries against both FrankenSQLite and C SQLite, returning mismatches.
 fn oracle_compare(
     fconn: &Connection,
@@ -101,6 +294,33 @@ fn test_oracle_compare_flags_dual_error_cases() {
     let mismatches = oracle_compare(&fconn, &rconn, &["SELECT * FROM missing_oracle_ext_table"]);
     assert_eq!(mismatches.len(), 1);
     assert!(mismatches[0].contains("BOTH_ERROR"));
+}
+
+#[test]
+fn test_conformance_corpus_coverage_accounting_gate_s76i() {
+    let names = conformance_test_names();
+    let snapshot = coverage_snapshot_json(&names);
+
+    assert!(
+        names.len() >= 1_500,
+        "conformance corpus unexpectedly shrank: {snapshot}"
+    );
+
+    for bucket in CONFORMANCE_COVERAGE_BUCKETS {
+        let matched = bucket_match_names(&names, bucket);
+        assert!(
+            matched.len() >= bucket.minimum_tests,
+            "coverage regression for category={} minimum={} matched={}\n{}",
+            bucket.category,
+            bucket.minimum_tests,
+            matched.len(),
+            snapshot
+        );
+    }
+
+    assert!(snapshot.contains("\"category\":\"ddl_schema_pragmas\""));
+    assert!(snapshot.contains("\"category\":\"windows\""));
+    assert!(snapshot.contains("\"category\":\"error_paths\""));
 }
 
 /// Hex literals, bitwise ops, CAST edge cases, boolean expressions.
@@ -32167,6 +32387,137 @@ fn test_conformance_alter_table_add_column_defaults_s76e() {
         }
         panic!(
             "{} s76e ALTER TABLE ADD COLUMN default mismatches",
+            mismatches.len()
+        );
+    }
+}
+
+/// s76f: PRAGMA/schema introspection for indexes and table metadata.
+#[test]
+fn test_conformance_pragma_index_introspection_s76f() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE pragma_items (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, active INTEGER DEFAULT 1)",
+        "CREATE UNIQUE INDEX idx_pragma_items_name ON pragma_items(name)",
+        "CREATE INDEX idx_pragma_items_category_price ON pragma_items(category, price)",
+        "INSERT INTO pragma_items(name, category, price) VALUES ('alpha', 'A', 10.0), ('beta', 'A', 12.5), ('gamma', 'B', 20.0)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "PRAGMA table_info('pragma_items')",
+        "PRAGMA index_list('pragma_items')",
+        "PRAGMA index_info('idx_pragma_items_name')",
+        "PRAGMA index_info('idx_pragma_items_category_price')",
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'pragma_items' ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for mismatch in &mismatches {
+            eprintln!("{mismatch}\n");
+        }
+        panic!("{} s76f PRAGMA/index introspection mismatches", mismatches.len());
+    }
+}
+
+/// s76g: COLLATE NOCASE should apply consistently to equality, DISTINCT, GROUP BY,
+/// and join semantics, not only ORDER BY.
+#[test]
+fn test_conformance_collation_grouping_distinct_join_s76g() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE coll_words (id INTEGER PRIMARY KEY, word TEXT COLLATE NOCASE)",
+        "CREATE TABLE coll_probe (probe TEXT)",
+        "INSERT INTO coll_words(word) VALUES ('Alpha'), ('alpha'), ('BETA'), ('beta'), ('Gamma')",
+        "INSERT INTO coll_probe(probe) VALUES ('ALPHA'), ('beta'), ('gamma')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT COUNT(DISTINCT word) FROM coll_words",
+        "SELECT word, COUNT(*) FROM coll_words GROUP BY word ORDER BY word",
+        "SELECT word FROM coll_words WHERE word = 'ALPHA' ORDER BY id",
+        "SELECT p.probe, COUNT(w.id) FROM coll_probe p JOIN coll_words w ON w.word = p.probe GROUP BY p.probe ORDER BY p.probe COLLATE NOCASE",
+        "SELECT word FROM coll_words ORDER BY word COLLATE NOCASE, id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for mismatch in &mismatches {
+            eprintln!("{mismatch}\n");
+        }
+        panic!(
+            "{} s76g collation grouping/distinct/join mismatches",
+            mismatches.len()
+        );
+    }
+}
+
+/// s76h: Constraint and shape failures should reject invalid statements in both engines
+/// and leave committed state unchanged.
+#[test]
+fn test_conformance_error_paths_constraint_and_shape_s76h() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE ref_parent (id INTEGER PRIMARY KEY)",
+        "INSERT INTO ref_parent VALUES (1)",
+        "CREATE TABLE err_surface (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, qty INTEGER CHECK(qty >= 0), parent_id INTEGER REFERENCES ref_parent(id))",
+        "INSERT INTO err_surface VALUES (1, 'seed', 10, 1)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    for (label, sql) in [
+        (
+            "unique_violation",
+            "INSERT INTO err_surface VALUES (2, 'seed', 11, 1)",
+        ),
+        (
+            "check_violation",
+            "INSERT INTO err_surface VALUES (3, 'neg', -1, 1)",
+        ),
+        (
+            "foreign_key_violation",
+            "INSERT INTO err_surface VALUES (4, 'orphan', 5, 99)",
+        ),
+        (
+            "arity_mismatch",
+            "INSERT INTO err_surface(id, name, qty, parent_id) VALUES (5, 'shape')",
+        ),
+        (
+            "duplicate_table",
+            "CREATE TABLE err_surface(id INTEGER PRIMARY KEY)",
+        ),
+    ] {
+        assert_both_execute_error(&fconn, &rconn, sql, label);
+    }
+
+    let mismatches = oracle_compare(
+        &fconn,
+        &rconn,
+        &[
+            "SELECT * FROM err_surface ORDER BY id",
+            "SELECT COUNT(*) FROM err_surface",
+            "SELECT name, qty, parent_id FROM err_surface",
+        ],
+    );
+    if !mismatches.is_empty() {
+        for mismatch in &mismatches {
+            eprintln!("{mismatch}\n");
+        }
+        panic!(
+            "{} s76h constraint/shape error-path mismatches",
             mismatches.len()
         );
     }
