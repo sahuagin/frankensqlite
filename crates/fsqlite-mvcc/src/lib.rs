@@ -397,11 +397,15 @@ pub use writer_routing_telemetry::{
     WriterHomeHintDisposition, WriterLockHolderClue, WriterOwnershipLineageTelemetry,
     WriterRetryAttribution, WriterRetryCause, WriterRoutingDecision, WriterRoutingDecisionConfig,
     WriterRoutingDecisionError, WriterRoutingDecisionReason, WriterRoutingHintDegradation,
-    WriterRoutingLaneId, WriterRoutingLaneScore, WriterRoutingLaneSnapshot, WriterRoutingNodeId,
+    WriterRoutingLaneId, WriterRoutingLaneScore, WriterRoutingLaneSnapshot, WriterRoutingMode,
+    WriterRoutingNodeId, WriterRoutingPlacementProfile, WriterRoutingSyntheticComparison,
+    WriterRoutingSyntheticConfig, WriterRoutingSyntheticFairnessSummary,
+    WriterRoutingSyntheticSummary, WriterRoutingSyntheticWorkload,
     WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass, WriterRoutingTelemetryInput,
     WriterRoutingTelemetryPhase, WriterRoutingTelemetryShape, WriterRoutingTelemetrySignal,
     WriterRoutingTelemetrySourceSpec, WriterTierSurfaceCounts, WriterTouchSurfaceTelemetry,
-    decide_writer_routing_target,
+    compare_writer_routing_synthetic_workload, decide_writer_routing_target,
+    evaluate_writer_routing_synthetic_workload,
 };
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
