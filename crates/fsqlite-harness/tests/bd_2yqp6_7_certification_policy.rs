@@ -1,0 +1,216 @@
+//! Track G certification-policy integration tests (bd-2yqp6.7).
+
+use std::collections::BTreeMap;
+
+use fsqlite_harness::adversarial_search::CampaignResult;
+use fsqlite_harness::certification_policy::{
+    CERTIFICATION_MAX_EVIDENCE_AGE_HOURS, CERTIFICATION_MIN_VERIFICATION_PCT,
+    CERTIFICATION_POLICY_ID, REQUIRED_CERTIFICATION_LANES, canonical_certification_policy,
+};
+use fsqlite_harness::ci_gate_matrix::{ArtifactEntry, ArtifactKind, ArtifactManifest};
+use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
+use fsqlite_harness::drift_monitor::ParityDriftMonitor;
+use fsqlite_harness::parity_invariant_catalog::{
+    InvariantId, ObligationStatus, ProofKind, ProofSummaryEntry, ReleaseTraceabilityReport,
+    TraceabilityEntry, build_canonical_catalog,
+};
+use fsqlite_harness::parity_taxonomy::{FeatureId, build_canonical_universe};
+use fsqlite_harness::release_certificate::{
+    CERTIFICATION_TRACEABILITY_SCHEMA_VERSION, CertificateConfig, CertificateInputs,
+    CertificateVerdict, build_certificate,
+};
+use fsqlite_harness::verification_contract_enforcement::{
+    ContractEnforcementOutcome, EnforcementDisposition,
+};
+
+const BEAD_ID: &str = "bd-2yqp6.7";
+
+fn passing_contract_outcome() -> ContractEnforcementOutcome {
+    ContractEnforcementOutcome {
+        schema_version: 1,
+        bead_id: "bd-1dp9.7.7".to_owned(),
+        base_gate_passed: true,
+        contract_passed: true,
+        final_gate_passed: true,
+        disposition: EnforcementDisposition::Allowed,
+        total_beads: 1,
+        failing_beads: 0,
+        missing_evidence_beads: 0,
+        invalid_reference_beads: 0,
+        bead_verdicts: Vec::new(),
+    }
+}
+
+fn failing_contract_outcome() -> ContractEnforcementOutcome {
+    ContractEnforcementOutcome {
+        schema_version: 1,
+        bead_id: "bd-1dp9.7.7".to_owned(),
+        base_gate_passed: true,
+        contract_passed: false,
+        final_gate_passed: false,
+        disposition: EnforcementDisposition::BlockedByContract,
+        total_beads: 2,
+        failing_beads: 1,
+        missing_evidence_beads: 1,
+        invalid_reference_beads: 0,
+        bead_verdicts: Vec::new(),
+    }
+}
+
+fn certification_manifest(contract: ContractEnforcementOutcome) -> ArtifactManifest {
+    ArtifactManifest {
+        schema_version: "1.0.0".to_owned(),
+        bead_id: BEAD_ID.to_owned(),
+        run_id: "run-cert-001".to_owned(),
+        lane: "e2e-differential".to_owned(),
+        git_sha: "deadbeefcafebabe".to_owned(),
+        seed: 42,
+        created_at: "2026-04-09T12:00:00Z".to_owned(),
+        artifacts: vec![ArtifactEntry {
+            kind: ArtifactKind::Benchmark,
+            path: "bench/scorecards.json".to_owned(),
+            content_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            size_bytes: 512,
+            description: "aligned causal scorecards".to_owned(),
+        }],
+        gate_passed: true,
+        bisect_request: None,
+        bisect_result_summary: None,
+        verification_contract: Some(contract),
+    }
+}
+
+fn certification_traceability() -> ReleaseTraceabilityReport {
+    ReleaseTraceabilityReport {
+        schema_version: 1,
+        entries: vec![TraceabilityEntry {
+            invariant_id: InvariantId("PAR-SQL-999".to_owned()),
+            feature_id: FeatureId("sql.insert.autocommit".to_owned()),
+            category: "Core SQL".to_owned(),
+            statement: "Simple INSERT remains behaviorally identical to the oracle.".to_owned(),
+            verified: true,
+            proof_summary: vec![ProofSummaryEntry {
+                kind: ProofKind::E2eTest,
+                status: ObligationStatus::Verified,
+                test_path: "fsqlite_e2e::oracle::insert_certification".to_owned(),
+            }],
+            artifact_refs: vec!["bench/scorecards.json".to_owned()],
+        }],
+        verification_pct: 100.0,
+        release_ready: true,
+    }
+}
+
+fn synthetic_passing_campaign() -> CampaignResult {
+    CampaignResult {
+        schema_version: 1,
+        base_seed: 42,
+        total_trials: 0,
+        counterexamples_found: 0,
+        by_severity: BTreeMap::new(),
+        by_category: BTreeMap::new(),
+        counterexamples: Vec::new(),
+        passed: true,
+        summary: "no adversarial findings".to_owned(),
+    }
+}
+
+fn strict_ready_inputs(
+    contract: ContractEnforcementOutcome,
+) -> (CertificateInputs, CertificateConfig) {
+    let config = CertificateConfig::default();
+    let catalog = build_canonical_catalog();
+    let universe = build_canonical_universe();
+    let (mut gate_report, ranking) = evaluate_full(&catalog, &universe, &config.gate_config);
+    gate_report.global_decision = GateDecision::Pass;
+    gate_report.release_ready = true;
+    gate_report.global_verification_pct = 100.0;
+    gate_report.passing_invariants = gate_report.total_invariants;
+
+    let ledger = build_evidence_ledger(&gate_report, &ranking);
+    let drift_snapshot = ParityDriftMonitor::new(config.drift_config.clone()).snapshot();
+    let campaign_result = synthetic_passing_campaign();
+
+    (
+        CertificateInputs {
+            gate_report,
+            expected_loss_ranking: ranking,
+            evidence_ledger: ledger,
+            catalog_stats: catalog.stats(),
+            traceability: certification_traceability(),
+            drift_snapshot,
+            campaign_result,
+            ci_flake_budget: None,
+            artifact_manifest: Some(certification_manifest(contract)),
+        },
+        config,
+    )
+}
+
+#[test]
+fn canonical_policy_matches_track_g_requirements() {
+    let policy = canonical_certification_policy();
+
+    assert_eq!(policy.policy_id, CERTIFICATION_POLICY_ID);
+    assert_eq!(policy.min_verification_pct, CERTIFICATION_MIN_VERIFICATION_PCT);
+    assert_eq!(policy.max_evidence_age_hours, CERTIFICATION_MAX_EVIDENCE_AGE_HOURS);
+    assert_eq!(policy.gate_config.category_min_verification_pct, 100.0);
+    assert_eq!(policy.ratchet_policy.regression_tolerance, 0.0);
+    assert!(!policy.ratchet_policy.quarantine_enabled);
+    assert!(!policy.ratchet_policy.waivers_enabled);
+    for lane in REQUIRED_CERTIFICATION_LANES {
+        assert!(
+            policy.required_ci_lanes.iter().any(|entry| entry == lane.as_str()),
+            "bead_id={BEAD_ID} case=missing_lane lane={}",
+            lane.as_str(),
+        );
+    }
+}
+
+#[test]
+fn release_certificate_embeds_feature_test_run_artifact_chain() {
+    let (inputs, config) = strict_ready_inputs(passing_contract_outcome());
+    let cert = build_certificate(&inputs, &config);
+
+    assert_eq!(cert.certification_policy_id, CERTIFICATION_POLICY_ID);
+    assert_eq!(
+        cert.certification_traceability.schema_version,
+        CERTIFICATION_TRACEABILITY_SCHEMA_VERSION,
+    );
+    assert!(
+        cert.certification_evidence.artifact_manifest_present,
+        "bead_id={BEAD_ID} case=manifest_present",
+    );
+    assert_eq!(
+        cert.certification_traceability.fully_linked_entries, 1,
+        "bead_id={BEAD_ID} case=linked_entries",
+    );
+
+    let entry = &cert.certification_traceability.entries[0];
+    assert_eq!(
+        entry.proof_summary[0].test_path,
+        "fsqlite_e2e::oracle::insert_certification",
+    );
+    assert_eq!(entry.run.as_ref().map(|run| run.run_id.as_str()), Some("run-cert-001"));
+    assert_eq!(entry.artifacts.len(), 1);
+    assert_eq!(
+        entry.artifacts[0].content_hash,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+}
+
+#[test]
+fn release_certificate_rejects_failed_verification_contract_from_manifest() {
+    let (inputs, config) = strict_ready_inputs(failing_contract_outcome());
+    let cert = build_certificate(&inputs, &config);
+
+    assert_eq!(cert.verdict, CertificateVerdict::Rejected);
+    assert_eq!(cert.certification_evidence.missing_evidence_beads, 1);
+    assert!(
+        cert.unresolved_risks
+            .iter()
+            .any(|risk| risk.source == "verification_contract"),
+        "bead_id={BEAD_ID} case=contract_risk",
+    );
+}
