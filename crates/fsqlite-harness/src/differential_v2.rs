@@ -1954,4 +1954,48 @@ mod tests {
         assert_eq!(result.outcome, Outcome::Pass);
         assert_eq!(result.metadata.normalized_outcome, "pass");
     }
+
+    #[test]
+    fn parity_mode_real_executors_preserve_rollback_visibility_and_metadata_contract() {
+        let envelope = ExecutionEnvelope::builder(2_026_040_906)
+            .scenario_id("bd-2yqp6.6-rollback-visibility")
+            .pragmas(PragmaConfig {
+                journal_mode: "memory".to_owned(),
+                ..PragmaConfig::default()
+            })
+            .schema([
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT);",
+                "INSERT INTO t(id, note) VALUES (1, 'seed');",
+            ])
+            .workload([
+                "BEGIN;",
+                "INSERT INTO t(id, note) VALUES (2, 'transient');",
+                "ROLLBACK;",
+                "SELECT id, note FROM t ORDER BY id;",
+            ])
+            .build();
+
+        let fsqlite = FsqliteExecutor::open_in_memory().expect("open FrankenSQLite executor");
+        let csqlite = CsqliteExecutor::open_in_memory().expect("open C SQLite executor");
+        let result = run_differential(&envelope, &fsqlite, &csqlite);
+
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert!(result.logical_state_matched);
+        assert_eq!(
+            result.statements_total,
+            envelope.schema.len() + envelope.workload.len()
+        );
+        assert_eq!(result.statements_matched, result.statements_total);
+        assert_eq!(result.statements_mismatched, 0);
+        assert!(result.divergences.is_empty());
+        assert_eq!(result.first_divergence_index, None);
+        assert_eq!(result.metadata.normalized_outcome, "pass");
+        assert_eq!(result.metadata.scenario_id, envelope.scenario_id);
+        assert_eq!(result.metadata.seed, envelope.seed);
+        assert_eq!(result.metadata.oracle_identity, REFERENCE_IDENTITY_LABEL);
+        assert_eq!(result.metadata.oracle_version, rusqlite::version());
+        assert_eq!(result.metadata.trace_id, envelope.artifact_id());
+        assert_eq!(result.metadata.first_failure, None);
+        assert!(result.metadata.validate().is_empty());
+    }
 }

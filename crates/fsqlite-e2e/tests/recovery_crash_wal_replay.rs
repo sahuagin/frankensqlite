@@ -35,6 +35,61 @@ fn row_count(conn: &Connection) -> i64 {
     }
 }
 
+fn ordered_values_fsqlite(conn: &Connection) -> Vec<i64> {
+    conn.query("SELECT x FROM t ORDER BY x;")
+        .expect("query ordered values")
+        .into_iter()
+        .map(|row| match row.get(0) {
+            Some(SqliteValue::Integer(value)) => *value,
+            other => panic!("expected integer row value, got {other:?}"),
+        })
+        .collect()
+}
+
+fn ordered_values_rusqlite(conn: &rusqlite::Connection) -> Vec<i64> {
+    let mut stmt = conn
+        .prepare("SELECT x FROM t ORDER BY x;")
+        .expect("prepare ordered values");
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .expect("query ordered values");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect ordered values")
+}
+
+fn assert_stock_sqlite_integrity(db_path: &Path, label: &str) {
+    let conn = rusqlite::Connection::open(db_path)
+        .unwrap_or_else(|e| panic!("[{label}] stock SQLite failed to open: {e}"));
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .unwrap_or_else(|e| panic!("[{label}] integrity_check query failed: {e}"));
+    assert_eq!(integrity, "ok", "[{label}] integrity_check = {integrity}");
+}
+
+fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &str) {
+    assert_stock_sqlite_integrity(db_path, label);
+
+    let csqlite = rusqlite::Connection::open(db_path)
+        .unwrap_or_else(|e| panic!("[{label}] stock SQLite failed to reopen: {e}"));
+    let c_rows = ordered_values_rusqlite(&csqlite);
+    assert_eq!(
+        c_rows, expected,
+        "[{label}] stock SQLite recovered rows diverged from expectation"
+    );
+
+    let fsqlite =
+        Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered fsqlite db");
+    let f_rows = ordered_values_fsqlite(&fsqlite);
+    assert_eq!(
+        f_rows, expected,
+        "[{label}] FrankenSQLite recovered rows diverged from expectation"
+    );
+    assert_eq!(
+        f_rows, c_rows,
+        "[{label}] recovered logical rows differed between FrankenSQLite and stock SQLite"
+    );
+}
+
 fn insert_range(conn: &Connection, start: i64, end_exclusive: i64) {
     for value in start..end_exclusive {
         conn.execute_with_params("INSERT INTO t VALUES (?1);", &[SqliteValue::Integer(value)])
@@ -106,6 +161,7 @@ fn committed_transaction_survives_crash_recovery() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("committed_survives.db");
     let wal_path = wal_path_for_db(&db_path);
+    let expected: Vec<i64> = (0..100).collect();
 
     spawn_crash_helper("committed", &db_path);
 
@@ -116,6 +172,8 @@ fn committed_transaction_survives_crash_recovery() {
         wal_meta.len()
     );
 
+    assert_recovered_rows_match_oracle(&db_path, &expected, "committed_survives");
+
     let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
     assert_eq!(row_count(&conn), 100, "committed rows must survive crash");
 }
@@ -124,6 +182,7 @@ fn committed_transaction_survives_crash_recovery() {
 fn uncommitted_transaction_is_discarded_after_crash() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("uncommitted_discarded.db");
+    let expected: Vec<i64> = (0..50).collect();
 
     {
         let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open seed db");
@@ -135,6 +194,8 @@ fn uncommitted_transaction_is_discarded_after_crash() {
     }
 
     spawn_crash_helper("uncommitted", &db_path);
+
+    assert_recovered_rows_match_oracle(&db_path, &expected, "uncommitted_discarded");
 
     let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
     assert_eq!(
@@ -148,8 +209,11 @@ fn uncommitted_transaction_is_discarded_after_crash() {
 fn only_committed_prefix_survives_multi_transaction_crash() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("multi_commit_prefix.db");
+    let expected: Vec<i64> = (0..20).collect();
 
     spawn_crash_helper("mixed", &db_path);
+
+    assert_recovered_rows_match_oracle(&db_path, &expected, "multi_commit_prefix");
 
     let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered db");
     assert_eq!(

@@ -9047,7 +9047,11 @@ impl VdbeEngine {
                         if is_update && update_restore.is_some() {
                             self.mark_statement_cold_state(StatementColdState::CONFLICT_TRACKING);
                         }
-                        self.set_pending_update_restore(if is_update { update_restore } else { None });
+                        self.set_pending_update_restore(if is_update {
+                            update_restore
+                        } else {
+                            None
+                        });
                         // P5 bit 0 = OPFLAG_NCHANGE: only count standalone
                         // DELETE changes. UPDATE's internal Delete uses P5=0
                         // so only the subsequent Insert counts.
@@ -10088,17 +10092,17 @@ impl VdbeEngine {
                         .ensure_cold_state_for(StatementColdState::AGGREGATES)
                         .aggregates
                         .entry_or_insert_with(accum_reg, || {
-                        let state = func.initial_state();
-                        AggregateContext {
-                            func: func.clone(),
-                            state,
-                            distinct_seen: if is_distinct {
-                                Some(std::collections::HashSet::new())
-                            } else {
-                                None
-                            },
-                        }
-                    });
+                            let state = func.initial_state();
+                            AggregateContext {
+                                func: func.clone(),
+                                state,
+                                distinct_seen: if is_distinct {
+                                    Some(std::collections::HashSet::new())
+                                } else {
+                                    None
+                                },
+                            }
+                        });
 
                     if !Arc::ptr_eq(&ctx.func, &func) {
                         return Err(FrankenError::Internal(
@@ -10217,12 +10221,12 @@ impl VdbeEngine {
                         .ensure_cold_state_for(StatementColdState::WINDOW_CONTEXTS)
                         .window_contexts
                         .entry_or_insert_with(accum_reg, || {
-                        let state = func.initial_state();
-                        WindowContext {
-                            func: func.clone(),
-                            state,
-                        }
-                    });
+                            let state = func.initial_state();
+                            WindowContext {
+                                func: func.clone(),
+                                state,
+                            }
+                        });
 
                     observe_execution_cancellation(&execution_cx)?;
                     ctx.func.inverse(&mut ctx.state, &args)?;
@@ -11975,7 +11979,14 @@ impl VdbeEngine {
                         }
                         self.make_record_lookaside
                             .clear_sideband_for_register(target);
-                        self.clear_register_subtype(target);
+                        if let Some(cold_state) = self.cold_state.as_mut()
+                            && cold_state.has_subtypes
+                        {
+                            cold_state.register_subtypes.remove(&target);
+                            if cold_state.register_subtypes.is_empty() {
+                                cold_state.has_subtypes = false;
+                            }
+                        }
                         match cached {
                             // NaN → Null normalization (matches set_reg behavior).
                             SqliteValue::Float(f) if f.is_nan() => {
@@ -27349,6 +27360,121 @@ mod tests {
                 .map(|row| row.clone().into_vec())
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(0)]]
+        );
+    }
+
+    #[test]
+    fn test_simple_statement_does_not_allocate_cold_state_sidecar() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        assert_eq!(
+            engine.execute(&program).expect("execution should succeed"),
+            ExecOutcome::Done
+        );
+
+        assert!(
+            !engine.has_cold_state_allocated(),
+            "simple non-feature statements should not allocate the cold sidecar"
+        );
+        assert!(engine.statement_cold_state.is_empty());
+    }
+
+    #[test]
+    fn test_aggregate_statement_allocates_cold_state_sidecar() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Integer, 7, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, 1, 2, P4::FuncName("sum".to_owned()), 1);
+        builder.emit_op(Opcode::AggFinal, 2, 1, 0, P4::FuncName("sum".to_owned()), 0);
+        builder.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+
+        assert_eq!(
+            engine
+                .execute(&program)
+                .expect("aggregate execution should succeed"),
+            ExecOutcome::Done
+        );
+        assert!(engine.has_cold_state_allocated());
+        assert!(
+            engine
+                .statement_cold_state
+                .contains(StatementColdState::AGGREGATES)
+        );
+        assert_eq!(
+            engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(7)]]
+        );
+    }
+
+    #[test]
+    fn test_execute_reuse_drops_cold_state_sidecar() {
+        let mut aggregate_builder = ProgramBuilder::new();
+        aggregate_builder.emit_op(Opcode::Integer, 3, 1, 0, P4::None, 0);
+        aggregate_builder.emit_op(Opcode::AggStep, 0, 1, 2, P4::FuncName("sum".to_owned()), 1);
+        aggregate_builder.emit_op(Opcode::AggFinal, 2, 1, 0, P4::FuncName("sum".to_owned()), 0);
+        aggregate_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let aggregate_program = aggregate_builder
+            .finish()
+            .expect("aggregate program should build");
+
+        let mut simple_builder = ProgramBuilder::new();
+        simple_builder.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        simple_builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let simple_program = simple_builder
+            .finish()
+            .expect("simple program should build");
+
+        let mut engine = VdbeEngine::new(
+            aggregate_program
+                .register_count()
+                .max(simple_program.register_count()),
+        );
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+
+        assert_eq!(
+            engine
+                .execute(&aggregate_program)
+                .expect("aggregate execution should succeed"),
+            ExecOutcome::Done
+        );
+        assert!(engine.has_cold_state_allocated());
+
+        assert_eq!(
+            engine
+                .execute(&simple_program)
+                .expect("simple execution should succeed"),
+            ExecOutcome::Done
+        );
+        assert!(
+            !engine.has_cold_state_allocated(),
+            "reuse should drop the cold sidecar before the next simple statement"
+        );
+        assert!(engine.statement_cold_state.is_empty());
+    }
+
+    #[test]
+    fn test_vdbe_engine_inline_size_stays_bounded() {
+        assert!(
+            std::mem::size_of::<VdbeEngine>() <= 2048,
+            "VdbeEngine inline size regressed to {} bytes",
+            std::mem::size_of::<VdbeEngine>()
         );
     }
 
