@@ -1997,7 +1997,29 @@ impl PublishedPages {
     }
 }
 
+/// Minimal metadata handoff from the parallel WAL ordered residue into the
+/// pager publication plane.
+///
+/// D1.a constrains the handoff to data that is already covered by a durable
+/// commit certificate. Later implementation beads may change how the handoff is
+/// transported, but not which facts must be carried or the rule that the pager
+/// only publishes them after the certificate becomes durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelWalPublicationIntent {
+    pub certificate_epoch: u64,
+    pub visible_commit_seq: CommitSeq,
+    pub page_plane_visible_commit_seq: CommitSeq,
+    pub db_size: u32,
+    pub journal_mode: JournalMode,
+    pub freelist_count: usize,
+    pub checkpoint_active: bool,
+    pub page_set_size: usize,
+}
+
 /// Point-in-time view of the pager metadata publication plane.
+///
+/// When the D1 parallel WAL path is active, this snapshot is the post-publish
+/// image produced from a durable [`ParallelWalPublicationIntent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagerPublishedSnapshot {
     /// Even-numbered generation identifying the current published snapshot.
@@ -4764,7 +4786,9 @@ impl<V: Vfs> SimpleTransaction<V> {
             let offset = u64::from(page_no.get() - 1) * page_size_bytes;
             batched_writes.push((offset, page.as_bytes()));
         }
-        inner.db_file.write_page_batch(cx, batched_writes.as_slice())?;
+        inner
+            .db_file
+            .write_page_batch(cx, batched_writes.as_slice())?;
         inner.committed_db_file_size_bytes =
             u64::from(original_db_size) * u64::from(inner.page_size.get());
         Ok(())

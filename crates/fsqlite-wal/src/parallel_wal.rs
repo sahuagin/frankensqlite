@@ -59,6 +59,154 @@ impl Default for ParallelWalConfig {
     }
 }
 
+/// Operator-visible control mode for the D1.a parallel WAL contract.
+///
+/// `Auto` keeps the deterministic parallel data plane enabled and allows the
+/// optional decision plane to tune batching/flush behavior within declared
+/// safety bounds. `Conservative` forces the compatibility-safe single ordered
+/// path. `ShadowCompare` runs the conservative proof path alongside the
+/// parallel data plane and forces a downgrade if the two disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelWalOperatingMode {
+    #[default]
+    Auto,
+    Conservative,
+    ShadowCompare,
+}
+
+/// The irreducible ordered residue that remains even after per-core lane
+/// staging removes the global append bottleneck.
+///
+/// D1.a explicitly constrains the ordered residue to:
+/// 1. commit-sequence assignment,
+/// 2. commit-certificate durability, and
+/// 3. pager visibility publication.
+///
+/// Everything before that point stays lane-local and parallelizable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelWalOrderedResidue {
+    #[default]
+    CommitCertificateThenPublish,
+}
+
+/// Deterministic reasons for forcing the conservative/safe path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWalFallbackReason {
+    OperatorForced,
+    LaneOverflow,
+    CertificateGap,
+    CertificateChecksumMismatch,
+    PublicationMismatch,
+    RecoveryGap,
+    CheckpointConflict,
+    ControllerEvidenceLost,
+}
+
+/// Explicit operator control surface for the D1.a contract.
+///
+/// This is intentionally configuration-shaped rather than implementation-
+/// shaped so the later D1.b/D1.c/D1.d beads cannot reinterpret the runtime
+/// knobs ad hoc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalControlSurface {
+    /// `Auto`, `Conservative`, or `ShadowCompare`.
+    pub mode: ParallelWalOperatingMode,
+    /// Optional hard override for the number of active append lanes.
+    pub lane_count_override: Option<usize>,
+    /// Optional cap for helper/combine lanes assisting with flush work.
+    pub helper_lane_budget: Option<usize>,
+    /// Optional cap on batch bytes the decision plane may stage before sealing.
+    pub max_parallel_commit_bytes: Option<u64>,
+    /// Optional cap on how long a batch may wait before being sealed/flushed.
+    pub max_flush_delay_ms: Option<u64>,
+    /// Shadow-compare sampling rate in per-mille. `None` disables sampling.
+    pub shadow_compare_sampling_per_mille: Option<u16>,
+}
+
+impl Default for ParallelWalControlSurface {
+    fn default() -> Self {
+        Self {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: None,
+            helper_lane_budget: None,
+            max_parallel_commit_bytes: None,
+            max_flush_delay_ms: None,
+            shadow_compare_sampling_per_mille: None,
+        }
+    }
+}
+
+/// Commit-certificate proof object for the parallel WAL data plane.
+///
+/// A commit becomes externally publishable only after the certificate is
+/// durably written. The certificate covers a contiguous commit-sequence range,
+/// the lanes that contributed to that range, and the pager-visible metadata
+/// that must be published once the ordered residue completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalCommitCertificate {
+    pub format_version: u16,
+    pub residue: ParallelWalOrderedResidue,
+    pub certificate_epoch: u64,
+    pub commit_seq_lo: CommitSeq,
+    pub commit_seq_hi: CommitSeq,
+    pub durable_segment_epoch: u64,
+    pub lane_count: u16,
+    pub lane_record_counts: Vec<u32>,
+    pub db_size_pages: u32,
+    pub page_set_size: u32,
+    pub certificate_crc32c: u32,
+    pub fallback_active: bool,
+}
+
+/// Trace schema shared by lane, combiner, checkpoint, recovery, and
+/// control-plane events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalTraceRecord {
+    pub component: String,
+    pub trace_id: u64,
+    pub decision_id: Option<u64>,
+    pub mode: ParallelWalOperatingMode,
+    pub lane_id: Option<usize>,
+    pub epoch: Option<u64>,
+    pub commit_seq_lo: Option<CommitSeq>,
+    pub commit_seq_hi: Option<CommitSeq>,
+    pub checkpoint_epoch: Option<u64>,
+    pub recovery_epoch: Option<u64>,
+    pub fallback_active: bool,
+    pub fallback_reason: Option<ParallelWalFallbackReason>,
+    pub policy_id: Option<String>,
+    pub policy_version: Option<String>,
+}
+
+/// Optional controller action for the D1 decision plane.
+///
+/// The deterministic data plane stays correct even when the controller is
+/// disabled. These actions only tune batching and lane budgets within the
+/// declared control surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWalDecisionAction {
+    KeepCurrent,
+    SealEpochNow,
+    IncreaseLaneBudget,
+    DecreaseLaneBudget,
+    ForceConservative,
+}
+
+/// Decision-record schema for the optional D1 controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelWalDecisionRecord {
+    pub policy_id: String,
+    pub policy_version: String,
+    pub decision_id: u64,
+    pub action: ParallelWalDecisionAction,
+    pub confidence_bps: u16,
+    pub expected_loss_micros: u64,
+    pub top_evidence_terms: Vec<String>,
+    pub counterfactual_action: ParallelWalDecisionAction,
+    pub counterfactual_regret_micros: i64,
+    pub fallback_active: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Segment File I/O (D1.6)
 // ---------------------------------------------------------------------------

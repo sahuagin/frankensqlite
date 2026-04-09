@@ -25,8 +25,8 @@ pub use page_cache::{
     resolve_page_buffer_max,
 };
 pub use pager::{
-    PagerPublishedSnapshot, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
-    WalCommitSyncPolicy, remove_group_commit_queue,
+    PagerPublishedSnapshot, ParallelWalPublicationIntent, SimplePager, SimplePagerCheckpointWriter,
+    SimpleTransaction, WalCommitSyncPolicy, remove_group_commit_queue,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,

@@ -1,210 +1,290 @@
-# Per-Core WAL Buffer Architecture (`bd-ncivz.1`)
+# Per-Core Parallel WAL Design Contract (`bd-3wop3.1.1`)
 
 ## Purpose
 
-Define the design contract for per-core WAL buffering used by the parallel WAL path.  
-This artifact provides:
+This document is the reference contract for Track D1.a:
 
-- data model and state machine
-- explicit invariants and failure modes
-- deterministic fallback behavior
-- MVCC integration points
-- prototype evidence links (unit + e2e)
+- per-core append lanes and local staging,
+- commit certificates,
+- pager visibility publication,
+- recovery/checkpoint semantics,
+- safe-mode fallback and operator controls,
+- optional decision-plane policy with explicit disable/fallback rules.
 
-## Scope
+It supersedes the older `bd-ncivz.*` prototype notes. Future D1.b/D1.c/D1.d
+and E3.2 work must implement this contract rather than reinterpret the parallel
+WAL shape ad hoc.
 
-This bead is a design-and-prototype slice. It does **not** replace the existing commit path end-to-end yet.  
-It establishes a concrete contract that `bd-ncivz.2+` can implement against.
+## Deterministic Data Plane
 
-## Core Model
+### Unit of parallel staging
 
-Each writer maps to a **core-local WAL buffer**.  
-A core-local buffer is double-buffered:
+The parallel data plane stages one **lane batch** per writer-owned lane:
 
-- `active` lane: writable by the mapped writer
-- `flush` lane: immutable while a flush is in progress
-- `overflow` queue: bounded spillover when `active` fills before epoch advance
+- a lane batch is the ordered set of `WalRecord`s emitted by one transaction on
+  one lane during one sealing interval,
+- `WalRecord` remains the lane-local mutation unit in
+  `crates/fsqlite-wal/src/per_core_buffer.rs`,
+- lane ownership is stable for the transaction lifetime; no transaction may
+  append across multiple lanes.
 
-Default sizing:
+### Commit ordering
 
-- `active` capacity: `4 MiB` per core
-- fallback trigger: `8 MiB` queued overflow per core
+Commit order is defined only by `CommitSeq` and is never inferred from wall
+ clock, epoch number, lane number, or segment file order.
 
-## WAL Record Schema
+- lane-local staging is parallel and unordered relative to other lanes,
+- the combiner assigns or confirms a contiguous `CommitSeq` interval,
+- the combiner emits one `ParallelWalCommitCertificate` covering that interval,
+- pager publication may only expose the certificate's `commit_seq_hi` after the
+  certificate is durable.
 
-Each buffered mutation record carries:
+### Exact irreducible ordered residue
 
-- `txn_token` (`txn_id`, `txn_epoch`)
-- `epoch` (group-commit epoch tag)
-- `page_id`
-- `begin_seq`
-- `end_seq` (optional until commit sealing)
-- `before_image`
-- `after_image`
+The ordered residue is deliberately tiny and explicit:
 
-The prototype uses this shape directly in `crates/fsqlite-wal/src/per_core_buffer.rs`.
+1. assign or finalize the `CommitSeq` interval,
+2. durably write the commit certificate,
+3. publish pager visibility metadata derived from that certificate.
 
-## Thread-to-Buffer Mapping
+Everything before residue step 1 is lane-local. Recovery, checkpoint, and
+readers must treat the certificate as the proof object that bridges lane-local
+ staging to globally ordered visibility.
 
-Deterministic mapping:
+## Commit Certificate Record
 
-- writer thread is assigned one logical core id for the transaction lifetime
-- all record appends for that writer go to that core’s `active` lane
-- no cross-core append sharing on the fast path
+The production proof object is `ParallelWalCommitCertificate` in
+`crates/fsqlite-wal/src/parallel_wal.rs`.
 
-Prototype evidence checks this with one writer thread per core and lock-contention counter assertions.
+### Required fields
 
-## NUMA Strategy
+| Field | Meaning |
+| --- | --- |
+| `format_version` | Stable certificate schema version |
+| `residue` | Declared ordered-residue contract (`CommitCertificateThenPublish`) |
+| `certificate_epoch` | Seal/drain epoch that produced the certificate |
+| `commit_seq_lo` / `commit_seq_hi` | Closed commit interval covered by the certificate |
+| `durable_segment_epoch` | Durable segment generation that contains the committed lane batches |
+| `lane_count` | Number of lanes contributing evidence |
+| `lane_record_counts` | Per-lane batch cardinality used for replay/audit |
+| `db_size_pages` | Post-commit database size visible after publication |
+| `page_set_size` | Published page-plane cardinality associated with the commit |
+| `certificate_crc32c` | Certificate-level integrity checksum |
+| `fallback_active` | Whether the conservative path owned this commit |
 
-Allocation policy:
+### Certificate semantics
 
-- allocate each core buffer on startup
-- place memory on the local NUMA node of the mapped core whenever topology info is available
-- if NUMA placement fails/unavailable, fall back to standard allocation and keep semantics unchanged
+- no commit is externally visible without a durable certificate,
+- certificates must cover contiguous `CommitSeq` intervals with no gaps or
+  overlaps,
+- certificate durability is the handoff point between WAL append and pager
+  publication,
+- shadow-compare mode must produce a conservative certificate candidate and
+  compare all contract fields before publication.
 
-`bd-ncivz.1` captures this as a contract; low-level NUMA placement hooks are planned for implementation beads.
+## Pager Visibility Publication
 
-## State Machine
+The pager handoff object is `ParallelWalPublicationIntent` in
+`crates/fsqlite-pager/src/pager.rs`.
 
-Lane states:
+Publication rules:
 
-- `Writable`
-- `Sealed { epoch }`
-- `Flushing { epoch }`
+- `visible_commit_seq` is the highest commit sequence made visible to readers,
+- `page_plane_visible_commit_seq` may lag `visible_commit_seq` only when the
+  page plane intentionally forces cache/inner fallback instead of serving stale
+  published pages,
+- `PagerPublishedSnapshot` is the post-publish image; it must correspond to a
+  durable publication intent derived from exactly one certificate interval,
+- publication must be monotone in `visible_commit_seq`.
 
-Transitions:
+## Recovery and Checkpoint Consumption
 
-1. `Writable -> Sealed` on epoch seal (`seal_active`)
-2. `Sealed -> Flushing` by lane rotation (`begin_flush`)
-3. `Flushing -> Writable` after successful drain (`complete_flush`)
-4. `Writable -> Writable` normal append
-5. `Writable -> overflow queue` when lane full and overflow policy permits
+### Recovery contract
 
-Invalid transitions are rejected deterministically (error return, no partial mutation).
+Recovery consumes lane batches only through certificate order:
 
-## Overflow and Deterministic Fallback
+- segment replay order is certificate interval order, not raw lane order,
+- if recovery sees a lane batch without a matching durable certificate, that
+  batch is ignored as uncommitted residue,
+- if recovery sees a certificate gap, checksum mismatch, or interval overlap,
+  it must force conservative recovery and stop trusting the parallel path.
 
-Policies:
+### Checkpoint contract
 
-- `BlockWriter`: return blocked outcome on active-lane overflow
-- `AllocateOverflow`: queue record in overflow queue
+Checkpoint uses the same visibility boundary:
 
-Deterministic fallback trigger:
+- only pages at or below the highest durable published certificate may be
+  checkpointed,
+- checkpoint metadata must record the certificate epoch / `commit_seq_hi` it
+  consumed,
+- checkpoint overlap with a certificate interval still being published forces
+  conservative/safe mode for that interval.
 
-- if overflow bytes exceed `overflow_fallback_bytes`, latch `ForceSerializedDrain`
-- fallback action drains `active + flush + overflow` through serialized path and resets lanes
+## Safe-Mode Fallback and Operator Control Surface
 
-This avoids unbounded queue growth and ensures a predictable failure containment path.
+The explicit runtime knobs live in `ParallelWalControlSurface` and
+`ParallelWalOperatingMode`.
 
-## MVCC and Commit Integration Points
+### Modes
 
-Write path integration points:
+- `Auto`: parallel data plane enabled; optional controller may tune batching
+  within caps
+- `Conservative`: force serialized append/commit/publish for debugging,
+  bisecting, and oracle comparison
+- `ShadowCompare`: parallel data plane remains authoritative only while a
+  conservative proof run agrees on certificate/publication facts
 
-1. MVCC page write emits `WalRecord` into mapped core buffer
-2. transaction commit marks records sealed under current epoch
-3. group flush drains sealed lanes and hands batches to WAL append/fsync path
-4. on fallback trigger, coordinator drains through serialized compatibility-safe path
+### Required overrides
 
-This design preserves the project requirement that concurrent-writer mode remains enabled by default.
+- lane-count override: hard cap or exact lane count
+- helper-lane budget override: cap on auxiliary flush/combine helpers
+- max batch bytes override
+- max flush delay override
+- shadow-compare sampling override
 
-## Invariants
+### Deterministic fallback triggers
 
-`INV-NCIVZ-1` Single-writer per core lane:
-- one mapped writer owns one `active` lane at a time
+The fallback reason taxonomy is fixed by `ParallelWalFallbackReason`:
 
-`INV-NCIVZ-2` Lane exclusivity:
-- a lane cannot be `Writable` and `Flushing` simultaneously
+- `OperatorForced`
+- `LaneOverflow`
+- `CertificateGap`
+- `CertificateChecksumMismatch`
+- `PublicationMismatch`
+- `RecoveryGap`
+- `CheckpointConflict`
+- `ControllerEvidenceLost`
 
-`INV-NCIVZ-3` Epoch monotonicity:
-- `epoch` tags on sealed/flush batches are non-decreasing per core
+Any of these forces `Conservative` behavior for the affected interval. The
+parallel path may only re-arm after an explicit clean-state transition verified
+by the validation surface.
 
-`INV-NCIVZ-4` Flush immutability:
-- records in `Flushing` lane are immutable until flush completion
+## Decision-Plane Contract
 
-`INV-NCIVZ-5` Overflow boundedness:
-- overflow growth beyond threshold always latches deterministic fallback
+The optional controller is policy-as-data only. Correctness does not depend on
+it.
 
-`INV-NCIVZ-6` No silent drop:
-- appends are either accepted in active lane, queued overflow, or explicitly blocked
+Runtime schema:
 
-`INV-NCIVZ-7` Deterministic fallback reset:
-- serialized drain leaves both lanes writable/empty and clears fallback latch
+- actions: `KeepCurrent`, `SealEpochNow`, `IncreaseLaneBudget`,
+  `DecreaseLaneBudget`, `ForceConservative`
+- record shape: `ParallelWalDecisionRecord`
+- logging schema: `ParallelWalTraceRecord`
 
-`INV-NCIVZ-8` No-contention target:
-- one writer per core has zero observed lock-contention events in prototype run
+### Conservative baseline
 
-## Failure Modes and Handling
+If the controller is disabled or evidence goes bad, runtime behavior must be
+equivalent to:
 
-1. Active lane overflow before epoch seal:
-- handled by configured policy (`BlockWriter` or `AllocateOverflow`)
+- `ParallelWalOperatingMode::Conservative`, or
+- `Auto` with no tuned overrides and immediate fallback to conservative on the
+  first bad-evidence event.
 
-2. Overflow runaway:
-- deterministic `ForceSerializedDrain` trigger and drain
+### State/action table
 
-3. Invalid state transitions:
-- rejected with explicit error, no state corruption
+| State slice | Allowed actions | Loss focus |
+| --- | --- | --- |
+| low occupancy, no fallback pressure | `KeepCurrent`, `DecreaseLaneBudget` | avoid helper waste |
+| high occupancy, low lag | `KeepCurrent`, `IncreaseLaneBudget` | reduce seal latency |
+| high lag, certificate backlog | `SealEpochNow`, `IncreaseLaneBudget` | bound publish delay |
+| publication mismatch, recovery anomaly, or low confidence | `ForceConservative` | correctness over throughput |
 
-4. Flush failure:
-- keep lane in flushing state and surface error; no writer success is reported from failed flush
+### Decision record requirements
 
-5. Mapping mismatch (invalid core id):
-- hard error at dispatch boundary; no implicit remap
+Every adaptive action must emit:
 
-## Observability Contract (Required Fields)
+- `policy_id`
+- `policy_version`
+- `decision_id`
+- chosen action
+- confidence / posterior (`confidence_bps`)
+- expected loss
+- top evidence terms
+- counterfactual action
+- counterfactual regret delta
+- fallback-active bit
 
-Per flush/fallback event must include:
+## Timescale Separation
+
+The D1 controller is the fastest control loop, but it still only tunes batch and
+lane behavior. It must not subsume other controllers.
+
+- D1 controller: flush timing, lane budget, helper-lane use; sub-second to
+  second scale
+- E4 admission control: writer admission / pressure caps; slower than D1 and
+  only constrains available work
+- E6 placement policy: lane/core placement and topology mapping; slower than E4
+  and only changes between transactions
+- later cache/routing controllers: may adapt read/write routing, but must treat
+  certificate/publication semantics as fixed invariants
+
+## Invariants Ledger
+
+`INV-D1-1` Commit order is defined solely by `CommitSeq`.
+
+`INV-D1-2` No publication without a durable certificate.
+
+`INV-D1-3` Certificate intervals are contiguous, non-overlapping, and auditable.
+
+`INV-D1-4` Pager publication is monotone in `visible_commit_seq`.
+
+`INV-D1-5` Recovery replays only certificate-backed intervals.
+
+`INV-D1-6` Checkpoint never crosses an unpublished certificate boundary.
+
+`INV-D1-7` Conservative mode is semantically equivalent to the parallel path for
+the same committed interval.
+
+`INV-D1-8` Disabling the decision plane never changes correctness, only tuning.
+
+## Logging Contract Schema
+
+Every lane, combiner, checkpoint, recovery, and controller event must expose
+the fields represented by `ParallelWalTraceRecord`, plus scenario-level
+envelope fields supplied by the caller:
 
 - `trace_id`
-- `run_id`
-- `scenario_id`
-- `bead_id`
-- `core_id`
+- `decision_id` when applicable
+- `component`
+- `mode`
+- `lane_id` when applicable
 - `epoch`
-- `lane_state_from`
-- `lane_state_to`
-- `outcome`
-- `duration_us`
-- `error_code` (nullable)
+- `commit_seq_lo`
+- `commit_seq_hi`
+- `checkpoint_epoch` when applicable
+- `recovery_epoch` when applicable
+- `fallback_active`
+- `fallback_reason`
+- `policy_id`
+- `policy_version`
+- outer envelope: `run_id`, `scenario_id`, `bead_id`, `artifact_path`
 
-The e2e verifier emits these in JSONL summary artifacts.
+## Validation Surface
 
-## Prototype Evidence
+The named validation entrypoint is:
 
-Unit tests:
+- `scripts/verify_d1_parallel_wal_design_contract.sh`
 
-- `bd_ncivz_1_state_machine_double_buffering`
-- `bd_ncivz_1_overflow_block_writer_policy`
-- `bd_ncivz_1_overflow_allocate_triggers_deterministic_fallback`
-- `bd_ncivz_1_per_core_pool_concurrent_writers_no_contention`
+Minimum scenarios and expected outcomes:
 
-All are implemented in:
+1. commit-order table test
+   Expected: no interval gaps/overlaps; certificate fields agree with replay order
+2. lane reordering replay
+   Expected: recovery replays by certificate order, not raw lane arrival order
+3. checkpoint overlap
+   Expected: checkpoint stops at the last published certificate boundary
+4. forced conservative mode
+   Expected: certificate/publication semantics remain equivalent
+5. shadow-compare divergence
+   Expected: `PublicationMismatch` or related fallback reason forces conservative mode
+6. controller evidence loss
+   Expected: `ControllerEvidenceLost` forces conservative mode and logs a decision record
 
-- `crates/fsqlite-wal/src/per_core_buffer.rs`
+## Immediate Implementation Bindings
 
-Pilot e2e script:
-
-- `e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh`
-
-Artifacts:
-
-- `artifacts/ncivz_1_parallel_wal_buffer/`
-
-Replay command:
-
-- `RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal bd_ncivz_1_ -- --nocapture`
-
-## `bd-ncivz.2` Progress Notes
-
-`bd-ncivz.2` builds directly on this contract with an epoch-order coordinator in
-`crates/fsqlite-wal/src/per_core_buffer.rs`:
-
-- global epoch clock with default `10ms` advance interval metadata
-- active-core fence (`advance_epoch_and_wait`) before sealing the previous epoch
-- per-epoch group flush across all core lanes with deterministic straddle detection
-- durability wait API (`wait_until_epoch_durable`) for writer unblock semantics
-- recovery ordering helper that replays records by `(epoch, begin_seq, txn_id, page_id)`
-
-Deterministic test replay:
-
-- `RUST_TEST_THREADS=1 rch exec -- cargo test -p fsqlite-wal bd_ncivz_2_ -- --nocapture`
-- `bash e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh --json --bead-id bd-ncivz.2 --scenario-id E2E-CNC-008 --filter bd_ncivz_2_`
+- D1.b must implement lane batches and sealing without expanding the ordered residue
+- D1.c must implement certificate durability and pager handoff exactly through
+  the named schemas
+- D1.d must prove recovery/checkpoint against this certificate boundary
+- E3.2 must treat pager publication as certificate-derived metadata, not an
+  independently interpreted plane

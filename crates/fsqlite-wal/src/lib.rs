@@ -84,11 +84,13 @@ pub use metrics::{
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
 };
 pub use parallel_wal::{
-    FsyncPolicy, ParallelWalBatch, ParallelWalConfig, ParallelWalCoordinator, ParallelWalFrame,
-    SegmentHeader, SegmentRecoveryOptions, SegmentRecoveryResult, cleanup_segments, delete_segment,
-    list_segments, max_durable_epoch, parallel_wal_coordinator_for_path, read_segment,
-    recover_and_apply_segments, recover_segments, remove_parallel_wal_coordinator, segment_path,
-    write_segment,
+    FsyncPolicy, ParallelWalBatch, ParallelWalCommitCertificate, ParallelWalConfig,
+    ParallelWalControlSurface, ParallelWalCoordinator, ParallelWalDecisionAction,
+    ParallelWalDecisionRecord, ParallelWalFallbackReason, ParallelWalFrame,
+    ParallelWalOperatingMode, ParallelWalOrderedResidue, ParallelWalTraceRecord, SegmentHeader,
+    SegmentRecoveryOptions, SegmentRecoveryResult, cleanup_segments, delete_segment, list_segments,
+    max_durable_epoch, parallel_wal_coordinator_for_path, read_segment, recover_and_apply_segments,
+    recover_segments, remove_parallel_wal_coordinator, segment_path, write_segment,
 };
 pub use per_core_buffer::{
     AppendOutcome, BufferConfig, BufferState, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig,
