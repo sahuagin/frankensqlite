@@ -173,3 +173,7 @@ entry point; the files below carry the enforceable machine-readable details:
 
 Any downstream parity, conformance, or release-gating work should cite these
 artifacts rather than restating the scope from memory.
+
+Track G certification policy, ratchets, and release-evidence requirements are
+documented in
+[`design/certification-gates-ratchets-release-evidence.md`](design/certification-gates-ratchets-release-evidence.md).

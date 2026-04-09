@@ -211,6 +211,14 @@ includes:
 Each benchmark row still writes its own canonical per-row bundle under the
 campaign artifact root with `final_scorecard` retention.
 
+### Track G Certification Note
+
+This evidence pack is the e2e half of the Track G certification bundle, not the
+whole bundle by itself. A release may only be called conformant after these e2e
+artifacts are paired with the harness-side gate report, verification-contract
+outcome, release certificate JSON, and ratchet state described in
+[`../../docs/design/certification-gates-ratchets-release-evidence.md`](../../docs/design/certification-gates-ratchets-release-evidence.md).
+
 ### Interpreting Results
 
 **SHA-256 match (all three tiers agree):**
