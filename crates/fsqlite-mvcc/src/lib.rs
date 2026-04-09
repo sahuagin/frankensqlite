@@ -53,6 +53,7 @@ pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
 pub mod witness_refinement;
+pub mod writer_routing_telemetry;
 pub mod write_coordinator;
 pub mod xor_delta;
 
@@ -384,6 +385,14 @@ pub use witness_publication::{
 pub use witness_refinement::{
     RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
     refine_edges,
+};
+pub use writer_routing_telemetry::{
+    WRITER_ROUTING_TELEMETRY_SOURCES, WriterConflictHistoryTelemetry, WriterLockHolderClue,
+    WriterOwnershipLineageTelemetry, WriterRetryAttribution, WriterRetryCause,
+    WriterRoutingTelemetryCaptureCost, WriterRoutingTelemetryClass,
+    WriterRoutingTelemetryInput, WriterRoutingTelemetryPhase, WriterRoutingTelemetryShape,
+    WriterRoutingTelemetrySignal, WriterRoutingTelemetrySourceSpec, WriterTierSurfaceCounts,
+    WriterTouchSurfaceTelemetry,
 };
 pub use write_coordinator::{
     CommitWriteSet, CompatCommitRequest, CompatCommitResponse, CoordinatorLease, CoordinatorMode,
