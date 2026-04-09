@@ -1413,7 +1413,7 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
     where
         F: FnOnce(&mut Self) -> Result<T>,
@@ -1432,7 +1432,7 @@ impl<P: PageReader> BtCursor<P> {
         result
     }
 
-    #[inline(always)]
+    #[inline]
     fn finish_btree_op_postlude(&mut self, cx: &Cx, op_type: BtreeOpType) {
         if let Err(error) = self.record_depth_gauge(cx) {
             debug!(
@@ -5294,14 +5294,13 @@ impl<P: PageWriter> BtCursor<P> {
         if self
             .pager
             .try_mutate_staged_page_data(hint.leaf_page, &mut mutate_payload_only)
+            && mutate_payload_result?.is_some()
         {
-            if let Some(_) = mutate_payload_result? {
-                self.last_insert_rowid = Some(rowid);
-                self.last_known_depth = Some(hint.tree_depth);
-                hint.last_rowid = rowid;
-                self.clear_rightmost_leaf_cache();
-                return Ok(true);
-            }
+            self.last_insert_rowid = Some(rowid);
+            self.last_known_depth = Some(hint.tree_depth);
+            hint.last_rowid = rowid;
+            self.clear_rightmost_leaf_cache();
+            return Ok(true);
         }
 
         if let Some(mut page_data) = hint.page_data.take() {
