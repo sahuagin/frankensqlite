@@ -1837,6 +1837,7 @@ mod tests {
 
     const BEAD_ID: &str = "bd-22n.2";
     const BEAD_TRACK_F: &str = "bd-pm1zd";
+    const BEAD_TRACK_Q: &str = "bd-aztlm";
 
     fn elapsed_ns(duration: Duration) -> u64 {
         u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
@@ -1883,6 +1884,91 @@ mod tests {
                 "extra": extra
             })
         );
+    }
+
+    fn emit_track_q_log(
+        test_name: &str,
+        phase: &str,
+        elapsed: Duration,
+        page_count: usize,
+        bucket_access_count: u64,
+        chain_walk_count: u64,
+        resize_count: u64,
+        cache_hit_rate: f64,
+        extra: serde_json::Value,
+    ) {
+        eprintln!(
+            "TRACK_Q:{}",
+            json!({
+                "bead_id": BEAD_TRACK_Q,
+                "test_name": test_name,
+                "phase": phase,
+                "elapsed_ns": elapsed_ns(elapsed),
+                "page_count": page_count,
+                "bucket_access_count": bucket_access_count,
+                "chain_walk_count": chain_walk_count,
+                "resize_count": resize_count,
+                "cache_hit_rate": cache_hit_rate,
+                "extra": extra
+            })
+        );
+    }
+
+    fn track_q_page_buf(page_no: PageNumber) -> PageBuf {
+        let pattern = page_pattern(page_no);
+        let mut buf = PageBuf::new(PageSize::DEFAULT);
+        buf.as_mut_slice().fill(pattern);
+        buf.as_mut_slice()[..4].copy_from_slice(&page_no.get().to_le_bytes());
+        buf
+    }
+
+    fn assert_track_q_page(page_no: PageNumber, data: &[u8]) {
+        assert_eq!(
+            &data[..4],
+            page_no.get().to_le_bytes().as_slice(),
+            "TRACK_Q page header mismatch for page {}",
+            page_no.get()
+        );
+        assert_eq!(
+            data[PageSize::DEFAULT.as_usize() - 1],
+            page_pattern(page_no),
+            "TRACK_Q page tail mismatch for page {}",
+            page_no.get()
+        );
+    }
+
+    fn track_q_probe_distance(slots: &FlatPageSlots, page_no: PageNumber) -> usize {
+        let slot_idx = slots.find_slot(page_no).expect("page should be present");
+        let start = slots.hash_pgno(page_no.get());
+        slot_idx.wrapping_sub(start) & slots.mask
+    }
+
+    fn track_q_collision_pages(
+        slots: &FlatPageSlots,
+        target_bucket: usize,
+        wanted: usize,
+    ) -> Vec<PageNumber> {
+        let mut pages = Vec::with_capacity(wanted);
+        let mut candidate = 1_u32;
+        while pages.len() < wanted {
+            let page_no = PageNumber::new(candidate).expect("collision candidate page number");
+            if slots.hash_pgno(candidate) == target_bucket {
+                pages.push(page_no);
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("collision search should not exhaust page numbers");
+        }
+        pages
+    }
+
+    fn track_q_hit_rate(hits: u64, misses: u64) -> f64 {
+        let total = hits.saturating_add(misses);
+        if total == 0 {
+            return 1.0;
+        }
+        f64::from(u32::try_from(hits.min(u64::from(u32::MAX))).expect("hit count fits u32"))
+            / f64::from(u32::try_from(total.min(u64::from(u32::MAX))).expect("total fits u32"))
     }
 
     fn lane_counter(data: &[u8], lane: usize) -> u32 {
@@ -4386,6 +4472,421 @@ mod tests {
                 "shared_pages": SHARED_PAGES,
                 "mutation_ops": mutation_ops,
                 "read_ops": read_ops
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_basic_insert_get_on_100_pages() {
+        let slots = FlatPageSlots::new(128);
+
+        for raw_pgno in 1_u32..=100 {
+            let page_no = PageNumber::new(raw_pgno).expect("page number");
+            let inserted = slots
+                .try_insert(page_no, track_q_page_buf(page_no))
+                .expect("basic insert should stay in flat slots");
+            assert!(inserted, "page {} should be newly inserted", page_no.get());
+        }
+
+        assert_eq!(slots.len(), 100, "all basic pages should remain resident");
+        slots.reset_metrics();
+
+        let started = Instant::now();
+        let mut bucket_access_count = 0_u64;
+        let mut chain_walk_count = 0_u64;
+        for raw_pgno in 1_u32..=100 {
+            let page_no = PageNumber::new(raw_pgno).expect("page number");
+            assert!(slots.contains(page_no), "page {} should be present", page_no.get());
+            let copy = slots
+                .get_copy(page_no)
+                .expect("inserted page should round-trip through flat slots");
+            assert_track_q_page(page_no, &copy);
+            let distance = u64::try_from(track_q_probe_distance(&slots, page_no))
+                .expect("probe distance fits u64");
+            bucket_access_count = bucket_access_count.saturating_add(distance.saturating_add(1));
+            chain_walk_count = chain_walk_count.saturating_add(distance);
+        }
+        let elapsed = started.elapsed();
+
+        let hits = slots.hits.load(Ordering::Relaxed);
+        let misses = slots.misses.load(Ordering::Relaxed);
+        assert_eq!(hits, 100, "basic readback should record one hit per page");
+        assert_eq!(misses, 0, "basic readback should not record misses");
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_basic_insert_get_on_100_pages",
+            "verify",
+            elapsed,
+            100,
+            bucket_access_count,
+            chain_walk_count,
+            0,
+            track_q_hit_rate(hits, misses),
+            json!({
+                "resident_pages": slots.len(),
+                "admits": slots.admits.load(Ordering::Relaxed),
+                "capacity": slots.mask + 1
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_forced_probe_collision_chain() {
+        let slots = FlatPageSlots::new(64);
+        let target_bucket = slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&slots, target_bucket, 8);
+
+        for (expected_distance, page_no) in colliders.iter().copied().enumerate() {
+            let inserted = slots
+                .try_insert(page_no, track_q_page_buf(page_no))
+                .expect("forced-collision page should stay in flat slots");
+            assert!(inserted, "collider {} should be newly inserted", page_no.get());
+            assert_eq!(
+                track_q_probe_distance(&slots, page_no),
+                expected_distance,
+                "collider {} should occupy the next probe slot in the chain",
+                page_no.get()
+            );
+        }
+
+        slots.reset_metrics();
+        let started = Instant::now();
+        let mut bucket_access_count = 0_u64;
+        let mut chain_walk_count = 0_u64;
+        for page_no in colliders.iter().copied() {
+            let copy = slots
+                .get_copy(page_no)
+                .expect("collider should be retrievable from probe chain");
+            assert_track_q_page(page_no, &copy);
+            let distance = u64::try_from(track_q_probe_distance(&slots, page_no))
+                .expect("probe distance fits u64");
+            bucket_access_count = bucket_access_count.saturating_add(distance.saturating_add(1));
+            chain_walk_count = chain_walk_count.saturating_add(distance);
+        }
+        let elapsed = started.elapsed();
+
+        let absent = track_q_collision_pages(&slots, target_bucket, colliders.len() + 1)
+            .last()
+            .copied()
+            .expect("absent collider");
+        assert!(
+            slots.get_copy(absent).is_none(),
+            "non-inserted collider should miss after walking the probe chain"
+        );
+
+        let hits = slots.hits.load(Ordering::Relaxed);
+        assert_eq!(
+            hits,
+            u64::try_from(colliders.len()).expect("collider hit count fits u64"),
+            "forced collision test should record one hit per inserted collider"
+        );
+        assert!(
+            chain_walk_count > 0,
+            "forced collision test should accumulate non-zero probe-chain walks"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_forced_probe_collision_chain",
+            "verify",
+            elapsed,
+            colliders.len(),
+            bucket_access_count,
+            chain_walk_count,
+            0,
+            1.0,
+            json!({
+                "target_bucket": target_bucket,
+                "max_probe_distance": colliders.len() - 1,
+                "resident_pages": slots.len()
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_capacity_growth_uses_overflow_shards_without_resize() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        let target_bucket = cache.flat_slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&cache.flat_slots, target_bucket, MAX_PROBE_LENGTH + 4);
+
+        for page_no in colliders.iter().copied() {
+            cache.insert_buffer(page_no, track_q_page_buf(page_no));
+        }
+
+        let overflow_pages = cache.shards.iter().map(|shard| shard.lock().len()).sum::<usize>();
+        assert_eq!(
+            cache.flat_slots.len(),
+            MAX_PROBE_LENGTH,
+            "flat slots should saturate exactly at the probe-window limit for one bucket"
+        );
+        assert_eq!(
+            overflow_pages,
+            colliders.len() - MAX_PROBE_LENGTH,
+            "pages beyond the probe window should spill into overflow shards"
+        );
+        assert_eq!(
+            cache.len(),
+            colliders.len(),
+            "composite cache should retain every page even when flat slots saturate"
+        );
+
+        cache.reset_metrics();
+        let started = Instant::now();
+        let mut bucket_access_count = 0_u64;
+        let mut chain_walk_count = 0_u64;
+        for page_no in colliders.iter().copied() {
+            let copy = cache
+                .get_copy(page_no)
+                .expect("all saturated pages should remain readable through the composite cache");
+            assert_track_q_page(page_no, &copy);
+            if cache.flat_slots.contains(page_no) {
+                let distance = u64::try_from(track_q_probe_distance(&cache.flat_slots, page_no))
+                    .expect("probe distance fits u64");
+                bucket_access_count =
+                    bucket_access_count.saturating_add(distance.saturating_add(1));
+                chain_walk_count = chain_walk_count.saturating_add(distance);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        let metrics = cache.metrics_snapshot();
+        assert_eq!(
+            metrics.cached_pages,
+            colliders.len(),
+            "metrics snapshot should include flat-slot and overflow pages"
+        );
+        assert!(
+            metrics.hits >= u64::try_from(colliders.len()).expect("collider count fits u64"),
+            "composite cache lookups should register hits for saturated pages"
+        );
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_capacity_growth_uses_overflow_shards_without_resize",
+            "verify",
+            elapsed,
+            colliders.len(),
+            bucket_access_count,
+            chain_walk_count,
+            0,
+            track_q_hit_rate(metrics.hits, metrics.misses),
+            json!({
+                "target_bucket": target_bucket,
+                "flat_slot_pages": cache.flat_slots.len(),
+                "overflow_pages": overflow_pages,
+                "probe_window_limit": MAX_PROBE_LENGTH
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_remove_and_reclaim_tombstone_slots() {
+        let slots = FlatPageSlots::new(64);
+        let target_bucket = slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&slots, target_bucket, 4);
+
+        for page_no in colliders.iter().copied().take(3) {
+            slots.try_insert(page_no, track_q_page_buf(page_no))
+                .expect("reclaim setup insert should stay in flat slots");
+        }
+
+        let removed = colliders[1];
+        let removed_slot = slots.find_slot(removed).expect("removed page should be present");
+        assert!(slots.remove(removed), "middle collider should be removable");
+        assert_eq!(slots.len(), 2, "remove should decrement occupied slot count");
+        assert!(
+            slots.get_copy(removed).is_none(),
+            "removed collider should no longer be visible"
+        );
+
+        let tail_copy = slots
+            .get_copy(colliders[2])
+            .expect("later collider must stay visible across the tombstone");
+        assert_track_q_page(colliders[2], &tail_copy);
+
+        let replacement = colliders[3];
+        let inserted = slots
+            .try_insert(replacement, track_q_page_buf(replacement))
+            .expect("replacement collider should reuse the tombstone slot");
+        assert!(inserted, "replacement collider should be newly inserted");
+        assert_eq!(
+            slots.find_slot(replacement).expect("replacement slot"),
+            removed_slot,
+            "replacement collider should reclaim the tombstoned slot"
+        );
+
+        slots.reset_metrics();
+        let started = Instant::now();
+        for page_no in [colliders[0], colliders[2], replacement] {
+            let copy = slots
+                .get_copy(page_no)
+                .expect("resident collider should read after tombstone reuse");
+            assert_track_q_page(page_no, &copy);
+        }
+        let elapsed = started.elapsed();
+
+        let distances = [colliders[0], colliders[2], replacement]
+            .into_iter()
+            .map(|page_no| u64::try_from(track_q_probe_distance(&slots, page_no)).expect("probe distance"))
+            .collect::<Vec<_>>();
+        let chain_walk_count = distances.iter().copied().sum::<u64>();
+        let bucket_access_count = chain_walk_count
+            .saturating_add(u64::try_from(distances.len()).expect("distance count fits u64"));
+        let hits = slots.hits.load(Ordering::Relaxed);
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_remove_and_reclaim_tombstone_slots",
+            "verify",
+            elapsed,
+            slots.len(),
+            bucket_access_count,
+            chain_walk_count,
+            0,
+            track_q_hit_rate(hits, slots.misses.load(Ordering::Relaxed)),
+            json!({
+                "target_bucket": target_bucket,
+                "removed_page": removed.get(),
+                "replacement_page": replacement.get(),
+                "reclaimed_slot": removed_slot
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_latency_hot_probe_sub_15ns() {
+        const ITERATIONS: u32 = 1_000_000;
+
+        let slots = FlatPageSlots::new(64);
+        let hot_page = PageNumber::ONE;
+        let inserted = slots
+            .try_insert(hot_page, track_q_page_buf(hot_page))
+            .expect("hot latency page should stay in flat slots");
+        assert!(inserted, "hot latency page should be newly inserted");
+        assert_eq!(
+            track_q_probe_distance(&slots, hot_page),
+            0,
+            "hot latency page should be a direct bucket hit"
+        );
+
+        let started = Instant::now();
+        let mut hits = 0_u64;
+        for _ in 0..ITERATIONS {
+            if slots.contains(hot_page) {
+                hits = hits.saturating_add(1);
+            }
+        }
+        let elapsed = started.elapsed();
+        let avg_ns = (elapsed.as_secs_f64() * 1_000_000_000.0) / f64::from(ITERATIONS);
+
+        assert_eq!(
+            hits,
+            u64::from(ITERATIONS),
+            "hot latency probe should hit on every iteration"
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                avg_ns <= 15.0,
+                "release/perf hot-probe average should stay under 15ns, got {avg_ns:.2}ns"
+            );
+        }
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_latency_hot_probe_sub_15ns",
+            "verify",
+            elapsed,
+            1,
+            hits,
+            0,
+            0,
+            1.0,
+            json!({
+                "iterations": ITERATIONS,
+                "average_ns_per_probe": avg_ns,
+                "debug_assertions": cfg!(debug_assertions)
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_concurrent_reads_eight_threads() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const ITERATIONS_PER_THREAD: usize = 1_024;
+        const HOT_COLLIDERS: usize = 8;
+
+        let slots = Arc::new(FlatPageSlots::new(64));
+        let target_bucket = slots.hash_pgno(PageNumber::ONE.get());
+        let hot_pages = track_q_collision_pages(&slots, target_bucket, HOT_COLLIDERS);
+        for page_no in hot_pages.iter().copied() {
+            let inserted = slots
+                .try_insert(page_no, track_q_page_buf(page_no))
+                .expect("concurrent-read collider should stay in flat slots");
+            assert!(inserted, "hot collider should be newly inserted");
+        }
+        slots.reset_metrics();
+
+        let start_barrier = Arc::new(Barrier::new(THREADS + 1));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread_idx| {
+                let slots = Arc::clone(&slots);
+                let start_barrier = Arc::clone(&start_barrier);
+                let hot_pages = hot_pages.clone();
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for iter in 0..ITERATIONS_PER_THREAD {
+                        let page_no = hot_pages[(thread_idx + iter) % hot_pages.len()];
+                        let copy = slots
+                            .get_copy(page_no)
+                            .expect("concurrent hot collider should remain readable");
+                        assert_track_q_page(page_no, &copy);
+                    }
+                })
+            })
+            .collect();
+
+        let started = Instant::now();
+        start_barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("track q concurrent reader should not panic");
+        }
+        let elapsed = started.elapsed();
+
+        let expected_hits =
+            u64::try_from(THREADS * ITERATIONS_PER_THREAD).expect("expected hit count fits u64");
+        assert_eq!(
+            slots.hits.load(Ordering::Relaxed),
+            expected_hits,
+            "every concurrent hot read should register as a flat-slot hit"
+        );
+
+        let mut bucket_access_count = 0_u64;
+        let mut chain_walk_count = 0_u64;
+        for thread_idx in 0..THREADS {
+            for iter in 0..ITERATIONS_PER_THREAD {
+                let page_no = hot_pages[(thread_idx + iter) % hot_pages.len()];
+                let distance = u64::try_from(track_q_probe_distance(&slots, page_no))
+                    .expect("probe distance fits u64");
+                bucket_access_count = bucket_access_count.saturating_add(distance.saturating_add(1));
+                chain_walk_count = chain_walk_count.saturating_add(distance);
+            }
+        }
+
+        emit_track_q_log(
+            "test_track_q_flat_hash_concurrent_reads_eight_threads",
+            "verify",
+            elapsed,
+            hot_pages.len(),
+            bucket_access_count,
+            chain_walk_count,
+            0,
+            1.0,
+            json!({
+                "threads": THREADS,
+                "iterations_per_thread": ITERATIONS_PER_THREAD,
+                "target_bucket": target_bucket,
+                "resident_pages": slots.len()
             }),
         );
     }
