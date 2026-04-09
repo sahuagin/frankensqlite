@@ -821,6 +821,46 @@ impl InProcessPageLockTable {
         None
     }
 
+    /// Snapshot the current aggregate release-progress epoch.
+    ///
+    /// Callers can pair this with [`Self::wait_for_release_progress`] to park
+    /// until any lock release (active or draining) advances the lock table.
+    #[must_use]
+    pub fn release_progress_epoch(&self) -> u64 {
+        self.change_epoch.load(Ordering::Acquire)
+    }
+
+    /// Wait until a lock release advances the aggregate progress epoch.
+    ///
+    /// Returns `true` if another thread released at least one lock after the
+    /// caller observed `observed_epoch`, or `false` if `timeout` elapsed first.
+    /// This uses the same missed-wakeup-safe epoch discipline as the targeted
+    /// per-page waiter path, but aggregates across the whole lock table.
+    #[must_use]
+    pub fn wait_for_release_progress(&self, observed_epoch: u64, timeout: Duration) -> bool {
+        if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
+            return true;
+        }
+
+        let mut gate = self.change_gate.lock();
+        if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
+            return true;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.change_cv.wait_for(&mut gate, timeout);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = timeout;
+            self.change_cv.wait(&mut gate);
+        }
+
+        self.change_epoch.load(Ordering::Acquire) != observed_epoch
+    }
+
     /// Wait until `page` is no longer held by `observed_holder`.
     ///
     /// Returns `true` if the holder changed (including becoming unlocked)
@@ -2867,6 +2907,43 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(10),
             "timeout path should not return immediately"
+        );
+    }
+
+    #[test]
+    fn test_in_process_lock_table_wait_for_release_progress_wakes_on_release() {
+        let table = Arc::new(InProcessPageLockTable::new());
+        let page = PageNumber::new(9).unwrap();
+        let holder = TxnId::new(3).unwrap();
+
+        table.try_acquire(page, holder).unwrap();
+        let observed_epoch = table.release_progress_epoch();
+
+        let waiter_table = Arc::clone(&table);
+        let waiter = std::thread::spawn(move || {
+            waiter_table.wait_for_release_progress(observed_epoch, Duration::from_secs(1))
+        });
+
+        assert!(table.release(page, holder));
+        assert!(
+            waiter.join().unwrap(),
+            "aggregate release-progress waiter should observe release before timing out"
+        );
+    }
+
+    #[test]
+    fn test_in_process_lock_table_wait_for_release_progress_times_out() {
+        let table = InProcessPageLockTable::new();
+        let observed_epoch = table.release_progress_epoch();
+        let started = Instant::now();
+
+        assert!(
+            !table.wait_for_release_progress(observed_epoch, Duration::from_millis(20)),
+            "aggregate release-progress wait should time out without any release"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(10),
+            "aggregate release-progress timeout should not return immediately"
         );
     }
 

@@ -319,6 +319,7 @@ pub struct DroHotPathDecision {
     pub active_readers: usize,
     pub active_writers: usize,
     pub cvar_penalty: f64,
+    /// Effective topology-aware abort threshold for this reader/writer shape.
     pub threshold: f64,
     pub radius: f64,
     pub tolerance: DroRiskTolerance,
@@ -332,15 +333,16 @@ impl DroHotPathDecision {
     }
 }
 
-/// Dense O(1) lookup table for T3 near-miss DRO penalties.
+/// Dense O(1) lookup table for T3 near-miss DRO penalties and thresholds.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::struct_field_names)]
 pub struct DroLossMatrix {
     max_active_readers: usize,
     max_active_writers: usize,
-    threshold: f64,
+    base_threshold: f64,
     radius: DroRadiusCertificate,
     penalties: Vec<f64>,
+    thresholds: Vec<f64>,
 }
 
 impl DroLossMatrix {
@@ -354,26 +356,36 @@ impl DroLossMatrix {
         let rows = max_active_readers.saturating_add(1);
         let cols = max_active_writers.saturating_add(1);
         let mut penalties = vec![0.0; rows.saturating_mul(cols)];
+        let base_threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mut thresholds = vec![base_threshold; rows.saturating_mul(cols)];
 
         for readers in 0..rows {
             for writers in 0..cols {
                 let idx = readers * cols + writers;
-                penalties[idx] = dro_cvar_penalty(readers, writers, radius);
+                let topology_pressure = dro_topology_pressure(readers, writers);
+                penalties[idx] = dro_cvar_penalty_from_pressure(topology_pressure, radius);
+                thresholds[idx] =
+                    dro_topology_threshold_from_pressure(topology_pressure, base_threshold, radius);
             }
         }
 
         Self {
             max_active_readers,
             max_active_writers,
-            threshold: threshold.max(0.0),
+            base_threshold,
             radius,
             penalties,
+            thresholds,
         }
     }
 
     #[must_use]
-    pub const fn threshold(&self) -> f64 {
-        self.threshold
+    pub const fn base_threshold(&self) -> f64 {
+        self.base_threshold
     }
 
     #[must_use]
@@ -390,11 +402,20 @@ impl DroLossMatrix {
     }
 
     #[must_use]
+    pub fn threshold(&self, active_readers: usize, active_writers: usize) -> f64 {
+        let readers = active_readers.min(self.max_active_readers);
+        let writers = active_writers.min(self.max_active_writers);
+        let cols = self.max_active_writers.saturating_add(1);
+        self.thresholds[(readers * cols) + writers]
+    }
+
+    #[must_use]
     pub fn evaluate(&self, active_readers: usize, active_writers: usize) -> DroHotPathDecision {
         let readers = active_readers.min(self.max_active_readers);
         let writers = active_writers.min(self.max_active_writers);
         let cvar_penalty = self.penalty(readers, writers);
-        let decision = if cvar_penalty > self.threshold {
+        let threshold = self.threshold(readers, writers);
+        let decision = if cvar_penalty > threshold {
             AbortDecision::Abort
         } else {
             AbortDecision::Commit
@@ -404,7 +425,7 @@ impl DroLossMatrix {
             active_readers: readers,
             active_writers: writers,
             cvar_penalty,
-            threshold: self.threshold,
+            threshold,
             radius: self.radius.effective_radius(),
             tolerance: self.radius.tolerance,
             decision,
@@ -690,18 +711,33 @@ fn sample_variance(values: &[f64]) -> Option<f64> {
 }
 
 #[must_use]
-fn dro_cvar_penalty(
-    active_readers: usize,
-    active_writers: usize,
-    radius: DroRadiusCertificate,
-) -> f64 {
+fn dro_topology_pressure(active_readers: usize, active_writers: usize) -> f64 {
     #[allow(clippy::cast_precision_loss)]
     let occupancy = active_readers as f64 + active_writers as f64;
     #[allow(clippy::cast_precision_loss)]
     let skew = (active_readers.max(active_writers) as f64 + 1.0)
         / (active_readers.min(active_writers) as f64 + 1.0);
     let tail_mass = (occupancy / 8.0).min(4.0);
-    radius.effective_radius() * tail_mass * skew.ln_1p()
+    tail_mass * skew.ln_1p()
+}
+
+#[must_use]
+fn dro_cvar_penalty_from_pressure(topology_pressure: f64, radius: DroRadiusCertificate) -> f64 {
+    radius.effective_radius() * topology_pressure
+}
+
+#[must_use]
+fn dro_topology_threshold_from_pressure(
+    topology_pressure: f64,
+    base_threshold: f64,
+    radius: DroRadiusCertificate,
+) -> f64 {
+    if topology_pressure <= f64::EPSILON {
+        return base_threshold;
+    }
+
+    let severity = topology_pressure * (1.0 + radius.effective_radius());
+    base_threshold / (1.0 + severity)
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +754,7 @@ pub(crate) struct DroLiveControllerConfig {
     pub(crate) max_readers: usize,
     /// Maximum writers dimension in the loss matrix.
     pub(crate) max_writers: usize,
-    /// Default abort threshold (CVaR penalty > threshold → abort).
+    /// Base abort threshold anchor for the adaptive DRO threshold surface.
     pub(crate) default_threshold: f64,
     /// Volatility tracker config.
     pub(crate) tracker_config: DroVolatilityTrackerConfig,
@@ -2274,6 +2310,49 @@ mod tests {
     }
 
     #[test]
+    fn test_dro_loss_matrix_threshold_tightens_with_contention() {
+        let cert = dro_wasserstein_radius(
+            &[0.03, 0.08, 0.13, 0.21],
+            &[0.02, 0.07, 0.11, 0.19],
+            DroRiskTolerance::High,
+        )
+        .expect("certificate");
+        let matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.5, cert);
+        let light = matrix.evaluate(1, 1);
+        let heavy = matrix.evaluate(6, 6);
+        assert!(
+            heavy.threshold < light.threshold,
+            "bead_id=bd-3t52f heavier topology should tighten the DRO threshold"
+        );
+        assert!(
+            light.threshold <= matrix.base_threshold(),
+            "bead_id=bd-3t52f light threshold should not exceed the configured base"
+        );
+    }
+
+    #[test]
+    fn test_dro_loss_matrix_threshold_tightens_with_radius() {
+        let calm = dro_wasserstein_radius(
+            &[0.04, 0.05, 0.04, 0.05],
+            &[0.03, 0.04, 0.03, 0.04],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let volatile = dro_wasserstein_radius(
+            &[0.02, 0.14, 0.01, 0.18],
+            &[0.01, 0.16, 0.02, 0.20],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let calm_matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.5, calm);
+        let volatile_matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.5, volatile);
+        assert!(
+            volatile_matrix.threshold(4, 4) < calm_matrix.threshold(4, 4),
+            "bead_id=bd-3t52f larger Wasserstein radius should tighten the threshold surface"
+        );
+    }
+
+    #[test]
     fn test_dro_loss_matrix_threshold_boundary() {
         let cert = dro_wasserstein_radius(
             &[0.05, 0.09, 0.15, 0.23],
@@ -2284,6 +2363,10 @@ mod tests {
         let matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.2, cert);
         let decision = matrix.evaluate(7, 7);
         assert!(decision.cvar_penalty >= 0.0);
+        assert!(
+            decision.threshold <= matrix.base_threshold(),
+            "bead_id=bd-3t52f effective threshold should never exceed the configured base"
+        );
         assert_eq!(
             decision.should_abort(),
             decision.cvar_penalty > decision.threshold

@@ -10,7 +10,12 @@
 //! [`VfsFile`]: crate::traits::VfsFile
 
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicU64, Ordering},
+};
+
+use fsqlite_error::{FrankenError, Result};
 
 // ---------------------------------------------------------------------------
 // Mmap-backed SHM region support (Unix only)
@@ -350,6 +355,156 @@ impl ShmRegion {
         guard[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
     }
 
+    /// Atomically load a little-endian `u64` at the given byte offset.
+    ///
+    /// Heap-backed regions emulate the atomic through the region mutex.
+    /// Mmap-backed regions use a native `AtomicU64` over the shared mapping so
+    /// updates are visible across processes that map the same file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
+    #[must_use]
+    pub fn atomic_load_u64_le(&self, offset: usize, ordering: Ordering) -> u64 {
+        self.assert_aligned_u64_offset(offset);
+        match &self.backing {
+            ShmRegionBacking::Heap(_) => self.read_u64_le(offset),
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: `offset` bounds/alignment were validated above and
+                // the mapping stays alive for the duration of the guard.
+                let raw = unsafe { atomic_u64_at(m.ptr, offset) }.load(ordering);
+                u64::from_le(raw)
+            }
+        }
+    }
+
+    /// Atomically store a little-endian `u64` at the given byte offset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
+    pub fn atomic_store_u64_le(&self, offset: usize, val: u64, ordering: Ordering) {
+        self.assert_aligned_u64_offset(offset);
+        match &self.backing {
+            ShmRegionBacking::Heap(_) => self.write_u64_le(offset, val),
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: `offset` bounds/alignment were validated above and
+                // the mapping stays alive for the duration of the guard.
+                unsafe { atomic_u64_at(m.ptr, offset) }.store(val.to_le(), ordering);
+            }
+        }
+    }
+
+    /// Atomically add `delta` to a little-endian `u64`, returning the previous value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
+    #[must_use]
+    pub fn atomic_fetch_add_u64_le(&self, offset: usize, delta: u64, ordering: Ordering) -> u64 {
+        self.assert_aligned_u64_offset(offset);
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let current = u64::from_le_bytes(
+                    guard[offset..offset + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                let next = current.wrapping_add(delta);
+                guard[offset..offset + 8].copy_from_slice(&next.to_le_bytes());
+                current
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                loop {
+                    // SAFETY: `offset` bounds/alignment were validated above and
+                    // the mapping stays alive for the duration of the guard.
+                    let atom = unsafe { atomic_u64_at(m.ptr, offset) };
+                    let current = u64::from_le(atom.load(Ordering::Acquire));
+                    let next = current.wrapping_add(delta);
+                    if atom
+                        .compare_exchange(
+                            current.to_le(),
+                            next.to_le(),
+                            ordering,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return current;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Atomically compare-exchange a little-endian `u64`.
+    ///
+    /// Returns `Ok(previous)` on success and `Err(actual)` on failure, matching
+    /// `AtomicU64::compare_exchange`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
+    pub fn atomic_compare_exchange_u64_le(
+        &self,
+        offset: usize,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> std::result::Result<u64, u64> {
+        self.assert_aligned_u64_offset(offset);
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let actual = u64::from_le_bytes(
+                    guard[offset..offset + 8]
+                        .try_into()
+                        .expect("slice is exactly 8 bytes"),
+                );
+                if actual == current {
+                    guard[offset..offset + 8].copy_from_slice(&new.to_le_bytes());
+                    Ok(actual)
+                } else {
+                    Err(actual)
+                }
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: `offset` bounds/alignment were validated above and
+                // the mapping stays alive for the duration of the guard.
+                unsafe { atomic_u64_at(m.ptr, offset) }
+                    .compare_exchange(current.to_le(), new.to_le(), success, failure)
+                    .map(u64::from_le)
+                    .map_err(u64::from_le)
+            }
+        }
+    }
+
     /// Resize the shared memory region.
     ///
     /// This is only supported for heap-backed regions. Mmap-backed regions
@@ -383,6 +538,45 @@ impl ShmRegion {
         }
     }
 
+    /// Resize a heap-backed shared-memory region without panicking on OOM.
+    pub fn try_resize_heap(&mut self, new_size: usize) -> Result<()> {
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if new_size > guard.len() {
+                    let current_len = guard.len();
+                    guard
+                        .try_reserve_exact(new_size.saturating_sub(current_len))
+                        .map_err(|_| FrankenError::OutOfMemory)?;
+                    guard.resize(new_size, 0);
+                } else if new_size < guard.len() {
+                    guard.truncate(new_size);
+                }
+                self.len = new_size;
+                Ok(())
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(_) => Err(FrankenError::Unsupported),
+        }
+    }
+
+    /// Heap-backed storage accounting, when available.
+    #[must_use]
+    pub fn heap_len_and_capacity(&self) -> Option<(usize, usize)> {
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Some((guard.len(), guard.capacity()))
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(_) => None,
+        }
+    }
+
     /// Returns `true` if this region is backed by mmap (multi-process visible).
     #[must_use]
     pub fn is_mmap_backed(&self) -> bool {
@@ -392,6 +586,19 @@ impl ShmRegion {
             ShmRegionBacking::Mmap(_) => true,
         }
     }
+
+    fn assert_aligned_u64_offset(&self, offset: usize) {
+        assert!(
+            offset % std::mem::align_of::<u64>() == 0,
+            "u64 SHM access requires 8-byte alignment"
+        );
+        assert!(offset.checked_add(8).is_some_and(|end| end <= self.len()));
+    }
+}
+
+#[cfg(unix)]
+unsafe fn atomic_u64_at<'a>(ptr: *mut u8, offset: usize) -> &'a AtomicU64 {
+    unsafe { &*ptr.add(offset).cast::<AtomicU64>() }
 }
 
 /// Locked SHM region access guard.
@@ -473,6 +680,36 @@ mod tests {
         let region = ShmRegion::new(64);
         region.write_u64_le(0, 0x0102_0304_0506_0708);
         assert_eq!(region.read_u64_le(0), 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn test_shm_region_atomic_u64_round_trip() {
+        let region = ShmRegion::new(64);
+
+        region.atomic_store_u64_le(8, 41, Ordering::SeqCst);
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 41);
+
+        let before = region.atomic_fetch_add_u64_le(8, 1, Ordering::SeqCst);
+        assert_eq!(before, 41);
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 42);
+
+        assert_eq!(
+            region.atomic_compare_exchange_u64_le(8, 42, 99, Ordering::SeqCst, Ordering::SeqCst),
+            Ok(42)
+        );
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 99);
+    }
+
+    #[test]
+    fn test_shm_region_atomic_compare_exchange_reports_actual_value() {
+        let region = ShmRegion::new(64);
+        region.atomic_store_u64_le(16, 7, Ordering::SeqCst);
+
+        assert_eq!(
+            region.atomic_compare_exchange_u64_le(16, 8, 9, Ordering::SeqCst, Ordering::SeqCst),
+            Err(7)
+        );
+        assert_eq!(region.atomic_load_u64_le(16, Ordering::SeqCst), 7);
     }
 
     #[test]

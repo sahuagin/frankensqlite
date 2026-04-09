@@ -722,6 +722,98 @@ impl VersionStore {
         }
     }
 
+    /// Resolve the newest committed version of `page` visible to `snapshot`
+    /// and apply `f` while the arena read lock is held.
+    ///
+    /// This keeps callers on borrowed page versions, avoiding `PageVersion` and
+    /// `PageData` cloning when they only need read-only access to committed
+    /// bytes during rebase/conflict analysis.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn with_visible_version<R>(
+        &self,
+        page: PageNumber,
+        snapshot: &Snapshot,
+        f: impl FnOnce(&PageVersion) -> R,
+    ) -> Option<R> {
+        'retry: loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                crate::observability::record_snapshot_read_versions_traversed(0);
+                return None;
+            };
+
+            let arena = self.arena.read();
+            let mut current_idx = head_idx;
+            let mut traversed = 0;
+
+            loop {
+                let Some(version) = arena.get(current_idx) else {
+                    continue 'retry;
+                };
+
+                traversed += 1;
+
+                if visible(version, snapshot) {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return Some(f(version));
+                }
+
+                if let Some(prev_ptr) = version.prev {
+                    current_idx = version_pointer_to_idx(prev_ptr);
+                } else {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Resolve both the snapshot-visible version and the current chain head
+    /// under a single arena read lock, then apply `f`.
+    ///
+    /// This keeps hot rebase/conflict paths on borrowed page versions without
+    /// cloning committed page images and without nesting arena lock
+    /// acquisitions inside helper closures.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn with_visible_and_chain_head_version<R>(
+        &self,
+        page: PageNumber,
+        snapshot: &Snapshot,
+        f: impl FnOnce(&PageVersion, &PageVersion) -> R,
+    ) -> Option<R> {
+        'retry: loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                crate::observability::record_snapshot_read_versions_traversed(0);
+                return None;
+            };
+
+            let arena = self.arena.read();
+            let Some(head_version) = arena.get(head_idx) else {
+                continue 'retry;
+            };
+
+            let mut current_version = head_version;
+            let mut traversed = 1;
+
+            loop {
+                if visible(current_version, snapshot) {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return Some(f(current_version, head_version));
+                }
+
+                let Some(prev_ptr) = current_version.prev else {
+                    crate::observability::record_snapshot_read_versions_traversed(traversed);
+                    return None;
+                };
+                let Some(prev_version) = arena.get(version_pointer_to_idx(prev_ptr)) else {
+                    continue 'retry;
+                };
+
+                traversed += 1;
+                current_version = prev_version;
+            }
+        }
+    }
+
     /// Resolve the commit sequence of the newest committed version of `page`
     /// visible to `snapshot` without cloning the full page image.
     #[must_use]
@@ -781,6 +873,25 @@ impl VersionStore {
             };
 
             return Some(version.clone());
+        }
+    }
+
+    /// Borrow the current chain head while the arena read lock is held.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn with_chain_head_version<R>(
+        &self,
+        page: PageNumber,
+        f: impl FnOnce(&PageVersion) -> R,
+    ) -> Option<R> {
+        'retry: loop {
+            let head_idx = self.chain_heads.get_head(page)?;
+
+            let arena = self.arena.read();
+            let Some(version) = arena.get(head_idx) else {
+                continue 'retry;
+            };
+
+            return Some(f(version));
         }
     }
 

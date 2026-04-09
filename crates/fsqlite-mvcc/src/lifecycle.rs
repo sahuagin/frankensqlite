@@ -15,11 +15,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use fsqlite_types::sync_primitives::Mutex;
+use fsqlite_types::sync_primitives::{Instant, Mutex};
 use fsqlite_types::{
     CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
     TxnEpoch, TxnId, TxnToken,
 };
+use fsqlite_vfs::ShmRegion;
 use fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS;
 
 use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
@@ -36,6 +37,15 @@ const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
 const DEFAULT_MAX_CHAIN_LENGTH: usize = 64;
 const DEFAULT_CHAIN_LENGTH_WARNING: usize = 32;
+// Serialized-writer drain handoff: bounded on-CPU spins, then a short park on
+// the lock-table release gate. The owner-handoff rule is explicit: every
+// `SERIALIZED_DRAIN_HANDOFF_PARK_EVERY` retries we park for at most
+// `SERIALIZED_DRAIN_HANDOFF_MAX_PARK`, so a releasing concurrent writer can
+// wake the serialized waiter directly without 1 ms polling sleeps.
+const SERIALIZED_DRAIN_HANDOFF_BASE_SPINS: u32 = 64;
+const SERIALIZED_DRAIN_HANDOFF_MAX_SPINS: u32 = 2_048;
+const SERIALIZED_DRAIN_HANDOFF_PARK_EVERY: u32 = 4;
+const SERIALIZED_DRAIN_HANDOFF_MAX_PARK: Duration = Duration::from_micros(250);
 /// Proactive compaction threshold — attempt GC when chain exceeds this length
 /// during commit-time publish.  This keeps average chains short (§8.10 version
 /// chain compaction) without waiting for the hard max_chain_length limit.
@@ -49,6 +59,69 @@ const NO_GC_HORIZON: u64 = u64::MAX;
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SerializedDrainWait {
+    attempt: u32,
+    spin_loops: u32,
+    park_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SerializedDrainHandoff {
+    next_attempt: u32,
+}
+
+impl SerializedDrainHandoff {
+    fn next_wait(&mut self, started: Instant, deadline: Duration) -> Option<SerializedDrainWait> {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return None;
+        }
+
+        let attempt = self.next_attempt.saturating_add(1);
+        self.next_attempt = attempt;
+        Some(SerializedDrainWait {
+            attempt,
+            spin_loops: serialized_drain_spin_loops(attempt),
+            park_timeout: if serialized_drain_should_park(attempt) {
+                remaining.min(SERIALIZED_DRAIN_HANDOFF_MAX_PARK)
+            } else {
+                Duration::ZERO
+            },
+        })
+    }
+}
+
+const fn serialized_drain_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = SERIALIZED_DRAIN_HANDOFF_BASE_SPINS << shift;
+    if spins > SERIALIZED_DRAIN_HANDOFF_MAX_SPINS {
+        SERIALIZED_DRAIN_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn serialized_drain_should_park(attempt: u32) -> bool {
+    attempt >= SERIALIZED_DRAIN_HANDOFF_PARK_EVERY
+        && attempt % SERIALIZED_DRAIN_HANDOFF_PARK_EVERY == 0
+}
+
+fn perform_serialized_drain_handoff(
+    lock_table: &InProcessPageLockTable,
+    observed_epoch: u64,
+    wait: SerializedDrainWait,
+) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+
+    if !wait.park_timeout.is_zero() {
+        let _ = lock_table.wait_for_release_progress(observed_epoch, wait.park_timeout);
+    }
+}
 
 #[cfg(unix)]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
@@ -398,19 +471,39 @@ impl TransactionManager {
     /// Create a new transaction manager.
     #[must_use]
     pub fn new(page_size: PageSize) -> Self {
+        Self::with_shm(page_size, SharedMemoryLayout::new(page_size, 128))
+    }
+
+    /// Create a transaction manager backed by a live shared SHM region.
+    ///
+    /// # Errors
+    ///
+    /// Returns any SHM validation failure from `SharedMemoryLayout`.
+    pub fn with_shared_shm_region(
+        page_size: PageSize,
+        region: ShmRegion,
+        max_txn_slots: u32,
+    ) -> Result<Self, MvccError> {
+        let shm = SharedMemoryLayout::open_or_initialize_region(region, page_size, max_txn_slots)?;
+        Ok(Self::with_shm(page_size, shm))
+    }
+
+    fn with_shm(page_size: PageSize, shm: SharedMemoryLayout) -> Self {
         let version_guard_registry = Arc::new(VersionGuardRegistry::default());
+        let initial_commit_seq = shm.load_commit_seq().get().saturating_add(1);
+        let initial_schema_epoch = shm.load_schema_epoch();
         Self {
-            txn_manager: TxnManager::default(),
+            txn_manager: TxnManager::new(1, initial_commit_seq),
             version_store: VersionStore::new_with_guard_registry(
                 page_size,
                 Arc::clone(&version_guard_registry),
             ),
             lock_table: InProcessPageLockTable::new(),
             write_mutex: SerializedWriteMutex::new(),
-            shm: SharedMemoryLayout::new(page_size, 128),
+            shm,
             commit_index: CommitIndex::new(),
             conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
-            schema_epoch: SchemaEpoch::ZERO,
+            schema_epoch: initial_schema_epoch,
             write_merge_policy: WriteMergePolicy::default(),
             ssi_enabled: true,
             raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
@@ -581,10 +674,7 @@ impl TransactionManager {
     /// (for Immediate/Exclusive modes).
     pub fn begin(&self, kind: BeginKind) -> Result<Transaction, MvccError> {
         // TxnId allocation via CAS (never fetch_add, never 0, never > MAX).
-        let txn_id = self
-            .txn_manager
-            .alloc_txn_id()
-            .ok_or(MvccError::TxnIdExhausted)?;
+        let txn_id = self.shm.alloc_txn_id().ok_or(MvccError::TxnIdExhausted)?;
 
         let mode = if kind == BeginKind::Concurrent {
             TransactionMode::Concurrent
@@ -775,7 +865,7 @@ impl TransactionManager {
         if let Some(cached) = self.cached_gc_horizon() {
             return cached;
         }
-        CommitSeq::new(self.txn_manager.current_commit_counter().saturating_sub(1))
+        self.shm.load_commit_seq()
     }
 
     #[allow(clippy::unused_self)]
@@ -1081,14 +1171,15 @@ impl TransactionManager {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Simplified consistent snapshot load (in-process; no seqlock needed).
-    ///
-    /// Derives the latest committed seq from the TxnManager's counter
-    /// (the counter holds the *next* seq to allocate, so latest = counter - 1).
+    fn publish_shared_snapshot(&self, commit_seq: CommitSeq) {
+        self.shm
+            .publish_snapshot(commit_seq, self.schema_epoch, self.shm.load_ecs_epoch());
+    }
+
+    /// Load the latest stable snapshot from the shared MVCC header.
     fn load_consistent_snapshot(&self) -> Snapshot {
-        let counter = self.txn_manager.current_commit_counter();
-        let high = CommitSeq::new(counter.saturating_sub(1));
-        Snapshot::new(high, self.schema_epoch)
+        let snapshot = self.shm.load_consistent_snapshot();
+        Snapshot::new(snapshot.commit_seq, snapshot.schema_epoch)
     }
 
     /// Serialized write path.
@@ -1224,6 +1315,7 @@ impl TransactionManager {
             }
         };
         self.txn_manager.finish_commit_seq(commit_seq);
+        self.publish_shared_snapshot(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
         self.post_commit_version_maintenance(&pages, snapshot_high);
@@ -1355,6 +1447,7 @@ impl TransactionManager {
             }
         };
         self.txn_manager.finish_commit_seq(commit_seq);
+        self.publish_shared_snapshot(commit_seq);
         txn.commit();
         self.release_all_resources(txn);
         self.post_commit_version_maintenance(&pages, snapshot_high);
@@ -1375,52 +1468,42 @@ impl TransactionManager {
     /// deltas have disjoint support (non-overlapping byte changes), composes
     /// them to produce a merged page and updates the transaction's write set.
     fn try_rebase_page(&self, txn: &mut Transaction, pgno: PageNumber) -> bool {
-        // Get base version visible at txn's snapshot.
-        let base_data = match self
-            .version_store
-            .resolve_visible_version(pgno, &txn.snapshot)
-        {
-            Some(version) => version.data,
-            None => {
-                // Page didn't exist at txn's snapshot — insert-insert conflict,
-                // cannot rebase without higher-level intent replay.
-                return false;
-            }
-        };
-
-        // Get latest committed version (chain head = "theirs").
-        let (latest_data, latest_seq) = match self.version_store.chain_head_version(pgno) {
-            Some(version) => (version.data.clone(), version.commit_seq),
-            None => return false,
-        };
-
-        // Get txn's written data ("ours").
-        let ours = match txn.write_set_data.get(&pgno) {
-            Some(data) => data.clone(),
-            None => return false,
-        };
-
-        // Compute XOR deltas.
-        let Some(delta_ours) = gf256_patch_delta(base_data.as_bytes(), ours.as_bytes()) else {
+        let Some(ours) = txn.write_set_data.get(&pgno) else {
             return false;
         };
-        let Some(delta_theirs) = gf256_patch_delta(base_data.as_bytes(), latest_data.as_bytes())
+
+        let Some((merged, latest_seq)) = self
+            .version_store
+            .with_visible_and_chain_head_version(
+                pgno,
+                &txn.snapshot,
+                |base_version, latest_version| {
+                    let delta_ours =
+                        gf256_patch_delta(base_version.data.as_bytes(), ours.as_bytes())?;
+                    let delta_theirs = gf256_patch_delta(
+                        base_version.data.as_bytes(),
+                        latest_version.data.as_bytes(),
+                    )?;
+
+                    compose_disjoint_gf256_patches(
+                        base_version.data.as_bytes(),
+                        &delta_ours,
+                        &delta_theirs,
+                    )
+                    .map(|merged| (merged, latest_version.commit_seq))
+                },
+            )
+            .flatten()
         else {
             return false;
         };
 
-        // Compose if disjoint.
-        match compose_disjoint_gf256_patches(base_data.as_bytes(), &delta_ours, &delta_theirs) {
-            Some(merged) => {
-                Arc::make_mut(&mut txn.write_set_data).insert(pgno, PageData::from_vec(merged));
-                txn.record_page_read(pgno, latest_seq);
-                if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
-                    entry.old_version = Some(latest_seq);
-                }
-                true
-            }
-            None => false,
+        Arc::make_mut(&mut txn.write_set_data).insert(pgno, PageData::from_vec(merged));
+        txn.record_page_read(pgno, latest_seq);
+        if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
+            entry.old_version = Some(latest_seq);
         }
+        true
     }
 
     /// Attempt structured page patch merge (Level 3) or intent replay via evaluate_merge_ladder.
@@ -1430,42 +1513,39 @@ impl TransactionManager {
         pgno: PageNumber,
         page_kind: MergePageKind,
     ) -> bool {
-        let base_data = match self
-            .version_store
-            .resolve_visible_version(pgno, &txn.snapshot)
-        {
-            Some(version) => version.data,
-            None => return false,
-        };
-
-        let (latest_data, latest_seq) = match self.version_store.chain_head_version(pgno) {
-            Some(version) => (version.data.clone(), version.commit_seq),
-            None => return false,
-        };
-
-        let ours = match txn.write_set_data.get(&pgno) {
-            Some(data) => data.clone(),
-            None => return false,
+        let Some(ours) = txn.write_set_data.get(&pgno) else {
+            return false;
         };
 
         let btree_ref = fsqlite_types::BtreeRef::Table(fsqlite_types::TableId::new(0));
 
-        let result = crate::physical_merge::evaluate_merge_ladder(
-            self.write_merge_policy,
-            base_data.as_bytes(),
-            latest_data.as_bytes(),
-            ours.as_bytes(),
-            self.shm.page_size(),
-            0,
-            pgno.get() == 1,
-            page_kind,
-            btree_ref,
-            txn.snapshot.schema_epoch.get(),
-            self.schema_epoch.get(),
-            Some(&txn.intent_log),
-            None,
-            None,
-        );
+        let Some((result, latest_seq)) = self.version_store.with_visible_and_chain_head_version(
+            pgno,
+            &txn.snapshot,
+            |base_version, latest_version| {
+                (
+                    crate::physical_merge::evaluate_merge_ladder(
+                        self.write_merge_policy,
+                        base_version.data.as_bytes(),
+                        latest_version.data.as_bytes(),
+                        ours.as_bytes(),
+                        self.shm.page_size(),
+                        0,
+                        pgno.get() == 1,
+                        page_kind,
+                        btree_ref,
+                        txn.snapshot.schema_epoch.get(),
+                        self.schema_epoch.get(),
+                        Some(&txn.intent_log),
+                        None,
+                        None,
+                    ),
+                    latest_version.commit_seq,
+                )
+            },
+        ) else {
+            return false;
+        };
 
         match result {
             Ok(crate::physical_merge::MergeLadderResult::StructuredMergeSucceeded {
@@ -1679,12 +1759,16 @@ impl TransactionManager {
     }
 
     fn drain_concurrent_writers_via_lock_table_scan(&self, txn_id: TxnId) -> Result<(), MvccError> {
-        let mut elapsed_ms = 0_u64;
-        let mut remaining_budget_ms = self.busy_timeout_ms;
+        let started = Instant::now();
+        let deadline = Duration::from_millis(self.busy_timeout_ms);
+        let mut handoff = SerializedDrainHandoff::default();
         let mut last_remaining = usize::MAX;
 
         loop {
+            let observed_epoch = self.lock_table.release_progress_epoch();
             let remaining = self.lock_table.total_lock_count();
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_ms = started.elapsed().as_millis() as u64;
             if remaining == 0 {
                 tracing::debug!(
                     txn_id = %txn_id,
@@ -1694,7 +1778,7 @@ impl TransactionManager {
                 return Ok(());
             }
 
-            if remaining_budget_ms == 0 {
+            if started.elapsed() >= deadline {
                 tracing::warn!(
                     txn_id = %txn_id,
                     remaining,
@@ -1715,10 +1799,17 @@ impl TransactionManager {
                 );
             }
 
-            // Be polite: this is a busy-wait with a deadline, not a hard spin.
-            std::thread::sleep(Duration::from_millis(1));
-            elapsed_ms = elapsed_ms.saturating_add(1);
-            remaining_budget_ms = remaining_budget_ms.saturating_sub(1);
+            let Some(wait) = handoff.next_wait(started, deadline) else {
+                tracing::warn!(
+                    txn_id = %txn_id,
+                    remaining,
+                    elapsed_ms,
+                    busy_timeout_ms = self.busy_timeout_ms,
+                    "serialized writer drain exhausted bounded handoff budget; returning SQLITE_BUSY"
+                );
+                return Err(MvccError::Busy);
+            };
+            perform_serialized_drain_handoff(&self.lock_table, observed_epoch, wait);
         }
     }
 
@@ -1781,10 +1872,7 @@ impl std::fmt::Debug for TransactionManager {
             .field("max_chain_length", &self.max_chain_length)
             .field("chain_length_warning", &self.chain_length_warning)
             .field("cached_gc_horizon", &self.cached_gc_horizon())
-            .field(
-                "current_commit_counter",
-                &self.txn_manager.current_commit_counter(),
-            )
+            .field("shm_commit_seq", &self.shm.load_commit_seq())
             .finish_non_exhaustive()
     }
 }
@@ -1822,6 +1910,13 @@ mod tests {
         m
     }
 
+    fn shared_mgr(region: ShmRegion) -> TransactionManager {
+        let mut m = TransactionManager::with_shared_shm_region(PageSize::DEFAULT, region, 64)
+            .expect("shared shm manager");
+        m.set_txn_max_duration_ms(u64::MAX);
+        m
+    }
+
     fn test_data(byte: u8) -> PageData {
         let mut data = PageData::zeroed(PageSize::DEFAULT);
         data.as_bytes_mut()[0] = byte;
@@ -1838,6 +1933,82 @@ mod tests {
         let mut bytes = [0_u8; 8];
         bytes.copy_from_slice(&data.as_bytes()[..8]);
         i64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn test_shared_shm_region_coordinates_txn_ids_and_snapshot_visibility() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        let writer = shared_mgr(region.clone());
+        let reader = shared_mgr(region);
+
+        let txn_a = writer.begin(BeginKind::Deferred).unwrap();
+        let txn_b = reader.begin(BeginKind::Deferred).unwrap();
+        assert_eq!(txn_a.txn_id.get(), 1);
+        assert_eq!(txn_b.txn_id.get(), 2);
+
+        let mut writer_txn = writer.begin(BeginKind::Immediate).unwrap();
+        writer
+            .write_page(&mut writer_txn, PageNumber::new(1).unwrap(), test_data(7))
+            .unwrap();
+        let commit_seq = writer.commit(&mut writer_txn).unwrap();
+
+        let snapshot = reader.begin(BeginKind::Immediate).unwrap().snapshot;
+        assert_eq!(snapshot.high, commit_seq);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SerializedDrainScheduleSummary {
+        attempts: u32,
+        total_spin_loops: u64,
+        max_spin_loops: u32,
+        park_count: u32,
+        max_park_us: u64,
+    }
+
+    fn summarize_serialized_drain_schedule(attempts: u32) -> SerializedDrainScheduleSummary {
+        assert!(
+            attempts > 0,
+            "serialized drain validation needs at least one attempt"
+        );
+
+        let waits = (1..=attempts)
+            .map(|attempt| SerializedDrainWait {
+                attempt,
+                spin_loops: serialized_drain_spin_loops(attempt),
+                park_timeout: if serialized_drain_should_park(attempt) {
+                    SERIALIZED_DRAIN_HANDOFF_MAX_PARK
+                } else {
+                    Duration::ZERO
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
+        let max_spin_loops = waits
+            .iter()
+            .map(|wait| wait.spin_loops)
+            .max()
+            .unwrap_or_default();
+        let park_count = u32::try_from(
+            waits
+                .iter()
+                .filter(|wait| !wait.park_timeout.is_zero())
+                .count(),
+        )
+        .expect("serialized drain validation should fit within u32 attempt counts");
+        let max_park_us = waits
+            .iter()
+            .map(|wait| wait.park_timeout.as_micros() as u64)
+            .max()
+            .unwrap_or_default();
+
+        SerializedDrainScheduleSummary {
+            attempts,
+            total_spin_loops,
+            max_spin_loops,
+            park_count,
+            max_park_us,
+        }
     }
 
     #[derive(Clone)]
@@ -2552,6 +2723,69 @@ mod tests {
         assert!(
             m.shm.check_serialized_writer().is_none(),
             "indicator must be cleared on failure"
+        );
+    }
+
+    #[test]
+    fn test_serialized_drain_handoff_park_cadence_is_bounded() {
+        for attempt in 1..SERIALIZED_DRAIN_HANDOFF_PARK_EVERY {
+            assert!(
+                !serialized_drain_should_park(attempt),
+                "attempt {attempt} should stay on-CPU"
+            );
+        }
+
+        assert!(serialized_drain_should_park(
+            SERIALIZED_DRAIN_HANDOFF_PARK_EVERY
+        ));
+        assert!(!serialized_drain_should_park(
+            SERIALIZED_DRAIN_HANDOFF_PARK_EVERY + 1
+        ));
+        assert!(serialized_drain_should_park(
+            SERIALIZED_DRAIN_HANDOFF_PARK_EVERY * 2
+        ));
+    }
+
+    #[test]
+    fn test_serialized_drain_handoff_respects_deadline() {
+        let mut handoff = SerializedDrainHandoff::default();
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("expired instant should be constructible");
+        assert!(
+            handoff
+                .next_wait(expired_started, Duration::from_millis(1))
+                .is_none(),
+            "expired deadline must stop serialized drain handoff"
+        );
+
+        let fresh_wait = handoff
+            .next_wait(Instant::now(), Duration::from_millis(1))
+            .expect("fresh deadline should allow a bounded serialized drain wait");
+        assert_eq!(fresh_wait.attempt, 1);
+        assert_eq!(fresh_wait.spin_loops, SERIALIZED_DRAIN_HANDOFF_BASE_SPINS);
+        assert_eq!(
+            fresh_wait.park_timeout,
+            Duration::ZERO,
+            "first retry should stay on-CPU"
+        );
+    }
+
+    #[test]
+    fn test_serialized_drain_schedule_summary_bounds_wake_amplification() {
+        let summary = summarize_serialized_drain_schedule(12);
+
+        assert_eq!(summary.attempts, 12);
+        assert_eq!(summary.total_spin_loops, 16_320);
+        assert_eq!(summary.max_spin_loops, SERIALIZED_DRAIN_HANDOFF_MAX_SPINS);
+        assert_eq!(
+            summary.park_count,
+            12 / SERIALIZED_DRAIN_HANDOFF_PARK_EVERY,
+            "wake amplification must stay at one park per bounded retry window"
+        );
+        assert_eq!(
+            summary.max_park_us,
+            SERIALIZED_DRAIN_HANDOFF_MAX_PARK.as_micros() as u64
         );
     }
 

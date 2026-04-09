@@ -3,7 +3,7 @@
 //! The `foo.db.fsqlite-shm` region is a 216-byte header that carries:
 //!
 //! - Immutable fields: magic, version, page_size, max_txn_slots, region offsets.
-//! - Atomic counters: next_txn_id, snapshot_seq (seqlock), commit_seq,
+//! - Atomic counters: next_txn_id, next_commit_seq, snapshot_seq (seqlock), commit_seq,
 //!   schema_epoch, ecs_epoch, gc_horizon.
 //! - Serialized writer indicator: writer_txn_id, pid, pid_birth, lease_expiry.
 //! - An xxh3_64 checksum over the immutable fields.
@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch, TxnId};
+use fsqlite_vfs::ShmRegion;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::lifecycle::MvccError;
@@ -43,6 +44,9 @@ mod offsets {
 
     /// `u64` — next transaction id (atomic counter).
     pub const NEXT_TXN_ID: usize = 24;
+
+    /// `u64` — next commit sequence to reserve.
+    pub const NEXT_COMMIT_SEQ: usize = 152;
 
     /// `u64` — snapshot sequence (seqlock counter).
     pub const SNAPSHOT_SEQ: usize = 32;
@@ -89,9 +93,9 @@ mod offsets {
     /// `u64` — xxh3_64 checksum over immutable fields.
     pub const LAYOUT_CHECKSUM: usize = 144;
 
-    /// `[u8;64]` — reserved padding to 216 bytes.
-    pub const _PADDING: usize = 152;
-    pub const _PADDING_LEN: usize = 64;
+    /// `[u8;56]` — reserved padding to 216 bytes.
+    pub const _PADDING: usize = 160;
+    pub const _PADDING_LEN: usize = 56;
 
     /// Total header size in bytes.
     pub const HEADER_SIZE: usize = 216;
@@ -149,6 +153,7 @@ pub struct SharedMemoryLayout {
 
     // -- Dynamic fields (atomics) --
     next_txn_id: AtomicU64,
+    next_commit_seq: AtomicU64,
     snapshot_seq: AtomicU64,
     commit_seq: AtomicU64,
     schema_epoch: AtomicU64,
@@ -158,6 +163,7 @@ pub struct SharedMemoryLayout {
     serialized_writer_pid_and_gen: AtomicU64,
     serialized_writer_pid_birth: AtomicU64,
     serialized_writer_lease_expiry: AtomicU64,
+    mapped_region: Option<ShmRegion>,
 }
 
 impl SharedMemoryLayout {
@@ -216,6 +222,7 @@ impl SharedMemoryLayout {
             committed_readers_bytes,
             layout_checksum: checksum,
             next_txn_id: AtomicU64::new(1),
+            next_commit_seq: AtomicU64::new(1),
             snapshot_seq: AtomicU64::new(0),
             commit_seq: AtomicU64::new(0),
             schema_epoch: AtomicU64::new(0),
@@ -225,6 +232,7 @@ impl SharedMemoryLayout {
             serialized_writer_pid_and_gen: AtomicU64::new(0),
             serialized_writer_pid_birth: AtomicU64::new(0),
             serialized_writer_lease_expiry: AtomicU64::new(0),
+            mapped_region: None,
         }
     }
 
@@ -285,6 +293,7 @@ impl SharedMemoryLayout {
 
         // Read dynamic fields.
         let next_txn_id = read_u64(buf, offsets::NEXT_TXN_ID);
+        let next_commit_seq = read_u64(buf, offsets::NEXT_COMMIT_SEQ);
         let snapshot_seq = read_u64(buf, offsets::SNAPSHOT_SEQ);
         let commit_seq = read_u64(buf, offsets::COMMIT_SEQ);
         let schema_epoch = read_u64(buf, offsets::SCHEMA_EPOCH);
@@ -305,6 +314,7 @@ impl SharedMemoryLayout {
             committed_readers_bytes,
             layout_checksum: stored_checksum,
             next_txn_id: AtomicU64::new(next_txn_id),
+            next_commit_seq: AtomicU64::new(next_commit_seq.max(commit_seq.saturating_add(1))),
             snapshot_seq: AtomicU64::new(snapshot_seq),
             commit_seq: AtomicU64::new(commit_seq),
             schema_epoch: AtomicU64::new(schema_epoch),
@@ -314,7 +324,54 @@ impl SharedMemoryLayout {
             serialized_writer_pid_and_gen: AtomicU64::new(sw_pid_and_gen),
             serialized_writer_pid_birth: AtomicU64::new(sw_pid_birth),
             serialized_writer_lease_expiry: AtomicU64::new(sw_lease),
+            mapped_region: None,
         })
+    }
+
+    /// Open a live shared-memory layout over an existing SHM region.
+    ///
+    /// The immutable header is validated once, after which all dynamic fields
+    /// are read and written directly through the shared region.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same validation failures as [`open`](Self::open).
+    pub fn open_region(region: ShmRegion) -> Result<Self, MvccError> {
+        let mut layout = {
+            let guard = region.lock();
+            Self::open(&guard[..])?
+        };
+        layout.mapped_region = Some(region);
+        Ok(layout)
+    }
+
+    /// Open an existing SHM region or initialize a zeroed one in place.
+    ///
+    /// This keeps the header bytes resident in the mapped region so later
+    /// loads/stores remain visible across handles and processes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`open_region`](Self::open_region).
+    pub fn open_or_initialize_region(
+        region: ShmRegion,
+        page_size: PageSize,
+        max_txn_slots: u32,
+    ) -> Result<Self, MvccError> {
+        if region.len() < Self::HEADER_SIZE {
+            return Err(MvccError::ShmTooSmall);
+        }
+
+        {
+            let mut guard = region.lock();
+            let magic = &guard[offsets::MAGIC..offsets::MAGIC + offsets::MAGIC_LEN];
+            if magic.iter().all(|byte| *byte == 0) {
+                let seed = Self::new(page_size, max_txn_slots).to_bytes();
+                guard[..Self::HEADER_SIZE].copy_from_slice(&seed);
+            }
+        }
+
+        Self::open_region(region)
     }
 
     /// Serialize the entire header to a 216-byte `Vec<u8>`.
@@ -333,54 +390,79 @@ impl SharedMemoryLayout {
         write_u64(
             &mut buf,
             offsets::NEXT_TXN_ID,
-            self.next_txn_id.load(Ordering::Acquire),
+            self.load_u64_field(offsets::NEXT_TXN_ID, &self.next_txn_id, Ordering::Acquire),
+        );
+        write_u64(
+            &mut buf,
+            offsets::NEXT_COMMIT_SEQ,
+            self.load_u64_field(
+                offsets::NEXT_COMMIT_SEQ,
+                &self.next_commit_seq,
+                Ordering::Acquire,
+            ),
         );
         write_u64(
             &mut buf,
             offsets::SNAPSHOT_SEQ,
-            self.snapshot_seq.load(Ordering::Acquire),
+            self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire),
         );
         write_u64(
             &mut buf,
             offsets::COMMIT_SEQ,
-            self.commit_seq.load(Ordering::Acquire),
+            self.load_u64_field(offsets::COMMIT_SEQ, &self.commit_seq, Ordering::Acquire),
         );
         write_u64(
             &mut buf,
             offsets::SCHEMA_EPOCH,
-            self.schema_epoch.load(Ordering::Acquire),
+            self.load_u64_field(offsets::SCHEMA_EPOCH, &self.schema_epoch, Ordering::Acquire),
         );
         write_u64(
             &mut buf,
             offsets::ECS_EPOCH,
-            self.ecs_epoch.load(Ordering::Acquire),
+            self.load_u64_field(offsets::ECS_EPOCH, &self.ecs_epoch, Ordering::Acquire),
         );
         write_u64(
             &mut buf,
             offsets::GC_HORIZON,
-            self.gc_horizon.load(Ordering::Acquire),
+            self.load_u64_field(offsets::GC_HORIZON, &self.gc_horizon, Ordering::Acquire),
         );
 
         // Serialized writer.
         write_u64(
             &mut buf,
             offsets::SERIALIZED_WRITER_TXN_ID,
-            self.serialized_writer_txn_id.load(Ordering::Acquire),
+            self.load_u64_field(
+                offsets::SERIALIZED_WRITER_TXN_ID,
+                &self.serialized_writer_txn_id,
+                Ordering::Acquire,
+            ),
         );
         write_u64(
             &mut buf,
             offsets::SERIALIZED_WRITER_PID_AND_GEN,
-            self.serialized_writer_pid_and_gen.load(Ordering::Acquire),
+            self.load_u64_field(
+                offsets::SERIALIZED_WRITER_PID_AND_GEN,
+                &self.serialized_writer_pid_and_gen,
+                Ordering::Acquire,
+            ),
         );
         write_u64(
             &mut buf,
             offsets::SERIALIZED_WRITER_PID_BIRTH,
-            self.serialized_writer_pid_birth.load(Ordering::Acquire),
+            self.load_u64_field(
+                offsets::SERIALIZED_WRITER_PID_BIRTH,
+                &self.serialized_writer_pid_birth,
+                Ordering::Acquire,
+            ),
         );
         write_u64(
             &mut buf,
             offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
-            self.serialized_writer_lease_expiry.load(Ordering::Acquire),
+            self.load_u64_field(
+                offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+                &self.serialized_writer_lease_expiry,
+                Ordering::Acquire,
+            ),
         );
 
         // Region offsets (immutable).
@@ -405,6 +487,49 @@ impl SharedMemoryLayout {
         buf
     }
 
+    fn load_u64_field(&self, offset: usize, fallback: &AtomicU64, ordering: Ordering) -> u64 {
+        self.mapped_region.as_ref().map_or_else(
+            || fallback.load(ordering),
+            |region| region.atomic_load_u64_le(offset, ordering),
+        )
+    }
+
+    fn store_u64_field(&self, offset: usize, fallback: &AtomicU64, value: u64, ordering: Ordering) {
+        if let Some(region) = &self.mapped_region {
+            region.atomic_store_u64_le(offset, value, ordering);
+        } else {
+            fallback.store(value, ordering);
+        }
+    }
+
+    fn fetch_add_u64_field(
+        &self,
+        offset: usize,
+        fallback: &AtomicU64,
+        delta: u64,
+        ordering: Ordering,
+    ) -> u64 {
+        self.mapped_region.as_ref().map_or_else(
+            || fallback.fetch_add(delta, ordering),
+            |region| region.atomic_fetch_add_u64_le(offset, delta, ordering),
+        )
+    }
+
+    fn compare_exchange_u64_field(
+        &self,
+        offset: usize,
+        fallback: &AtomicU64,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> std::result::Result<u64, u64> {
+        self.mapped_region.as_ref().map_or_else(
+            || fallback.compare_exchange(current, new, success, failure),
+            |region| region.atomic_compare_exchange_u64_le(offset, current, new, success, failure),
+        )
+    }
+
     // -----------------------------------------------------------------------
     // Seqlock protocol
     // -----------------------------------------------------------------------
@@ -416,14 +541,21 @@ impl SharedMemoryLayout {
     /// will advance past the stale odd value.
     pub fn begin_snapshot_publish(&self) {
         loop {
-            let seq = self.snapshot_seq.load(Ordering::Acquire);
+            let seq =
+                self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
             if seq % 2 == 1 {
                 // Already odd (crash-stale or concurrent publisher).
                 return;
             }
             if self
-                .snapshot_seq
-                .compare_exchange_weak(seq, seq + 1, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_u64_field(
+                    offsets::SNAPSHOT_SEQ,
+                    &self.snapshot_seq,
+                    seq,
+                    seq + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return;
@@ -437,8 +569,12 @@ impl SharedMemoryLayout {
     /// and all preceding stores.
     pub fn end_snapshot_publish(&self) {
         let new_seq = self
-            .snapshot_seq
-            .fetch_add(1, Ordering::Release)
+            .fetch_add_u64_field(
+                offsets::SNAPSHOT_SEQ,
+                &self.snapshot_seq,
+                1,
+                Ordering::Release,
+            )
             .wrapping_add(1);
         debug_assert!(new_seq != 0, "seqlock counter wrapped to zero");
     }
@@ -451,17 +587,20 @@ impl SharedMemoryLayout {
     #[must_use]
     pub fn load_consistent_snapshot(&self) -> ShmSnapshot {
         loop {
-            let seq1 = self.snapshot_seq.load(Ordering::Acquire);
+            let seq1 =
+                self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
             if seq1 % 2 == 1 {
                 std::hint::spin_loop();
                 continue;
             }
 
-            let cs = self.commit_seq.load(Ordering::Acquire);
-            let se = self.schema_epoch.load(Ordering::Acquire);
-            let ee = self.ecs_epoch.load(Ordering::Acquire);
+            let cs = self.load_u64_field(offsets::COMMIT_SEQ, &self.commit_seq, Ordering::Acquire);
+            let se =
+                self.load_u64_field(offsets::SCHEMA_EPOCH, &self.schema_epoch, Ordering::Acquire);
+            let ee = self.load_u64_field(offsets::ECS_EPOCH, &self.ecs_epoch, Ordering::Acquire);
 
-            let seq2 = self.snapshot_seq.load(Ordering::Acquire);
+            let seq2 =
+                self.load_u64_field(offsets::SNAPSHOT_SEQ, &self.snapshot_seq, Ordering::Acquire);
             if seq1 == seq2 {
                 return ShmSnapshot {
                     commit_seq: CommitSeq::new(cs),
@@ -486,10 +625,24 @@ impl SharedMemoryLayout {
     ) {
         self.begin_snapshot_publish();
         // DDL ordering: schema_epoch (Release) before commit_seq (Release).
-        self.schema_epoch
-            .store(schema_epoch.get(), Ordering::Release);
-        self.ecs_epoch.store(ecs_epoch, Ordering::Release);
-        self.commit_seq.store(commit_seq.get(), Ordering::Release);
+        self.store_u64_field(
+            offsets::SCHEMA_EPOCH,
+            &self.schema_epoch,
+            schema_epoch.get(),
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::ECS_EPOCH,
+            &self.ecs_epoch,
+            ecs_epoch,
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::COMMIT_SEQ,
+            &self.commit_seq,
+            commit_seq.get(),
+            Ordering::Release,
+        );
         self.end_snapshot_publish();
     }
 
@@ -510,11 +663,24 @@ impl SharedMemoryLayout {
         self.begin_snapshot_publish();
 
         // DDL ordering: schema_epoch before commit_seq (§5.6.1).
-        self.schema_epoch
-            .store(durable_schema_epoch.get(), Ordering::Release);
-        self.ecs_epoch.store(durable_ecs_epoch, Ordering::Release);
-        self.commit_seq
-            .store(durable_commit_seq.get(), Ordering::Release);
+        self.store_u64_field(
+            offsets::SCHEMA_EPOCH,
+            &self.schema_epoch,
+            durable_schema_epoch.get(),
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::ECS_EPOCH,
+            &self.ecs_epoch,
+            durable_ecs_epoch,
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::COMMIT_SEQ,
+            &self.commit_seq,
+            durable_commit_seq.get(),
+            Ordering::Release,
+        );
 
         // Repair: if snapshot_seq was odd from a crash, end_snapshot_publish
         // will advance it to even.
@@ -542,24 +708,46 @@ impl SharedMemoryLayout {
         );
         // CAS 0 → writer_txn_id_raw.
         if self
-            .serialized_writer_txn_id
-            .compare_exchange(0, writer_txn_id_raw, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_u64_field(
+                offsets::SERIALIZED_WRITER_TXN_ID,
+                &self.serialized_writer_txn_id,
+                0,
+                writer_txn_id_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return false;
         }
 
-        let old_packed = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
+        let old_packed = self.load_u64_field(
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
+            &self.serialized_writer_pid_and_gen,
+            Ordering::Acquire,
+        );
         let old_gen = (old_packed >> 32) as u32;
         let new_gen = old_gen.wrapping_add(1);
         let new_packed = u64::from(pid) | (u64::from(new_gen) << 32);
 
-        self.serialized_writer_pid_and_gen
-            .store(new_packed, Ordering::Release);
-        self.serialized_writer_pid_birth
-            .store(pid_birth, Ordering::Release);
-        self.serialized_writer_lease_expiry
-            .store(lease_expiry_epoch_secs, Ordering::Release);
+        self.store_u64_field(
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
+            &self.serialized_writer_pid_and_gen,
+            new_packed,
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::SERIALIZED_WRITER_PID_BIRTH,
+            &self.serialized_writer_pid_birth,
+            pid_birth,
+            Ordering::Release,
+        );
+        self.store_u64_field(
+            offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+            &self.serialized_writer_lease_expiry,
+            lease_expiry_epoch_secs,
+            Ordering::Release,
+        );
         true
     }
 
@@ -569,13 +757,31 @@ impl SharedMemoryLayout {
     /// Per spec: clear writer txn id BEFORE releasing mutex.
     pub fn release_serialized_writer(&self, writer_txn_id_raw: u64) -> bool {
         // Read our own aux fields before releasing the lock so we can carefully CAS them.
-        let my_packed = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
-        let my_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
-        let my_lease = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
+        let my_packed = self.load_u64_field(
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
+            &self.serialized_writer_pid_and_gen,
+            Ordering::Acquire,
+        );
+        let my_birth = self.load_u64_field(
+            offsets::SERIALIZED_WRITER_PID_BIRTH,
+            &self.serialized_writer_pid_birth,
+            Ordering::Acquire,
+        );
+        let my_lease = self.load_u64_field(
+            offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+            &self.serialized_writer_lease_expiry,
+            Ordering::Acquire,
+        );
 
         if self
-            .serialized_writer_txn_id
-            .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange_u64_field(
+                offsets::SERIALIZED_WRITER_TXN_ID,
+                &self.serialized_writer_txn_id,
+                writer_txn_id_raw,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return false;
@@ -586,19 +792,25 @@ impl SharedMemoryLayout {
         // Because `pid_and_gen` incorporates a generation counter incremented on every
         // acquire, this CAS is guaranteed to fail if a new writer acquired the lock,
         // even if the new writer is from the exact same process (same PID).
-        let _ = self.serialized_writer_pid_and_gen.compare_exchange(
+        let _ = self.compare_exchange_u64_field(
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
+            &self.serialized_writer_pid_and_gen,
             my_packed,
             0,
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
-        let _ = self.serialized_writer_pid_birth.compare_exchange(
+        let _ = self.compare_exchange_u64_field(
+            offsets::SERIALIZED_WRITER_PID_BIRTH,
+            &self.serialized_writer_pid_birth,
             my_birth,
             0,
             Ordering::AcqRel,
             Ordering::Relaxed,
         );
-        let _ = self.serialized_writer_lease_expiry.compare_exchange(
+        let _ = self.compare_exchange_u64_field(
+            offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+            &self.serialized_writer_lease_expiry,
             my_lease,
             0,
             Ordering::AcqRel,
@@ -612,7 +824,11 @@ impl SharedMemoryLayout {
     /// Returns `Some(TxnId)` if a writer holds the indicator, `None` otherwise.
     #[must_use]
     pub fn check_serialized_writer(&self) -> Option<TxnId> {
-        let writer_txn_id_raw = self.serialized_writer_txn_id.load(Ordering::Acquire);
+        let writer_txn_id_raw = self.load_u64_field(
+            offsets::SERIALIZED_WRITER_TXN_ID,
+            &self.serialized_writer_txn_id,
+            Ordering::Acquire,
+        );
         TxnId::new(writer_txn_id_raw)
     }
 
@@ -645,15 +861,31 @@ impl SharedMemoryLayout {
         F: FnMut(u64),
     {
         loop {
-            let writer_txn_id_raw = self.serialized_writer_txn_id.load(Ordering::Acquire);
+            let writer_txn_id_raw = self.load_u64_field(
+                offsets::SERIALIZED_WRITER_TXN_ID,
+                &self.serialized_writer_txn_id,
+                Ordering::Acquire,
+            );
             if writer_txn_id_raw == 0 {
                 return Ok(());
             }
 
-            let packed_pid = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
+            let packed_pid = self.load_u64_field(
+                offsets::SERIALIZED_WRITER_PID_AND_GEN,
+                &self.serialized_writer_pid_and_gen,
+                Ordering::Acquire,
+            );
             let pid = packed_pid as u32;
-            let pid_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
-            let lease_expiry = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
+            let pid_birth = self.load_u64_field(
+                offsets::SERIALIZED_WRITER_PID_BIRTH,
+                &self.serialized_writer_pid_birth,
+                Ordering::Acquire,
+            );
+            let lease_expiry = self.load_u64_field(
+                offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+                &self.serialized_writer_lease_expiry,
+                Ordering::Acquire,
+            );
 
             let lease_set = lease_expiry != 0;
             let lease_expired = lease_set && now_epoch_secs >= lease_expiry;
@@ -685,8 +917,16 @@ impl SharedMemoryLayout {
             let mut is_torn = false;
             for _ in 0..10 {
                 std::hint::spin_loop();
-                if self.serialized_writer_txn_id.load(Ordering::Acquire) != writer_txn_id_raw
-                    || self.serialized_writer_pid_and_gen.load(Ordering::Acquire) != packed_pid
+                if self.load_u64_field(
+                    offsets::SERIALIZED_WRITER_TXN_ID,
+                    &self.serialized_writer_txn_id,
+                    Ordering::Acquire,
+                ) != writer_txn_id_raw
+                    || self.load_u64_field(
+                        offsets::SERIALIZED_WRITER_PID_AND_GEN,
+                        &self.serialized_writer_pid_and_gen,
+                        Ordering::Acquire,
+                    ) != packed_pid
                 {
                     is_torn = true;
                     break;
@@ -709,24 +949,36 @@ impl SharedMemoryLayout {
             on_stale_before_cas(writer_txn_id_raw);
 
             if self
-                .serialized_writer_txn_id
-                .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_u64_field(
+                    offsets::SERIALIZED_WRITER_TXN_ID,
+                    &self.serialized_writer_txn_id,
+                    writer_txn_id_raw,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 // Clear auxiliary fields using CAS to avoid stomping a new writer's fields.
-                let _ = self.serialized_writer_pid_and_gen.compare_exchange(
+                let _ = self.compare_exchange_u64_field(
+                    offsets::SERIALIZED_WRITER_PID_AND_GEN,
+                    &self.serialized_writer_pid_and_gen,
                     packed_pid,
                     0,
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 );
-                let _ = self.serialized_writer_pid_birth.compare_exchange(
+                let _ = self.compare_exchange_u64_field(
+                    offsets::SERIALIZED_WRITER_PID_BIRTH,
+                    &self.serialized_writer_pid_birth,
                     pid_birth,
                     0,
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 );
-                let _ = self.serialized_writer_lease_expiry.compare_exchange(
+                let _ = self.compare_exchange_u64_field(
+                    offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
+                    &self.serialized_writer_lease_expiry,
                     lease_expiry,
                     0,
                     Ordering::AcqRel,
@@ -752,18 +1004,31 @@ impl SharedMemoryLayout {
     /// Load the current commit sequence.
     #[must_use]
     pub fn load_commit_seq(&self) -> CommitSeq {
-        CommitSeq::new(self.commit_seq.load(Ordering::Acquire))
+        CommitSeq::new(self.load_u64_field(
+            offsets::COMMIT_SEQ,
+            &self.commit_seq,
+            Ordering::Acquire,
+        ))
     }
 
     /// Load the current GC horizon.
     #[must_use]
     pub fn load_gc_horizon(&self) -> CommitSeq {
-        CommitSeq::new(self.gc_horizon.load(Ordering::Acquire))
+        CommitSeq::new(self.load_u64_field(
+            offsets::GC_HORIZON,
+            &self.gc_horizon,
+            Ordering::Acquire,
+        ))
     }
 
     /// Store the GC horizon.
     pub fn store_gc_horizon(&self, horizon: CommitSeq) {
-        self.gc_horizon.store(horizon.get(), Ordering::Release);
+        self.store_u64_field(
+            offsets::GC_HORIZON,
+            &self.gc_horizon,
+            horizon.get(),
+            Ordering::Release,
+        );
     }
 
     /// Allocate the next `TxnId` via CAS loop.
@@ -771,14 +1036,21 @@ impl SharedMemoryLayout {
     /// Returns `None` if the id space is exhausted.
     pub fn alloc_txn_id(&self) -> Option<TxnId> {
         loop {
-            let current = self.next_txn_id.load(Ordering::Acquire);
+            let current =
+                self.load_u64_field(offsets::NEXT_TXN_ID, &self.next_txn_id, Ordering::Acquire);
             if current > TxnId::MAX_RAW {
                 return None;
             }
             let next = current.checked_add(1)?;
             if self
-                .next_txn_id
-                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_u64_field(
+                    offsets::NEXT_TXN_ID,
+                    &self.next_txn_id,
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_ok()
             {
                 return TxnId::new(current);
@@ -789,13 +1061,27 @@ impl SharedMemoryLayout {
     /// Load the current schema epoch.
     #[must_use]
     pub fn load_schema_epoch(&self) -> SchemaEpoch {
-        SchemaEpoch::new(self.schema_epoch.load(Ordering::Acquire))
+        SchemaEpoch::new(self.load_u64_field(
+            offsets::SCHEMA_EPOCH,
+            &self.schema_epoch,
+            Ordering::Acquire,
+        ))
     }
 
     /// Load the current ECS epoch.
     #[must_use]
     pub fn load_ecs_epoch(&self) -> u64 {
-        self.ecs_epoch.load(Ordering::Acquire)
+        self.load_u64_field(offsets::ECS_EPOCH, &self.ecs_epoch, Ordering::Acquire)
+    }
+
+    /// Load the next commit-sequence reservation watermark.
+    #[must_use]
+    pub fn load_next_commit_seq(&self) -> CommitSeq {
+        CommitSeq::new(self.load_u64_field(
+            offsets::NEXT_COMMIT_SEQ,
+            &self.next_commit_seq,
+            Ordering::Acquire,
+        ))
     }
 
     /// Database page size.
@@ -880,10 +1166,28 @@ impl std::fmt::Debug for SharedMemoryLayout {
         f.debug_struct("SharedMemoryLayout")
             .field("page_size", &self.page_size)
             .field("max_txn_slots", &self.max_txn_slots)
-            .field("commit_seq", &self.commit_seq.load(Ordering::Relaxed))
-            .field("schema_epoch", &self.schema_epoch.load(Ordering::Relaxed))
-            .field("gc_horizon", &self.gc_horizon.load(Ordering::Relaxed))
+            .field(
+                "next_commit_seq",
+                &self.load_u64_field(
+                    offsets::NEXT_COMMIT_SEQ,
+                    &self.next_commit_seq,
+                    Ordering::Relaxed,
+                ),
+            )
+            .field(
+                "commit_seq",
+                &self.load_u64_field(offsets::COMMIT_SEQ, &self.commit_seq, Ordering::Relaxed),
+            )
+            .field(
+                "schema_epoch",
+                &self.load_u64_field(offsets::SCHEMA_EPOCH, &self.schema_epoch, Ordering::Relaxed),
+            )
+            .field(
+                "gc_horizon",
+                &self.load_u64_field(offsets::GC_HORIZON, &self.gc_horizon, Ordering::Relaxed),
+            )
             .field("layout_checksum", &self.layout_checksum)
+            .field("mapped_region", &self.mapped_region.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1679,6 +1983,30 @@ mod tests {
 
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn test_open_or_initialize_region_shares_live_state_between_handles() {
+        let region = ShmRegion::new(SharedMemoryLayout::HEADER_SIZE);
+        let layout_a =
+            SharedMemoryLayout::open_or_initialize_region(region.clone(), PageSize::DEFAULT, 64)
+                .unwrap();
+        let layout_b =
+            SharedMemoryLayout::open_or_initialize_region(region, PageSize::DEFAULT, 64).unwrap();
+
+        assert_eq!(layout_a.alloc_txn_id().unwrap().get(), 1);
+        assert_eq!(layout_b.alloc_txn_id().unwrap().get(), 2);
+
+        layout_a.publish_snapshot(CommitSeq::new(9), SchemaEpoch::new(4), 11);
+        let snapshot = layout_b.load_consistent_snapshot();
+        assert_eq!(snapshot.commit_seq, CommitSeq::new(9));
+        assert_eq!(snapshot.schema_epoch, SchemaEpoch::new(4));
+        assert_eq!(snapshot.ecs_epoch, 11);
+
+        assert!(layout_a.acquire_serialized_writer(77, 1234, 5678, 9999));
+        assert_eq!(layout_b.check_serialized_writer().unwrap().get(), 77);
+        assert!(layout_b.release_serialized_writer(77));
+        assert!(layout_a.check_serialized_writer().is_none());
     }
 
     #[test]
