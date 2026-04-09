@@ -18,6 +18,7 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
+use serde::Serialize;
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
+const JSON_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.comprehensive-bench-report.v1";
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -349,6 +351,311 @@ struct ReportRow {
     fsqlite: Option<Measurement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    quick: bool,
+    filter: Option<String>,
+    html_path: Option<String>,
+    emit_html: bool,
+    emit_timestamped_json: bool,
+    json_out_path: Option<String>,
+    json_stdout: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+struct ReportSummaryStats {
+    total_scenarios: usize,
+    franken_faster: usize,
+    comparable: usize,
+    csqlite_faster: usize,
+    average_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct DetectedEnvironment {
+    os: Option<String>,
+    cpu_model: Option<String>,
+    cpu_cores: Option<usize>,
+    ram_gb: Option<f64>,
+    rust_version: Option<String>,
+    build_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct JsonRunConfig {
+    quick: bool,
+    filter: Option<String>,
+    warmup_iterations: usize,
+    min_iterations: usize,
+    max_iterations: usize,
+    target_duration_secs: u64,
+    row_counts: Vec<usize>,
+    html_output_path: Option<String>,
+    json_output_path: Option<String>,
+    json_stdout: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonMeasurement {
+    median_ms: f64,
+    mean_ms: f64,
+    min_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    stddev_ms: f64,
+    cv_pct: f64,
+    rows_per_sec: f64,
+    us_per_row: f64,
+    iterations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonRow {
+    scenario_id: String,
+    scenario: String,
+    csqlite: Option<JsonMeasurement>,
+    fsqlite: Option<JsonMeasurement>,
+    ratio_fsqlite_over_csqlite: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonSection {
+    section_id: String,
+    title: String,
+    description: String,
+    rows: Vec<JsonRow>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonBenchmarkReport {
+    schema_version: String,
+    generated_at_utc: String,
+    total_elapsed_ms: u64,
+    config: JsonRunConfig,
+    environment: DetectedEnvironment,
+    summary: ReportSummaryStats,
+    sections: Vec<JsonSection>,
+}
+
+fn compute_report_summary(report: &BenchReport) -> ReportSummaryStats {
+    let mut franken_faster = 0_usize;
+    let mut csqlite_faster = 0_usize;
+    let mut comparable = 0_usize;
+    let mut total_ratio = 0.0_f64;
+    let mut total_scenarios = 0_usize;
+
+    for section in &report.sections {
+        for row in &section.rows {
+            if let Some(ratio) = row_ratio(row) {
+                total_ratio += ratio;
+                total_scenarios += 1;
+                if ratio < 0.95 {
+                    franken_faster += 1;
+                } else if ratio > 1.05 {
+                    csqlite_faster += 1;
+                } else {
+                    comparable += 1;
+                }
+            }
+        }
+    }
+
+    ReportSummaryStats {
+        total_scenarios,
+        franken_faster,
+        comparable,
+        csqlite_faster,
+        average_ratio: (total_scenarios > 0).then_some(total_ratio / total_scenarios as f64),
+    }
+}
+
+fn row_ratio(row: &ReportRow) -> Option<f64> {
+    let csqlite = row.csqlite.as_ref()?;
+    let fsqlite = row.fsqlite.as_ref()?;
+    let csqlite_nanos = csqlite.median().as_nanos();
+    if csqlite_nanos == 0 {
+        return None;
+    }
+    Some(fsqlite.median().as_nanos() as f64 / csqlite_nanos as f64)
+}
+
+fn stable_slug(value: &str) -> String {
+    let mut slug = String::with_capacity(value.len());
+    let mut last_was_sep = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep && !slug.is_empty() {
+            slug.push('-');
+            last_was_sep = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        slug
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+impl JsonMeasurement {
+    fn from_measurement(measurement: &Measurement) -> Self {
+        Self {
+            median_ms: duration_ms(measurement.median()),
+            mean_ms: duration_ms(measurement.mean()),
+            min_ms: duration_ms(measurement.min()),
+            p95_ms: duration_ms(measurement.p95()),
+            p99_ms: duration_ms(measurement.p99()),
+            stddev_ms: duration_ms(measurement.stddev()),
+            cv_pct: measurement.cv_percent(),
+            rows_per_sec: measurement.rows_per_sec(),
+            us_per_row: measurement.us_per_row(),
+            iterations: measurement.iter_count(),
+        }
+    }
+}
+
+impl DetectedEnvironment {
+    fn detect() -> Self {
+        let os = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|os_release| {
+                os_release.lines().find_map(|line| {
+                    line.strip_prefix("PRETTY_NAME=")
+                        .map(|pretty| pretty.trim_matches('"').to_owned())
+                })
+            });
+
+        let (cpu_model, cpu_cores) =
+            std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .map_or((None, None), |cpuinfo| {
+                    let mut model = None;
+                    let mut count = 0_usize;
+                    for line in cpuinfo.lines() {
+                        if line.starts_with("model name") {
+                            if model.is_none() {
+                                model = line.split(':').nth(1).map(|part| part.trim().to_owned());
+                            }
+                            count += 1;
+                        }
+                    }
+                    (model, (count > 0).then_some(count))
+                });
+
+        let ram_gb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| {
+                meminfo.lines().find_map(|line| {
+                    if !line.starts_with("MemTotal:") {
+                        return None;
+                    }
+                    let kb_str: String = line.chars().filter(char::is_ascii_digit).collect();
+                    kb_str.parse::<u64>().ok().map(|kb| kb as f64 / 1_048_576.0)
+                })
+            });
+
+        let rust_version = std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .filter(|version| !version.is_empty());
+
+        Self {
+            os,
+            cpu_model,
+            cpu_cores,
+            ram_gb,
+            rust_version,
+            build_profile: "release-perf".to_owned(),
+        }
+    }
+
+    fn print(&self, to_stdout: bool) {
+        if let Some(os) = &self.os {
+            emit_line(to_stdout, format!("  OS: {os}"));
+        }
+        if let Some(cpu_model) = &self.cpu_model {
+            match self.cpu_cores {
+                Some(cpu_cores) => {
+                    emit_line(to_stdout, format!("  CPU: {cpu_model} ({cpu_cores} cores)"))
+                }
+                None => emit_line(to_stdout, format!("  CPU: {cpu_model}")),
+            }
+        }
+        if let Some(ram_gb) = self.ram_gb {
+            emit_line(to_stdout, format!("  RAM: {ram_gb:.1} GB"));
+        }
+        if let Some(rust_version) = &self.rust_version {
+            emit_line(to_stdout, format!("  Rust: {rust_version}"));
+        }
+        emit_line(
+            to_stdout,
+            format!("  Build: {} (opt-level 3, LTO)", self.build_profile),
+        );
+    }
+}
+
+fn build_json_report(
+    report: &BenchReport,
+    total_elapsed: Duration,
+    config: JsonRunConfig,
+    environment: DetectedEnvironment,
+) -> JsonBenchmarkReport {
+    let summary = compute_report_summary(report);
+    let sections = report
+        .sections
+        .iter()
+        .map(|section| {
+            let section_id = stable_slug(&section.title);
+            let rows = section
+                .rows
+                .iter()
+                .map(|row| JsonRow {
+                    scenario_id: format!("{}__{}", section_id, stable_slug(&row.scenario)),
+                    scenario: row.scenario.clone(),
+                    csqlite: row.csqlite.as_ref().map(JsonMeasurement::from_measurement),
+                    fsqlite: row.fsqlite.as_ref().map(JsonMeasurement::from_measurement),
+                    ratio_fsqlite_over_csqlite: row_ratio(row),
+                })
+                .collect();
+            JsonSection {
+                section_id,
+                title: section.title.clone(),
+                description: section.description.clone(),
+                rows,
+            }
+        })
+        .collect();
+
+    JsonBenchmarkReport {
+        schema_version: JSON_REPORT_SCHEMA_V1.to_owned(),
+        generated_at_utc: chrono_stamp(),
+        total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
+        config,
+        environment,
+        summary,
+        sections,
+    }
+}
+
+fn emit_line(to_stdout: bool, line: impl AsRef<str>) {
+    if to_stdout {
+        println!("{}", line.as_ref());
+    } else {
+        eprintln!("{}", line.as_ref());
+    }
+}
+
 impl BenchReport {
     fn new() -> Self {
         Self {
@@ -365,11 +672,11 @@ impl BenchReport {
         self.sections.last_mut().unwrap()
     }
 
-    fn print(&self, total_elapsed: Duration) {
+    fn print(&self, total_elapsed: Duration, environment: &DetectedEnvironment) {
         println!("\n{}", "=".repeat(140));
         println!("  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite");
         println!("  {}", chrono_stamp());
-        print_environment();
+        environment.print(true);
         println!(
             "  Total benchmark time: {:.1}s",
             total_elapsed.as_secs_f64()
@@ -448,34 +755,14 @@ impl BenchReport {
         println!("  SUMMARY STATISTICS");
         println!("{}\n", "=".repeat(120));
 
-        let mut faster_count = 0_usize;
-        let mut slower_count = 0_usize;
-        let mut equal_count = 0_usize;
-        let mut total_ratio = 0.0_f64;
-        let mut ratio_count = 0_usize;
-
-        for section in &self.sections {
-            for row in &section.rows {
-                if let (Some(c), Some(f)) = (&row.csqlite, &row.fsqlite) {
-                    let r = f.median().as_nanos() as f64 / c.median().as_nanos() as f64;
-                    total_ratio += r;
-                    ratio_count += 1;
-                    if r < 0.95 {
-                        faster_count += 1;
-                    } else if r > 1.05 {
-                        slower_count += 1;
-                    } else {
-                        equal_count += 1;
-                    }
-                }
-            }
-        }
-
-        if ratio_count > 0 {
-            let avg_ratio = total_ratio / ratio_count as f64;
+        let summary = compute_report_summary(self);
+        if let Some(avg_ratio) = summary.average_ratio {
             println!(
                 "  Total scenarios: {}  |  FrankenSQLite faster: {}  |  Comparable: {}  |  C SQLite faster: {}",
-                ratio_count, faster_count, equal_count, slower_count
+                summary.total_scenarios,
+                summary.franken_faster,
+                summary.comparable,
+                summary.csqlite_faster
             );
             println!(
                 "  Average time ratio (FrankenSQLite / C SQLite): {:.2}x",
@@ -565,32 +852,8 @@ impl BenchReport {
         sections_json.push(']');
 
         // Summary stats.
-        let mut faster = 0_usize;
-        let mut slower = 0_usize;
-        let mut comparable = 0_usize;
-        let mut total_ratio = 0.0_f64;
-        let mut count = 0_usize;
-        for section in &self.sections {
-            for row in &section.rows {
-                if let (Some(c), Some(f)) = (&row.csqlite, &row.fsqlite) {
-                    let r = f.median().as_nanos() as f64 / c.median().as_nanos() as f64;
-                    total_ratio += r;
-                    count += 1;
-                    if r < 0.95 {
-                        faster += 1;
-                    } else if r > 1.05 {
-                        slower += 1;
-                    } else {
-                        comparable += 1;
-                    }
-                }
-            }
-        }
-        let avg_ratio = if count > 0 {
-            total_ratio / count as f64
-        } else {
-            1.0
-        };
+        let summary = compute_report_summary(self);
+        let avg_ratio = summary.average_ratio.unwrap_or(1.0);
 
         html.push_str(&format!(
             r#"<!DOCTYPE html>
@@ -658,19 +921,19 @@ tailwind.config = {{
   <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
     <div class="card rounded-xl p-5 stat-card glow">
       <div class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Total Scenarios</div>
-      <div class="text-3xl font-bold text-white">{count}</div>
+      <div class="text-3xl font-bold text-white">{}</div>
     </div>
     <div class="card rounded-xl p-5 stat-card" style="box-shadow: 0 0 40px rgba(52,211,153,0.12);">
       <div class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">FrankenSQLite Faster</div>
-      <div class="text-3xl font-bold faster">{faster}</div>
+      <div class="text-3xl font-bold faster">{}</div>
     </div>
     <div class="card rounded-xl p-5 stat-card">
       <div class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">Comparable</div>
-      <div class="text-3xl font-bold equal">{comparable}</div>
+      <div class="text-3xl font-bold equal">{}</div>
     </div>
     <div class="card rounded-xl p-5 stat-card" style="box-shadow: 0 0 40px rgba(248,113,113,0.10);">
       <div class="text-xs font-medium text-slate-400 uppercase tracking-wider mb-1">C SQLite Faster</div>
-      <div class="text-3xl font-bold slower">{slower}</div>
+      <div class="text-3xl font-bold slower">{}</div>
     </div>
   </div>
   <div class="card rounded-xl p-5 mt-4 text-center">
@@ -873,6 +1136,10 @@ document.querySelectorAll('[id^="section-"]').forEach(el => observer.observe(el)
 </html>"#,
             chrono_stamp(),
             if avg_ratio < 1.0 { "faster" } else { "slower" },
+            summary.total_scenarios,
+            summary.franken_faster,
+            summary.comparable,
+            summary.csqlite_faster,
         ));
 
         let Ok(mut file) = std::fs::File::create(path) else {
@@ -994,57 +1261,6 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m + 1, remaining + 1)
 }
 
-fn print_environment() {
-    // OS info.
-    if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
-        for line in os_release.lines() {
-            if let Some(pretty) = line.strip_prefix("PRETTY_NAME=") {
-                let name = pretty.trim_matches('"');
-                println!("  OS: {name}");
-                break;
-            }
-        }
-    }
-    // CPU info.
-    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
-        let mut model = None;
-        let mut count = 0_usize;
-        for line in cpuinfo.lines() {
-            if line.starts_with("model name") {
-                if model.is_none() {
-                    model = line.split(':').nth(1).map(|s| s.trim().to_string());
-                }
-                count += 1;
-            }
-        }
-        if let Some(m) = model {
-            println!("  CPU: {m} ({count} cores)");
-        }
-    }
-    // Memory.
-    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-        for line in meminfo.lines() {
-            if line.starts_with("MemTotal:") {
-                let kb_str: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
-                if let Ok(kb) = kb_str.parse::<u64>() {
-                    let gb = kb as f64 / 1_048_576.0;
-                    println!("  RAM: {gb:.1} GB");
-                }
-                break;
-            }
-        }
-    }
-    // Rust version.
-    if let Ok(output) = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
-        let ver = String::from_utf8_lossy(&output.stdout);
-        println!("  Rust: {}", ver.trim());
-    }
-    println!("  Build: release-perf (opt-level 3, LTO)");
-}
-
 fn timestamp_filename(base: &str, ext: &str) -> String {
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1054,6 +1270,123 @@ fn timestamp_filename(base: &str, ext: &str) -> String {
     let h = (now % 86400) / 3600;
     let min = (now % 3600) / 60;
     format!("{base}_{y}{m:02}{d:02}_{h:02}{min:02}.{ext}")
+}
+
+fn print_usage() {
+    eprintln!(
+        "Usage:
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html
+
+Flags:
+  --quick              Run the reduced benchmark matrix.
+  --filter <text>      Run only sections whose names match <text>.
+  --html <path>        Write the HTML report to an explicit path.
+  --no-html            Skip HTML report generation.
+  --json               Write the JSON report to a timestamped file.
+  --json-out <path>    Write the JSON report to an explicit path.
+  --json-stdout        Emit only the structured JSON report to stdout.
+  --help, -h           Show this help text."
+    );
+}
+
+fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
+    let mut options = CliOptions {
+        quick: false,
+        filter: None,
+        html_path: None,
+        emit_html: true,
+        emit_timestamped_json: false,
+        json_out_path: None,
+        json_stdout: false,
+    };
+
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--quick" => {
+                options.quick = true;
+                index += 1;
+            }
+            "--filter" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a value after --filter".to_owned())?;
+                options.filter = Some(value.clone());
+                index += 2;
+            }
+            "--html" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a path after --html".to_owned())?;
+                options.html_path = Some(value.clone());
+                options.emit_html = true;
+                index += 2;
+            }
+            "--no-html" => {
+                options.emit_html = false;
+                index += 1;
+            }
+            "--json" => {
+                options.emit_timestamped_json = true;
+                index += 1;
+            }
+            "--json-out" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "expected a path after --json-out".to_owned())?;
+                options.json_out_path = Some(value.clone());
+                index += 2;
+            }
+            "--json-stdout" => {
+                options.json_stdout = true;
+                index += 1;
+            }
+            unknown => {
+                return Err(format!("unrecognized argument `{unknown}`"));
+            }
+        }
+    }
+
+    Ok(options)
+}
+
+fn print_run_banner(
+    to_stdout: bool,
+    options: &CliOptions,
+    row_counts: &[usize],
+    environment: &DetectedEnvironment,
+) {
+    emit_line(to_stdout, format!("\n{}", "=".repeat(80)));
+    emit_line(
+        to_stdout,
+        "  Comprehensive FrankenSQLite vs C SQLite Benchmark",
+    );
+    emit_line(to_stdout, "=".repeat(80));
+    environment.print(to_stdout);
+    emit_line(
+        to_stdout,
+        format!("  Mode: {}", if options.quick { "quick" } else { "full" }),
+    );
+    emit_line(
+        to_stdout,
+        format!("  Row counts: {:?}", row_counts.iter().collect::<Vec<_>>()),
+    );
+    emit_line(
+        to_stdout,
+        format!(
+            "  Measurement: {WARMUP_ITERS} warmup, {MIN_ITERS}-{MAX_ITERS} iters, target {:.0}s",
+            TARGET_DURATION.as_secs_f64()
+        ),
+    );
+    if let Some(filter) = &options.filter {
+        emit_line(to_stdout, format!("  Filter: {filter}"));
+    }
+    emit_line(to_stdout, "=".repeat(80));
+    emit_line(to_stdout, "");
 }
 
 // ─── Section 1: Insert throughput by row count ─────────────────────────
@@ -1504,6 +1837,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn sample_measurement(label: &str, row_count: usize, durations_ms: &[u64]) -> Measurement {
+        Measurement {
+            label: label.to_owned(),
+            durations: durations_ms
+                .iter()
+                .map(|ms| Duration::from_millis(*ms))
+                .collect(),
+            row_count,
+        }
+    }
+
+    fn sample_report() -> BenchReport {
+        let mut report = BenchReport::new();
+        let section = report.add_section(
+            "Insert Throughput",
+            "Sequential insert benchmarking for parser-stable JSON output.",
+        );
+        section.add_row(
+            "100 rows / small record",
+            Some(sample_measurement("csqlite", 100, &[1, 1, 2])),
+            Some(sample_measurement("frankensqlite", 100, &[2, 2, 3])),
+        );
+        report
+    }
+
     #[test]
     fn spawn_bench_task_runs_on_runtime_blocking_pool() {
         let runtime = RuntimeBuilder::new()
@@ -1541,6 +1899,90 @@ mod tests {
         assert!(
             message.contains("benchmark worker panic should surface"),
             "panic payload should mention original worker failure: {message}",
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_supports_machine_readable_flags() {
+        let args = vec![
+            "comprehensive-bench".to_owned(),
+            "--quick".to_owned(),
+            "--filter".to_owned(),
+            "insert".to_owned(),
+            "--json-out".to_owned(),
+            "bench.json".to_owned(),
+            "--json-stdout".to_owned(),
+            "--no-html".to_owned(),
+        ];
+
+        let options = parse_cli_args(&args).expect("cli args should parse");
+
+        assert_eq!(
+            options,
+            CliOptions {
+                quick: true,
+                filter: Some("insert".to_owned()),
+                html_path: None,
+                emit_html: false,
+                emit_timestamped_json: false,
+                json_out_path: Some("bench.json".to_owned()),
+                json_stdout: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cli_args_rejects_missing_filter_value() {
+        let args = vec!["comprehensive-bench".to_owned(), "--filter".to_owned()];
+
+        let error = parse_cli_args(&args).expect_err("missing filter value should error");
+        assert!(
+            error.contains("expected a value after --filter"),
+            "unexpected error: {error}",
+        );
+    }
+
+    #[test]
+    fn build_json_report_uses_stable_ids_and_summary() {
+        let report = sample_report();
+        let json = build_json_report(
+            &report,
+            Duration::from_secs(2),
+            JsonRunConfig {
+                quick: true,
+                filter: Some("insert".to_owned()),
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: vec![100],
+                html_output_path: Some("report.html".to_owned()),
+                json_output_path: Some("report.json".to_owned()),
+                json_stdout: false,
+            },
+            DetectedEnvironment {
+                os: Some("TestOS".to_owned()),
+                cpu_model: Some("Test CPU".to_owned()),
+                cpu_cores: Some(8),
+                ram_gb: Some(32.0),
+                rust_version: Some("rustc test".to_owned()),
+                build_profile: "release-perf".to_owned(),
+            },
+        );
+
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V1);
+        assert_eq!(json.summary.total_scenarios, 1);
+        assert_eq!(json.sections.len(), 1);
+        assert_eq!(json.sections[0].section_id, "insert-throughput");
+        assert_eq!(
+            json.sections[0].rows[0].scenario_id,
+            "insert-throughput__100-rows-small-record",
+        );
+        assert!(
+            json.summary
+                .average_ratio
+                .expect("average ratio should exist for comparable row")
+                > 1.0
         );
     }
 }
@@ -2737,109 +3179,61 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
 
 // ─── Main ──────────────────────────────────────────────────────────────
 
-fn write_json_report(report: &BenchReport, path: &str) {
-    let mut json = String::with_capacity(16 * 1024);
-    json.push_str("{\n  \"timestamp\": \"");
-    json.push_str(&chrono_stamp());
-    json.push_str("\",\n  \"sections\": [\n");
+fn write_json_report(report: &JsonBenchmarkReport, path: &str) {
+    let Ok(json) = serde_json::to_string_pretty(report) else {
+        eprintln!("ERROR: Could not serialize JSON report");
+        return;
+    };
 
-    for (si, section) in report.sections.iter().enumerate() {
-        if si > 0 {
-            json.push_str(",\n");
-        }
-        json.push_str(&format!(
-            "    {{\"title\": {}, \"rows\": [",
-            json_string(&section.title)
-        ));
-        for (ri, row) in section.rows.iter().enumerate() {
-            if ri > 0 {
-                json.push(',');
-            }
-            let cs_median = row
-                .csqlite
-                .as_ref()
-                .map_or(0.0, |m| m.median().as_secs_f64() * 1000.0);
-            let fs_median = row
-                .fsqlite
-                .as_ref()
-                .map_or(0.0, |m| m.median().as_secs_f64() * 1000.0);
-            let cs_p95 = row
-                .csqlite
-                .as_ref()
-                .map_or(0.0, |m| m.p95().as_secs_f64() * 1000.0);
-            let fs_p95 = row
-                .fsqlite
-                .as_ref()
-                .map_or(0.0, |m| m.p95().as_secs_f64() * 1000.0);
-            let cs_cv = row.csqlite.as_ref().map_or(0.0, Measurement::cv_percent);
-            let fs_cv = row.fsqlite.as_ref().map_or(0.0, Measurement::cv_percent);
-            let cs_rps = row.csqlite.as_ref().map_or(0.0, Measurement::rows_per_sec);
-            let fs_rps = row.fsqlite.as_ref().map_or(0.0, Measurement::rows_per_sec);
-            let cs_iters = row.csqlite.as_ref().map_or(0, Measurement::iter_count);
-            let fs_iters = row.fsqlite.as_ref().map_or(0, Measurement::iter_count);
-            let ratio = if cs_median > 0.0 {
-                fs_median / cs_median
-            } else {
-                0.0
-            };
-            json.push_str(&format!(
-                "\n      {{\"scenario\":{},\"cs_median_ms\":{cs_median:.4},\"fs_median_ms\":{fs_median:.4},\
-                 \"cs_p95_ms\":{cs_p95:.4},\"fs_p95_ms\":{fs_p95:.4},\
-                 \"cs_cv_pct\":{cs_cv:.2},\"fs_cv_pct\":{fs_cv:.2},\
-                 \"cs_rps\":{cs_rps:.1},\"fs_rps\":{fs_rps:.1},\
-                 \"cs_iters\":{cs_iters},\"fs_iters\":{fs_iters},\
-                 \"ratio\":{ratio:.4}}}",
-                json_string(&row.scenario),
-            ));
-        }
-        json.push_str("\n    ]}");
-    }
-    json.push_str("\n  ]\n}\n");
-
-    match std::fs::write(path, &json) {
+    match std::fs::write(path, format!("{json}\n")) {
         Ok(()) => eprintln!("JSON report written to: {path}"),
         Err(e) => eprintln!("ERROR: Could not write JSON report: {e}"),
     }
 }
 
+fn print_json_report(report: &JsonBenchmarkReport) {
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => println!("{json}"),
+        Err(err) => {
+            eprintln!("ERROR: Could not serialize JSON report: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let quick = args.iter().any(|a| a == "--quick");
-    let json_out = args.iter().any(|a| a == "--json");
-    let filter = args
-        .windows(2)
-        .find(|w| w[0] == "--filter")
-        .map(|w| w[1].clone());
-    let html_path = args
-        .windows(2)
-        .find(|w| w[0] == "--html")
-        .map(|w| w[1].clone());
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return;
+    }
 
-    let row_counts = if quick { ROW_COUNTS_QUICK } else { ROW_COUNTS };
+    let options = match parse_cli_args(&args) {
+        Ok(options) => options,
+        Err(err) => {
+            eprintln!("ERROR: {err}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+
+    let row_counts = if options.quick {
+        ROW_COUNTS_QUICK
+    } else {
+        ROW_COUNTS
+    };
+    let filter_lower = options.filter.as_ref().map(|filter| filter.to_lowercase());
 
     let should_run = |name: &str| -> bool {
-        match &filter {
-            Some(f) => name.to_lowercase().contains(&f.to_lowercase()),
+        match &filter_lower {
+            Some(filter) => name.to_lowercase().contains(filter),
             None => true,
         }
     };
 
     let bench_start = Instant::now();
-
-    println!("\n{}", "=".repeat(80));
-    println!("  Comprehensive FrankenSQLite vs C SQLite Benchmark");
-    println!("{}", "=".repeat(80));
-    print_environment();
-    println!("  Mode: {}", if quick { "quick" } else { "full" });
-    println!("  Row counts: {:?}", row_counts.iter().collect::<Vec<_>>());
-    println!(
-        "  Measurement: {WARMUP_ITERS} warmup, {MIN_ITERS}-{MAX_ITERS} iters, target {:.0}s",
-        TARGET_DURATION.as_secs_f64()
-    );
-    if let Some(ref f) = filter {
-        println!("  Filter: {f}");
-    }
-    println!("{}\n", "=".repeat(80));
+    let environment = DetectedEnvironment::detect();
+    print_run_banner(!options.json_stdout, &options, row_counts, &environment);
 
     let mut report = BenchReport::new();
     let total_sections = 10;
@@ -2923,15 +3317,56 @@ fn main() {
         total_elapsed.as_secs_f64()
     );
 
-    report.print(total_elapsed);
+    if !options.json_stdout {
+        report.print(total_elapsed, &environment);
+    }
 
-    // HTML report.
-    let html_file = html_path.unwrap_or_else(|| timestamp_filename("benchmark_report", "html"));
-    report.write_html(&html_file);
+    let html_file = if options.emit_html {
+        Some(
+            options
+                .html_path
+                .clone()
+                .unwrap_or_else(|| timestamp_filename("benchmark_report", "html")),
+        )
+    } else {
+        None
+    };
+    if let Some(path) = html_file.as_deref() {
+        report.write_html(path);
+    }
 
-    // JSON report.
-    if json_out {
-        let json_file = timestamp_filename("benchmark_report", "json");
-        write_json_report(&report, &json_file);
+    let json_file = if let Some(path) = options.json_out_path.clone() {
+        Some(path)
+    } else if options.emit_timestamped_json {
+        Some(timestamp_filename("benchmark_report", "json"))
+    } else {
+        None
+    };
+
+    if json_file.is_some() || options.json_stdout {
+        let json_report = build_json_report(
+            &report,
+            total_elapsed,
+            JsonRunConfig {
+                quick: options.quick,
+                filter: options.filter.clone(),
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: row_counts.to_vec(),
+                html_output_path: html_file.clone(),
+                json_output_path: json_file.clone(),
+                json_stdout: options.json_stdout,
+            },
+            environment.clone(),
+        );
+
+        if let Some(path) = json_file.as_deref() {
+            write_json_report(&json_report, path);
+        }
+        if options.json_stdout {
+            print_json_report(&json_report);
+        }
     }
 }

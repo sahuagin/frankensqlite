@@ -21,7 +21,10 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 
 use crate::HarnessSettings;
-use crate::benchmark::BenchmarkSummary;
+use crate::benchmark::{
+    BenchmarkCausalChainLink, BenchmarkCausalScorecard, BenchmarkSummary,
+    build_benchmark_causal_scorecard_report,
+};
 use crate::perf_runner::{CellOutcome, PerfResult};
 use crate::report::RunRecordV1;
 
@@ -68,6 +71,35 @@ fn ratio_string(numerator: Option<f64>, denominator: Option<f64>) -> String {
         }
         _ => "-".to_owned(),
     }
+}
+
+fn scorecard_mode_label(scorecard: &BenchmarkCausalScorecard) -> &str {
+    scorecard.row_identity.mode_id.as_str()
+}
+
+fn format_scorecard_wall_delta(delta_ms: f64) -> String {
+    if delta_ms.abs() <= f64::EPSILON {
+        "neutral".to_owned()
+    } else if delta_ms > 0.0 {
+        format!("{delta_ms:.1} saved")
+    } else {
+        format!("{:.1} slower", delta_ms.abs())
+    }
+}
+
+fn format_scorecard_share(share_basis_points: Option<u32>) -> String {
+    share_basis_points
+        .map(|bps| format!("{:.1}%", f64::from(bps) / 100.0))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn summarize_scorecard_counter_deltas(link: &BenchmarkCausalChainLink) -> String {
+    link.counter_deltas
+        .iter()
+        .take(4)
+        .map(|delta| format!("`{}` {}", delta.counter_id, delta.summary))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 // ── Parsing ────────────────────────────────────────────────────────────
@@ -335,13 +367,13 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
             for summary in ordered {
                 let comparison = summary.comparison.as_ref();
                 let retry_policy = comparison
-                    .and_then(|meta| meta.retry_policy_id.as_deref())
+                    .and_then(|meta| meta.provenance.retry_policy_id.as_deref())
                     .unwrap_or("-");
                 let placement = comparison
-                    .and_then(|meta| meta.placement_profile_id.as_deref())
+                    .and_then(|meta| meta.row_identity.placement_profile_id.as_deref())
                     .unwrap_or("-");
                 let row_id = comparison
-                    .and_then(|meta| meta.row_id.as_deref())
+                    .and_then(|meta| meta.row_identity.row_id.as_deref())
                     .unwrap_or("-");
                 let _ = writeln!(
                     out,
@@ -358,6 +390,86 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
                 );
             }
             let _ = writeln!(out);
+        }
+    }
+
+    let scorecard_report = build_benchmark_causal_scorecard_report(summaries);
+    if !scorecard_report.groups.is_empty() {
+        let _ = writeln!(out, "## Causal Scorecards\n");
+        for group in &scorecard_report.groups {
+            let _ = writeln!(
+                out,
+                "### {} / {} (c={})\n",
+                group.fixture_id, group.workload, group.concurrency
+            );
+            for scorecard in &group.scorecards {
+                let _ = writeln!(
+                    out,
+                    "#### {}\n",
+                    mode_display_name(scorecard_mode_label(scorecard))
+                );
+                if let Some(ref row_id) = scorecard.row_identity.row_id {
+                    let _ = writeln!(out, "- **Row:** {row_id}");
+                }
+                let _ = writeln!(
+                    out,
+                    "- **Baseline comparator:** {}",
+                    scorecard.baseline_comparator
+                );
+                let _ = writeln!(out, "- **Claim:** {}", scorecard.claim_summary);
+                let _ = writeln!(
+                    out,
+                    "- **Interpretation:** {}\n",
+                    scorecard.interpretation_note
+                );
+                if scorecard.causal_chain.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "_No attributable causal chain is available for this row._\n"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "| Step | Transition | Family | Wall-Time Delta (ms) | Share of Total Gain |"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "|------|------------|--------|----------------------|---------------------|"
+                    );
+                    for link in &scorecard.causal_chain {
+                        let _ = writeln!(
+                            out,
+                            "| {} | {} → {} | {} | {} | {} |",
+                            link.rank,
+                            mode_display_name(link.from_mode_id.as_str()),
+                            mode_display_name(link.to_mode_id.as_str()),
+                            link.optimization_family,
+                            format_scorecard_wall_delta(link.attributed_wall_time_delta_ms),
+                            format_scorecard_share(link.share_of_total_wall_time_gain_basis_points),
+                        );
+                    }
+                    let _ = writeln!(out);
+                    for link in &scorecard.causal_chain {
+                        let _ = writeln!(out, "- **Step {}:** {}", link.rank, link.claim_summary);
+                        let _ = writeln!(out, "- **Rationale:** {}", link.rationale);
+                        let delta_summary = summarize_scorecard_counter_deltas(link);
+                        if !delta_summary.is_empty() {
+                            let _ = writeln!(out, "- **Counter deltas:** {delta_summary}");
+                        }
+                        if !link.evidence.is_empty() {
+                            let _ = writeln!(out, "- **Evidence:** {}", link.evidence.join("; "));
+                        }
+                    }
+                    let _ = writeln!(out);
+                }
+                if !scorecard.negative_findings.is_empty() {
+                    let _ = writeln!(out, "**Negative Findings:**");
+                    for finding in &scorecard.negative_findings {
+                        let _ = writeln!(out, "- {finding}");
+                    }
+                    let _ = writeln!(out);
+                }
+            }
         }
     }
 
@@ -409,20 +521,35 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
             s.total_measurement_ms
         );
         if let Some(ref comparison) = s.comparison {
-            if let Some(ref row_id) = comparison.row_id {
+            if let Some(ref row_id) = comparison.row_identity.row_id {
                 let _ = writeln!(out, "- **Canonical row:** {row_id}");
             }
-            if let Some(ref retry_policy_id) = comparison.retry_policy_id {
+            let _ = writeln!(
+                out,
+                "- **Build profile:** {}",
+                comparison.row_identity.build_profile_id.as_str()
+            );
+            if let Some(ref retry_policy_id) = comparison.provenance.retry_policy_id {
                 let _ = writeln!(out, "- **Retry policy:** {retry_policy_id}");
             }
-            if let Some(ref placement_profile_id) = comparison.placement_profile_id {
+            if let Some(ref placement_profile_id) = comparison.row_identity.placement_profile_id {
                 let _ = writeln!(out, "- **Placement profile:** {placement_profile_id}");
             }
-            if let Some(ref hardware_class_id) = comparison.hardware_class_id {
+            if let Some(ref run_id) = comparison.row_identity.run_id {
+                let _ = writeln!(out, "- **Run ID:** {run_id}");
+            }
+            if let Some(ref source_revision) = comparison.row_identity.source_revision {
+                let _ = writeln!(out, "- **Source revision:** {source_revision}");
+            }
+            if let Some(ref hardware_class_id) = comparison.provenance.hardware_class_id {
                 let _ = writeln!(out, "- **Hardware class:** {hardware_class_id}");
             }
-            if let Some(ref artifact_manifest_path) = comparison.artifact_manifest_path {
-                let _ = writeln!(out, "- **Artifact manifest:** {artifact_manifest_path}");
+            if let Some(layout) = comparison.artifact_layout.as_ref() {
+                let _ = writeln!(
+                    out,
+                    "- **Artifact manifest:** {}",
+                    layout.artifact_manifest_path.as_str()
+                );
             }
             let _ = writeln!(out);
         }
@@ -905,7 +1032,8 @@ pub fn render_benchmark_summaries_from_file(path: &Path) -> std::io::Result<Stri
 mod tests {
     use super::*;
     use crate::benchmark::{
-        BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, run_benchmark,
+        BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary,
+        run_benchmark,
     };
     use crate::methodology::EnvironmentMeta;
     use crate::perf_runner::PERF_RESULT_SCHEMA_V1;
@@ -964,6 +1092,30 @@ mod tests {
             ops_count: 100,
             report: dummy_engine_report(500, 100),
         })
+    }
+
+    fn scorecard_summary(mode_id: &str, wall_ms: u64) -> BenchmarkSummary {
+        let engine = match mode_id {
+            "sqlite_reference" => "sqlite3",
+            _ => "fsqlite",
+        };
+        let mut summary = run_benchmark(
+            &BenchmarkConfig {
+                warmup_iterations: 0,
+                min_iterations: 1,
+                measurement_time_secs: 0,
+            },
+            &BenchmarkMeta {
+                engine: engine.to_owned(),
+                workload: "mixed_read_write".to_owned(),
+                fixture_id: "db-a".to_owned(),
+                concurrency: 4,
+                cargo_profile: "test".to_owned(),
+            },
+            |_| Ok::<_, String>(dummy_engine_report(wall_ms, 1_000)),
+        );
+        summary.comparison = Some(BenchmarkComparisonMetadata::anonymous(&summary, mode_id));
+        summary
     }
 
     #[test]
@@ -1064,6 +1216,20 @@ mod tests {
         assert!(md.contains("Latency (ms)"));
         assert!(md.contains("Throughput (ops/sec)"));
         assert!(md.contains("Iteration details"));
+    }
+
+    #[test]
+    fn render_benchmark_summaries_includes_causal_scorecards() {
+        let sqlite = scorecard_summary("sqlite_reference", 100);
+        let single_writer = scorecard_summary("fsqlite_single_writer", 70);
+        let mvcc = scorecard_summary("fsqlite_mvcc", 50);
+
+        let md = render_benchmark_summaries_markdown(&[sqlite, single_writer, mvcc]);
+        assert!(md.contains("## Causal Scorecards"));
+        assert!(md.contains("shared_fixed_tax_reduction"));
+        assert!(md.contains("mvcc_concurrency_routing"));
+        assert!(md.contains("Share of Total Gain"));
+        assert!(md.contains("Counter deltas"));
     }
 
     #[test]
@@ -1169,23 +1335,8 @@ mod tests {
             "fsqlite_single_writer" => "fsqlite_single_writer",
             _ => "fsqlite_mvcc",
         };
-        summary.comparison = Some(BenchmarkComparisonMetadata {
-            mode_id: mode_id.to_owned(),
-            row_id: None,
-            retry_policy_id: None,
-            seed_policy_id: None,
-            build_profile_id: None,
-            placement_profile_id: None,
-            hardware_class_id: None,
-            hardware_signature: None,
-            run_id: None,
-            source_revision: None,
-            beads_data_hash: None,
-            artifact_bundle_key: None,
-            artifact_bundle_relpath: None,
-            artifact_manifest_path: None,
-            canonical_artifact_manifest: None,
-        });
+        let comparison = BenchmarkComparisonMetadata::anonymous(&summary, mode_id);
+        summary.comparison = Some(comparison);
         summary
     }
 

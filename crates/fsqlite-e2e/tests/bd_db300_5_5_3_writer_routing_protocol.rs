@@ -3,9 +3,8 @@
 use std::sync::Mutex;
 
 use fsqlite_mvcc::{
-    WriterRoutingDecisionConfig, WriterRoutingPlacementProfile,
-    WriterRoutingSyntheticComparison, WriterRoutingSyntheticConfig,
-    WriterRoutingSyntheticSummary, WriterRoutingSyntheticWorkload,
+    WriterRoutingDecisionConfig, WriterRoutingPlacementProfile, WriterRoutingSyntheticComparison,
+    WriterRoutingSyntheticConfig, WriterRoutingSyntheticSummary, WriterRoutingSyntheticWorkload,
     compare_writer_routing_synthetic_workload,
 };
 use serde::Serialize;
@@ -91,7 +90,10 @@ fn synthetic_config(
     }
 }
 
-fn case_evidence(trace_id: &str, summary: &WriterRoutingSyntheticSummary) -> RoutingProtocolCaseEvidence {
+fn case_evidence(
+    trace_id: &str,
+    summary: &WriterRoutingSyntheticSummary,
+) -> RoutingProtocolCaseEvidence {
     RoutingProtocolCaseEvidence {
         trace_id: trace_id.to_owned(),
         scenario_id: summary.scenario_id.clone(),
@@ -181,9 +183,7 @@ fn assert_case_fields(case: &Value) {
         );
     }
     assert!(
-        case["fairness_summary"]
-            .get("lane_writer_counts")
-            .is_some(),
+        case["fairness_summary"].get("lane_writer_counts").is_some(),
         "fairness summary should include lane counts"
     );
     assert!(
@@ -196,7 +196,14 @@ fn assert_case_fields(case: &Value) {
 
 fn assert_protocol_artifact_fields(artifact: &RoutingProtocolArtifact) {
     let artifact_json = serde_json::to_value(artifact).expect("protocol artifact should serialize");
-    for field in ["bead_id", "trace_id", "scenario_id", "replay_command", "comparison", "cases"] {
+    for field in [
+        "bead_id",
+        "trace_id",
+        "scenario_id",
+        "replay_command",
+        "comparison",
+        "cases",
+    ] {
         assert!(
             artifact_json.get(field).is_some(),
             "protocol artifact should include required field `{field}`"
@@ -223,7 +230,11 @@ fn assert_protocol_artifact_fields(artifact: &RoutingProtocolArtifact) {
     let cases = artifact_json["cases"]
         .as_array()
         .expect("protocol cases should serialize as an array");
-    assert_eq!(cases.len(), 2, "protocol artifact should carry baseline and routed cases");
+    assert_eq!(
+        cases.len(),
+        2,
+        "protocol artifact should carry baseline and routed cases"
+    );
     for case in cases {
         assert_case_fields(case);
     }
@@ -241,7 +252,9 @@ fn emit_protocol_artifact(test_name: &str, artifact: &RoutingProtocolArtifact) {
 
 #[test]
 fn bd_db300_5_5_3_disjoint_workload_protocol_is_conflict_free() {
-    let _guard = WRITER_ROUTING_PROTOCOL_LOCK.lock().expect("writer routing protocol lock");
+    let _guard = WRITER_ROUTING_PROTOCOL_LOCK
+        .lock()
+        .expect("writer routing protocol lock");
 
     let comparison = compare_writer_routing_synthetic_workload(
         &synthetic_config(
@@ -266,7 +279,9 @@ fn bd_db300_5_5_3_disjoint_workload_protocol_is_conflict_free() {
 
 #[test]
 fn bd_db300_5_5_3_overlapping_workload_protocol_shows_conflict_reduction() {
-    let _guard = WRITER_ROUTING_PROTOCOL_LOCK.lock().expect("writer routing protocol lock");
+    let _guard = WRITER_ROUTING_PROTOCOL_LOCK
+        .lock()
+        .expect("writer routing protocol lock");
 
     let comparison = compare_writer_routing_synthetic_workload(
         &synthetic_config(
@@ -291,7 +306,9 @@ fn bd_db300_5_5_3_overlapping_workload_protocol_shows_conflict_reduction() {
 
 #[test]
 fn bd_db300_5_5_3_hot_page_workload_protocol_shows_publication_relief() {
-    let _guard = WRITER_ROUTING_PROTOCOL_LOCK.lock().expect("writer routing protocol lock");
+    let _guard = WRITER_ROUTING_PROTOCOL_LOCK
+        .lock()
+        .expect("writer routing protocol lock");
 
     let comparison = compare_writer_routing_synthetic_workload(
         &synthetic_config(

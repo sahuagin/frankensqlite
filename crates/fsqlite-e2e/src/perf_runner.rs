@@ -4468,23 +4468,8 @@ fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
             iteration_idx,
         )
     });
-    summary.comparison = Some(BenchmarkComparisonMetadata {
-        mode_id: mode_id.clone(),
-        row_id: None,
-        retry_policy_id: None,
-        seed_policy_id: None,
-        build_profile_id: None,
-        placement_profile_id: None,
-        hardware_class_id: None,
-        hardware_signature: None,
-        run_id: None,
-        source_revision: None,
-        beads_data_hash: None,
-        artifact_bundle_key: None,
-        artifact_bundle_relpath: None,
-        artifact_manifest_path: None,
-        canonical_artifact_manifest: None,
-    });
+    let comparison = BenchmarkComparisonMetadata::anonymous(&summary, mode_id.clone());
+    summary.comparison = Some(comparison);
     let error = benchmark_summary_error(&summary);
 
     CellOutcome {

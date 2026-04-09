@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
 
 use fsqlite_e2e::benchmark::{
-    BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark,
+    BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary,
+    build_benchmark_causal_scorecard_report, run_benchmark,
 };
 use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fixture_metadata::{
@@ -48,7 +49,7 @@ use fsqlite_e2e::fixture_select::{
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
-use fsqlite_e2e::methodology::EnvironmentMeta;
+use fsqlite_e2e::methodology::{EnvironmentMeta, MethodologyMeta};
 use fsqlite_e2e::oplog::{self, OpLog};
 #[cfg(test)]
 use fsqlite_e2e::perf_runner::HotPathConnectionCeremonyProfile;
@@ -78,6 +79,13 @@ const VERIFY_SUITE_FOCUSED_RERUN_NAME: &str = "focused_rerun_entrypoint.sh";
 const VERIFY_SUITE_LOG_NAME: &str = "logs/verify_suite.jsonl";
 const VERIFY_SUITE_COUNTEREXAMPLE_NAME: &str = "counterexamples/shadow_counterexample_bundle.json";
 const DEFAULT_VERIFY_SUITE_ID: &str = "db300_verification";
+const BENCHMARK_EVIDENCE_PACK_SCHEMA_V1: &str = "fsqlite-e2e.benchmark_evidence_pack.v1";
+const BENCHMARK_EVIDENCE_PACK_BEAD_ID: &str = "bd-db300.7.7";
+const BENCHMARK_EVIDENCE_PACK_MANIFEST_NAME: &str = "manifest.json";
+const BENCHMARK_EVIDENCE_PACK_RESULTS_NAME: &str = "bench/results.jsonl";
+const BENCHMARK_EVIDENCE_PACK_SUMMARY_NAME: &str = "bench/summary.md";
+const BENCHMARK_EVIDENCE_PACK_SCORECARDS_NAME: &str = "bench/scorecards.json";
+const BENCHMARK_EVIDENCE_PACK_RERUN_NAME: &str = "rerun_matrix.sh";
 const VERIFY_SUITE_REGIME_RED_PATH_CORRECTNESS: &str = "red_path_correctness";
 const VERIFY_SUITE_REGIME_LOW_CONCURRENCY_FIXED_COST: &str = "low_concurrency_fixed_cost";
 const VERIFY_SUITE_REGIME_MID_CONCURRENCY_SCALING: &str = "mid_concurrency_scaling";
@@ -355,6 +363,16 @@ struct BenchCampaignDefaults {
     concurrency: Vec<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchMatrixSelection {
+    golden_dir: PathBuf,
+    fixture_ids: Vec<String>,
+    presets: Vec<String>,
+    concurrency: Vec<u16>,
+    workspace_root: Option<PathBuf>,
+    canonical_fixture_paths: HashMap<String, PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunModeOptions {
     run_integrity_check: bool,
@@ -512,8 +530,79 @@ struct CanonicalBenchContext {
     run_id: String,
     source_revision: String,
     beads_data_hash: String,
+    command_entrypoint: String,
     command_line: String,
+    rerun_command: String,
+    retention_class: BenchmarkArtifactRetentionClass,
     tool_versions: Vec<BenchmarkArtifactToolVersion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchExecutionLane {
+    engine_name: &'static str,
+    engine_label: &'static str,
+    fsqlite_mvcc: bool,
+}
+
+#[derive(Debug)]
+struct BenchMatrixRequest<'a> {
+    selection: &'a BenchMatrixSelection,
+    lanes: &'a [BenchExecutionLane],
+    bench_cfg: &'a BenchmarkConfig,
+    cargo_profile: &'a str,
+    canonical_context: Option<&'a CanonicalBenchContext>,
+    output_jsonl: Option<&'a Path>,
+    pretty_stdout: bool,
+    emit_stdout: bool,
+}
+
+#[derive(Debug, Default)]
+struct BenchMatrixOutcome {
+    summaries: Vec<BenchmarkSummary>,
+    any_iteration_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BenchmarkEvidencePackRowArtifact {
+    benchmark_id: String,
+    mode_id: String,
+    fixture_id: String,
+    workload: String,
+    concurrency: u16,
+    row_id: Option<String>,
+    artifact_bundle_relpath: Option<String>,
+    artifact_manifest_path: Option<String>,
+    result_jsonl_path: Option<String>,
+    summary_md_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BenchmarkEvidencePackManifest {
+    schema_version: String,
+    bead_id: String,
+    run_id: String,
+    command_entrypoint: String,
+    command_line: String,
+    rerun_command: String,
+    workspace_root: String,
+    output_dir: String,
+    golden_dir: String,
+    source_revision: String,
+    beads_data_hash: String,
+    cargo_profile: String,
+    benchmark_config: MethodologyMeta,
+    requested_fixture_ids: Vec<String>,
+    requested_workloads: Vec<String>,
+    requested_concurrency: Vec<u16>,
+    modes: Vec<String>,
+    placement_profile_ids: Vec<String>,
+    results_jsonl_path: String,
+    summary_md_path: String,
+    scorecards_json_path: String,
+    summary_count: usize,
+    scorecard_group_count: usize,
+    row_artifacts: Vec<BenchmarkEvidencePackRowArtifact>,
+    environment: Option<EnvironmentMeta>,
 }
 
 fn benchmark_mode_from_engine_label(engine: &str) -> Option<BenchmarkMode> {
@@ -627,8 +716,35 @@ fn benchmark_tool_versions() -> Vec<BenchmarkArtifactToolVersion> {
     tool_versions
 }
 
-fn benchmark_command_line(argv: &[String]) -> String {
-    let mut parts = vec!["realdb-e2e".to_owned(), "bench".to_owned()];
+fn benchmark_command_line(subcommand: &str, argv: &[String]) -> String {
+    let mut parts = vec!["realdb-e2e".to_owned(), subcommand.to_owned()];
+    parts.extend(argv.iter().cloned());
+    parts
+        .iter()
+        .map(|part| shell_escape(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn benchmark_rerun_command(subcommand: &str, argv: &[String], cargo_profile: &str) -> String {
+    let mut parts = vec![
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "-p".to_owned(),
+        "fsqlite-e2e".to_owned(),
+        "--bin".to_owned(),
+        "realdb-e2e".to_owned(),
+    ];
+    match cargo_profile {
+        "release-perf" => {
+            parts.push("--profile".to_owned());
+            parts.push("release-perf".to_owned());
+        }
+        "release" => parts.push("--release".to_owned()),
+        _ => {}
+    }
+    parts.push("--".to_owned());
+    parts.push(subcommand.to_owned());
     parts.extend(argv.iter().cloned());
     parts
         .iter()
@@ -666,16 +782,42 @@ fn build_canonical_bench_context(
     workspace_root: &Path,
     argv: &[String],
 ) -> Option<CanonicalBenchContext> {
-    let campaign = load_beads_benchmark_campaign(workspace_root).ok()?;
-    let source_revision = resolve_bench_source_revision(workspace_root)?;
-    let beads_data_hash = resolve_bench_beads_data_hash(workspace_root, &campaign)?;
-    Some(CanonicalBenchContext {
+    try_build_canonical_bench_context(
+        workspace_root,
+        argv,
+        "bench",
+        BenchmarkArtifactRetentionClass::FullProof,
+    )
+    .ok()
+}
+
+fn try_build_canonical_bench_context(
+    workspace_root: &Path,
+    argv: &[String],
+    subcommand: &str,
+    retention_class: BenchmarkArtifactRetentionClass,
+) -> Result<CanonicalBenchContext, String> {
+    let campaign = load_beads_benchmark_campaign(workspace_root)?;
+    let source_revision = resolve_bench_source_revision(workspace_root).ok_or_else(|| {
+        "failed to resolve git HEAD for canonical benchmark provenance".to_owned()
+    })?;
+    let beads_data_hash =
+        resolve_bench_beads_data_hash(workspace_root, &campaign).ok_or_else(|| {
+            format!(
+                "failed to hash canonical Beads data file `{}`",
+                campaign.beads_data_relpath
+            )
+        })?;
+    Ok(CanonicalBenchContext {
         workspace_root: workspace_root.to_path_buf(),
         campaign,
         run_id: benchmark_run_id(),
         source_revision,
         beads_data_hash,
-        command_line: benchmark_command_line(argv),
+        command_entrypoint: format!("realdb-e2e {subcommand}"),
+        command_line: benchmark_command_line(subcommand, argv),
+        rerun_command: benchmark_rerun_command(subcommand, argv, cargo_profile_name()),
+        retention_class,
         tool_versions: benchmark_tool_versions(),
     })
 }
@@ -741,11 +883,11 @@ fn write_benchmark_artifact_bundle(
     let hardware_discovery_bundle = serde_json::json!({
         "schema_version": "fsqlite-e2e.hardware_discovery_bundle.v1",
         "fixture_id": summary.fixture_id,
-        "row_id": comparison.row_id,
-        "mode_id": comparison.mode_id,
-        "placement_profile_id": comparison.placement_profile_id,
-        "hardware_class_id": comparison.hardware_class_id,
-        "hardware_signature": comparison.hardware_signature,
+        "row_id": comparison.row_identity.row_id.as_deref(),
+        "mode_id": comparison.row_identity.mode_id.as_str(),
+        "placement_profile_id": comparison.row_identity.placement_profile_id.as_deref(),
+        "hardware_class_id": comparison.provenance.hardware_class_id.as_deref(),
+        "hardware_signature": comparison.provenance.hardware_signature.as_deref(),
         "cpu_affinity_mask": "unspecified",
         "smt_policy_state": "host_default",
         "memory_policy": "host_default",
@@ -773,14 +915,24 @@ fn write_benchmark_artifact_bundle(
     let hardware_discovery_summary = format!(
         "# Hardware Discovery\n\n- Fixture: `{}`\n- Row: `{}`\n- Mode: `{}`\n- Placement profile: `{}`\n- Hardware class: `{}`\n- Hardware signature: `{}`\n- OS: `{}`\n- Arch: `{}`\n- CPU count: `{}`\n- Cargo profile: `{}`\n",
         summary.fixture_id,
-        comparison.row_id.as_deref().unwrap_or("unknown"),
-        comparison.mode_id,
         comparison
+            .row_identity
+            .row_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        comparison.row_identity.mode_id.as_str(),
+        comparison
+            .row_identity
             .placement_profile_id
             .as_deref()
             .unwrap_or("unknown"),
-        comparison.hardware_class_id.as_deref().unwrap_or("unknown"),
         comparison
+            .provenance
+            .hardware_class_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        comparison
+            .provenance
             .hardware_signature
             .as_deref()
             .unwrap_or("unknown"),
@@ -829,8 +981,8 @@ fn attach_canonical_benchmark_metadata(
         &cell,
         BenchmarkArtifactProvenanceCapture {
             run_id: context.run_id.clone(),
-            retention_class: BenchmarkArtifactRetentionClass::FullProof,
-            command_entrypoint: "realdb-e2e bench".to_owned(),
+            retention_class: context.retention_class,
+            command_entrypoint: context.command_entrypoint.clone(),
             source_revision: context.source_revision.clone(),
             beads_data_hash: context.beads_data_hash.clone(),
             kernel_release: summary.environment.os.clone(),
@@ -842,30 +994,12 @@ fn attach_canonical_benchmark_metadata(
             fallback_notes: Vec::new(),
         },
     )?;
-    let artifact_manifest_path = format!(
-        "{}/{}",
-        manifest.artifact_bundle_relpath, manifest.artifact_names.manifest_json
+    let comparison = BenchmarkComparisonMetadata::canonical(
+        &summary,
+        manifest,
+        canonical_hardware_signature(&context.campaign, &cell.hardware_class_id),
     );
-    summary.comparison = Some(BenchmarkComparisonMetadata {
-        mode_id: mode.as_str().to_owned(),
-        row_id: Some(manifest.row_id.clone()),
-        retry_policy_id: Some(manifest.retry_policy_id.clone()),
-        seed_policy_id: Some(manifest.seed_policy_id.clone()),
-        build_profile_id: Some(manifest.build_profile_id.clone()),
-        placement_profile_id: Some(manifest.placement_profile_id.clone()),
-        hardware_class_id: Some(manifest.hardware_class_id.clone()),
-        hardware_signature: canonical_hardware_signature(
-            &context.campaign,
-            &manifest.hardware_class_id,
-        ),
-        run_id: Some(manifest.run_id.clone()),
-        source_revision: Some(context.source_revision.clone()),
-        beads_data_hash: Some(context.beads_data_hash.clone()),
-        artifact_bundle_key: Some(manifest.artifact_bundle_key.clone()),
-        artifact_bundle_relpath: Some(manifest.artifact_bundle_relpath.clone()),
-        artifact_manifest_path: Some(artifact_manifest_path),
-        canonical_artifact_manifest: Some(manifest),
-    });
+    summary.comparison = Some(comparison);
     write_benchmark_artifact_bundle(&context.workspace_root, &summary)?;
     Ok(summary)
 }
@@ -2165,6 +2299,404 @@ fn validate_verify_suite_shadow_contract(
     Ok(())
 }
 
+fn benchmark_engine_lanes(engine: &str, mvcc: bool) -> Result<Vec<BenchExecutionLane>, String> {
+    match engine {
+        "sqlite3" => Ok(vec![BenchExecutionLane {
+            engine_name: "sqlite3",
+            engine_label: "sqlite3",
+            fsqlite_mvcc: false,
+        }]),
+        "fsqlite" => Ok(vec![BenchExecutionLane {
+            engine_name: "fsqlite",
+            engine_label: if mvcc {
+                "fsqlite_mvcc"
+            } else {
+                "fsqlite_single_writer"
+            },
+            fsqlite_mvcc: mvcc,
+        }]),
+        "both" => Ok(vec![
+            BenchExecutionLane {
+                engine_name: "sqlite3",
+                engine_label: "sqlite3",
+                fsqlite_mvcc: false,
+            },
+            BenchExecutionLane {
+                engine_name: "fsqlite",
+                engine_label: if mvcc {
+                    "fsqlite_mvcc"
+                } else {
+                    "fsqlite_single_writer"
+                },
+                fsqlite_mvcc: mvcc,
+            },
+        ]),
+        other => Err(format!(
+            "unknown --engine `{other}` (expected sqlite3|fsqlite|both)"
+        )),
+    }
+}
+
+fn benchmark_all_mode_lanes() -> [BenchExecutionLane; 3] {
+    [
+        BenchExecutionLane {
+            engine_name: "sqlite3",
+            engine_label: "sqlite3",
+            fsqlite_mvcc: false,
+        },
+        BenchExecutionLane {
+            engine_name: "fsqlite",
+            engine_label: "fsqlite_single_writer",
+            fsqlite_mvcc: false,
+        },
+        BenchExecutionLane {
+            engine_name: "fsqlite",
+            engine_label: "fsqlite_mvcc",
+            fsqlite_mvcc: true,
+        },
+    ]
+}
+
+fn resolve_bench_matrix_selection(
+    mut golden_dir: PathBuf,
+    golden_dir_overridden: bool,
+    mut fixture_ids: Vec<String>,
+    db_overridden: bool,
+    mut presets: Vec<String>,
+    mut concurrency: Vec<u16>,
+    concurrency_overridden: bool,
+) -> Result<BenchMatrixSelection, String> {
+    let needs_canonical_defaults = !golden_dir_overridden
+        || !db_overridden
+        || !concurrency_overridden
+        || presets.is_empty()
+        || presets.iter().any(|preset| preset == "all");
+    let workspace_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_bench_workspace_root(&cwd));
+
+    let canonical_defaults = if needs_canonical_defaults {
+        match workspace_root.as_deref() {
+            Some(workspace_root) => Some(canonical_bench_defaults(workspace_root)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if !golden_dir_overridden {
+        if let Some(defaults) = &canonical_defaults {
+            golden_dir.clone_from(&defaults.golden_dir);
+        }
+    }
+
+    if !concurrency_overridden {
+        if let Some(defaults) = &canonical_defaults {
+            concurrency.clone_from(&defaults.concurrency);
+        }
+    }
+
+    if presets.is_empty() || presets.iter().any(|preset| preset == "all") {
+        presets = canonical_defaults
+            .as_ref()
+            .map_or_else(default_bench_presets, |defaults| defaults.presets.clone());
+    }
+
+    if fixture_ids.is_empty() {
+        if !golden_dir_overridden {
+            if let Some(defaults) = &canonical_defaults {
+                fixture_ids.clone_from(&defaults.fixture_ids);
+            }
+        }
+        if fixture_ids.is_empty() {
+            fixture_ids = discover_golden_fixture_ids(&golden_dir)?;
+        }
+    }
+
+    let canonical_fixture_paths = canonical_defaults
+        .as_ref()
+        .filter(|defaults| golden_dir == defaults.golden_dir)
+        .map_or_else(HashMap::new, |defaults| defaults.fixture_paths.clone());
+
+    Ok(BenchMatrixSelection {
+        golden_dir,
+        fixture_ids,
+        presets,
+        concurrency,
+        workspace_root,
+        canonical_fixture_paths,
+    })
+}
+
+fn prepare_output_path(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "failed to create output directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn truncate_output_file(path: &Path) -> Result<(), String> {
+    prepare_output_path(path)?;
+    fs::File::create(path)
+        .map(|_| ())
+        .map_err(|error| format!("failed to create output file {}: {error}", path.display()))
+}
+
+fn write_output_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    prepare_output_path(path)?;
+    fs::write(path, contents)
+        .map_err(|error| format!("failed to write output file {}: {error}", path.display()))
+}
+
+fn execute_benchmark_matrix(
+    request: &BenchMatrixRequest<'_>,
+) -> Result<BenchMatrixOutcome, String> {
+    let mut outcome = BenchMatrixOutcome::default();
+
+    for fixture_id in &request.selection.fixture_ids {
+        let golden_path =
+            if let Some(path) = request.selection.canonical_fixture_paths.get(fixture_id) {
+                path.clone()
+            } else {
+                resolve_golden_db_in(&request.selection.golden_dir, fixture_id)?
+            };
+
+        for preset in &request.selection.presets {
+            for &concurrency in &request.selection.concurrency {
+                for lane in request.lanes {
+                    let meta = BenchmarkMeta {
+                        engine: lane.engine_label.to_owned(),
+                        workload: preset.to_owned(),
+                        fixture_id: fixture_id.to_owned(),
+                        concurrency,
+                        cargo_profile: request.cargo_profile.to_owned(),
+                    };
+
+                    let sqlite_cfg = SqliteExecConfig {
+                        run_integrity_check: false,
+                        ..SqliteExecConfig::default()
+                    };
+                    let fsqlite_cfg = FsqliteExecConfig {
+                        concurrent_mode: lane.fsqlite_mvcc,
+                        run_integrity_check: false,
+                        ..FsqliteExecConfig::default()
+                    };
+
+                    let mut summary = run_benchmark(request.bench_cfg, &meta, |global_idx| {
+                        let _ = global_idx;
+                        let tempdir = tempfile::tempdir()
+                            .map_err(|error| format!("failed to create temp dir: {error}"))?;
+                        let work_db = tempdir.path().join("work.db");
+                        copy_db_with_sidecars(&golden_path, &work_db)?;
+
+                        let oplog = resolve_workload(preset, fixture_id, concurrency)?;
+
+                        if lane.engine_name == "sqlite3" {
+                            run_oplog_sqlite(&work_db, &oplog, &sqlite_cfg)
+                                .map_err(|error| format!("{error}"))
+                        } else {
+                            run_oplog_fsqlite(&work_db, &oplog, &fsqlite_cfg)
+                                .map_err(|error| format!("{error}"))
+                        }
+                    });
+                    if let Some(context) = request.canonical_context {
+                        match attach_canonical_benchmark_metadata(summary.clone(), context) {
+                            Ok(enriched) => summary = enriched,
+                            Err(error) => {
+                                eprintln!(
+                                    "warning: failed to attach canonical benchmark metadata for {}:{}:{}:c{}: {error}",
+                                    lane.engine_label, preset, fixture_id, concurrency
+                                );
+                            }
+                        }
+                    }
+
+                    outcome.any_iteration_error |= summary
+                        .iterations
+                        .iter()
+                        .any(|iteration| iteration.error.is_some());
+
+                    if let Some(path) = request.output_jsonl {
+                        let compact = summary.to_jsonl().map_err(|error| {
+                            format!("failed to serialize benchmark for JSONL output: {error}")
+                        })?;
+                        append_jsonl_line(path, &compact).map_err(|error| {
+                            format!(
+                                "failed to append benchmark JSONL output {}: {error}",
+                                path.display()
+                            )
+                        })?;
+                    }
+
+                    if request.emit_stdout {
+                        let rendered = if request.pretty_stdout {
+                            summary
+                                .to_pretty_json()
+                                .map_err(|error| format!("serialize benchmark: {error}"))?
+                        } else {
+                            summary
+                                .to_jsonl()
+                                .map_err(|error| format!("serialize benchmark: {error}"))?
+                        };
+                        println!("{rendered}");
+                    }
+
+                    outcome.summaries.push(summary);
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn unique_sorted_strings(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn path_string_for_manifest(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root).map_or_else(
+        |_| path.display().to_string(),
+        |relative| relative.display().to_string(),
+    )
+}
+
+fn scorecard_row_artifacts(
+    summaries: &[BenchmarkSummary],
+) -> Vec<BenchmarkEvidencePackRowArtifact> {
+    summaries
+        .iter()
+        .map(|summary| {
+            let comparison = summary.comparison.as_ref();
+            let artifact_layout = comparison.and_then(|meta| meta.artifact_layout.as_ref());
+            BenchmarkEvidencePackRowArtifact {
+                benchmark_id: summary.benchmark_id.clone(),
+                mode_id: summary.comparison_mode_id().to_owned(),
+                fixture_id: summary.fixture_id.clone(),
+                workload: summary.workload.clone(),
+                concurrency: summary.concurrency,
+                row_id: comparison.and_then(|meta| meta.row_identity.row_id.clone()),
+                artifact_bundle_relpath: artifact_layout
+                    .map(|layout| layout.artifact_bundle_relpath.clone()),
+                artifact_manifest_path: artifact_layout
+                    .map(|layout| layout.artifact_manifest_path.clone()),
+                result_jsonl_path: artifact_layout.map(|layout| layout.result_jsonl_path.clone()),
+                summary_md_path: artifact_layout.map(|layout| layout.summary_md_path.clone()),
+            }
+        })
+        .collect()
+}
+
+fn write_benchmark_evidence_pack(
+    output_dir: &Path,
+    selection: &BenchMatrixSelection,
+    summaries: &[BenchmarkSummary],
+    bench_cfg: &BenchmarkConfig,
+    cargo_profile: &str,
+    context: &CanonicalBenchContext,
+) -> Result<BenchmarkEvidencePackManifest, String> {
+    let results_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_RESULTS_NAME);
+    let summary_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_SUMMARY_NAME);
+    let scorecards_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_SCORECARDS_NAME);
+    let rerun_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_RERUN_NAME);
+    let manifest_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_MANIFEST_NAME);
+
+    let mut results_jsonl = summaries
+        .iter()
+        .map(BenchmarkSummary::to_jsonl)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("serialize benchmark evidence pack JSONL: {error}"))?
+        .join("\n");
+    if !results_jsonl.is_empty() {
+        results_jsonl.push('\n');
+    }
+    write_output_file(&results_path, results_jsonl.as_bytes())?;
+
+    let summary_md = render_benchmark_summaries_markdown(summaries);
+    write_output_file(&summary_path, summary_md.as_bytes())?;
+
+    let scorecard_report = build_benchmark_causal_scorecard_report(summaries);
+    let scorecards_json = serde_json::to_vec_pretty(&scorecard_report)
+        .map_err(|error| format!("serialize benchmark causal scorecards: {error}"))?;
+    write_output_file(&scorecards_path, &scorecards_json)?;
+
+    let rerun_script = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\n{}\n",
+        context.rerun_command
+    );
+    write_output_file(&rerun_path, rerun_script.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        let permissions = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&rerun_path, permissions).map_err(|error| {
+            format!(
+                "failed to mark benchmark evidence rerun script executable {}: {error}",
+                rerun_path.display()
+            )
+        })?;
+    }
+
+    let placement_profile_ids = unique_sorted_strings(
+        summaries
+            .iter()
+            .filter_map(|summary| {
+                summary
+                    .comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.row_identity.placement_profile_id.clone())
+            })
+            .collect(),
+    );
+    let manifest = BenchmarkEvidencePackManifest {
+        schema_version: BENCHMARK_EVIDENCE_PACK_SCHEMA_V1.to_owned(),
+        bead_id: BENCHMARK_EVIDENCE_PACK_BEAD_ID.to_owned(),
+        run_id: context.run_id.clone(),
+        command_entrypoint: context.command_entrypoint.clone(),
+        command_line: context.command_line.clone(),
+        rerun_command: context.rerun_command.clone(),
+        workspace_root: context.workspace_root.display().to_string(),
+        output_dir: path_string_for_manifest(&context.workspace_root, output_dir),
+        golden_dir: path_string_for_manifest(&context.workspace_root, &selection.golden_dir),
+        source_revision: context.source_revision.clone(),
+        beads_data_hash: context.beads_data_hash.clone(),
+        cargo_profile: cargo_profile.to_owned(),
+        benchmark_config: bench_cfg.methodology_meta(),
+        requested_fixture_ids: selection.fixture_ids.clone(),
+        requested_workloads: selection.presets.clone(),
+        requested_concurrency: selection.concurrency.clone(),
+        modes: unique_sorted_strings(
+            summaries
+                .iter()
+                .map(|summary| summary.comparison_mode_id().to_owned())
+                .collect(),
+        ),
+        placement_profile_ids,
+        results_jsonl_path: path_string_for_manifest(&context.workspace_root, &results_path),
+        summary_md_path: path_string_for_manifest(&context.workspace_root, &summary_path),
+        scorecards_json_path: path_string_for_manifest(&context.workspace_root, &scorecards_path),
+        summary_count: summaries.len(),
+        scorecard_group_count: scorecard_report.groups.len(),
+        row_artifacts: scorecard_row_artifacts(summaries),
+        environment: summaries.first().map(|summary| summary.environment.clone()),
+    };
+
+    let manifest_json = serde_json::to_vec_pretty(&manifest)
+        .map_err(|error| format!("serialize benchmark evidence manifest: {error}"))?;
+    write_output_file(&manifest_path, &manifest_json)?;
+
+    Ok(manifest)
+}
+
 fn sanitize_verify_suite_component(raw: &str) -> String {
     sanitize_db_id(raw).unwrap_or_else(|_| "unknown".to_owned())
 }
@@ -2585,6 +3117,7 @@ where
         "corpus" => cmd_corpus(&tail[1..]),
         "run" => cmd_run(&tail[1..]),
         "bench" => cmd_bench(&tail[1..]),
+        "evidence-pack" => cmd_evidence_pack(&tail[1..]),
         "verify-suite" => cmd_verify_suite(&tail[1..]),
         "hot-profile" => cmd_hot_profile(&tail[1..]),
         "corrupt" => cmd_corrupt(&tail[1..]),
@@ -2613,6 +3146,7 @@ SUBCOMMANDS:
     corpus verify           Verify golden copies against checksums.sha256
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
+    evidence-pack           Run the canonical three-mode benchmark matrix and write a scorecard pack
     verify-suite            Resolve and package one-command verification suite entrypoints
     hot-profile             Capture hot-path evidence for a benchmark preset
     corrupt                 Inject corruption into a working copy
@@ -2629,6 +3163,7 @@ EXAMPLES:
     realdb-e2e run --engine sqlite3 --db beads-proj-a --workload commutative_inserts --concurrency 4
     realdb-e2e run --engine fsqlite --db beads-proj-a --workload hot_page_contention --concurrency 8
     realdb-e2e bench --db beads-proj-a --preset all
+    realdb-e2e evidence-pack --repeat 1
     realdb-e2e verify-suite --mode fsqlite_mvcc --placement-profile recommended_pinned --verification-depth full
     realdb-e2e hot-profile --db beads-proj-a --workload mixed_read_write --concurrency 4
     realdb-e2e corrupt --db beads-proj-a --strategy page --page 1 --seed 42
@@ -4626,255 +5161,72 @@ fn cmd_bench(argv: &[String]) -> i32 {
         }
         i += 1;
     }
-
-    let needs_canonical_defaults = !golden_dir_overridden
-        || !db_overridden
-        || !concurrency_overridden
-        || presets.is_empty()
-        || presets.iter().any(|preset| preset == "all");
-    let workspace_root = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| find_bench_workspace_root(&cwd));
-
-    let canonical_defaults = if needs_canonical_defaults {
-        match workspace_root.as_deref() {
-            Some(workspace_root) => match canonical_bench_defaults(workspace_root) {
-                Ok(defaults) => Some(defaults),
-                Err(e) => {
-                    eprintln!("error: failed to load canonical Beads benchmark defaults: {e}");
-                    return 1;
-                }
-            },
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    if !golden_dir_overridden {
-        if let Some(defaults) = &canonical_defaults {
-            golden_dir.clone_from(&defaults.golden_dir);
-        }
-    }
-
-    if !concurrency_overridden {
-        if let Some(defaults) = &canonical_defaults {
-            concurrency.clone_from(&defaults.concurrency);
-        }
-    }
-
-    if presets.is_empty() || presets.iter().any(|p| p == "all") {
-        presets = canonical_defaults
-            .as_ref()
-            .map_or_else(default_bench_presets, |defaults| defaults.presets.clone());
-    }
-
-    if fixture_ids.is_empty() {
-        if !golden_dir_overridden {
-            if let Some(defaults) = &canonical_defaults {
-                fixture_ids.clone_from(&defaults.fixture_ids);
-            }
-        }
-        if fixture_ids.is_empty() {
-            match discover_golden_fixture_ids(&golden_dir) {
-                Ok(ids) => fixture_ids = ids,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-        }
-    }
-
     let bench_cfg = BenchmarkConfig {
         warmup_iterations,
         min_iterations,
         measurement_time_secs,
     };
+    let selection = match resolve_bench_matrix_selection(
+        golden_dir,
+        golden_dir_overridden,
+        fixture_ids,
+        db_overridden,
+        presets,
+        concurrency,
+        concurrency_overridden,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("error: failed to resolve benchmark matrix selection: {error}");
+            return 1;
+        }
+    };
+    let lanes = match benchmark_engine_lanes(&engine, mvcc) {
+        Ok(lanes) => lanes,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 2;
+        }
+    };
 
     let cargo_profile = cargo_profile_name();
-    let canonical_context = workspace_root
+    let canonical_context = selection
+        .workspace_root
         .as_deref()
         .and_then(|workspace_root| build_canonical_bench_context(workspace_root, argv));
-    let mut summaries: Vec<BenchmarkSummary> = Vec::new();
-    let mut any_iteration_error = false;
-
-    // If an output file is specified, truncate it up front so this run produces a
-    // clean report artifact (rather than appending to an existing file).
     if let Some(ref path) = output_jsonl {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!(
-                        "error: failed to create output directory {}: {e}",
-                        parent.display()
-                    );
-                    return 1;
-                }
-            }
-        }
-        if let Err(e) = fs::File::create(path) {
-            eprintln!(
-                "error: failed to create output file {}: {e}",
-                path.display()
-            );
+        if let Err(error) = truncate_output_file(path) {
+            eprintln!("error: {error}");
             return 1;
         }
     }
-
-    let canonical_fixture_paths = canonical_defaults
-        .as_ref()
-        .filter(|defaults| golden_dir == defaults.golden_dir)
-        .map_or_else(HashMap::new, |defaults| defaults.fixture_paths.clone());
-
-    for fixture_id in &fixture_ids {
-        let golden_path = if let Some(path) = canonical_fixture_paths.get(fixture_id) {
-            path.clone()
-        } else {
-            match resolve_golden_db_in(&golden_dir, fixture_id) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return 1;
-                }
-            }
-        };
-
-        for preset in &presets {
-            for &c in &concurrency {
-                let engines: Vec<(&str, bool)> = match engine.as_str() {
-                    "sqlite3" => vec![("sqlite3", false)],
-                    "fsqlite" => vec![("fsqlite", mvcc)],
-                    "both" => vec![("sqlite3", false), ("fsqlite", mvcc)],
-                    other => {
-                        eprintln!(
-                            "error: unknown --engine `{other}` (expected sqlite3|fsqlite|both)"
-                        );
-                        return 2;
-                    }
-                };
-
-                for (engine_name, fsqlite_mvcc) in engines {
-                    let engine_label = match (engine_name, fsqlite_mvcc) {
-                        ("fsqlite", true) => "fsqlite_mvcc",
-                        ("fsqlite", false) => "fsqlite_single_writer",
-                        _ => engine_name,
-                    };
-
-                    let meta = BenchmarkMeta {
-                        engine: engine_label.to_owned(),
-                        workload: preset.to_owned(),
-                        fixture_id: fixture_id.to_owned(),
-                        concurrency: c,
-                        cargo_profile: cargo_profile.to_owned(),
-                    };
-
-                    let sqlite_cfg = SqliteExecConfig {
-                        run_integrity_check: false,
-                        ..SqliteExecConfig::default()
-                    };
-                    let fsqlite_cfg = FsqliteExecConfig {
-                        concurrent_mode: fsqlite_mvcc,
-                        run_integrity_check: false,
-                        ..FsqliteExecConfig::default()
-                    };
-
-                    let mut summary = run_benchmark(&bench_cfg, &meta, |global_idx| {
-                        let _ = global_idx; // currently unused, but kept for future run-id tagging.
-                        let td = tempfile::tempdir()
-                            .map_err(|e| format!("failed to create temp dir: {e}"))?;
-                        let work_db = td.path().join("work.db");
-                        copy_db_with_sidecars(&golden_path, &work_db)?;
-
-                        let oplog = resolve_workload(preset, fixture_id, c)?;
-
-                        if engine_name == "sqlite3" {
-                            run_oplog_sqlite(&work_db, &oplog, &sqlite_cfg)
-                                .map_err(|e| format!("{e}"))
-                        } else {
-                            run_oplog_fsqlite(&work_db, &oplog, &fsqlite_cfg)
-                                .map_err(|e| format!("{e}"))
-                        }
-                    });
-                    if let Some(ref context) = canonical_context {
-                        match attach_canonical_benchmark_metadata(summary.clone(), context) {
-                            Ok(enriched) => summary = enriched,
-                            Err(error) => {
-                                eprintln!(
-                                    "warning: failed to attach canonical benchmark metadata for {}:{}:{}:c{}: {error}",
-                                    engine_label, preset, fixture_id, c
-                                );
-                            }
-                        }
-                    }
-
-                    any_iteration_error |= summary.iterations.iter().any(|it| it.error.is_some());
-
-                    let line = if pretty {
-                        summary
-                            .to_pretty_json()
-                            .map_err(|e| format!("serialize benchmark: {e}"))
-                    } else {
-                        summary
-                            .to_jsonl()
-                            .map_err(|e| format!("serialize benchmark: {e}"))
-                    };
-
-                    let text = match line {
-                        Ok(t) => t,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            return 1;
-                        }
-                    };
-
-                    if let Some(ref path) = output_jsonl {
-                        let compact = match summary.to_jsonl() {
-                            Ok(t) => t,
-                            Err(e) => {
-                                eprintln!(
-                                    "error: failed to serialize benchmark for JSONL output: {e}"
-                                );
-                                return 1;
-                            }
-                        };
-                        if let Err(e) = append_jsonl_line(path, &compact) {
-                            eprintln!("error: failed to append JSONL output: {e}");
-                            return 1;
-                        }
-                    }
-
-                    println!("{text}");
-                    summaries.push(summary);
-                }
-            }
+    let execution = match execute_benchmark_matrix(&BenchMatrixRequest {
+        selection: &selection,
+        lanes: &lanes,
+        bench_cfg: &bench_cfg,
+        cargo_profile,
+        canonical_context: canonical_context.as_ref(),
+        output_jsonl: output_jsonl.as_deref(),
+        pretty_stdout: pretty,
+        emit_stdout: true,
+    }) {
+        Ok(execution) => execution,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
         }
-    }
+    };
 
     if let Some(path) = output_md.as_deref() {
-        let md = render_benchmark_summaries_markdown(&summaries);
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!(
-                        "error: failed to create output directory {}: {e}",
-                        parent.display()
-                    );
-                    return 1;
-                }
-            }
-        }
-        if let Err(e) = fs::write(path, md.as_bytes()) {
-            eprintln!(
-                "error: failed to write markdown report {}: {e}",
-                path.display()
-            );
+        let md = render_benchmark_summaries_markdown(&execution.summaries);
+        if let Err(error) = write_output_file(path, md.as_bytes()) {
+            eprintln!("error: {error}");
             return 1;
         }
         eprintln!("Wrote markdown report: {}", path.display());
     }
 
-    i32::from(any_iteration_error)
+    i32::from(execution.any_iteration_error)
 }
 
 fn print_bench_help() {
@@ -4905,6 +5257,271 @@ OPTIONS:
     --output-jsonl <PATH>   Append compact JSONL BenchmarkSummary records to PATH
     --output-md <PATH>      Write a Markdown report to PATH (rendered from summaries)
     --pretty                Pretty-print JSON to stdout (default: JSONL)
+    -h, --help              Show this help message
+";
+    let _ = io::stdout().write_all(text.as_bytes());
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_evidence_pack(argv: &[String]) -> i32 {
+    if argv.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_evidence_pack_help();
+        return 0;
+    }
+
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+    let mut fixture_ids: Vec<String> = Vec::new();
+    let mut presets: Vec<String> = Vec::new();
+    let mut concurrency: Vec<u16> = vec![1, 2, 4, 8];
+    let defaults = BenchmarkConfig::default();
+    let mut warmup_iterations = defaults.warmup_iterations;
+    let mut min_iterations = defaults.min_iterations;
+    let mut measurement_time_secs = defaults.measurement_time_secs;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut golden_dir_overridden = false;
+    let mut db_overridden = false;
+    let mut concurrency_overridden = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--golden-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --golden-dir requires a directory path");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&argv[i]);
+                golden_dir_overridden = true;
+            }
+            "--db" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db requires a fixture id or comma-separated list");
+                    return 2;
+                }
+                db_overridden = true;
+                for part in argv[i].split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        fixture_ids.push(part.to_owned());
+                    }
+                }
+            }
+            "--preset" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --preset requires a preset name or comma-separated list");
+                    return 2;
+                }
+                for part in argv[i].split(',') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        presets.push(part.to_owned());
+                    }
+                }
+            }
+            "--concurrency" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --concurrency requires an integer or comma-separated list");
+                    return 2;
+                }
+                match parse_u16_list(&argv[i]) {
+                    Ok(values) => {
+                        concurrency = values;
+                        concurrency_overridden = true;
+                    }
+                    Err(error) => {
+                        eprintln!("error: {error}");
+                        return 2;
+                    }
+                }
+            }
+            "--warmup" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --warmup requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --warmup: `{}`", argv[i]);
+                    return 2;
+                };
+                warmup_iterations = value;
+            }
+            "--repeat" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --repeat requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --repeat: `{}`", argv[i]);
+                    return 2;
+                };
+                if value == 0 {
+                    eprintln!("error: --repeat must be >= 1");
+                    return 2;
+                }
+                min_iterations = value;
+                measurement_time_secs = 0;
+            }
+            "--min-iters" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --min-iters requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --min-iters: `{}`", argv[i]);
+                    return 2;
+                };
+                min_iterations = value;
+            }
+            "--time-secs" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --time-secs requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --time-secs: `{}`", argv[i]);
+                    return 2;
+                };
+                measurement_time_secs = value;
+            }
+            "--output-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-dir requires a path");
+                    return 2;
+                }
+                output_dir = Some(PathBuf::from(&argv[i]));
+            }
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let bench_cfg = BenchmarkConfig {
+        warmup_iterations,
+        min_iterations,
+        measurement_time_secs,
+    };
+    let selection = match resolve_bench_matrix_selection(
+        golden_dir,
+        golden_dir_overridden,
+        fixture_ids,
+        db_overridden,
+        presets,
+        concurrency,
+        concurrency_overridden,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("error: failed to resolve canonical evidence-pack matrix: {error}");
+            return 1;
+        }
+    };
+    let Some(workspace_root) = selection.workspace_root.as_deref() else {
+        eprintln!(
+            "error: evidence-pack requires the checked-in canonical Beads benchmark campaign"
+        );
+        return 1;
+    };
+    let canonical_context = match try_build_canonical_bench_context(
+        workspace_root,
+        argv,
+        "evidence-pack",
+        BenchmarkArtifactRetentionClass::FinalScorecard,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("error: failed to build canonical evidence-pack provenance: {error}");
+            return 1;
+        }
+    };
+    let output_dir = output_dir.unwrap_or_else(|| {
+        canonical_context
+            .workspace_root
+            .join("artifacts")
+            .join("perf")
+            .join(BENCHMARK_EVIDENCE_PACK_BEAD_ID)
+            .join(&canonical_context.run_id)
+    });
+    let results_path = output_dir.join(BENCHMARK_EVIDENCE_PACK_RESULTS_NAME);
+    if let Err(error) = truncate_output_file(&results_path) {
+        eprintln!("error: {error}");
+        return 1;
+    }
+
+    let lanes = benchmark_all_mode_lanes();
+    let cargo_profile = cargo_profile_name();
+    let execution = match execute_benchmark_matrix(&BenchMatrixRequest {
+        selection: &selection,
+        lanes: &lanes,
+        bench_cfg: &bench_cfg,
+        cargo_profile,
+        canonical_context: Some(&canonical_context),
+        output_jsonl: Some(&results_path),
+        pretty_stdout: false,
+        emit_stdout: false,
+    }) {
+        Ok(execution) => execution,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let manifest = match write_benchmark_evidence_pack(
+        &output_dir,
+        &selection,
+        &execution.summaries,
+        &bench_cfg,
+        cargo_profile,
+        &canonical_context,
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("error: failed to write benchmark evidence pack: {error}");
+            return 1;
+        }
+    };
+    eprintln!("Wrote benchmark evidence pack: {}", output_dir.display());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&manifest)
+            .unwrap_or_else(|_| format!("{{\"output_dir\":\"{}\"}}", output_dir.display()))
+    );
+
+    i32::from(execution.any_iteration_error)
+}
+
+fn print_evidence_pack_help() {
+    let text = "\
+realdb-e2e evidence-pack — Run the canonical three-mode matrix and assemble a scorecard pack
+
+USAGE:
+    realdb-e2e evidence-pack [OPTIONS]
+
+OPTIONS:
+    --golden-dir <DIR>      Golden directory (default: canonical Beads campaign working golden/,
+                            else sample_sqlite_db_files/golden)
+    --db <DB_ID>            Database fixture id, or comma-separated list
+                            (default: canonical campaign fixtures, else all DBs in golden dir)
+    --preset <NAME>         Workload preset, or comma-separated list
+                            (default: canonical campaign workloads, else all wired presets)
+    --concurrency <N|LIST>  Concurrency levels (default: canonical campaign matrix 1,4,8,
+                            else 1,2,4,8)
+    --warmup <N>            Warmup iterations discarded (default: methodology default)
+    --repeat <N>            Exact measurement iterations (sets --min-iters=N and --time-secs=0)
+    --min-iters <N>         Minimum measurement iterations (default: methodology default)
+    --time-secs <N>         Measurement time floor in seconds (default: methodology default)
+    --output-dir <PATH>     Evidence-pack root (default: artifacts/perf/bd-db300.7.7/<run_id>)
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -6280,15 +6897,21 @@ fn quote_ident(name: &str) -> String {
 }
 
 fn cargo_profile_name() -> &'static str {
+    if let Some(profile) = option_env!("PROFILE") {
+        return match profile {
+            "debug" => "dev",
+            other => other,
+        };
+    }
     if cfg!(debug_assertions) {
-        "dev"
-    } else if option_env!("OPT_LEVEL") == Some("3") {
+        return "dev";
+    }
+    if option_env!("OPT_LEVEL") == Some("3") {
         // release-perf inherits release but sets opt-level = 3.
         // Plain release uses opt-level = "z".
-        "release-perf"
-    } else {
-        "release"
+        return "release-perf";
     }
+    "release"
 }
 
 fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
@@ -6782,20 +7405,23 @@ fn cmd_compare(argv: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_e2e::benchmark::{IterationRecord, LatencyStats, ThroughputStats};
     use fsqlite_e2e::fixture_select::{
         BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1, BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1,
         BeadsBenchmarkCampaign, BeadsBenchmarkFixture, BeadsBenchmarkMatrixRow,
-        BenchmarkArtifactContract, BenchmarkArtifactProvenanceCapture,
-        BenchmarkArtifactRetentionClass, BenchmarkArtifactRetentionPolicy, BenchmarkMode,
-        BuildProfile, ExpandedBenchmarkCell, HARDWARE_CLASS_LINUX_X86_64_ANY, HardwareClass,
-        HardwareClassIdFields, HardwareCpuArchitecture, HardwareOsFamily, HardwareTopologyClass,
-        PlacementAvailability, PlacementClaimContract, PlacementCpuAffinityPolicy,
-        PlacementExecutionContract, PlacementFocusedRerunContract,
-        PlacementFocusedRerunSelectorKind, PlacementHelperLanePolicy, PlacementMemoryPolicy,
-        PlacementProfile, PlacementProfileKind, PlacementSmtPolicy,
-        PlacementSuiteSelectionContract, PlacementSuiteSelectorKind, PlacementVariant,
-        PlacementViolationDisposition, RetryPolicy, SeedPolicy, build_benchmark_artifact_manifest,
+        BenchmarkArtifactCommand, BenchmarkArtifactContract, BenchmarkArtifactProvenanceCapture,
+        BenchmarkArtifactRetentionClass, BenchmarkArtifactRetentionPolicy,
+        BenchmarkArtifactToolVersion, BenchmarkMode, BuildProfile, ExpandedBenchmarkCell,
+        HARDWARE_CLASS_LINUX_X86_64_ANY, HardwareClass, HardwareClassIdFields,
+        HardwareCpuArchitecture, HardwareOsFamily, HardwareTopologyClass, PlacementAvailability,
+        PlacementClaimContract, PlacementCpuAffinityPolicy, PlacementExecutionContract,
+        PlacementFocusedRerunContract, PlacementFocusedRerunSelectorKind,
+        PlacementHelperLanePolicy, PlacementMemoryPolicy, PlacementProfile, PlacementProfileKind,
+        PlacementSmtPolicy, PlacementSuiteSelectionContract, PlacementSuiteSelectorKind,
+        PlacementVariant, PlacementViolationDisposition, RetryPolicy, SeedPolicy,
+        build_benchmark_artifact_manifest,
     };
+    use fsqlite_e2e::methodology::{EnvironmentCaptureMode, EnvironmentMeta, MethodologyMeta};
     use fsqlite_e2e::perf_runner::{
         HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
@@ -7266,7 +7892,11 @@ mod tests {
                 fixtures: vec!["frankensqlite".to_owned()],
                 workload: "mixed_read_write".to_owned(),
                 concurrency: 4,
-                modes: vec![BenchmarkMode::FsqliteMvcc],
+                modes: vec![
+                    BenchmarkMode::SqliteReference,
+                    BenchmarkMode::FsqliteSingleWriter,
+                    BenchmarkMode::FsqliteMvcc,
+                ],
                 placement_variants: vec![PlacementVariant {
                     placement_profile_id: "baseline_unpinned".to_owned(),
                     hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
@@ -7295,14 +7925,25 @@ mod tests {
                 hardware_discovery_summary_md_name: "hardware_discovery_summary.md".to_owned(),
                 logs_dir_name: "logs".to_owned(),
                 profiles_dir_name: "profiles".to_owned(),
-                retention_policies: vec![BenchmarkArtifactRetentionPolicy {
-                    class: BenchmarkArtifactRetentionClass::FailureBundle,
-                    description:
-                        "Failure bundle kept immutably for diagnosis and replay.".to_owned(),
-                    superseded_by_newer: false,
-                    immutable: true,
-                    authoritative: true,
-                }],
+                retention_policies: vec![
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::FailureBundle,
+                        description:
+                            "Failure bundle kept immutably for diagnosis and replay.".to_owned(),
+                        superseded_by_newer: false,
+                        immutable: true,
+                        authoritative: true,
+                    },
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::FinalScorecard,
+                        description:
+                            "Final scorecard bundle kept for operator-facing comparisons."
+                                .to_owned(),
+                        superseded_by_newer: false,
+                        immutable: true,
+                        authoritative: true,
+                    },
+                ],
             },
         }
     }
@@ -7320,6 +7961,94 @@ mod tests {
             build_profile_id: "release_perf".to_owned(),
             seed_policy_id: "fixed_seed_42".to_owned(),
         }
+    }
+
+    fn sample_benchmark_cell_for_mode(mode: BenchmarkMode) -> ExpandedBenchmarkCell {
+        let mut cell = sample_benchmark_cell();
+        cell.mode = mode;
+        cell
+    }
+
+    fn sample_benchmark_summary(
+        workspace_root: &Path,
+        mode: BenchmarkMode,
+        engine: &str,
+        wall_time_ms: u64,
+    ) -> BenchmarkSummary {
+        let mut summary = BenchmarkSummary {
+            benchmark_id: format!("{engine}:mixed_read_write:frankensqlite:c4"),
+            engine: engine.to_owned(),
+            workload: "mixed_read_write".to_owned(),
+            fixture_id: "frankensqlite".to_owned(),
+            concurrency: 4,
+            methodology: MethodologyMeta::current(),
+            environment: EnvironmentMeta {
+                capture_mode: EnvironmentCaptureMode::Captured,
+                os: "Linux 6.17.0-test".to_owned(),
+                arch: "x86_64".to_owned(),
+                cpu_count: 16,
+                cpu_model: Some("Test CPU".to_owned()),
+                ram_bytes: Some(64 * 1_073_741_824),
+                rustc_version: "rustc 1.91.0-nightly".to_owned(),
+                cargo_profile: "release-perf".to_owned(),
+            },
+            warmup_count: 1,
+            measurement_count: 1,
+            total_measurement_ms: wall_time_ms,
+            latency: LatencyStats {
+                min_ms: wall_time_ms as f64,
+                max_ms: wall_time_ms as f64,
+                mean_ms: wall_time_ms as f64,
+                median_ms: wall_time_ms as f64,
+                p95_ms: wall_time_ms as f64,
+                p99_ms: wall_time_ms as f64,
+                stddev_ms: 0.0,
+            },
+            throughput: ThroughputStats {
+                mean_ops_per_sec: 100.0,
+                median_ops_per_sec: 100.0,
+                peak_ops_per_sec: 100.0,
+            },
+            comparison: None,
+            iterations: vec![IterationRecord {
+                iteration: 0,
+                wall_time_ms,
+                ops_per_sec: 100.0,
+                ops_total: 100,
+                retries: 0,
+                aborts: 0,
+                error: None,
+            }],
+        };
+        let manifest = build_benchmark_artifact_manifest(
+            workspace_root,
+            &sample_benchmark_campaign(),
+            &sample_benchmark_cell_for_mode(mode),
+            BenchmarkArtifactProvenanceCapture {
+                run_id: "run-20260409T000000Z".to_owned(),
+                retention_class: BenchmarkArtifactRetentionClass::FinalScorecard,
+                command_entrypoint: "realdb-e2e evidence-pack".to_owned(),
+                source_revision: "1234567890abcdef1234567890abcdef12345678".to_owned(),
+                beads_data_hash: "a".repeat(64),
+                kernel_release: "Linux 6.17.0-test".to_owned(),
+                commands: vec![BenchmarkArtifactCommand {
+                    tool: "realdb-e2e".to_owned(),
+                    command_line: "realdb-e2e evidence-pack --repeat 1".to_owned(),
+                }],
+                tool_versions: vec![BenchmarkArtifactToolVersion {
+                    tool: "cargo".to_owned(),
+                    version: "cargo 1.91.0-nightly".to_owned(),
+                }],
+                fallback_notes: Vec::new(),
+            },
+        )
+        .expect("sample benchmark manifest should build");
+        summary.comparison = Some(BenchmarkComparisonMetadata::canonical(
+            &summary,
+            manifest,
+            Some("linux:x86_64:any".to_owned()),
+        ));
+        summary
     }
 
     fn sample_hot_path_manifest() -> HotPathArtifactManifest {
@@ -8380,8 +9109,143 @@ mod tests {
     }
 
     #[test]
+    fn test_evidence_pack_help() {
+        assert_eq!(run_with(&["realdb-e2e", "evidence-pack", "--help"]), 0);
+    }
+
+    #[test]
     fn test_verify_suite_help() {
         assert_eq!(run_with(&["realdb-e2e", "verify-suite", "--help"]), 0);
+    }
+
+    #[test]
+    fn benchmark_evidence_pack_writes_unified_scorecards() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let workspace_root = tempdir.path().to_path_buf();
+        let output_dir = workspace_root.join("artifacts/perf/bd-db300.7.7/run-1");
+        let selection = BenchMatrixSelection {
+            golden_dir: workspace_root.join("golden"),
+            fixture_ids: vec!["frankensqlite".to_owned()],
+            presets: vec!["mixed_read_write".to_owned()],
+            concurrency: vec![4],
+            workspace_root: Some(workspace_root.clone()),
+            canonical_fixture_paths: HashMap::new(),
+        };
+        let context = CanonicalBenchContext {
+            workspace_root: workspace_root.clone(),
+            campaign: sample_benchmark_campaign(),
+            run_id: "run-20260409T000000Z".to_owned(),
+            source_revision: "1234567890abcdef1234567890abcdef12345678".to_owned(),
+            beads_data_hash: "a".repeat(64),
+            command_entrypoint: "realdb-e2e evidence-pack".to_owned(),
+            command_line: "realdb-e2e evidence-pack --repeat 1".to_owned(),
+            rerun_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- evidence-pack --repeat 1"
+                .to_owned(),
+            retention_class: BenchmarkArtifactRetentionClass::FinalScorecard,
+            tool_versions: vec![BenchmarkArtifactToolVersion {
+                tool: "cargo".to_owned(),
+                version: "cargo 1.91.0-nightly".to_owned(),
+            }],
+        };
+        let bench_cfg = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 1,
+            measurement_time_secs: 0,
+        };
+        let summaries = vec![
+            sample_benchmark_summary(
+                &workspace_root,
+                BenchmarkMode::SqliteReference,
+                "sqlite3",
+                1_000,
+            ),
+            sample_benchmark_summary(
+                &workspace_root,
+                BenchmarkMode::FsqliteSingleWriter,
+                "fsqlite_single_writer",
+                700,
+            ),
+            sample_benchmark_summary(
+                &workspace_root,
+                BenchmarkMode::FsqliteMvcc,
+                "fsqlite_mvcc",
+                400,
+            ),
+        ];
+
+        let manifest = write_benchmark_evidence_pack(
+            &output_dir,
+            &selection,
+            &summaries,
+            &bench_cfg,
+            "release-perf",
+            &context,
+        )
+        .expect("evidence pack should be written");
+
+        assert_eq!(manifest.schema_version, BENCHMARK_EVIDENCE_PACK_SCHEMA_V1);
+        assert_eq!(manifest.bead_id, BENCHMARK_EVIDENCE_PACK_BEAD_ID);
+        assert_eq!(manifest.cargo_profile, "release-perf");
+        assert_eq!(manifest.benchmark_config.warmup_iterations, 0);
+        assert_eq!(manifest.benchmark_config.min_measurement_iterations, 1);
+        assert_eq!(manifest.benchmark_config.measurement_time_secs, 0);
+        assert_eq!(manifest.summary_count, 3);
+        assert_eq!(manifest.scorecard_group_count, 1);
+        assert_eq!(
+            manifest.modes,
+            vec![
+                "fsqlite_mvcc".to_owned(),
+                "fsqlite_single_writer".to_owned(),
+                "sqlite_reference".to_owned(),
+            ]
+        );
+        assert_eq!(manifest.row_artifacts.len(), 3);
+        assert!(
+            output_dir
+                .join(BENCHMARK_EVIDENCE_PACK_MANIFEST_NAME)
+                .is_file()
+        );
+        assert!(
+            output_dir
+                .join(BENCHMARK_EVIDENCE_PACK_RESULTS_NAME)
+                .is_file()
+        );
+        assert!(
+            output_dir
+                .join(BENCHMARK_EVIDENCE_PACK_SUMMARY_NAME)
+                .is_file()
+        );
+        assert!(
+            output_dir
+                .join(BENCHMARK_EVIDENCE_PACK_SCORECARDS_NAME)
+                .is_file()
+        );
+        assert!(
+            output_dir
+                .join(BENCHMARK_EVIDENCE_PACK_RERUN_NAME)
+                .is_file()
+        );
+
+        let summary_md = fs::read_to_string(output_dir.join(BENCHMARK_EVIDENCE_PACK_SUMMARY_NAME))
+            .expect("summary markdown should exist");
+        assert!(summary_md.contains("## Causal Scorecards"));
+        assert!(summary_md.contains("mixed_read_write"));
+
+        let scorecards: Value = serde_json::from_str(
+            &fs::read_to_string(output_dir.join(BENCHMARK_EVIDENCE_PACK_SCORECARDS_NAME))
+                .expect("scorecards JSON should exist"),
+        )
+        .expect("scorecards JSON should parse");
+        assert_eq!(
+            scorecards["schema_version"],
+            "fsqlite-e2e.benchmark_causal_scorecard_report.v1"
+        );
+        assert_eq!(
+            scorecards["groups"][0]["scorecards"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
     }
 
     #[test]

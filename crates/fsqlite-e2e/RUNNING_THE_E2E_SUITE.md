@@ -183,6 +183,34 @@ becomes `true`, `run_mode.run_integrity_check` becomes `false`,
 `integrity_check_ok` field is omitted. Default runs remain full correctness
 runs with captured environment metadata.
 
+## 3. Canonical Scorecard Evidence Pack
+
+Use the dedicated evidence-pack entrypoint when you need the canonical
+three-mode benchmark matrix plus one top-level scorecard bundle.
+
+```bash
+cargo run --profile release-perf -p fsqlite-e2e --bin realdb-e2e -- evidence-pack
+```
+
+For a quicker smoke pass that still covers the full fixture/workload/concurrency
+matrix, pin the measurement count explicitly:
+
+```bash
+cargo run --profile release-perf -p fsqlite-e2e --bin realdb-e2e -- evidence-pack --repeat 1
+```
+
+The output goes under `artifacts/perf/bd-db300.7.7/<run_id>/` by default and
+includes:
+
+- `manifest.json` — top-level evidence-pack manifest with rerun command and row artifact links
+- `bench/results.jsonl` — unified `BenchmarkSummary` rows across SQLite, single-writer, and MVCC
+- `bench/summary.md` — markdown report with direct comparisons and causal scorecards
+- `bench/scorecards.json` — machine-readable G1.x causal scorecard report
+- `rerun_matrix.sh` — executable rerun script for the exact captured invocation
+
+Each benchmark row still writes its own canonical per-row bundle under the
+campaign artifact root with `final_scorecard` retention.
+
 ### Interpreting Results
 
 **SHA-256 match (all three tiers agree):**
