@@ -202,6 +202,24 @@ fn assert_protocol_artifact_fields(artifact: &RoutingProtocolArtifact) {
             "protocol artifact should include required field `{field}`"
         );
     }
+    for field in [
+        "trace_id",
+        "scenario_id",
+        "placement_profile",
+        "workload_shape",
+        "conflict_rate_reduction",
+        "retry_rate_reduction",
+        "fallback_rate_reduction",
+        "publication_retry_rate_reduction",
+        "remote_ownership_events_reduction",
+        "ops_per_sec_improvement",
+        "fairness_jain_delta",
+    ] {
+        assert!(
+            artifact_json["comparison"].get(field).is_some(),
+            "protocol comparison should include required field `{field}`"
+        );
+    }
     let cases = artifact_json["cases"]
         .as_array()
         .expect("protocol cases should serialize as an array");
