@@ -202,7 +202,9 @@ impl StatementColdState {
         Self(0)
     }
 
+    #[cfg(test)]
     #[must_use]
+    #[allow(dead_code)]
     const fn contains(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }

@@ -39,7 +39,10 @@ impl ConnectionPoolTelemetrySample {
     /// Total queries observed across every tracked connection.
     #[must_use]
     pub fn total_queries(&self) -> u64 {
-        self.connections.iter().map(|conn| conn.queries_executed).sum()
+        self.connections
+            .iter()
+            .map(|conn| conn.queries_executed)
+            .sum()
     }
 
     /// Total prepare calls observed across every tracked connection.
@@ -237,7 +240,10 @@ impl ConnectionPoolValidator {
     }
 
     #[must_use]
-    pub fn validate(&self, sample: &ConnectionPoolTelemetrySample) -> ConnectionPoolValidationReport {
+    pub fn validate(
+        &self,
+        sample: &ConnectionPoolTelemetrySample,
+    ) -> ConnectionPoolValidationReport {
         let stale_connections = sample.stale_connection_count(self.config.stale_idle_threshold_ms);
         let stale_snapshot_holders = sample.stale_snapshot_holder_count(
             self.config.stale_idle_threshold_ms,
@@ -259,23 +265,39 @@ impl ConnectionPoolValidator {
         let mut findings = Vec::new();
 
         self.detect_single_connection_serialization(sample, &mut findings);
-        self.detect_over_pooling(sample, recommended_pool_size, stale_connections, &mut findings);
-        self.detect_stale_snapshots(sample, stale_connections, stale_snapshot_holders, &mut findings);
+        self.detect_over_pooling(
+            sample,
+            recommended_pool_size,
+            stale_connections,
+            &mut findings,
+        );
+        self.detect_stale_snapshots(
+            sample,
+            stale_connections,
+            stale_snapshot_holders,
+            &mut findings,
+        );
         self.detect_connection_thrashing(sample, &mut findings);
         self.detect_unprepared_hot_loop(sample, &mut findings);
 
-        let health = findings.iter().fold(ConnectionPoolHealth::Healthy, |health, finding| {
-            match finding.severity {
-                ConnectionPoolSeverity::Critical => ConnectionPoolHealth::Critical,
-                ConnectionPoolSeverity::Warn if health == ConnectionPoolHealth::Healthy => {
-                    ConnectionPoolHealth::NeedsAttention
-                }
-                _ => health,
-            }
-        });
+        let health =
+            findings.iter().fold(
+                ConnectionPoolHealth::Healthy,
+                |health, finding| match finding.severity {
+                    ConnectionPoolSeverity::Critical => ConnectionPoolHealth::Critical,
+                    ConnectionPoolSeverity::Warn if health == ConnectionPoolHealth::Healthy => {
+                        ConnectionPoolHealth::NeedsAttention
+                    }
+                    _ => health,
+                },
+            );
 
-        let recommendation =
-            self.recommendation_for(sample, recommended_pool_size, stale_snapshot_holders, &findings);
+        let recommendation = self.recommendation_for(
+            sample,
+            recommended_pool_size,
+            stale_snapshot_holders,
+            &findings,
+        );
 
         ConnectionPoolValidationReport {
             health,
@@ -322,7 +344,8 @@ impl ConnectionPoolValidator {
         findings: &mut Vec<ConnectionPoolFinding>,
     ) {
         let pool_limit = recommended_pool_size.saturating_mul(self.config.over_pool_multiplier);
-        if sample.configured_pool_size <= pool_limit || sample.observed_active_connections > recommended_pool_size
+        if sample.configured_pool_size <= pool_limit
+            || sample.observed_active_connections > recommended_pool_size
         {
             return;
         }
@@ -331,7 +354,8 @@ impl ConnectionPoolValidator {
             pattern: ConnectionPoolPattern::OverPooling,
             severity: ConnectionPoolSeverity::Warn,
             confidence_score: 0.82,
-            summary: "The configured pool is materially larger than observed useful parallelism.".to_owned(),
+            summary: "The configured pool is materially larger than observed useful parallelism."
+                .to_owned(),
             evidence: vec![
                 format!("configured_pool_size={}", sample.configured_pool_size),
                 format!("recommended_pool_size={recommended_pool_size}"),
@@ -363,7 +387,8 @@ impl ConnectionPoolValidator {
                 ConnectionPoolSeverity::Warn
             },
             confidence_score: 0.9,
-            summary: "Long-idle connections are retaining snapshots or open transactions.".to_owned(),
+            summary: "Long-idle connections are retaining snapshots or open transactions."
+                .to_owned(),
             evidence: vec![
                 format!("stale_connections={stale_connections}"),
                 format!("stale_snapshot_holders={stale_snapshot_holders}"),
@@ -374,8 +399,9 @@ impl ConnectionPoolValidator {
             ],
         });
 
-        if sample.connections.iter().any(|conn| conn.open_transactions > 0 && conn.idle_ms >= self.config.stale_idle_threshold_ms)
-        {
+        if sample.connections.iter().any(|conn| {
+            conn.open_transactions > 0 && conn.idle_ms >= self.config.stale_idle_threshold_ms
+        }) {
             findings.push(ConnectionPoolFinding {
                 pattern: ConnectionPoolPattern::StaleIdleSnapshot,
                 severity: ConnectionPoolSeverity::Critical,
@@ -441,7 +467,8 @@ impl ConnectionPoolValidator {
             pattern: ConnectionPoolPattern::UnpreparedHotLoop,
             severity: ConnectionPoolSeverity::Warn,
             confidence_score: 0.78,
-            summary: "The pool is spending too much work preparing statements in hot query paths.".to_owned(),
+            summary: "The pool is spending too much work preparing statements in hot query paths."
+                .to_owned(),
             evidence: vec![
                 format!("total_queries={total_queries}"),
                 format!("total_prepare_calls={total_prepare_calls}"),
@@ -536,23 +563,19 @@ pub fn best_practices(
     let mut practices = vec![
         ConnectionPoolBestPractice {
             title: "Prefer multiple writer connections",
-            guidance:
-                "FrankenSQLite is designed for concurrent writers. Do not collapse the application onto one shared writer connection unless the workload is truly single-threaded.",
+            guidance: "FrankenSQLite is designed for concurrent writers. Do not collapse the application onto one shared writer connection unless the workload is truly single-threaded.",
         },
         ConnectionPoolBestPractice {
             title: "Start pool sizing at min(cpu_cores, writer concurrency)",
-            guidance:
-                "Use enough connections to expose writer parallelism, but stop growing the pool once the workload no longer has real concurrent work to issue.",
+            guidance: "Use enough connections to expose writer parallelism, but stop growing the pool once the workload no longer has real concurrent work to issue.",
         },
         ConnectionPoolBestPractice {
             title: "Recycle stale idle connections",
-            guidance:
-                "Idle connections that retain snapshots or transactions can delay cleanup and keep old visibility state alive longer than necessary.",
+            guidance: "Idle connections that retain snapshots or transactions can delay cleanup and keep old visibility state alive longer than necessary.",
         },
         ConnectionPoolBestPractice {
             title: "Prepare hot statements per connection",
-            guidance:
-                "Avoid reparsing and repreparing the same SQL inside tight loops. Reuse prepared statements or enable a statement cache in the pool wrapper.",
+            guidance: "Avoid reparsing and repreparing the same SQL inside tight loops. Reuse prepared statements or enable a statement cache in the pool wrapper.",
         },
     ];
 
@@ -642,9 +665,12 @@ mod tests {
         sample.concurrent_writers = 2;
 
         let report = validate_connection_pool(&sample);
-        assert!(report.findings.iter().any(|finding| {
-            finding.pattern == ConnectionPoolPattern::OverPooling
-        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.pattern == ConnectionPoolPattern::OverPooling })
+        );
         assert!(report.recommendation.recommended_pool_size < sample.configured_pool_size);
     }
 
@@ -662,9 +688,12 @@ mod tests {
         });
 
         let report = validate_connection_pool(&sample);
-        assert!(report.findings.iter().any(|finding| {
-            finding.pattern == ConnectionPoolPattern::StaleIdleSnapshot
-        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.pattern == ConnectionPoolPattern::StaleIdleSnapshot })
+        );
         assert!(report.summary.stale_snapshot_holders >= 1);
     }
 
@@ -677,9 +706,12 @@ mod tests {
         sample.measurement_window_ms = 60_000;
 
         let report = validate_connection_pool(&sample);
-        assert!(report.findings.iter().any(|finding| {
-            finding.pattern == ConnectionPoolPattern::ConnectionThrashing
-        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.pattern == ConnectionPoolPattern::ConnectionThrashing })
+        );
     }
 
     #[test]
@@ -690,9 +722,12 @@ mod tests {
         }
 
         let report = validate_connection_pool(&sample);
-        assert!(report.findings.iter().any(|finding| {
-            finding.pattern == ConnectionPoolPattern::UnpreparedHotLoop
-        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.pattern == ConnectionPoolPattern::UnpreparedHotLoop })
+        );
     }
 
     #[test]
@@ -711,7 +746,10 @@ mod tests {
         heavy.peak_concurrent_checkout_requests = 8;
         let heavy_report = validator.validate(&heavy);
 
-        assert!(heavy_report.recommendation.recommended_pool_size >= light_report.recommendation.recommended_pool_size);
+        assert!(
+            heavy_report.recommendation.recommended_pool_size
+                >= light_report.recommendation.recommended_pool_size
+        );
         assert_eq!(heavy_report.recommendation.recommended_pool_size, 4);
     }
 
@@ -726,7 +764,9 @@ mod tests {
     fn test_best_practices_include_mvcc_specific_guidance() {
         let practices = best_practices(ConnectionPoolWorkloadProfile::WriteHeavy);
         assert!(practices.iter().any(|practice| {
-            practice.guidance.contains("FrankenSQLite is designed for concurrent writers")
+            practice
+                .guidance
+                .contains("FrankenSQLite is designed for concurrent writers")
         }));
     }
 
@@ -742,8 +782,11 @@ mod tests {
         sample.connections[0].active_snapshot_age_ms = Some(200);
 
         let report = validator.validate(&sample);
-        assert!(report.findings.iter().any(|finding| {
-            finding.pattern == ConnectionPoolPattern::StaleIdleSnapshot
-        }));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| { finding.pattern == ConnectionPoolPattern::StaleIdleSnapshot })
+        );
     }
 }
