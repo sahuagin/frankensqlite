@@ -1116,6 +1116,8 @@ Tests (SLT format) covering:
 
 The canonical target/version contract is pinned in
 `sqlite_version_contract.toml` and referenced by parity harness reports.
+The human-readable scope lock for that contract lives in
+`docs/canonical_parity_contract.md`.
 
 - All DML and DDL operations
 - All join types (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)
@@ -2523,7 +2525,8 @@ A: SQLite's C codebase is well-engineered but carries 24 years of accumulated co
 A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
 surface, measured by running the SQLite test corpus against both implementations
 and comparing results. Any intentional divergence is documented and annotated
-with rationale. The canonical contract file is `sqlite_version_contract.toml`.
+with rationale. The canonical contract file is `sqlite_version_contract.toml`,
+and the corresponding scope document is `docs/canonical_parity_contract.md`.
 
 **Q: How does MVCC garbage collection affect latency?**
 A: The current runtime uses epoch-based reclamation rather than a periodic sweep. Commit-time version maintenance prunes unreachable versions, and retired arena slots are batch-freed only after all pinned readers have advanced past the retire epoch, keeping reclamation incremental without a background GC loop.

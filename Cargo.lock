@@ -1055,6 +1055,7 @@ dependencies = [
  "fsqlite-observability",
  "fsqlite-pager",
  "fsqlite-types",
+ "fsqlite-vfs",
  "fsqlite-wal",
  "loom",
  "nix 0.29.0",
