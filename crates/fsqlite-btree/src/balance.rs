@@ -60,6 +60,7 @@ struct PreparedLeafTableLocalSplit {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
 pub(crate) struct QuickBalanceResult {
     pub(crate) new_pgno: PageNumber,
     pub(crate) new_page_data: PageData,
@@ -237,6 +238,7 @@ pub fn balance_quick<W: PageWriter>(
     .map(|result| result.new_pgno))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
@@ -380,7 +382,7 @@ pub(crate) fn balance_quick_known_divider_rowid<W: PageWriter>(
 
 fn quick_balance_divider_rowid<W: PageWriter>(
     cx: &Cx,
-    writer: &mut W,
+    writer: &W,
     leaf_page_no: PageNumber,
     overflow_rowid: i64,
     usable_size: u32,

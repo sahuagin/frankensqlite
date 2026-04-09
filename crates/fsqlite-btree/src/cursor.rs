@@ -109,6 +109,34 @@ pub trait PageWriter: PageReader {
         self.write_page(cx, page_no, data.as_bytes())
     }
 
+    /// Temporarily take ownership of an unpublished staged page image.
+    ///
+    /// Implementations that sit directly on top of a transaction write-set can
+    /// override this to let the cursor mutate the authoritative staged page in
+    /// place instead of cloning a second page image for retained append hints.
+    fn try_take_staged_page_data(&mut self, _page_no: PageNumber) -> Option<PageData> {
+        None
+    }
+
+    /// Mutate an unpublished staged page already owned by the transaction.
+    fn try_mutate_staged_page_data(
+        &mut self,
+        _page_no: PageNumber,
+        _f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        false
+    }
+
+    /// Restore a page image previously taken with `try_take_staged_page_data`.
+    fn restore_staged_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        self.write_page_data(cx, page_no, data)
+    }
+
     /// Allocate a new page.
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
     /// Free a page.
@@ -157,6 +185,10 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
     fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         self.txn.get_page(cx, page_no)
     }
+
+    fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
+        self.txn.prefetch_page_hint(cx, page_no);
+    }
 }
 
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
@@ -166,6 +198,27 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.txn.write_page_data(cx, page_no, data)
+    }
+
+    fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        <T as TransactionHandle>::try_take_staged_page_data(self.txn, page_no)
+    }
+
+    fn try_mutate_staged_page_data(
+        &mut self,
+        page_no: PageNumber,
+        f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        <T as TransactionHandle>::try_mutate_staged_page_data(self.txn, page_no, f)
+    }
+
+    fn restore_staged_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        <T as TransactionHandle>::restore_staged_page_data(self.txn, cx, page_no, data)
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
@@ -426,7 +479,7 @@ pub struct TableAppendHint {
     last_rowid: i64,
     tree_depth: usize,
     parent_page: Option<PageNumber>,
-    page_data: PageData,
+    page_data: Option<PageData>,
     header: BtreePageHeader,
 }
 
@@ -450,6 +503,17 @@ impl TableAppendHint {
     pub const fn parent_page(&self) -> Option<PageNumber> {
         self.parent_page
     }
+
+    #[must_use]
+    pub fn without_page_data(mut self) -> Self {
+        self.page_data = None;
+        self
+    }
+
+    #[must_use]
+    pub const fn retains_page_data(&self) -> bool {
+        self.page_data.is_some()
+    }
 }
 
 impl From<&RightmostLeafCacheEntry> for TableAppendHint {
@@ -459,7 +523,7 @@ impl From<&RightmostLeafCacheEntry> for TableAppendHint {
             last_rowid: value.rowid,
             tree_depth: value.tree_depth,
             parent_page: value.parent_page,
-            page_data: value.page_data.clone(),
+            page_data: Some(value.page_data.clone()),
             header: value.header,
         }
     }
@@ -1293,6 +1357,14 @@ impl<P: PageReader> BtCursor<P> {
     fn current_tree_depth_hint(&self) -> Option<usize> {
         if self.stack.is_empty() {
             self.last_known_depth
+        } else if self.stack.len() == 1 {
+            self.stack.last().and_then(|entry| {
+                self.rightmost_leaf_cache
+                    .as_ref()
+                    .filter(|cached| cached.page_no == entry.page_no)
+                    .map(|cached| cached.tree_depth)
+                    .or(Some(1))
+            })
         } else {
             Some(self.stack.len())
         }
@@ -2786,32 +2858,55 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
-        if self
+        if let Some(cached) = self
             .rightmost_leaf_cache
-            .as_ref()
-            .is_some_and(|cached| cached.rowid == rowid)
+            .clone()
+            .filter(|cached| cached.rowid == rowid)
         {
-            return Ok(());
+            let cursor_on_cached_leaf = !self.at_eof
+                && self.stack.last().is_some_and(|entry| {
+                    entry.page_no == cached.page_no
+                        && entry.header.page_type == cell::BtreePageType::LeafTable
+                });
+            if cursor_on_cached_leaf {
+                return Ok(());
+            }
+
+            if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
+                self.stack.clear();
+                self.stack.push(StackEntry {
+                    page_no: cached.page_no,
+                    page_data: cached.page_data.clone(),
+                    header: cached.header,
+                    cell_pointers: cached.cell_pointers.clone(),
+                    cell_idx,
+                });
+                self.at_eof = false;
+                self.last_known_depth = Some(cached.tree_depth);
+                return Ok(());
+            }
         }
 
-        let parent_page = self.current_parent_page_hint_from_stack();
         if !self.at_eof
-            && let Some(cache_entry) = self.stack.last().and_then(|entry| {
-                (entry.header.page_type == cell::BtreePageType::LeafTable).then(|| {
-                    RightmostLeafCacheEntry {
-                        page_no: entry.page_no,
-                        rowid,
-                        tree_depth: self.current_tree_depth_hint().unwrap_or(1),
-                        parent_page,
-                        page_data: entry.page_data.clone(),
-                        header: entry.header,
-                        cell_pointers: entry.cell_pointers.clone(),
-                    }
-                })
-            })
+            && self
+                .stack
+                .last()
+                .is_some_and(|entry| entry.header.page_type == cell::BtreePageType::LeafTable)
+            && self.rowid(cx)? == rowid
         {
-            self.rightmost_leaf_cache = Some(cache_entry);
-            return Ok(());
+            let parent_page = self.current_parent_page_hint_from_stack();
+            if let Some(cache_entry) = self.stack.last().map(|entry| RightmostLeafCacheEntry {
+                page_no: entry.page_no,
+                rowid,
+                tree_depth: self.current_tree_depth_hint().unwrap_or(1),
+                parent_page,
+                page_data: entry.page_data.clone(),
+                header: entry.header,
+                cell_pointers: entry.cell_pointers.clone(),
+            }) {
+                self.rightmost_leaf_cache = Some(cache_entry);
+                return Ok(());
+            }
         }
 
         if self.last(cx)? {
@@ -2837,7 +2932,16 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     fn current_parent_page_hint_from_stack(&self) -> Option<PageNumber> {
-        (self.stack.len() >= 2).then(|| self.stack[self.stack.len() - 2].page_no)
+        if self.stack.len() >= 2 {
+            return Some(self.stack[self.stack.len() - 2].page_no);
+        }
+
+        self.stack.last().and_then(|entry| {
+            self.rightmost_leaf_cache
+                .as_ref()
+                .filter(|cached| cached.page_no == entry.page_no)
+                .and_then(|cached| cached.parent_page)
+        })
     }
 
     fn write_overflow_chain_for_insert(
@@ -3520,9 +3624,8 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
-    fn try_append_table_leaf_payload_in_place_no_overflow(
-        &mut self,
-        cx: &Cx,
+    fn try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
+        usable_size: u32,
         leaf_page_no: PageNumber,
         page_data: &mut PageData,
         header: &mut BtreePageHeader,
@@ -3530,11 +3633,9 @@ impl<P: PageWriter> BtCursor<P> {
         payload: &[u8],
     ) -> Result<Option<(u16, u16)>> {
         let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
-        let local_size = cell::local_payload_size(
-            payload_size,
-            self.usable_size,
-            cell::BtreePageType::LeafTable,
-        ) as usize;
+        let local_size =
+            cell::local_payload_size(payload_size, usable_size, cell::BtreePageType::LeafTable)
+                as usize;
         let local_size = local_size.min(payload.len());
         if local_size < payload.len() {
             return Ok(None);
@@ -3548,7 +3649,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let insert_idx = header.cell_count;
-        let content_offset = header.content_offset(self.usable_size);
+        let content_offset = header.content_offset(usable_size);
         let Some(new_content_offset) = content_offset.checked_sub(cell_len) else {
             return Ok(None);
         };
@@ -3608,7 +3709,30 @@ impl<P: PageWriter> BtCursor<P> {
         instrumentation::record_fast_table_leaf_payload_append_mutate(
             u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
+        Ok(Some((insert_idx, new_cell_offset)))
+    }
 
+    fn try_append_table_leaf_payload_in_place_no_overflow(
+        &mut self,
+        cx: &Cx,
+        leaf_page_no: PageNumber,
+        page_data: &mut PageData,
+        header: &mut BtreePageHeader,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<Option<(u16, u16)>> {
+        let Some((insert_idx, new_cell_offset)) =
+            Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
+                self.usable_size,
+                leaf_page_no,
+                page_data,
+                header,
+                rowid,
+                payload,
+            )?
+        else {
+            return Ok(None);
+        };
         let staged_page = page_data.clone();
         let stage_start = std::time::Instant::now();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
@@ -4650,7 +4774,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(true) => {
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
-                return Ok(());
+                Ok(())
             }
             Ok(false) => {
                 instrumentation::record_conservative_reload_fallback();
@@ -4661,14 +4785,14 @@ impl<P: PageWriter> BtCursor<P> {
                 } else if let Some(first) = overflow_head {
                     let _ = self.free_overflow_chain(cx, first);
                 }
-                return balance_result;
+                balance_result
             }
             Err(error) => {
                 self.cell_buf = cell_data;
                 if let Some(first) = overflow_head {
                     let _ = self.free_overflow_chain(cx, first);
                 }
-                return Err(error);
+                Err(error)
             }
         }
     }
@@ -4958,6 +5082,35 @@ impl<P: PageWriter> BtCursor<P> {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
         }
+        let header_offset = cell::header_offset_for_page(hinted_leaf_page);
+        let cell_pointers =
+            match cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset) {
+                Ok(cell_pointers) => cell_pointers,
+                Err(_) => {
+                    self.clear_rightmost_leaf_cache();
+                    return Ok(None);
+                }
+            };
+        let Some(last_ptr) = cell_pointers.last().copied() else {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
+        };
+        let actual_last_rowid = match CellRef::parse(
+            page_data.as_bytes(),
+            usize::from(last_ptr),
+            header.page_type,
+            self.usable_size,
+        ) {
+            Ok(cell) => cell.rowid,
+            Err(_) => {
+                self.clear_rightmost_leaf_cache();
+                return Ok(None);
+            }
+        };
+        if actual_last_rowid != Some(hinted_last_rowid) {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
+        }
 
         if let Some((insert_idx, _)) = self.try_append_table_leaf_payload_in_place_no_overflow(
             cx,
@@ -4967,7 +5120,6 @@ impl<P: PageWriter> BtCursor<P> {
             rowid,
             data,
         )? {
-            let header_offset = cell::header_offset_for_page(hinted_leaf_page);
             let cell_pointers =
                 cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
             self.last_insert_rowid = Some(rowid);
@@ -4994,7 +5146,7 @@ impl<P: PageWriter> BtCursor<P> {
                 last_rowid: rowid,
                 tree_depth: hinted_tree_depth,
                 parent_page: self.current_parent_page_hint_from_stack(),
-                page_data,
+                page_data: Some(page_data),
                 header,
             }));
         }
@@ -5010,7 +5162,6 @@ impl<P: PageWriter> BtCursor<P> {
         );
         match append_result {
             Ok(Some((insert_idx, _))) => {
-                let header_offset = cell::header_offset_for_page(hinted_leaf_page);
                 let cell_pointers =
                     cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
                 self.cell_buf = cell_data;
@@ -5038,7 +5189,7 @@ impl<P: PageWriter> BtCursor<P> {
                     last_rowid: rowid,
                     tree_depth: hinted_tree_depth,
                     parent_page: self.current_parent_page_hint_from_stack(),
-                    page_data,
+                    page_data: Some(page_data),
                     header,
                 }))
             }
@@ -5081,17 +5232,140 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         self.record_range_page_witness(hint.leaf_page);
-        if let Some(_) = self.try_append_table_leaf_payload_in_place_no_overflow(
-            cx,
-            hint.leaf_page,
-            &mut hint.page_data,
-            &mut hint.header,
-            rowid,
-            data,
-        )? {
+        let usable_size = self.usable_size;
+        let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
+        let mut mutate_payload_only = |staged_page: &mut PageData| {
+            mutate_payload_result =
+                Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
+                    usable_size,
+                    hint.leaf_page,
+                    staged_page,
+                    &mut hint.header,
+                    rowid,
+                    data,
+                );
+        };
+        if self
+            .pager
+            .try_mutate_staged_page_data(hint.leaf_page, &mut mutate_payload_only)
+        {
+            if let Some(_) = mutate_payload_result? {
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.last_rowid = rowid;
+                self.clear_rightmost_leaf_cache();
+                return Ok(true);
+            }
+        }
+
+        if let Some(mut page_data) = hint.page_data.take() {
+            let result = self.try_append_on_external_rightmost_leaf_hint_page_data(
+                cx,
+                hint,
+                rowid,
+                data,
+                &mut page_data,
+            );
+            if hint.page_data.is_none() {
+                hint.page_data = Some(page_data);
+            }
+            return result;
+        }
+
+        if let Some(mut page_data) = self.pager.try_take_staged_page_data(hint.leaf_page) {
+            if self
+                .try_append_table_leaf_payload_in_place_no_overflow(
+                    cx,
+                    hint.leaf_page,
+                    &mut page_data,
+                    &mut hint.header,
+                    rowid,
+                    data,
+                )?
+                .is_some()
+            {
+                self.pager
+                    .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
+                self.last_insert_rowid = Some(rowid);
+                self.last_known_depth = Some(hint.tree_depth);
+                hint.last_rowid = rowid;
+                self.clear_rightmost_leaf_cache();
+                return Ok(true);
+            }
+
+            let mut cell_data = std::mem::take(&mut self.cell_buf);
+            let overflow_head =
+                match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data) {
+                    Ok(head) => head,
+                    Err(error) => {
+                        self.cell_buf = cell_data;
+                        self.pager
+                            .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
+                        return Err(error);
+                    }
+                };
+            let append_result = self.try_append_leaf_page_in_place(
+                cx,
+                hint.leaf_page,
+                &mut page_data,
+                &mut hint.header,
+                &cell_data,
+            );
+            self.cell_buf = cell_data;
+            self.pager
+                .restore_staged_page_data(cx, hint.leaf_page, page_data)?;
+            match append_result {
+                Ok(Some(_)) => {
+                    self.last_insert_rowid = Some(rowid);
+                    self.last_known_depth = Some(hint.tree_depth);
+                    hint.last_rowid = rowid;
+                    self.clear_rightmost_leaf_cache();
+                    return Ok(true);
+                }
+                Ok(None) => {
+                    if let Some(first) = overflow_head {
+                        self.free_overflow_chain(cx, first)?;
+                    }
+                    return Ok(false);
+                }
+                Err(error) => {
+                    if let Some(first) = overflow_head {
+                        let _ = self.free_overflow_chain(cx, first);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn try_append_on_external_rightmost_leaf_hint_page_data(
+        &mut self,
+        cx: &Cx,
+        hint: &mut TableAppendHint,
+        rowid: i64,
+        data: &[u8],
+        page_data: &mut PageData,
+    ) -> Result<bool> {
+        if self
+            .try_append_table_leaf_payload_in_place_no_overflow(
+                cx,
+                hint.leaf_page,
+                page_data,
+                &mut hint.header,
+                rowid,
+                data,
+            )?
+            .is_some()
+        {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(hint.tree_depth);
             hint.last_rowid = rowid;
+            // The caller-owned retained hint is now the authoritative leaf image.
+            // Clear the internal cache rather than keep a stale pre-append copy
+            // that could overwrite this row on a later plain `table_insert()`.
+            self.clear_rightmost_leaf_cache();
             return Ok(true);
         }
         let mut cell_data = std::mem::take(&mut self.cell_buf);
@@ -5099,7 +5373,7 @@ impl<P: PageWriter> BtCursor<P> {
         let append_result = self.try_append_leaf_page_in_place(
             cx,
             hint.leaf_page,
-            &mut hint.page_data,
+            page_data,
             &mut hint.header,
             &cell_data,
         );
@@ -5109,6 +5383,9 @@ impl<P: PageWriter> BtCursor<P> {
                 self.last_insert_rowid = Some(rowid);
                 self.last_known_depth = Some(hint.tree_depth);
                 hint.last_rowid = rowid;
+                // See the no-overflow fast path above: without a full in-cursor
+                // refresh, the retained hint is newer than any cached leaf image.
+                self.clear_rightmost_leaf_cache();
                 Ok(true)
             }
             Ok(None) => {
@@ -5216,7 +5493,7 @@ impl<P: PageWriter> BtCursor<P> {
                 hint.leaf_page = result.new_pgno;
                 hint.last_rowid = rowid;
                 hint.parent_page = Some(parent_page);
-                hint.page_data = result.new_page_data.clone();
+                hint.page_data = Some(result.new_page_data.clone());
                 hint.header = result.new_header;
                 self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
                     page_no: result.new_pgno,
@@ -6021,32 +6298,116 @@ mod tests {
     // the former `MemPageStore::new(USABLE)`.
     static LEAF_REUSE_CURSOR_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct PrefetchProbeSnapshot {
+        hinted_pages: Vec<PageNumber>,
+        read_pages: Vec<PageNumber>,
+        prefetch_issued_count: usize,
+        prefetch_hit_count: usize,
+        slot_prefetch_count: usize,
+        page_prefetch_count: usize,
+        invalid_slot_pages: Vec<PageNumber>,
+        missing_page_pages: Vec<PageNumber>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PrefetchProbeState {
+        hinted_pages: Vec<PageNumber>,
+        read_pages: Vec<PageNumber>,
+        pending_hints: BTreeMap<u32, usize>,
+        prefetch_issued_count: usize,
+        prefetch_hit_count: usize,
+        slot_prefetch_count: usize,
+        page_prefetch_count: usize,
+        invalid_slot_pages: Vec<PageNumber>,
+        missing_page_pages: Vec<PageNumber>,
+    }
+
     #[derive(Debug, Clone)]
     struct PrefetchProbeStore {
         inner: MemPageStore,
-        hinted_pages: Rc<RefCell<Vec<PageNumber>>>,
+        probe: Rc<RefCell<PrefetchProbeState>>,
     }
 
     impl PrefetchProbeStore {
         fn new(inner: MemPageStore) -> Self {
             Self {
                 inner,
-                hinted_pages: Rc::new(RefCell::new(Vec::new())),
+                probe: Rc::new(RefCell::new(PrefetchProbeState::default())),
             }
         }
 
         fn hinted_pages(&self) -> Vec<PageNumber> {
-            self.hinted_pages.borrow().clone()
+            self.probe.borrow().hinted_pages.clone()
+        }
+
+        fn clear_probe(&self) {
+            *self.probe.borrow_mut() = PrefetchProbeState::default();
+        }
+
+        fn snapshot(&self) -> PrefetchProbeSnapshot {
+            let probe = self.probe.borrow();
+            PrefetchProbeSnapshot {
+                hinted_pages: probe.hinted_pages.clone(),
+                read_pages: probe.read_pages.clone(),
+                prefetch_issued_count: probe.prefetch_issued_count,
+                prefetch_hit_count: probe.prefetch_hit_count,
+                slot_prefetch_count: probe.slot_prefetch_count,
+                page_prefetch_count: probe.page_prefetch_count,
+                invalid_slot_pages: probe.invalid_slot_pages.clone(),
+                missing_page_pages: probe.missing_page_pages.clone(),
+            }
         }
     }
 
     impl PageReader for PrefetchProbeStore {
         fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            let mut probe = self.probe.borrow_mut();
+            probe.read_pages.push(page_no);
+            let mut counted_prefetch_hit = false;
+            let remove_pending = if let Some(pending) = probe.pending_hints.get_mut(&page_no.get())
+                && *pending > 0
+            {
+                *pending -= 1;
+                counted_prefetch_hit = true;
+                *pending == 0
+            } else {
+                false
+            };
+            if counted_prefetch_hit {
+                probe.prefetch_hit_count = probe.prefetch_hit_count.saturating_add(1);
+            }
+            if remove_pending {
+                probe.pending_hints.remove(&page_no.get());
+            }
             self.inner.read_page(cx, page_no)
         }
 
         fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
-            self.hinted_pages.borrow_mut().push(page_no);
+            let mut probe = self.probe.borrow_mut();
+            probe.hinted_pages.push(page_no);
+            probe.prefetch_issued_count = probe.prefetch_issued_count.saturating_add(1);
+
+            let Some(slot_idx) = MemPageStore::page_slot_index(page_no) else {
+                probe.invalid_slot_pages.push(page_no);
+                return;
+            };
+
+            if self.inner.page_slots.get(slot_idx).is_some() {
+                probe.slot_prefetch_count = probe.slot_prefetch_count.saturating_add(1);
+            } else {
+                probe.invalid_slot_pages.push(page_no);
+                return;
+            }
+
+            if self.inner.pages.contains_key(&page_no.get()) {
+                probe.page_prefetch_count = probe.page_prefetch_count.saturating_add(1);
+                *probe.pending_hints.entry(page_no.get()).or_default() += 1;
+            } else {
+                probe.missing_page_pages.push(page_no);
+            }
+
+            drop(probe);
             self.inner.prefetch_page_hint(cx, page_no);
         }
     }
@@ -7229,6 +7590,92 @@ mod tests {
             payload.push(byte);
         }
         payload
+    }
+
+    fn build_prefetch_descent_probe_store() -> PrefetchProbeStore {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .write_page(&cx, pn(2), &build_interior_table(&[(pn(3), 15)], pn(4)))
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(3),
+                &build_interior_table(&[(pn(5), 3), (pn(6), 8)], pn(7)),
+            )
+            .unwrap();
+        store
+            .write_page(&cx, pn(4), &build_interior_table(&[(pn(8), 25)], pn(9)))
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(5),
+                &build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(6),
+                &build_leaf_table(&[(4, b"d"), (5, b"e"), (8, b"f")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(7),
+                &build_leaf_table(&[(9, b"g"), (10, b"h"), (15, b"i")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(8),
+                &build_leaf_table(&[(16, b"j"), (20, b"k"), (24, b"l")]),
+            )
+            .unwrap();
+        store
+            .write_page(
+                &cx,
+                pn(9),
+                &build_leaf_table(&[(26, b"m"), (30, b"n"), (40, b"o")]),
+            )
+            .unwrap();
+        PrefetchProbeStore::new(store)
+    }
+
+    fn assert_prefetch_snapshot_addresses_are_valid(
+        store: &PrefetchProbeStore,
+        snapshot: &PrefetchProbeSnapshot,
+        root: PageNumber,
+    ) {
+        let mut reachable = BTreeSet::new();
+        collect_reachable_pages(&store.inner, root, USABLE, &mut reachable);
+
+        assert!(
+            snapshot.invalid_slot_pages.is_empty(),
+            "prefetch should never touch an out-of-range slot address: {:?}",
+            snapshot.invalid_slot_pages
+        );
+        assert!(
+            snapshot.missing_page_pages.is_empty(),
+            "prefetch should never dereference a missing page: {:?}",
+            snapshot.missing_page_pages
+        );
+        assert!(
+            snapshot
+                .hinted_pages
+                .iter()
+                .all(|page_no| reachable.contains(&page_no.get())),
+            "descent should only hint reachable child pages, got {:?}",
+            snapshot.hinted_pages
+        );
+        assert_eq!(
+            snapshot.page_prefetch_count, snapshot.prefetch_issued_count,
+            "every descent hint in this seeded tree should resolve to a real page"
+        );
     }
 
     #[test]
@@ -9314,6 +9761,144 @@ mod tests {
     }
 
     #[test]
+    fn test_prefetch_valid_address() {
+        let cx = Cx::new();
+        let probe_store = build_prefetch_descent_probe_store();
+        probe_store.clear_probe();
+
+        for rowid in [2_i64, 5, 10, 20, 24, 26, 35, 41] {
+            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+            cursor
+                .table_seek_for_insert(&cx, rowid)
+                .expect("descent path should remain valid");
+        }
+
+        let snapshot = probe_store.snapshot();
+        assert!(
+            snapshot.prefetch_issued_count > 0,
+            "test setup must exercise at least one interior prefetch"
+        );
+        assert!(
+            !snapshot.read_pages.is_empty(),
+            "descent path should read at least one child page after prefetch"
+        );
+        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+        assert_eq!(
+            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+            "insert descent should immediately consume each hinted child page"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_sequential_insert() {
+        let cx = Cx::new();
+        let probe_store = build_prefetch_descent_probe_store();
+        probe_store.clear_probe();
+
+        for rowid in 26_i64..=40_i64 {
+            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+            cursor
+                .table_seek_for_insert(&cx, rowid)
+                .expect("right-edge insert descent should succeed");
+        }
+
+        let snapshot = probe_store.snapshot();
+        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+        assert_eq!(
+            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+            "right-edge insert descent should consume every hinted page"
+        );
+        assert!(
+            snapshot
+                .hinted_pages
+                .iter()
+                .all(|page_no| matches!(page_no.get(), 4 | 9)),
+            "sequential insert descent should stay on the rightmost child chain, got {:?}",
+            snapshot.hinted_pages
+        );
+        assert!(
+            snapshot.hinted_pages.contains(&pn(4)) && snapshot.hinted_pages.contains(&pn(9)),
+            "sequential insert descent should prefetch both rightmost interior levels"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_random_insert() {
+        let cx = Cx::new();
+        let probe_store = build_prefetch_descent_probe_store();
+        probe_store.clear_probe();
+
+        let mut targets: Vec<i64> = (1_i64..=40_i64).collect();
+        deterministic_shuffle(&mut targets, 0xE2A4_0001_u64);
+
+        for rowid in targets.into_iter().take(24) {
+            let mut cursor = BtCursor::new(probe_store.clone(), pn(2), USABLE, true);
+            cursor
+                .table_seek_for_insert(&cx, rowid)
+                .expect("random insert descent should succeed");
+        }
+
+        let snapshot = probe_store.snapshot();
+        assert_prefetch_snapshot_addresses_are_valid(&probe_store, &snapshot, pn(2));
+        assert_eq!(
+            snapshot.prefetch_hit_count, snapshot.prefetch_issued_count,
+            "random insert descent should still consume every hinted child page"
+        );
+        assert!(
+            snapshot.hinted_pages.contains(&pn(3))
+                && snapshot.hinted_pages.contains(&pn(4))
+                && snapshot
+                    .hinted_pages
+                    .iter()
+                    .any(|page_no| matches!(page_no.get(), 6 | 8)),
+            "random insert descent should cover both left/mid and right child paths, got {:?}",
+            snapshot.hinted_pages
+        );
+    }
+
+    #[test]
+    fn test_prefetch_no_crash_on_evicted() {
+        let cx = Cx::new();
+        let mut inner = MemPageStore::new(USABLE);
+        inner
+            .write_page(&cx, pn(2), &build_leaf_table(&[(1, b"alive")]))
+            .unwrap();
+        inner.free_page(&cx, pn(2)).unwrap();
+
+        let probe_store = PrefetchProbeStore::new(inner);
+        probe_store.prefetch_page_hint(&cx, pn(2));
+
+        let snapshot = probe_store.snapshot();
+        assert_eq!(snapshot.prefetch_issued_count, 1);
+        assert_eq!(snapshot.slot_prefetch_count, 1);
+        assert_eq!(snapshot.page_prefetch_count, 0);
+        assert_eq!(snapshot.prefetch_hit_count, 0);
+        assert_eq!(snapshot.missing_page_pages, vec![pn(2)]);
+    }
+
+    #[test]
+    fn test_cache_line_alignment() {
+        const CACHE_LINE_BYTES: usize = 64;
+
+        for page_type in [
+            cell::BtreePageType::LeafTable,
+            cell::BtreePageType::InteriorTable,
+            cell::BtreePageType::LeafIndex,
+            cell::BtreePageType::InteriorIndex,
+        ] {
+            let header_bytes = usize::from(page_type.header_size());
+            assert!(
+                header_bytes <= CACHE_LINE_BYTES,
+                "page header should fit in one cache line for prefetch locality: type={page_type:?} header_bytes={header_bytes}"
+            );
+            assert!(
+                cell::header_offset_for_page(pn(2)) + header_bytes <= CACHE_LINE_BYTES,
+                "prefetching page.as_ptr() should warm the entire header cache line: type={page_type:?} header_bytes={header_bytes}"
+            );
+        }
+    }
+
+    #[test]
     fn test_btree_insert_delete_5k() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
@@ -9588,6 +10173,50 @@ mod tests {
     }
 
     #[test]
+    fn test_table_try_append_cached_rightmost_leaf_hint_drops_stale_internal_cache() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, payload_for_rowid(1).as_slice())
+            .unwrap();
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed insert should capture a retained rightmost-leaf hint");
+        assert!(
+            cursor
+                .table_try_append_cached_rightmost_leaf_hint(
+                    &cx,
+                    &mut hint,
+                    2,
+                    payload_for_rowid(2).as_slice(),
+                )
+                .unwrap(),
+            "retained-hint helper should append directly on the cached leaf"
+        );
+        assert!(
+            cursor.rightmost_leaf_cache.is_none(),
+            "retained-hint appends must not leave a stale internal leaf image behind"
+        );
+
+        cursor
+            .table_insert(&cx, 3, payload_for_rowid(3).as_slice())
+            .unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=3_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 3 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
     fn test_table_try_append_cached_rightmost_leaf_hint_handles_split_fallback() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
@@ -9686,11 +10315,12 @@ mod tests {
                 "helper should not need a second append API when the hinted leaf fills"
             );
 
-            if parent_before.is_some() && hint.leaf_page() != previous_leaf {
+            if let Some(parent_before) = parent_before.filter(|_| hint.leaf_page() != previous_leaf)
+            {
                 observed_post_root_split = true;
                 assert_eq!(
                     cursor.pager.read_pages(),
-                    vec![parent_before.expect("post-root split should know its parent")],
+                    vec![parent_before],
                     "cached-hint split should read only the parent page once it has a parent hint"
                 );
                 break;

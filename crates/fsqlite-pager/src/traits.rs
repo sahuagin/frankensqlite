@@ -499,6 +499,12 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// at commit time.
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData>;
 
+    /// Hint that `page_no` is likely to be read soon.
+    ///
+    /// Implementations should keep this best-effort and non-blocking. It is
+    /// purely a latency-hiding hint and must not affect correctness.
+    fn prefetch_page_hint(&self, _cx: &Cx, _page_no: PageNumber) {}
+
     /// Write a page within this transaction.
     ///
     /// Acquires a page-level lock and records the write for SSI
@@ -511,6 +517,43 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// can override this to adopt owned buffers without another copy.
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.write_page(cx, page_no, data.as_bytes())
+    }
+
+    /// Temporarily take ownership of an unpublished staged page image.
+    ///
+    /// This exists for hot B-tree append paths that want to mutate the
+    /// transaction's authoritative staged page without cloning a separate
+    /// compatibility copy first. Implementations may return `None` when the
+    /// staged page is unavailable or has already been published for read reuse.
+    fn try_take_staged_page_data(&mut self, _page_no: PageNumber) -> Option<PageData> {
+        None
+    }
+
+    /// Mutate an unpublished staged page image in place.
+    ///
+    /// This is the cheapest hot-path option for repeated right-edge writes:
+    /// the transaction already owns the authoritative staged page, so callers
+    /// can patch it without removing and re-inserting the page in the write-set.
+    fn try_mutate_staged_page_data(
+        &mut self,
+        _page_no: PageNumber,
+        _f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        false
+    }
+
+    /// Restore a page image previously taken with `try_take_staged_page_data`.
+    ///
+    /// The default implementation routes through `write_page_data`, which is
+    /// correct but may copy. Implementations can override this to restore the
+    /// staged page without extra allocation.
+    fn restore_staged_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        self.write_page_data(cx, page_no, data)
     }
 
     /// Allocate a new page and return its page number.
@@ -1143,12 +1186,24 @@ impl TransactionHandle for TransactionKind {
         self.with_handle(|txn| txn.get_page(cx, page_no))
     }
 
+    fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
+        self.with_handle(|txn| txn.prefetch_page_hint(cx, page_no));
+    }
+
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.with_handle_mut(|txn| txn.write_page(cx, page_no, data))
     }
 
     fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.with_handle_mut(|txn| txn.write_page_data(cx, page_no, data))
+    }
+
+    fn try_mutate_staged_page_data(
+        &mut self,
+        page_no: PageNumber,
+        f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        self.with_handle_mut(|txn| txn.try_mutate_staged_page_data(page_no, f))
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {

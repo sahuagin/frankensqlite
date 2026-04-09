@@ -22,6 +22,9 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(target_arch = "x86_64")]
+use core::intrinsics::prefetch_read_data;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::Mutex;
@@ -29,6 +32,20 @@ use fsqlite_types::{PageData, PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prefetch_l1_read<T>(ptr: *const T) {
+    if ptr.is_null() {
+        return;
+    }
+
+    prefetch_read_data::<T, 3>(ptr);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_l1_read<T>(_ptr: *const T) {}
 
 // ---------------------------------------------------------------------------
 // Page buffer pool sizing
@@ -620,6 +637,19 @@ impl FastPageArray {
         self.admits = 0;
         self.evictions = 0;
     }
+
+    /// Best-effort software prefetch for an imminent page lookup.
+    fn prefetch_page_hint(&self, page_no: PageNumber) {
+        let idx = Self::pgno_to_idx(page_no);
+        let Some(slot) = self.pages.get(idx) else {
+            return;
+        };
+
+        prefetch_l1_read(std::ptr::from_ref(slot));
+        if let Some(buf) = slot.as_ref() {
+            prefetch_l1_read(buf.as_slice().as_ptr());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +760,39 @@ impl FlatPageSlots {
         guard
             .as_ref()
             .map(|buf| PageData::from_vec(buf.as_slice().to_vec()))
+    }
+
+    #[inline]
+    fn prefetch_slot(&self, idx: usize) {
+        let slot = &self.slots[idx & self.mask];
+        prefetch_l1_read(std::ptr::from_ref(slot));
+    }
+
+    /// Best-effort software prefetch for the flat-slot probe chain and, when
+    /// already resident, the page bytes themselves.
+    fn prefetch_page_hint(&self, page_no: PageNumber) {
+        let pgno = page_no.get();
+        let start = self.hash_pgno(pgno);
+        self.prefetch_slot(start);
+        self.prefetch_slot(start + 1);
+
+        for probe in 0..MAX_PROBE_LENGTH {
+            let idx = (start + probe) & self.mask;
+            let slot = &self.slots[idx];
+            let slot_pgno = slot.pgno.load(Ordering::Acquire);
+            if slot_pgno == pgno {
+                self.prefetch_slot(idx);
+                if let Some(guard) = slot.data.try_lock()
+                    && let Some(buf) = guard.as_ref()
+                {
+                    prefetch_l1_read(buf.as_slice().as_ptr());
+                }
+                return;
+            }
+            if slot_pgno == SLOT_EMPTY {
+                return;
+            }
+        }
     }
 
     /// Try to insert a page buffer. Returns `Ok(true)` if newly inserted,
@@ -1677,6 +1740,34 @@ impl ShardedPageCache {
             .get(page_no)
             .map(|data| PageData::from_vec(data.to_vec()))
     }
+
+    /// Best-effort software prefetch for an upcoming `page_no` lookup.
+    ///
+    /// This intentionally avoids blocking. It warms the likely flat-slot or
+    /// shard metadata, and opportunistically prefetches resident page bytes
+    /// when a non-blocking lock can observe them.
+    pub fn prefetch_page_hint(&self, page_no: PageNumber) {
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                prefetch_l1_read(std::ptr::from_ref(fast));
+                if let Some(guard) = fast.try_lock() {
+                    guard.prefetch_page_hint(page_no);
+                }
+            }
+            return;
+        }
+
+        self.flat_slots.prefetch_page_hint(page_no);
+
+        let shard_idx = Self::shard_index(page_no);
+        let shard = &self.shards[shard_idx];
+        prefetch_l1_read(std::ptr::from_ref(shard));
+        if let Some(guard) = shard.try_lock()
+            && let Some(buf) = guard.pages.get(&page_no)
+        {
+            prefetch_l1_read(buf.as_slice().as_ptr());
+        }
+    }
 }
 
 impl std::fmt::Debug for ShardedPageCache {
@@ -1738,12 +1829,74 @@ mod tests {
     use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::{MemoryVfs, Vfs};
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::hint::black_box;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     const BEAD_ID: &str = "bd-22n.2";
+    const BEAD_TRACK_F: &str = "bd-pm1zd";
+
+    fn elapsed_ns(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn page_pattern(page_no: PageNumber) -> u8 {
+        let folded = page_no.get().wrapping_mul(37).wrapping_add(11) & 0xFF;
+        u8::try_from(folded).expect("masked page pattern must fit in u8")
+    }
+
+    fn percentile_u64(samples: &[u64], percentile: u32) -> u64 {
+        assert!(
+            !samples.is_empty(),
+            "percentile input must contain at least one sample"
+        );
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let pct = percentile.clamp(1, 100);
+        let rank = ((sorted.len() - 1) * usize::try_from(pct).expect("pct fits")) / 100;
+        sorted[rank]
+    }
+
+    fn emit_track_f_log(
+        test_name: &str,
+        phase: &str,
+        elapsed: Duration,
+        page_count: usize,
+        lock_acquisitions: u64,
+        cache_hits: u64,
+        cache_misses: u64,
+        extra: serde_json::Value,
+    ) {
+        eprintln!(
+            "TRACK_F:{}",
+            json!({
+                "bead_id": BEAD_TRACK_F,
+                "test_name": test_name,
+                "phase": phase,
+                "elapsed_ns": elapsed_ns(elapsed),
+                "page_count": page_count,
+                "lock_acquisitions": lock_acquisitions,
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "extra": extra
+            })
+        );
+    }
+
+    fn lane_counter(data: &[u8], lane: usize) -> u32 {
+        let offset = lane * std::mem::size_of::<u32>();
+        let bytes: [u8; 4] = data[offset..offset + 4]
+            .try_into()
+            .expect("lane counter bytes");
+        u32::from_le_bytes(bytes)
+    }
+
+    fn set_lane_counter(data: &mut [u8], lane: usize, value: u32) {
+        let offset = lane * std::mem::size_of::<u32>();
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
 
     fn setup() -> (Cx, impl VfsFile) {
         let cx = Cx::new();
@@ -3902,6 +4055,338 @@ mod tests {
         assert!(
             copy.iter().all(|&b| b == 0x88),
             "bead_id={BEAD_FZR07} case=fp_read_page_copy"
+        );
+    }
+
+    #[test]
+    fn test_track_f_flat_slots_lock_free_read_correctness() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const ITERATIONS_PER_THREAD: usize = 2_048;
+        const HOT_PAGES: usize = 16;
+
+        let slots = Arc::new(FlatPageSlots::new(FLAT_SLOTS_MIN_CAPACITY));
+        for page_idx in 0..HOT_PAGES {
+            let page_no = PageNumber::new(u32::try_from(page_idx + 1).expect("page idx fits"))
+                .expect("hot page number");
+            let pattern = page_pattern(page_no);
+            let mut buf = PageBuf::new(PageSize::DEFAULT);
+            buf.as_mut_slice().fill(pattern);
+            let inserted = slots
+                .try_insert(page_no, buf)
+                .expect("hot page should stay in flat slots");
+            assert!(inserted, "hot page should be newly inserted");
+        }
+
+        let start_barrier = Arc::new(Barrier::new(THREADS + 1));
+        let started = Instant::now();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread_idx| {
+                let slots = Arc::clone(&slots);
+                let start_barrier = Arc::clone(&start_barrier);
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for iter in 0..ITERATIONS_PER_THREAD {
+                        let hot_page_idx = (thread_idx + iter) % HOT_PAGES;
+                        let hot_page = PageNumber::new(
+                            u32::try_from(hot_page_idx + 1).expect("hot page idx fits"),
+                        )
+                        .expect("hot page");
+                        let expected = page_pattern(hot_page);
+                        let page = slots.get_copy(hot_page).expect("hot page must exist");
+                        assert_eq!(
+                            page[0],
+                            expected,
+                            "TRACK_F hot read returned wrong prefix byte for page {}",
+                            hot_page.get()
+                        );
+                        assert_eq!(
+                            page[PageSize::DEFAULT.as_usize() - 1],
+                            expected,
+                            "TRACK_F hot read returned wrong tail byte for page {}",
+                            hot_page.get()
+                        );
+
+                        let cold_page = PageNumber::new(
+                            10_000
+                                + u32::try_from((thread_idx * HOT_PAGES) + hot_page_idx)
+                                    .expect("cold page idx fits"),
+                        )
+                        .expect("cold page");
+                        assert!(
+                            slots.get_copy(cold_page).is_none(),
+                            "cold page {} should miss the flat slots table",
+                            cold_page.get()
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        start_barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .expect("flat-slot concurrent reader must not panic");
+        }
+        let elapsed = started.elapsed();
+
+        let expected_hits = u64::try_from(THREADS * ITERATIONS_PER_THREAD).expect("hit count fits");
+        assert_eq!(
+            slots.hits.load(Ordering::Relaxed),
+            expected_hits,
+            "flat-slot concurrent hit count should match the hot-read workload"
+        );
+        assert_eq!(
+            slots.len(),
+            HOT_PAGES,
+            "flat-slot table should keep every hot page resident"
+        );
+
+        emit_track_f_log(
+            "test_track_f_flat_slots_lock_free_read_correctness",
+            "verify",
+            elapsed,
+            HOT_PAGES,
+            expected_hits,
+            expected_hits,
+            expected_hits,
+            json!({
+                "threads": THREADS,
+                "iterations_per_thread": ITERATIONS_PER_THREAD,
+                "resident_pages": slots.len(),
+                "observed_misses": expected_hits
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_f_page_cache_latency_microbenchmark_under_load() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const HOT_PAGES: usize = 32;
+        const BACKGROUND_THREADS: usize = 4;
+        const BACKGROUND_READS_PER_THREAD: usize = 4_096;
+        const SAMPLES: usize = 2_048;
+
+        let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+        for page_idx in 0..HOT_PAGES {
+            let page_no = PageNumber::new(u32::try_from(page_idx + 1).expect("page idx fits"))
+                .expect("hot page");
+            let pattern = page_pattern(page_no);
+            cache
+                .insert_fresh(page_no, |data| data.fill(pattern))
+                .expect("hot page insert should succeed");
+        }
+
+        let before = cache.metrics_snapshot();
+        let start_barrier = Arc::new(Barrier::new(BACKGROUND_THREADS + 1));
+        let workers: Vec<_> = (0..BACKGROUND_THREADS)
+            .map(|thread_idx| {
+                let cache = Arc::clone(&cache);
+                let start_barrier = Arc::clone(&start_barrier);
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for iter in 0..BACKGROUND_READS_PER_THREAD {
+                        let page_idx =
+                            (thread_idx * BACKGROUND_READS_PER_THREAD + iter) % HOT_PAGES;
+                        let page_no =
+                            PageNumber::new(u32::try_from(page_idx + 1).expect("page idx fits"))
+                                .expect("background hot page");
+                        let page = cache
+                            .get_copy(page_no)
+                            .expect("background hot page should stay cached");
+                        black_box(page[0]);
+                    }
+                })
+            })
+            .collect();
+
+        start_barrier.wait();
+        let started = Instant::now();
+        let mut latencies = Vec::with_capacity(SAMPLES);
+        for sample_idx in 0..SAMPLES {
+            let page_no = PageNumber::new(
+                u32::try_from((sample_idx % HOT_PAGES) + 1).expect("page idx fits"),
+            )
+            .expect("sample page");
+            let read_started = Instant::now();
+            let page = cache
+                .get_copy(page_no)
+                .expect("latency sample page should stay cached");
+            latencies.push(elapsed_ns(read_started.elapsed()));
+            black_box(page[0]);
+        }
+        for worker in workers {
+            worker
+                .join()
+                .expect("background latency worker must not panic");
+        }
+        let elapsed = started.elapsed();
+
+        let after = cache.metrics_snapshot();
+        let hit_delta = after.hits.saturating_sub(before.hits);
+        let miss_delta = after.misses.saturating_sub(before.misses);
+        let p50 = percentile_u64(&latencies, 50);
+        let p95 = percentile_u64(&latencies, 95);
+        let p99 = percentile_u64(&latencies, 99);
+
+        assert_eq!(
+            latencies.len(),
+            SAMPLES,
+            "latency run should keep all samples"
+        );
+        assert!(
+            p50 <= p95 && p95 <= p99,
+            "latency percentiles must be monotonic: p50={p50} p95={p95} p99={p99}"
+        );
+        assert_eq!(
+            miss_delta, 0,
+            "hot-read latency microbenchmark should not miss the page cache"
+        );
+        assert!(
+            hit_delta
+                >= u64::try_from(SAMPLES + BACKGROUND_THREADS * BACKGROUND_READS_PER_THREAD)
+                    .expect("read count fits"),
+            "latency microbenchmark should record every hot read as a cache hit"
+        );
+
+        emit_track_f_log(
+            "test_track_f_page_cache_latency_microbenchmark_under_load",
+            "verify",
+            elapsed,
+            HOT_PAGES,
+            hit_delta,
+            hit_delta,
+            miss_delta,
+            json!({
+                "samples": SAMPLES,
+                "background_threads": BACKGROUND_THREADS,
+                "background_reads_per_thread": BACKGROUND_READS_PER_THREAD,
+                "p50_ns": p50,
+                "p95_ns": p95,
+                "p99_ns": p99
+            }),
+        );
+    }
+
+    #[test]
+    fn test_track_f_page_cache_stress_concurrent_access() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const SHARED_PAGES: usize = 6;
+        const ITERATIONS_PER_THREAD: usize = 512;
+
+        let cache = Arc::new(ShardedPageCache::new(PageSize::DEFAULT));
+        for page_idx in 0..SHARED_PAGES {
+            let page_no = PageNumber::new(u32::try_from(page_idx + 1).expect("page idx fits"))
+                .expect("shared page");
+            cache
+                .insert_fresh(page_no, |data| data.fill(0))
+                .expect("shared page insert should succeed");
+        }
+
+        let before = cache.metrics_snapshot();
+        let start_barrier = Arc::new(Barrier::new(THREADS + 1));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|thread_idx| {
+                let cache = Arc::clone(&cache);
+                let start_barrier = Arc::clone(&start_barrier);
+                thread::spawn(move || {
+                    start_barrier.wait();
+                    for iter in 0..ITERATIONS_PER_THREAD {
+                        for page_idx in 0..SHARED_PAGES {
+                            let page_no = PageNumber::new(
+                                u32::try_from(page_idx + 1).expect("page idx fits"),
+                            )
+                            .expect("shared page");
+                            cache
+                                .with_page_mut(page_no, |data| {
+                                    let next = lane_counter(data, thread_idx).saturating_add(1);
+                                    set_lane_counter(data, thread_idx, next);
+                                    data[256 + thread_idx] =
+                                        u8::try_from((iter + page_idx) & 0xFF).expect("byte fits");
+                                })
+                                .expect("shared page must stay resident");
+
+                            if page_idx % 2 == 0 {
+                                let snapshot = cache
+                                    .get_copy(page_no)
+                                    .expect("shared page copy should succeed");
+                                assert!(
+                                    lane_counter(&snapshot, thread_idx) >= 1,
+                                    "stress reader should observe at least one write on lane {thread_idx}"
+                                );
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        start_barrier.wait();
+        let started = Instant::now();
+        for handle in handles {
+            handle
+                .join()
+                .expect("page-cache stress worker must not panic");
+        }
+        let elapsed = started.elapsed();
+
+        for page_idx in 0..SHARED_PAGES {
+            let page_no = PageNumber::new(u32::try_from(page_idx + 1).expect("page idx fits"))
+                .expect("shared page");
+            let page = cache
+                .get_copy(page_no)
+                .expect("shared page should remain cached after stress");
+            for thread_idx in 0..THREADS {
+                assert_eq!(
+                    lane_counter(&page, thread_idx),
+                    u32::try_from(ITERATIONS_PER_THREAD).expect("iteration count fits"),
+                    "shared page {} lane {} lost writes under concurrent access",
+                    page_no.get(),
+                    thread_idx
+                );
+            }
+        }
+
+        let after = cache.metrics_snapshot();
+        let hit_delta = after.hits.saturating_sub(before.hits);
+        let miss_delta = after.misses.saturating_sub(before.misses);
+        let mutation_ops =
+            u64::try_from(THREADS * SHARED_PAGES * ITERATIONS_PER_THREAD).expect("ops fit");
+        let read_ops = u64::try_from(THREADS * ((SHARED_PAGES + 1) / 2) * ITERATIONS_PER_THREAD)
+            .expect("ops fit");
+
+        assert_eq!(
+            miss_delta, 0,
+            "stress workload should operate entirely on hot pages"
+        );
+        assert!(
+            hit_delta >= mutation_ops.saturating_add(read_ops),
+            "stress workload should account for every shared-page probe as a cache hit"
+        );
+
+        emit_track_f_log(
+            "test_track_f_page_cache_stress_concurrent_access",
+            "verify",
+            elapsed,
+            SHARED_PAGES,
+            mutation_ops.saturating_add(read_ops),
+            hit_delta,
+            miss_delta,
+            json!({
+                "threads": THREADS,
+                "iterations_per_thread": ITERATIONS_PER_THREAD,
+                "shared_pages": SHARED_PAGES,
+                "mutation_ops": mutation_ops,
+                "read_ops": read_ops
+            }),
         );
     }
 

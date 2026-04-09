@@ -1,3 +1,6 @@
+#![allow(internal_features)]
+#![feature(core_intrinsics)]
+
 pub mod arc_cache;
 pub mod encrypt;
 #[cfg(any(test, feature = "fault-injection"))]
@@ -25,8 +28,10 @@ pub use page_cache::{
     resolve_page_buffer_max,
 };
 pub use pager::{
-    PagerPublishedSnapshot, ParallelWalPublicationIntent, SimplePager, SimplePagerCheckpointWriter,
-    SimpleTransaction, WalCommitSyncPolicy, remove_group_commit_queue,
+    PAGER_METADATA_PUBLICATION_CONTRACTS, PagerMetadataPublicationClass,
+    PagerMetadataPublicationContract, PagerPublishedSnapshot, ParallelWalPublicationIntent,
+    SimplePager, SimplePagerCheckpointWriter, SimpleTransaction, WalCommitSyncPolicy,
+    remove_group_commit_queue,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,

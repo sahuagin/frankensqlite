@@ -4,6 +4,8 @@
 //! VFS-backed database file and a zero-copy [`PageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
+#[cfg(target_arch = "x86_64")]
+use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,6 +35,20 @@ use fsqlite_wal::{
     FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
     SubmitOutcome, TransactionFrameBatch, WalFile,
 };
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prefetch_l1_read<T>(ptr: *const T) {
+    if ptr.is_null() {
+        return;
+    }
+
+    prefetch_read_data::<T, 3>(ptr);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn prefetch_l1_read<T>(_ptr: *const T) {}
 
 // ---------------------------------------------------------------------------
 // Group Commit Queue (D1: replaces global WAL_APPEND_GATES mutex)
@@ -73,6 +89,54 @@ const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEvent
 const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
 const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
+// Flush busy handoff: retry on-CPU with a bounded spin budget and yield only
+// every `FLUSH_BUSY_HANDOFF_YIELD_EVERY` attempts. The owner-handoff rule is
+// that a losing flusher yields rarely and otherwise stays hot so the current
+// lock holder can complete without millisecond sleeps or exponential backoff.
+const FLUSH_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
+const FLUSH_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
+const FLUSH_BUSY_HANDOFF_YIELD_EVERY: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlushBusyRetryWait {
+    attempt: u32,
+    spin_loops: u32,
+    yielded: bool,
+}
+
+const fn flush_busy_retry_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = FLUSH_BUSY_HANDOFF_BASE_SPINS << shift;
+    if spins > FLUSH_BUSY_HANDOFF_MAX_SPINS {
+        FLUSH_BUSY_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn flush_busy_retry_should_yield(attempt: u32) -> bool {
+    attempt >= FLUSH_BUSY_HANDOFF_YIELD_EVERY && attempt % FLUSH_BUSY_HANDOFF_YIELD_EVERY == 0
+}
+
+const fn flush_busy_retry_wait(attempt: u32) -> FlushBusyRetryWait {
+    FlushBusyRetryWait {
+        attempt,
+        spin_loops: flush_busy_retry_spin_loops(attempt),
+        yielded: flush_busy_retry_should_yield(attempt),
+    }
+}
+
+fn perform_flush_busy_retry_handoff(wait: FlushBusyRetryWait) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if wait.yielded {
+        std::thread::yield_now();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ArrivalWaitObservation {
@@ -1785,6 +1849,20 @@ impl AtomicPublishedPages {
     fn len(&self) -> usize {
         self.page_count.load(AtomicOrdering::Acquire)
     }
+
+    fn prefetch_hint(&self, page_no: PageNumber) {
+        let Some(idx) = Self::slot_index(page_no) else {
+            return;
+        };
+        let slot = &self.slots[idx];
+        prefetch_l1_read(std::ptr::from_ref(slot));
+        if slot.present.load(AtomicOrdering::Relaxed)
+            && let Ok(guard) = slot.page.try_lock()
+            && let Some(page) = guard.as_ref()
+        {
+            prefetch_l1_read(page.as_bytes().as_ptr());
+        }
+    }
 }
 
 /// Overflow publication plane for pages outside the direct-index atomic range.
@@ -1919,6 +1997,17 @@ impl ShardedPublishedPages {
     fn len(&self) -> usize {
         self.page_count.load(AtomicOrdering::Acquire)
     }
+
+    fn prefetch_hint(&self, page_no: PageNumber) {
+        let shard_idx = Self::shard_index(page_no);
+        let shard = &self.shards[shard_idx];
+        prefetch_l1_read(std::ptr::from_ref(shard));
+        if let Ok(guard) = shard.try_read()
+            && let Some(page) = guard.get(&page_no)
+        {
+            prefetch_l1_read(page.as_bytes().as_ptr());
+        }
+    }
 }
 
 /// Hybrid published-page store: direct-index atomic slots for the hot
@@ -1995,6 +2084,14 @@ impl PublishedPages {
     fn len(&self) -> usize {
         self.atomic.len().saturating_add(self.overflow.len())
     }
+
+    fn prefetch_hint(&self, page_no: PageNumber) {
+        if AtomicPublishedPages::slot_index(page_no).is_some() {
+            self.atomic.prefetch_hint(page_no);
+        } else {
+            self.overflow.prefetch_hint(page_no);
+        }
+    }
 }
 
 /// Minimal metadata handoff from the parallel WAL ordered residue into the
@@ -2016,6 +2113,64 @@ pub struct ParallelWalPublicationIntent {
     pub page_set_size: usize,
 }
 
+/// Reader-visible pager metadata classes covered by the Track E3 design
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagerMetadataPublicationClass {
+    /// The multi-field metadata summary exposed through
+    /// `PublishedPagerState::snapshot()`.
+    SnapshotSummary,
+    /// The published page plane plus its lag-detecting horizon.
+    PagePlaneResidency,
+    /// The durable ordered-residue handoff that authorizes pager publication.
+    CertificateDerivedIntent,
+}
+
+/// Design-time publication contract for one pager metadata class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagerMetadataPublicationContract {
+    /// Concrete metadata class on the hot path.
+    pub class: PagerMetadataPublicationClass,
+    /// Current implementation touchpoint.
+    pub touchpoint: &'static str,
+    /// Primitive in the current code.
+    pub current_primitive: &'static str,
+    /// Primitive selected by the E3 design contract.
+    pub selected_primitive: &'static str,
+    /// Read-side retry / staleness contract.
+    pub retry_contract: &'static str,
+    /// Fallback boundary when the optimistic publication surface is not usable.
+    pub fallback_contract: &'static str,
+}
+
+/// Concrete pager metadata-publication mapping for Track E3.
+pub const PAGER_METADATA_PUBLICATION_CONTRACTS: [PagerMetadataPublicationContract; 3] = [
+    PagerMetadataPublicationContract {
+        class: PagerMetadataPublicationClass::SnapshotSummary,
+        touchpoint: "pager.rs::PublishedPagerState::{snapshot,finalize_publish}",
+        current_primitive: "writer-serialized seqlock summary over visible_commit_seq/db_size/journal_mode/freelist/checkpoint/page_set_size",
+        selected_primitive: "keep seqlock-style summary publication",
+        retry_contract: "readers retry while the sequence is odd or unstable and never take the publish lock",
+        fallback_contract: "targeted sequence waits may park briefly before re-reading the summary",
+    },
+    PagerMetadataPublicationContract {
+        class: PagerMetadataPublicationClass::PagePlaneResidency,
+        touchpoint: "pager.rs::PublishedPages plus page_plane_visible_commit_seq",
+        current_primitive: "lock-free published-page plane gated by a monotone lag-detecting horizon",
+        selected_primitive: "keep monotone horizon with explicit cache/inner fallback",
+        retry_contract: "published pages are readable only when the page-plane horizon covers the bound snapshot; otherwise the read must fall back",
+        fallback_contract: "a lagging page plane is intentional and forces cache/inner reads instead of serving stale published pages",
+    },
+    PagerMetadataPublicationContract {
+        class: PagerMetadataPublicationClass::CertificateDerivedIntent,
+        touchpoint: "pager.rs::ParallelWalPublicationIntent",
+        current_primitive: "immutable certificate-derived intent handed from ordered residue into publish",
+        selected_primitive: "keep immutable certificate-derived handoff; never publish beyond durable certificate scope",
+        retry_contract: "not directly polled by readers; it constrains what the pager may expose as visible",
+        fallback_contract: "certificate mismatch or gap forces conservative publication and blocks newer visibility",
+    },
+];
+
 /// Point-in-time view of the pager metadata publication plane.
 ///
 /// When the D1 parallel WAL path is active, this snapshot is the post-publish
@@ -2036,6 +2191,44 @@ pub struct PagerPublishedSnapshot {
     pub checkpoint_active: bool,
     /// Number of committed pages currently served through the publication plane.
     pub page_set_size: usize,
+}
+
+#[cfg(test)]
+mod metadata_publication_contract_tests {
+    use super::{
+        PAGER_METADATA_PUBLICATION_CONTRACTS, PagerMetadataPublicationClass,
+        PagerMetadataPublicationContract,
+    };
+
+    fn contract(class: PagerMetadataPublicationClass) -> PagerMetadataPublicationContract {
+        PAGER_METADATA_PUBLICATION_CONTRACTS
+            .iter()
+            .find(|contract| contract.class == class)
+            .copied()
+            .expect("pager metadata contract must exist")
+    }
+
+    #[test]
+    fn test_pager_metadata_publication_contract_keeps_seqlock_summary() {
+        let summary = contract(PagerMetadataPublicationClass::SnapshotSummary);
+        assert_eq!(
+            summary.selected_primitive,
+            "keep seqlock-style summary publication"
+        );
+        assert!(
+            summary.retry_contract.contains("retry"),
+            "summary publication must preserve explicit seqlock retry semantics"
+        );
+    }
+
+    #[test]
+    fn test_pager_metadata_publication_contract_keeps_page_plane_fallback_boundary() {
+        let page_plane = contract(PagerMetadataPublicationClass::PagePlaneResidency);
+        assert!(
+            page_plane.fallback_contract.contains("cache/inner"),
+            "page-plane contract must preserve the explicit fallback boundary"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2160,6 +2353,10 @@ impl PublishedPagerState {
         // F2: use the hybrid published-page store. Reads in the low-page hot
         // range avoid shard hashing entirely.
         self.pages.get(page_no)
+    }
+
+    fn prefetch_page_hint(&self, page_no: PageNumber) {
+        self.pages.prefetch_hint(page_no);
     }
 
     fn page_plane_visible_commit_seq(&self) -> CommitSeq {
@@ -4240,15 +4437,12 @@ struct StagedPage {
 
 impl StagedPage {
     fn from_buf(buf: PageBuf) -> Self {
-        // bd-perf (V1.3): Eagerly create the published PageData at write time.
-        // StagedPage is never mutated after creation (only replaced wholesale
-        // via insert_staged_page), so the eager snapshot is always correct.
-        // This avoids a lazy 4KB copy + Arc allocation on first read.
-        let published = OnceLock::new();
-        let _ = published.set(PageData::from_vec(buf.as_slice().to_vec()));
         Self {
             backing: StagedPageBacking::Buffered(buf),
-            published,
+            // Keep the staged page single-copy until a read/publication path
+            // actually asks for a shared snapshot. Eager publication turned
+            // every write into an unconditional full-page clone.
+            published: OnceLock::new(),
         }
     }
 
@@ -4263,10 +4457,10 @@ impl StagedPage {
     }
 
     fn from_page_data(data: PageData) -> Self {
-        let published = OnceLock::new();
-        let backing = StagedPageBacking::Owned(data.clone());
-        let _ = published.set(data);
-        Self { backing, published }
+        Self {
+            backing: StagedPageBacking::Owned(data),
+            published: OnceLock::new(),
+        }
     }
 
     fn from_page_data_for_pool(pool: &PageBufPool, data: PageData) -> Result<Self> {
@@ -4299,6 +4493,23 @@ impl StagedPage {
         match backing {
             StagedPageBacking::Buffered(buf) => PageData::from_vec(buf.as_slice().to_vec()),
             StagedPageBacking::Owned(data) => data,
+        }
+    }
+
+    fn try_into_unpublished_owned_page_data(self) -> std::result::Result<PageData, Self> {
+        let Self { backing, published } = self;
+        if let Some(page) = published.into_inner() {
+            let published = OnceLock::new();
+            let _ = published.set(page);
+            return Err(Self { backing, published });
+        }
+
+        match backing {
+            StagedPageBacking::Owned(data) => Ok(data),
+            other => Err(Self {
+                backing: other,
+                published: OnceLock::new(),
+            }),
         }
     }
 
@@ -5213,20 +5424,7 @@ where
                             | FrankenError::BusyRecovery
                             | FrankenError::BusySnapshot { .. },
                         ) if attempt + 1 < MAX_FLUSH_RETRIES => {
-                            let base_delay_ms = 1u64 << attempt;
-                            // Use thread ID + attempt as a cheap entropy source
-                            // for jitter. The previous `Instant::now().elapsed()`
-                            // always returned ~0 (elapsed from now to now).
-                            let thread_hash = {
-                                use std::hash::{Hash, Hasher};
-                                let mut h = std::collections::hash_map::DefaultHasher::new();
-                                std::thread::current().id().hash(&mut h);
-                                attempt.hash(&mut h);
-                                h.finish()
-                            };
-                            let jitter_ms = thread_hash % (base_delay_ms / 2).max(1);
-                            let delay_ms = base_delay_ms.saturating_add(jitter_ms);
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            perform_flush_busy_retry_handoff(flush_busy_retry_wait(attempt + 1));
                             GLOBAL_CONSOLIDATION_METRICS.record_busy_retry();
                             // bd-db300.3.8.1: wake reason = busy_retry
                             GLOBAL_CONSOLIDATION_METRICS
@@ -5736,6 +5934,26 @@ where
         Ok(page)
     }
 
+    fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+        if let Some(staged) = self.write_set.get(&page_no) {
+            prefetch_l1_read(staged.as_page_bytes().as_ptr());
+            return;
+        }
+
+        if let Ok(txn_read_cache) = self.txn_read_cache.try_borrow()
+            && let Some(page) = txn_read_cache.get(&page_no)
+        {
+            prefetch_l1_read(page.as_bytes().as_ptr());
+            return;
+        }
+
+        if self.published.page_plane_visible_commit_seq() == self.published_visible_commit_seq.get()
+        {
+            self.published.prefetch_page_hint(page_no);
+        }
+        self.cache.prefetch_page_hint(page_no);
+    }
+
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.ensure_writer(cx)?;
 
@@ -5764,6 +5982,55 @@ where
 
         let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
 
+        insert_staged_page(
+            &mut self.write_set,
+            &mut self.write_pages_sorted,
+            page_no,
+            staged,
+        );
+        Ok(())
+    }
+
+    fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+        let staged = self.write_set.remove(&page_no)?;
+        match staged.try_into_unpublished_owned_page_data() {
+            Ok(data) => {
+                remove_page_sorted(&mut self.write_pages_sorted, page_no);
+                Some(data)
+            }
+            Err(staged) => {
+                self.write_set.insert(page_no, staged);
+                None
+            }
+        }
+    }
+
+    fn try_mutate_staged_page_data(
+        &mut self,
+        page_no: PageNumber,
+        f: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        let Some(staged) = self.write_set.get_mut(&page_no) else {
+            return false;
+        };
+        if staged.published.get().is_some() {
+            return false;
+        }
+        let StagedPageBacking::Owned(data) = &mut staged.backing else {
+            return false;
+        };
+        f(data);
+        true
+    }
+
+    fn restore_staged_page_data(
+        &mut self,
+        cx: &Cx,
+        page_no: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        self.ensure_writer(cx)?;
+        let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
         insert_staged_page(
             &mut self.write_set,
             &mut self.write_pages_sorted,
@@ -6392,7 +6659,6 @@ where
                     // rewrite the VFS backing store on every row. Keep the
                     // committed page image in `txn_read_cache` and flush once
                     // when the retained writer is actually released.
-                    Ok(())
                 } else {
                     // bd-wwqen.3: :memory: retained-commit fast path.
                     // Skip journal creation, pre-image backup, sync, and deletion.
@@ -6426,8 +6692,8 @@ where
                         return Err(e);
                     }
                     inner.db_size = flushed_db_size;
-                    Ok(())
                 }
+                Ok(())
             } else {
                 Self::commit_journal(
                     cx,
@@ -7237,11 +7503,12 @@ mod tests {
     use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex, OnceLock};
 
     const BEAD_ID: &str = "bd-bca.1";
+    const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
     type ObservedLockLevel = Arc<Mutex<LockLevel>>;
     type ObservedUnlockTraceIds = Arc<Mutex<Vec<u64>>>;
     type ObservedCleanupUnlockHarness = (
@@ -7280,6 +7547,92 @@ mod tests {
             *byte = reduced ^ seed;
         }
         page
+    }
+
+    fn track_u_log_counts(
+        case: &str,
+        dirty_set_count: usize,
+        already_dirty_skip_count: usize,
+        commit_flush_count: usize,
+    ) {
+        eprintln!(
+            "INFO bead_id={TRACK_U_BEAD_ID} case={case} dirty_set_count={dirty_set_count} \
+             already_dirty_skip_count={already_dirty_skip_count} \
+             commit_flush_count={commit_flush_count}"
+        );
+    }
+
+    fn private_memory_pager() -> SimplePager<MemoryVfs> {
+        SimplePager::open(MemoryVfs::new(), Path::new("/:memory:"), PageSize::DEFAULT).unwrap()
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FlushBusyRetryScheduleSummary {
+        attempts: u32,
+        total_spin_loops: u64,
+        max_spin_loops: u32,
+        yield_count: u32,
+    }
+
+    fn summarize_flush_busy_retry_schedule(attempts: u32) -> FlushBusyRetryScheduleSummary {
+        assert!(
+            attempts > 0,
+            "flush busy retry validation needs at least one attempt"
+        );
+
+        let waits = (1..=attempts)
+            .map(flush_busy_retry_wait)
+            .collect::<Vec<_>>();
+
+        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
+        let max_spin_loops = waits
+            .iter()
+            .map(|wait| wait.spin_loops)
+            .max()
+            .unwrap_or_default();
+        let yield_count = u32::try_from(waits.iter().filter(|wait| wait.yielded).count())
+            .expect("flush busy retry validation should fit within u32 attempt counts");
+
+        FlushBusyRetryScheduleSummary {
+            attempts,
+            total_spin_loops,
+            max_spin_loops,
+            yield_count,
+        }
+    }
+
+    #[test]
+    fn test_flush_busy_retry_yield_cadence_is_bounded() {
+        for attempt in 1..FLUSH_BUSY_HANDOFF_YIELD_EVERY {
+            assert!(
+                !flush_busy_retry_should_yield(attempt),
+                "attempt {attempt} should stay on-CPU"
+            );
+        }
+
+        assert!(flush_busy_retry_should_yield(
+            FLUSH_BUSY_HANDOFF_YIELD_EVERY
+        ));
+        assert!(!flush_busy_retry_should_yield(
+            FLUSH_BUSY_HANDOFF_YIELD_EVERY + 1
+        ));
+        assert!(flush_busy_retry_should_yield(
+            FLUSH_BUSY_HANDOFF_YIELD_EVERY * 2
+        ));
+    }
+
+    #[test]
+    fn test_flush_busy_retry_schedule_summary_bounds_tail_budget() {
+        let summary = summarize_flush_busy_retry_schedule(10);
+
+        assert_eq!(summary.attempts, 10);
+        assert_eq!(summary.total_spin_loops, 12_224);
+        assert_eq!(summary.max_spin_loops, FLUSH_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(
+            summary.yield_count,
+            10 / FLUSH_BUSY_HANDOFF_YIELD_EVERY,
+            "wake amplification must stay at one scheduler yield per bounded retry window"
+        );
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -16285,6 +16638,310 @@ mod tests {
             0x31,
             "bead_id={BEAD_ID} case=single_connection_commit_and_retain_rollback_keeps_last_committed_page"
         );
+    }
+
+    #[test]
+    fn test_dirty_bitmap_set_check() {
+        let pager = private_memory_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x41; ps]).unwrap();
+
+        assert_eq!(
+            txn.write_pages_sorted,
+            vec![page],
+            "bead_id={TRACK_U_BEAD_ID} case=dirty_bitmap_tracks_single_page"
+        );
+        assert!(
+            txn.write_set.contains_key(&page),
+            "bead_id={TRACK_U_BEAD_ID} case=dirty_bitmap_marks_page_in_write_set"
+        );
+        assert!(
+            !txn.retained_memory_overlay_dirty_pages.contains(&page),
+            "bead_id={TRACK_U_BEAD_ID} case=retained_overlay_stays_empty_before_retain"
+        );
+
+        track_u_log_counts("dirty_bitmap_set_check", 1, 0, 0);
+    }
+
+    #[test]
+    fn test_dirty_bitmap_double_write_dedups_wal_entry() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let (backend, frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &sample_page(0x11)).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+        frames.lock().unwrap().clear();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page, &sample_page(0x22)).unwrap();
+        let final_bytes = sample_page(0x33);
+        txn.write_page(&cx, page, &final_bytes).unwrap();
+
+        assert_eq!(
+            txn.write_pages_sorted,
+            vec![page],
+            "bead_id={TRACK_U_BEAD_ID} case=double_write_dedups_dirty_surface"
+        );
+
+        txn.commit(&cx).unwrap();
+
+        let written = frames.lock().unwrap().clone();
+        let page_frames = written
+            .iter()
+            .filter(|(page_no, _, _)| *page_no == page.get())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page_frames.len(),
+            1,
+            "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_single_data_frame"
+        );
+        assert_eq!(
+            page_frames[0].1,
+            final_bytes,
+            "bead_id={TRACK_U_BEAD_ID} case=double_write_keeps_last_page_image"
+        );
+        assert_eq!(
+            written
+                .iter()
+                .filter(|(page_no, _, _)| *page_no == PageNumber::ONE.get())
+                .count(),
+            1,
+            "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_single_page_one_metadata_frame"
+        );
+
+        track_u_log_counts("dirty_bitmap_double_write", 1, 1, page_frames.len());
+    }
+
+    #[test]
+    fn test_dirty_bitmap_commit_flushes_all_dirty_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let (backend, frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let pages = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let mut pages = Vec::with_capacity(100);
+            for seed_byte in 0_u8..100 {
+                let page = seed.allocate_page(&cx).unwrap();
+                seed.write_page(&cx, page, &sample_page(seed_byte)).unwrap();
+                pages.push(page);
+            }
+            seed.commit(&cx).unwrap();
+            pages
+        };
+        frames.lock().unwrap().clear();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        for (idx, page) in pages.iter().copied().enumerate() {
+            let seed_byte = u8::try_from(idx).expect("100-page test index fits u8");
+            txn.write_page(&cx, page, &sample_page(seed_byte.wrapping_add(100)))
+                .unwrap();
+        }
+        assert_eq!(
+            txn.write_pages_sorted.len(),
+            pages.len(),
+            "bead_id={TRACK_U_BEAD_ID} case=dirty_surface_tracks_all_100_pages"
+        );
+
+        txn.commit(&cx).unwrap();
+
+        let written = frames.lock().unwrap().clone();
+        let flushed_pages = written
+            .iter()
+            .filter(|(page_no, _, _)| *page_no != PageNumber::ONE.get())
+            .map(|(page_no, _, _)| *page_no)
+            .collect::<Vec<_>>();
+        let expected_pages = pages.iter().map(|page| page.get()).collect::<Vec<_>>();
+        assert_eq!(
+            flushed_pages, expected_pages,
+            "bead_id={TRACK_U_BEAD_ID} case=commit_flushes_every_dirty_page_once"
+        );
+        assert_eq!(
+            written
+                .iter()
+                .filter(|(page_no, _, _)| *page_no == PageNumber::ONE.get())
+                .count(),
+            1,
+            "bead_id={TRACK_U_BEAD_ID} case=commit_flush_emits_single_page_one_metadata_frame"
+        );
+
+        track_u_log_counts(
+            "dirty_bitmap_commit_flushes_all",
+            pages.len(),
+            0,
+            flushed_pages.len(),
+        );
+    }
+
+    #[test]
+    fn test_dirty_bitmap_rollback_clears_retained_overlay() {
+        let pager = private_memory_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+        let cx = Cx::new();
+
+        let original_one = sample_page(0x31);
+        let original_two = sample_page(0x32);
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_one = txn.allocate_page(&cx).unwrap();
+        let page_two = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page_one, &original_one).unwrap();
+        txn.write_page(&cx, page_two, &original_two).unwrap();
+        assert!(
+            txn.commit_and_retain(&cx).unwrap(),
+            "bead_id={TRACK_U_BEAD_ID} case=rollback_clear_requires_retained_commit"
+        );
+        assert_eq!(
+            txn.retained_memory_overlay_dirty_pages.len(),
+            2,
+            "bead_id={TRACK_U_BEAD_ID} case=retained_overlay_tracks_committed_pages"
+        );
+
+        txn.write_page(&cx, page_one, &sample_page(0x7A)).unwrap();
+        txn.rollback(&cx).unwrap();
+
+        assert!(
+            txn.retained_memory_overlay_dirty_pages.is_empty(),
+            "bead_id={TRACK_U_BEAD_ID} case=rollback_clears_retained_overlay_bitmap"
+        );
+        assert!(
+            txn.write_set.is_empty() && txn.write_pages_sorted.is_empty(),
+            "bead_id={TRACK_U_BEAD_ID} case=rollback_clears_live_dirty_surface"
+        );
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_one).unwrap().into_vec(),
+            original_one,
+            "bead_id={TRACK_U_BEAD_ID} case=rollback_restores_last_committed_page_one"
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            original_two,
+            "bead_id={TRACK_U_BEAD_ID} case=rollback_restores_last_committed_page_two"
+        );
+
+        track_u_log_counts("dirty_bitmap_rollback_clears", 2, 0, 2);
+    }
+
+    #[test]
+    fn test_dirty_bitmap_large_10k_pages() {
+        let pager = private_memory_pager();
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::with_capacity(10_000);
+        for idx in 0..10_000_usize {
+            let page = txn.allocate_page(&cx).unwrap();
+            let fill = u8::try_from(idx % 251).expect("modulo fits u8");
+            txn.write_page(&cx, page, &vec![fill; ps]).unwrap();
+            pages.push((page, fill));
+        }
+        assert_eq!(
+            txn.write_pages_sorted.len(),
+            pages.len(),
+            "bead_id={TRACK_U_BEAD_ID} case=large_dirty_surface_tracks_10k_pages"
+        );
+        assert!(
+            txn.commit_and_retain(&cx).unwrap(),
+            "bead_id={TRACK_U_BEAD_ID} case=large_dirty_surface_retain_succeeds"
+        );
+        assert_eq!(
+            txn.retained_memory_overlay_dirty_pages.len(),
+            pages.len(),
+            "bead_id={TRACK_U_BEAD_ID} case=large_retained_overlay_tracks_10k_pages"
+        );
+
+        txn.rollback(&cx).unwrap();
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for &(sample_idx, expected_fill) in &[
+            (0_usize, pages[0].1),
+            (4_999_usize, pages[4_999].1),
+            (9_999_usize, pages[9_999].1),
+        ] {
+            let page = pages[sample_idx].0;
+            assert_eq!(
+                reader.get_page(&cx, page).unwrap().as_ref()[0],
+                expected_fill,
+                "bead_id={TRACK_U_BEAD_ID} case=large_dirty_surface_preserves_sample sample_idx={sample_idx}"
+            );
+        }
+
+        track_u_log_counts("dirty_bitmap_large", pages.len(), 0, pages.len());
+    }
+
+    #[test]
+    fn test_dirty_bitmap_crash_recovery_restores_original_pages() {
+        let path = PathBuf::from("/track_u_dirty_bitmap_crash_recovery.db");
+        let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
+        let vfs = DbWriteFailOnceVfs::new(path.clone());
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let original_pages = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let mut pages = Vec::with_capacity(32);
+            for seed_byte in 1_u8..=32 {
+                let page = txn.allocate_page(&cx).unwrap();
+                let original = sample_page(seed_byte);
+                txn.write_page(&cx, page, &original).unwrap();
+                pages.push((page, original));
+            }
+            txn.commit(&cx).unwrap();
+            pages
+        };
+
+        vfs.arm_after_db_writes(8);
+
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            for (idx, (page, _)) in original_pages.iter().enumerate() {
+                let seed_byte = u8::try_from(idx).expect("32-page test index fits u8");
+                txn.write_page(&cx, *page, &sample_page(seed_byte.wrapping_add(101)))
+                    .unwrap();
+            }
+            let err = txn.commit(&cx).unwrap_err();
+            assert!(
+                matches!(err, FrankenError::Io(_)),
+                "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_surfaces_partial_commit_io_error"
+            );
+        }
+
+        drop(pager);
+
+        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (page, original) in &original_pages {
+            assert_eq!(
+                reader.get_page(&cx, *page).unwrap().as_ref(),
+                original.as_slice(),
+                "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_restores_original_page page={}",
+                page.get()
+            );
+        }
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_clears_abandoned_journal"
+        );
+
+        track_u_log_counts("dirty_bitmap_crash_recovery", original_pages.len(), 0, 0);
     }
 
     #[test]
