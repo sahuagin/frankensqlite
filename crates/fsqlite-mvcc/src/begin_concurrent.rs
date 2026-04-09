@@ -29,6 +29,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
+use crate::rcu::{ActiveTxnSnapshotEntry, QsbrHandle, RcuActiveTxnSnapshotTable};
 use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
     discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro, witness_key_page,
@@ -722,6 +723,37 @@ impl ConcurrentRegistry {
         self.active
             .iter()
             .map(|(&id, handle)| (id, Arc::clone(handle)))
+    }
+
+    /// Build the immutable active-session image selected by Track E3's RCU
+    /// publication mapping.
+    ///
+    /// This surfaces the active transaction snapshot table as sorted
+    /// `(session_id, snapshot_high)` pairs plus the current GC horizon, leaving
+    /// the per-session mutable leaves in the existing handle objects.
+    #[must_use]
+    pub fn active_snapshot_entries(&self) -> smallvec::SmallVec<[ActiveTxnSnapshotEntry; 8]> {
+        let mut entries = self
+            .active_snapshot_highs
+            .iter()
+            .map(|(&session_id, &snapshot_high)| ActiveTxnSnapshotEntry {
+                session_id,
+                snapshot_high,
+            })
+            .collect::<smallvec::SmallVec<[ActiveTxnSnapshotEntry; 8]>>();
+        entries.sort_unstable_by_key(|entry| entry.session_id);
+        entries
+    }
+
+    /// Publish the current active-session image through the E3.3 RCU/QSBR
+    /// prototype without changing the current registry ownership model.
+    pub fn publish_active_snapshot_prototype(
+        &self,
+        table: &RcuActiveTxnSnapshotTable,
+        handle: &QsbrHandle<'_>,
+    ) {
+        let entries = self.active_snapshot_entries();
+        table.publish(entries.as_slice(), self.gc_horizon(), handle);
     }
 
     /// Look up a shared concurrent handle by session id.

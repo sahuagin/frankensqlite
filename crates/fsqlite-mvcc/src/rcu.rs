@@ -46,7 +46,8 @@
 //!   - `fsqlite_rcu_grace_period_duration_ns_max`
 //!   - `fsqlite_rcu_reclaimed_total`
 
-use fsqlite_types::sync_primitives::Instant;
+use fsqlite_types::{CommitSeq, sync_primitives::Instant};
+use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::sync_primitives::Mutex;
@@ -107,6 +108,203 @@ pub fn reset_rcu_metrics() {
 /// Record reclaimed objects (for use after grace period).
 pub fn record_rcu_reclaimed(count: u64) {
     FSQLITE_RCU_RECLAIMED_TOTAL.fetch_add(count, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Active transaction snapshot-table prototype
+// ---------------------------------------------------------------------------
+
+/// Representative capacity for the E3.3 active-transaction snapshot-table
+/// prototype.
+///
+/// This intentionally matches the soft writer cap in
+/// `begin_concurrent.rs::MAX_CONCURRENT_WRITERS` without coupling the RCU
+/// helper module to the transaction-protocol module.
+pub const MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES: usize = 128;
+
+/// Immutable entry published through [`RcuActiveTxnSnapshotTable`].
+///
+/// This models the active portion of
+/// `begin_concurrent.rs::ConcurrentRegistry::{active_snapshot_highs,gc_horizon_counts}`:
+/// readers bind one immutable view of `(session_id, snapshot_high)` pairs plus
+/// the GC horizon, while per-session mutable leaves remain elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveTxnSnapshotEntry {
+    pub session_id: u64,
+    pub snapshot_high: CommitSeq,
+}
+
+/// Owned point-in-time image returned by [`RcuActiveTxnSnapshotTable::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTxnSnapshotImage {
+    pub generation: u64,
+    pub gc_horizon: Option<CommitSeq>,
+    pub entries: SmallVec<[ActiveTxnSnapshotEntry; 8]>,
+}
+
+impl ActiveTxnSnapshotImage {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+struct ActiveTxnSnapshotSlot {
+    session_ids: [AtomicU64; MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES],
+    snapshot_highs: [AtomicU64; MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES],
+    count: AtomicU64,
+    generation: AtomicU64,
+    gc_horizon: AtomicU64,
+}
+
+impl ActiveTxnSnapshotSlot {
+    fn new() -> Self {
+        Self {
+            session_ids: std::array::from_fn(|_| AtomicU64::new(0)),
+            snapshot_highs: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            gc_horizon: AtomicU64::new(0),
+        }
+    }
+
+    fn publish_from(
+        &self,
+        generation: u64,
+        entries: &[ActiveTxnSnapshotEntry],
+        gc_horizon: Option<CommitSeq>,
+    ) {
+        for (idx, entry) in entries.iter().enumerate() {
+            self.session_ids[idx].store(entry.session_id, Ordering::Release);
+            self.snapshot_highs[idx].store(entry.snapshot_high.get(), Ordering::Release);
+        }
+        self.gc_horizon.store(
+            gc_horizon.map_or(0, CommitSeq::get),
+            Ordering::Release,
+        );
+        self.count.store(entries.len() as u64, Ordering::Release);
+        self.generation.store(generation, Ordering::Release);
+    }
+
+    fn load_image(&self) -> ActiveTxnSnapshotImage {
+        let generation = self.generation.load(Ordering::Acquire);
+        let gc_horizon = match self.gc_horizon.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(CommitSeq::new(value)),
+        };
+        let count = usize::try_from(self.count.load(Ordering::Acquire))
+            .expect("active transaction snapshot count must fit in usize");
+        let mut entries = SmallVec::<[ActiveTxnSnapshotEntry; 8]>::with_capacity(count);
+        for idx in 0..count {
+            entries.push(ActiveTxnSnapshotEntry {
+                session_id: self.session_ids[idx].load(Ordering::Acquire),
+                snapshot_high: CommitSeq::new(
+                    self.snapshot_highs[idx].load(Ordering::Acquire),
+                ),
+            });
+        }
+        ActiveTxnSnapshotImage {
+            generation,
+            gc_horizon,
+            entries,
+        }
+    }
+}
+
+/// Double-buffered RCU/QSBR publication prototype for the ActiveTxnRegistry
+/// snapshot table selected in Track E3.
+///
+/// Writers publish a full immutable image into the inactive slot, flip the
+/// active slot with a release store, then wait for a QSBR grace period before
+/// the old slot becomes eligible for reuse. Readers bind the active slot with a
+/// single atomic load and copy out one coherent image without contending with
+/// the writer.
+pub struct RcuActiveTxnSnapshotTable {
+    slot0: ActiveTxnSnapshotSlot,
+    slot1: ActiveTxnSnapshotSlot,
+    active: AtomicU64,
+    next_generation: AtomicU64,
+    writer_lock: Mutex<()>,
+}
+
+impl RcuActiveTxnSnapshotTable {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slot0: ActiveTxnSnapshotSlot::new(),
+            slot1: ActiveTxnSnapshotSlot::new(),
+            active: AtomicU64::new(0),
+            next_generation: AtomicU64::new(1),
+            writer_lock: Mutex::new(()),
+        }
+    }
+
+    /// Bind the current immutable image.
+    ///
+    /// Callers are expected to use this within one QSBR read-side critical
+    /// section, bounded by `QsbrHandle::quiescent()` calls.
+    #[must_use]
+    pub fn snapshot(&self) -> ActiveTxnSnapshotImage {
+        if self.active.load(Ordering::Acquire) == 0 {
+            self.slot0.load_image()
+        } else {
+            self.slot1.load_image()
+        }
+    }
+
+    /// Publish a new immutable image and wait for a grace period before the
+    /// previously active slot may be reused.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entries.len()` exceeds
+    /// [`MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES`].
+    pub fn publish(
+        &self,
+        entries: &[ActiveTxnSnapshotEntry],
+        gc_horizon: Option<CommitSeq>,
+        handle: &QsbrHandle<'_>,
+    ) {
+        assert!(
+            entries.len() <= MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES,
+            "active transaction snapshot image exceeded prototype capacity"
+        );
+        let _guard = self.writer_lock.lock();
+        let current = self.active.load(Ordering::Acquire);
+        let next_slot = 1 - current;
+        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel);
+        if next_slot == 0 {
+            self.slot0.publish_from(generation, entries, gc_horizon);
+        } else {
+            self.slot1.publish_from(generation, entries, gc_horizon);
+        }
+        self.active.store(next_slot, Ordering::Release);
+        handle.synchronize_as_writer();
+    }
+}
+
+impl Default for RcuActiveTxnSnapshotTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for RcuActiveTxnSnapshotTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RcuActiveTxnSnapshotTable")
+            .field("active", &self.active.load(Ordering::Relaxed))
+            .field(
+                "next_generation",
+                &self.next_generation.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +852,213 @@ mod tests {
         assert_eq!(triple.read(), (10, 20, 30));
 
         drop(h);
+    }
+
+    #[test]
+    fn active_txn_snapshot_table_basic_publication() {
+        let reg = QsbrRegistry::new();
+        let h = reg.register().unwrap();
+        let table = RcuActiveTxnSnapshotTable::new();
+
+        let empty = table.snapshot();
+        assert_eq!(empty.generation, 0);
+        assert_eq!(empty.gc_horizon, None);
+        assert!(empty.is_empty());
+
+        h.quiescent();
+        let entries = [
+            ActiveTxnSnapshotEntry {
+                session_id: 7,
+                snapshot_high: CommitSeq::new(41),
+            },
+            ActiveTxnSnapshotEntry {
+                session_id: 9,
+                snapshot_high: CommitSeq::new(43),
+            },
+        ];
+        table.publish(&entries, Some(CommitSeq::new(41)), &h);
+        h.quiescent();
+
+        let image = table.snapshot();
+        assert_eq!(image.generation, 1);
+        assert_eq!(image.gc_horizon, Some(CommitSeq::new(41)));
+        assert_eq!(image.entries.as_slice(), &entries);
+
+        drop(h);
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn active_txn_snapshot_table_no_mixed_generations() {
+        let reg = Arc::new(QsbrRegistry::new());
+        let table = Arc::new(RcuActiveTxnSnapshotTable::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(Barrier::new(5)); // 1 writer + 4 readers
+
+        let w_reg = Arc::clone(&reg);
+        let w_table = Arc::clone(&table);
+        let w_stop = Arc::clone(&stop);
+        let w_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            let h = w_reg.register().unwrap();
+            h.quiescent();
+            w_barrier.wait();
+            let mut generation = 0_u64;
+            while !w_stop.load(Ordering::Relaxed) {
+                generation += 1;
+                let entries = [
+                    ActiveTxnSnapshotEntry {
+                        session_id: 1,
+                        snapshot_high: CommitSeq::new(generation * 10 + 1),
+                    },
+                    ActiveTxnSnapshotEntry {
+                        session_id: 2,
+                        snapshot_high: CommitSeq::new(generation * 10 + 2),
+                    },
+                    ActiveTxnSnapshotEntry {
+                        session_id: 3,
+                        snapshot_high: CommitSeq::new(generation * 10 + 3),
+                    },
+                ];
+                w_table.publish(&entries, Some(CommitSeq::new(generation * 10 + 1)), &h);
+            }
+            h.quiescent();
+            drop(h);
+            generation
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let r_reg = Arc::clone(&reg);
+            let r_table = Arc::clone(&table);
+            let r_stop = Arc::clone(&stop);
+            let r_barrier = Arc::clone(&barrier);
+            readers.push(thread::spawn(move || {
+                let h = r_reg.register().unwrap();
+                h.quiescent();
+                r_barrier.wait();
+                let mut reads = 0_u64;
+                while !r_stop.load(Ordering::Relaxed) {
+                    let image = r_table.snapshot();
+                    if !image.is_empty() {
+                        assert_eq!(image.len(), 3);
+                        assert_eq!(
+                            image.gc_horizon,
+                            Some(CommitSeq::new(image.generation * 10 + 1))
+                        );
+                        for (idx, entry) in image.entries.iter().enumerate() {
+                            let expected_session_id = idx as u64 + 1;
+                            assert_eq!(entry.session_id, expected_session_id);
+                            assert_eq!(
+                                entry.snapshot_high,
+                                CommitSeq::new(image.generation * 10 + expected_session_id)
+                            );
+                        }
+                    }
+                    reads += 1;
+                    if reads % 200 == 0 {
+                        h.quiescent();
+                    }
+                }
+                h.quiescent();
+                drop(h);
+                reads
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(250));
+        stop.store(true, Ordering::Release);
+
+        let writes = writer.join().unwrap();
+        let mut total_reads = 0_u64;
+        for reader in readers {
+            total_reads += reader.join().unwrap();
+        }
+
+        assert!(writes > 0);
+        assert!(total_reads > 0);
+    }
+
+    #[test]
+    fn active_txn_snapshot_table_publish_waits_for_reader_quiescent() {
+        let reg = Arc::new(QsbrRegistry::new());
+        let table = Arc::new(RcuActiveTxnSnapshotTable::new());
+        let bootstrap = reg.register().unwrap();
+        bootstrap.quiescent();
+        table.publish(
+            &[ActiveTxnSnapshotEntry {
+                session_id: 1,
+                snapshot_high: CommitSeq::new(11),
+            }],
+            Some(CommitSeq::new(11)),
+            &bootstrap,
+        );
+        bootstrap.quiescent();
+        drop(bootstrap);
+
+        let reader_in_critical = Arc::new(AtomicBool::new(false));
+        let allow_reader_quiesce = Arc::new(AtomicBool::new(false));
+        let publish_finished = Arc::new(AtomicBool::new(false));
+
+        let reader = {
+            let reg = Arc::clone(&reg);
+            let table = Arc::clone(&table);
+            let reader_in_critical = Arc::clone(&reader_in_critical);
+            let allow_reader_quiesce = Arc::clone(&allow_reader_quiesce);
+            thread::spawn(move || {
+                let h = reg.register().unwrap();
+                h.quiescent();
+                let image = table.snapshot();
+                assert_eq!(image.generation, 1);
+                reader_in_critical.store(true, Ordering::Release);
+                while !allow_reader_quiesce.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                h.quiescent();
+                drop(h);
+            })
+        };
+
+        let writer = {
+            let reg = Arc::clone(&reg);
+            let table = Arc::clone(&table);
+            let reader_in_critical = Arc::clone(&reader_in_critical);
+            let publish_finished = Arc::clone(&publish_finished);
+            thread::spawn(move || {
+                let h = reg.register().unwrap();
+                h.quiescent();
+                while !reader_in_critical.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                table.publish(
+                    &[ActiveTxnSnapshotEntry {
+                        session_id: 2,
+                        snapshot_high: CommitSeq::new(21),
+                    }],
+                    Some(CommitSeq::new(21)),
+                    &h,
+                );
+                publish_finished.store(true, Ordering::Release);
+                h.quiescent();
+                drop(h);
+            })
+        };
+
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !publish_finished.load(Ordering::Acquire),
+            "writer publish should wait for the reader grace period"
+        );
+
+        allow_reader_quiesce.store(true, Ordering::Release);
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        assert!(publish_finished.load(Ordering::Acquire));
+        let image = table.snapshot();
+        assert_eq!(image.generation, 2);
+        assert_eq!(image.entries[0].session_id, 2);
+        assert_eq!(image.entries[0].snapshot_high, CommitSeq::new(21));
     }
 
     #[test]

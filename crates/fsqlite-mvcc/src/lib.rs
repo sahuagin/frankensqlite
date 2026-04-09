@@ -304,8 +304,9 @@ pub use provenance::{
     why_not,
 };
 pub use rcu::{
-    MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,
-    rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
+    ActiveTxnSnapshotEntry, ActiveTxnSnapshotImage, MAX_ACTIVE_TXN_SNAPSHOT_ENTRIES,
+    MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuActiveTxnSnapshotTable, RcuCell, RcuMetrics,
+    RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
 };
 pub use regime_monitor::{RegimeMonitor, RegimeMonitorConfig};
 pub use retry_policy::{
