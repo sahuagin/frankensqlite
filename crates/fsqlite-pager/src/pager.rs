@@ -6440,6 +6440,14 @@ where
                 self.publish_committed_state(cx, publish_update);
             }
 
+            // Keep the transaction-local published snapshot hint aligned with
+            // the commit we just published so post-commit callers querying the
+            // still-live handle see committed metadata rather than the
+            // pre-commit snapshot boundary.
+            self.published_visible_commit_seq
+                .set(publish_update.visible_commit_seq);
+            self.published_db_size.set(publish_update.db_size);
+
             let t_phase_c2_done = Instant::now();
 
             // Record full commit path timing.
@@ -16507,6 +16515,35 @@ mod tests {
             pager.publication_write_count(),
             publication_writes_before_multi_connection_commit + 1,
             "bead_id={BEAD_ID} case=multi_connection_commit_restores_publication_write"
+        );
+    }
+
+    #[test]
+    fn test_single_connection_commit_updates_transaction_published_snapshot_hint() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let shared_connection_count = Arc::new(AtomicUsize::new(1));
+        pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+
+        let before = pager.published_snapshot();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x6B; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let committed_hint = txn
+            .published_visible_commit_seq_hint()
+            .expect("transaction should expose a published commit-seq hint");
+        let after = pager.published_snapshot();
+        assert!(
+            after.visible_commit_seq > before.visible_commit_seq,
+            "bead_id={BEAD_ID} case=single_connection_commit_advances_visible_commit_seq"
+        );
+        assert_eq!(
+            committed_hint, after.visible_commit_seq,
+            "bead_id={BEAD_ID} case=single_connection_commit_refreshes_transaction_published_snapshot_hint"
         );
     }
 
