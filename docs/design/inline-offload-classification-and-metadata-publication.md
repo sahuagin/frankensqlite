@@ -325,11 +325,21 @@ Recommendation: Option 2 (RCU snapshot) for E3.2/E3.3, because SSI validation is
 | Reclamation | **None** | Schema data is owned by connection-local registries. Global publication is epoch-only. |
 | Topology sensitivity | **Low** | Single atomic read per statement (schema epoch check). Extremely low traffic. |
 
-**Current primitive:** SeqLock for schema_epoch.
+**Current primitive:** standalone schema invalidation reads use a monotone
+epoch (`lifecycle.rs::schema_epoch`, `shm.rs::load_schema_epoch`), while the
+cross-process `(commit_seq, schema_epoch, ecs_epoch)` publication is bundled
+into the M5b seqlock triple.
 
-**Publication constraint:** Already optimal. SeqLock gives sub-nanosecond reads with no writer blocking.
+**Publication constraint:** if a reader only needs staleness detection, a
+single monotone epoch is sufficient. If a reader needs `schema_epoch` coherent
+with `commit_seq` or `ecs_epoch`, it must bind through the M5b triple and not
+sample the fields independently.
 
-**Observation for E3.2:** No change needed. This is already at the correct primitive.
+**Observation for E3.2:** keep schema metadata split by coupling. Use a single
+atomic epoch for invalidation-only reads; use the M5b seqlock triple whenever
+schema state is part of a durable multi-field snapshot. RCU, Left-Right, and
+BRAVO are unjustified here because the payload is scalar and the schema objects
+themselves remain connection-local.
 
 ---
 
@@ -394,33 +404,79 @@ Recommendation: Option 2 (RCU snapshot) for E3.2/E3.3, because SSI validation is
 | M1 | CommitIndex | 100:1+ | Yes | Relaxed | None | High | AtomicU64 array + LeftRight | Extend flat array; replace LeftRight with epoch hash |
 | M2 | PageLockTable | 1:1 | No | Strict | None | High | AtomicU64 array + shard Mutex | No primitive change; routing (E5) is the lever |
 | M3 | next_commit_seq | 0:1 | N/A | Strict | None | High | AtomicU64 + CommitSequenceCombiner | HTM fast-path (bd-77l3t) |
-| M4 | ConcurrentRegistry | 1:2 | No | Strict | Immediate | Medium | registry Mutex + per-handle Mutex leaves | **RCU snapshot for SSI reads** |
+| M4 | ConcurrentRegistry | 1:2 | No | Strict | Immediate | Medium | registry Mutex + per-handle Mutex leaves | **Split into RCU active snapshot + append-only committed conflict ledger** |
 | M5 | PagerPublishedSnapshot | N:1 | Yes | Relaxed | None | Medium | writer-serialized seqlock summary + lagging page-plane horizon | Keep seqlock summary + explicit fallback |
 | M5b | ShmSnapshot triple | N:1 | Yes | Strict | None | Medium | explicit seqlock triple | Keep seqlock triple |
-| M6 | Schema/Pragma epoch | 10000:1 | Yes | Relaxed | None | Low | SeqLock | No change |
+| M6 | Schema/Pragma epoch | 10000:1 | Yes | Relaxed | None | Low | monotone atomic epoch + M5b seqlock triple when coupled | Keep scalar invalidation epoch local; bind through M5b for durable multi-field reads |
 | M7 | VersionStore | 5:1+ | No | Strict | EBR | Medium | Epoch-based concurrent store | GC optimization (WS3) |
 | M7b | GC horizon / reader-pin floor | N:1 | Conditional | Relaxed monotone | Self-gating | Medium | monotone atomics + epoch floor | No primitive change |
-| M8 | SSI Evidence | 0.01:1 | Yes | None | None | Low | Async ring buffer | No change |
+| M8 | SSI Evidence | 0.01:1 | Yes | None | None | Low | Async ring buffer | Keep async telemetry; treat witness archive as separate append-only publication surface |
 
 ---
 
-## E3.2 Primitive Selection Ledger
+## E3.2 Primitive Selection Matrix
 
-The table below makes the primitive choice explicit for the reader-visible
-metadata classes that still had real design ambiguity.
+E3.1 classified the coarse metadata surfaces. E3.2 refines that inventory at
+the actual publication boundaries that exist in code:
 
-| Class | Selected Primitive | Rejected Alternatives | Why Rejected |
-|-------|--------------------|-----------------------|--------------|
-| M4 ActiveTxnRegistry | RCU/QSBR-published immutable registry snapshot plus mutable leaves | global registry `Mutex`; whole-registry seqlock; Left-Right full duplicate | long SSI scans should not hold a writer lock, and a whole-registry seqlock can livelock under commit churn |
-| M5 PagerPublishedSnapshot | seqlock-style summary over fixed fields | `RwLock`/Mutex summary; RCU copy-on-write snapshot object | read path is tiny and retryable, so allocation-heavy RCU is worse than a stable seqlock summary |
-| M5b ShmSnapshot triple | seqlock triple | independent atomics; RCU object swap | independent atomics allow torn `(commit_seq, schema_epoch, ecs_epoch)` reads; RCU is overkill for three words |
-| M7 VersionStore | append-only EBR publication | RCU full-copy chains; seqlock-protected chain heads | readers need stable historical chain traversal and delayed reclamation, not snapshot replacement |
-| M7b GC horizon | monotone atomics with floor recomputation | RCU snapshot floor; seqlock floor | stale-low floors are safe, so retryable snapshot machinery only adds latency |
+- M4 splits into the **active transaction snapshot table** and the
+  **committed conflict ledger** because SSI scans and historical conflict
+  lookups have different read/write shapes.
+- M6 splits by coupling: a standalone schema invalidation epoch is a scalar,
+  but the durable `(commit_seq, schema_epoch, ecs_epoch)` image is a coherent
+  multi-field snapshot and therefore belongs with M5b.
+- M8 splits low-value policy telemetry from the higher-fidelity witness
+  archive because they tolerate very different publication costs.
 
-The corresponding code-level contract anchors are:
+### Primitive Heuristics
+
+| Metadata shape | Preferred primitive | Why |
+|----------------|---------------------|-----|
+| Fixed-width multi-field summary with retryable reads | **Seqlock** | readers cheaply retry until they see a coherent generation |
+| Immutable snapshot table scanned by readers | **RCU/QSBR** | readers bind one image and do not block writers |
+| Append-only ledger / archive | **Atomic pointer swap or RCU-published immutable segments** | readers consume a prefix; writers never mutate published history in place |
+| Exact ownership / exclusion directory | **Sharded atomics + CAS** | state must be linearizable and cannot tolerate stale reads |
+| Monotone floor / horizon | **Single atomics with min-reduction** | stale-low is safe, so richer snapshot machinery only adds latency |
+
+### Class-by-Class Mapping
+
+| Class | Touchpoint | Selected Primitive | Candidates Considered | Explicitly Rejected | Why This Fits FrankenSQLite |
+|-------|------------|--------------------|-----------------------|---------------------|-----------------------------|
+| M1 CommitIndex | `core_types.rs::CommitIndex` | direct-indexed atomics for hot pages, sharded fallback for cold/large pages | Left-Right shards, RCU hash, seqlock summary | BRAVO rwlock, whole-map RLU-like copy, whole-array seqlock | per-page visibility is a single-word publish; readers can safely observe stale-old page visibility without needing a cross-page snapshot |
+| M2 Page ownership directory | `begin_concurrent.rs::InProcessPageLockTable` | sharded atomic CAS directory with bounded handoff waiters | seqlock directory, BRAVO `RwLock`, RCU map, Left-Right copy | seqlock, RCU, Left-Right, BRAVO | first-touch ownership is exact and mutation-heavy; a writer must know whether it owns the page now, not eventually |
+| M3 next_commit_seq | `shm.rs::next_commit_seq` plus `CommitSequenceCombiner` | flat-combined atomic `fetch_add` | HTM-guarded combiner, per-node reservation blocks | seqlock, Left-Right, RCU, BRAVO, RLU-like | the value is one globally ordered scalar; the only real lever is reducing cache-line traffic, not changing snapshot semantics |
+| M3b Durable commit ledger | `core_types.rs::CommitLog` | append-only immutable segments with atomic tail publication | single locked `Vec` tail, whole-log Left-Right, seqlock over tail metadata | whole-log Left-Right, seqlock, BRAVO, RLU-like whole-log copy | readers only need a prefix-stable history; published records are immutable, so segment append plus atomic tail swap matches the access pattern better than copying or retry loops |
+| M4a Active transaction snapshot table | `begin_concurrent.rs::ConcurrentRegistry::{active,active_snapshot_highs,gc_horizon_counts}` | RCU/QSBR-published immutable registry image with mutable per-handle leaves retained separately | global `Mutex`, sharded `Mutex`, whole-registry seqlock, Left-Right duplicate | whole-registry seqlock, BRAVO rwlock, long-term global `Mutex` | SSI validation wants one immutable view of the active set; readers should not hold the writer lock across conflict scans |
+| M4b Committed conflict ledger | `begin_concurrent.rs::ConcurrentRegistry::{committed_readers*,committed_writers*}` | append-only shard-per-key-family ledgers published via immutable segment headers and epoch reclamation | global registry `Mutex`, Left-Right full duplicate, seqlock-protected vectors, RLU-like copied indexes | seqlock, BRAVO, whole-registry Left-Right | committed conflict history is append-only and lookup-heavy by page / exact cell, so immutable indexed segments fit better than retry-on-write schemes |
+| M5 Pager snapshot summary | `pager.rs::PublishedPagerState::{snapshot,finalize_publish}` | seqlock-style summary publication | `RwLock` summary, atomic pointer swap of summary objects, Left-Right copies | BRAVO rwlock, Left-Right, RLU-like snapshot objects | readers sample a tiny fixed field set at BEGIN and may retry; allocation-heavy snapshot replacement is strictly worse than a stable seqlock summary |
+| M5b SHM durable snapshot triple | `shm.rs::SharedMemoryLayout::{publish_snapshot,load_consistent_snapshot}` | seqlock triple | independent atomics, RCU object swap, Left-Right pair copies | independent atomics, Left-Right, BRAVO, RLU-like | readers must never combine `commit_seq`, `schema_epoch`, and `ecs_epoch` from different generations, but the payload is too small to justify copy-on-write |
+| M6 Schema invalidation epoch | `lifecycle.rs::schema_epoch` and `shm.rs::load_schema_epoch` | monotone atomic epoch when standalone; piggyback on M5b when bundled with durable snapshot state | standalone seqlock, RCU schema object publication | Left-Right, BRAVO, standalone RCU copies | most readers only need staleness detection; the real schema objects are connection-local, so only the epoch needs publication |
+| M7 VersionStore chain publication | `invariants.rs::VersionStore` plus `ebr.rs::VersionGuardRegistry` | CAS-published chain heads plus append-only EBR-protected nodes | full-copy RCU chains, seqlock-protected mutable chains, RLU-like node indirection | seqlock chains, BRAVO, whole-chain copy on commit | readers need stable historical chain traversal and delayed reclamation, not snapshot replacement of entire page histories |
+| M7b GC horizon / reader pins | `core_types.rs::raise_gc_horizon` plus `VersionGuardRegistry::min_pinned_epoch` | monotone atomics with floor recomputation | seqlock floor, RCU floor snapshot, Left-Right duplicate floor | seqlock, RCU, BRAVO, Left-Right | consumers only need a safe lower bound; stale-low is correct and cheaper than any retry-based scheme |
+| M8 SSI decision telemetry | `ssi_abort_policy.rs::record_async` | bounded async ring / offload lane | RCU observation list, seqlock counters, global mutex log | seqlock on commit path, BRAVO, Left-Right | this stream informs policy and diagnostics only; best-effort publication keeps it off the commit critical path |
+| M8b Witness publication archive | `witness_publication.rs::WitnessPublisher` | two-plane publication: mutex-protected pending reservations plus append-only committed chunks published as immutable history | coarse mutex `Vec`, whole-archive Left-Right, seqlock over archive header | seqlock whole archive, BRAVO, whole-archive Left-Right, RLU-like archive copy | the reserve/write/commit protocol already separates private mutation from public visibility; only the committed side needs reader-friendly immutable publication |
+
+Two design decisions fall out of the matrix:
+
+1. **Seqlock is narrow by design.** It is the right answer only for tiny
+   fixed-width snapshots whose readers can cheaply retry, not for ledgers,
+   version chains, or ownership state.
+2. **RCU is for bounded immutable views, not everything.** The active
+   transaction snapshot table wants RCU because SSI scans are long and
+   read-dominant. The version store and ownership table do not, because they
+   require exact current state or append-only reclamation semantics instead.
+
+The code-level contract anchors that already exist today are:
 
 - `crates/fsqlite-pager/src/pager.rs`: `PAGER_METADATA_PUBLICATION_CONTRACTS`
 - `crates/fsqlite-mvcc/src/lib.rs`: `MVCC_METADATA_PUBLICATION_CONTRACTS`
+
+The design-only anchors that this matrix makes explicit for downstream beads
+are:
+
+- `crates/fsqlite-mvcc/src/core_types.rs`: `CommitLog`
+- `crates/fsqlite-mvcc/src/begin_concurrent.rs`: `ConcurrentRegistry`
+- `crates/fsqlite-mvcc/src/witness_publication.rs`: `WitnessPublisher`
 
 ---
 
@@ -565,7 +621,7 @@ a backlog of deferred work.
 | A2 | ConcurrentRegistry Mutex is the primary c4 contention source | Lock-hold timing + contention rate measurement | If false, CommitIndex or PageLockTable contention dominates — change E3.2 priority |
 | A3 | Waiter wakeup can be safely moved outside the publish window | Test: writer releases lock, reader sees committed state before wakeup fires | If false, some reader depends on synchronous wakeup — keep wakeup in IC |
 | A4 | RCU-style snapshot is viable for ConcurrentRegistry at ≤ 64 concurrent sessions | Prototype + benchmark at c4/c8 | If false, session count exceeds RCU copy budget — fall back to sharded Mutex |
-| A5 | SeqLockPair eliminates Mutex contention on pager snapshot bind | Before/after c4 BEGIN latency measurement | If false, other BEGIN work dominates — deprioritize M5 change |
+| A5 | seqlock-style pager summary publication eliminates Mutex contention on snapshot bind | Before/after c4 BEGIN latency measurement | If false, other BEGIN work dominates — deprioritize M5 change |
 
 ---
 
@@ -574,7 +630,7 @@ a backlog of deferred work.
 | Downstream Bead | What This Artifact Provides |
 |-----------------|---------------------------|
 | **bd-db300.5.4.2** (E4.2: queue budgets) | Lane definitions, queue depth bounds, Little's Law parameters, backpressure trigger formula |
-| **bd-db300.5.3.2** (E3.2: primitive mapping) | Metadata class axes, current primitives, candidate upgrades, coupling constraints |
+| **bd-db300.5.3.2** (E3.2: primitive mapping) | Selected and rejected primitive matrix, split of active snapshot vs committed ledger, coupling constraints |
 | **bd-db300.5.4.3** (E4.3: admission control) | Admission control trigger sequence, p50 protection mechanism |
 | **bd-77l3t** (HTM fast-path) | M3 classification confirms CommitSequenceCombiner is the HTM target |
 | **bd-3t52f** (DRO abort policy) | M8 classification confirms evidence is OA/fire-and-forget, safe for policy input |
