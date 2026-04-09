@@ -587,7 +587,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
-            let mut unique_groups = Vec::<Vec<usize>>::new();
+            let mut unique_groups = Vec::<(Vec<usize>, Vec<Option<String>>)>::new();
             for (column_index, column) in schema
                 .last()
                 .expect("current table schema must exist")
@@ -596,25 +596,32 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                 .enumerate()
             {
                 if column.unique && !column.is_ipk {
-                    unique_groups.push(vec![column_index]);
+                    unique_groups.push((vec![column_index], vec![column.collation.clone()]));
                 }
             }
             for index in &indexes {
                 if !index.is_unique || index.columns.is_empty() {
                     continue;
                 }
-                let group = index
+                let (group, collations): (Vec<_>, Vec<_>) = index
                     .columns
                     .iter()
-                    .filter_map(|column_name| {
+                    .enumerate()
+                    .filter_map(|(term_idx, column_name)| {
                         schema
                             .last()
                             .expect("current table schema must exist")
                             .columns
                             .iter()
                             .position(|column| column.name.eq_ignore_ascii_case(column_name))
+                            .map(|column_index| {
+                                (
+                                    column_index,
+                                    index.key_collations.get(term_idx).cloned().flatten(),
+                                )
+                            })
                     })
-                    .collect::<Vec<_>>();
+                    .unzip();
                 if group.is_empty()
                     || group.iter().all(|&column_index| {
                         schema
@@ -623,14 +630,14 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             .columns[column_index]
                             .is_ipk
                     })
-                    || unique_groups.iter().any(|existing| existing == &group)
+                    || unique_groups.iter().any(|(existing, _)| existing == &group)
                 {
                     continue;
                 }
-                unique_groups.push(group);
+                unique_groups.push((group, collations));
             }
-            for group in unique_groups {
-                mem_table.add_unique_column_group(group);
+            for (group, collations) in unique_groups {
+                mem_table.add_unique_column_group_with_collations(group, collations);
             }
             if cursor.first(cx)? {
                 if without_rowid {
