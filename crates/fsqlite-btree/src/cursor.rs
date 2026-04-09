@@ -1413,83 +1413,86 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
+    #[inline(always)]
     fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
     where
         F: FnOnce(&mut Self) -> Result<T>,
     {
         instrumentation::record_operation(op_type);
 
-        // Fast path: skip tracing span + stats when tracing is disabled (common case).
-        // tracing::span! allocates metadata even when disabled (~20-50ns).
-        // For hot-path operations like INSERT this matters: ~100ns saved per call.
-        let tracing_active = tracing::enabled!(target: "fsqlite.btree", Level::DEBUG);
-
-        if tracing_active {
-            let span = tracing::span!(
-                Level::DEBUG,
-                "btree_op",
-                op_type = op_type.as_str(),
-                pages_visited = tracing::field::Empty,
-                splits = tracing::field::Empty,
-                merges = tracing::field::Empty
-            );
-            let _entered = span.enter();
-            debug!(op_type = op_type.as_str(), "starting btree operation");
-
-            self.active_op_stats = Some(BtreeOpRuntimeStats::default());
-            let result = work(self);
-
-            if let Err(error) = self.record_depth_gauge(cx) {
-                debug!(
-                    op_type = op_type.as_str(),
-                    error = %error,
-                    "failed to refresh btree depth gauge"
-                );
-            }
-
-            if !matches!(op_type, BtreeOpType::Seek) {
-                self.clear_seek_cache();
-            }
-
-            let stats = self.active_op_stats.take().unwrap_or_default();
-            span.record("pages_visited", stats.pages_visited);
-            span.record("splits", stats.splits);
-            span.record("merges", stats.merges);
-
-            if let Err(error) = &result {
-                debug!(
-                    op_type = op_type.as_str(),
-                    pages_visited = stats.pages_visited,
-                    splits = stats.splits,
-                    merges = stats.merges,
-                    error = %error,
-                    "btree operation failed"
-                );
-            } else {
-                debug!(
-                    op_type = op_type.as_str(),
-                    pages_visited = stats.pages_visited,
-                    splits = stats.splits,
-                    merges = stats.merges,
-                    "btree operation completed"
-                );
-            }
-            result
-        } else {
-            // Hot path: no tracing, no stats, minimal overhead.
-            let result = work(self);
-            if let Err(error) = self.record_depth_gauge(cx) {
-                debug!(
-                    op_type = op_type.as_str(),
-                    error = %error,
-                    "failed to refresh btree depth gauge"
-                );
-            }
-            if !matches!(op_type, BtreeOpType::Seek) {
-                self.clear_seek_cache();
-            }
-            result
+        // Keep the common path shaped like SQLite's narrow step/execute flow:
+        // one branch, direct work call, then a tiny postlude. The traced/stats
+        // machinery stays in a cold helper so it does not bloat the hot body.
+        if tracing::enabled!(target: "fsqlite.btree", Level::DEBUG) {
+            return self.with_btree_op_tracing(cx, op_type, work);
         }
+
+        let result = work(self);
+        self.finish_btree_op_postlude(cx, op_type);
+        result
+    }
+
+    #[inline(always)]
+    fn finish_btree_op_postlude(&mut self, cx: &Cx, op_type: BtreeOpType) {
+        if let Err(error) = self.record_depth_gauge(cx) {
+            debug!(
+                op_type = op_type.as_str(),
+                error = %error,
+                "failed to refresh btree depth gauge"
+            );
+        }
+
+        if !matches!(op_type, BtreeOpType::Seek) {
+            self.clear_seek_cache();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn with_btree_op_tracing<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        let span = tracing::span!(
+            Level::DEBUG,
+            "btree_op",
+            op_type = op_type.as_str(),
+            pages_visited = tracing::field::Empty,
+            splits = tracing::field::Empty,
+            merges = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        debug!(op_type = op_type.as_str(), "starting btree operation");
+
+        self.active_op_stats = Some(BtreeOpRuntimeStats::default());
+        let result = work(self);
+        self.finish_btree_op_postlude(cx, op_type);
+
+        let stats = self.active_op_stats.take().unwrap_or_default();
+        span.record("pages_visited", stats.pages_visited);
+        span.record("splits", stats.splits);
+        span.record("merges", stats.merges);
+
+        if let Err(error) = &result {
+            debug!(
+                op_type = op_type.as_str(),
+                pages_visited = stats.pages_visited,
+                splits = stats.splits,
+                merges = stats.merges,
+                error = %error,
+                "btree operation failed"
+            );
+        } else {
+            debug!(
+                op_type = op_type.as_str(),
+                pages_visited = stats.pages_visited,
+                splits = stats.splits,
+                merges = stats.merges,
+                "btree operation completed"
+            );
+        }
+
+        result
     }
 
     /// Load a page into a stack entry.
