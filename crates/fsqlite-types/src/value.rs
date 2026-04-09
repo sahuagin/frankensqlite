@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memchr::{memchr, memchr2};
 
@@ -154,31 +154,55 @@ const SMALL_TEXT_INLINE_CAP: usize = 23;
 /// A small-string-optimized text value.
 ///
 /// Stores strings ≤ 23 bytes inline without heap allocation. Longer strings
-/// use `Arc<str>` for O(1) cloning. This eliminates malloc for the vast
-/// majority of database text values (column names, short strings, numbers).
-///
-/// Layout:
-/// - Inline: 1 byte length (0..=23), followed by up to 23 UTF-8 bytes
-/// - Heap: tag byte 0xFF, followed by Arc<str> pointer
-#[derive(Clone)]
+/// stay owned until the first clone, then lazily promote to `Arc<str>` for
+/// shared O(1) cloning. This eliminates both malloc and refcount traffic for
+/// the common single-owner path.
 pub struct SmallText {
-    /// Representation: either inline bytes or a heap pointer.
-    ///
-    /// Inline layout: buf[0] = length (0..=23), buf[1..1+len] = UTF-8 data
-    /// Heap layout: buf[0] = 0xFF (tag), buf[8..16] = Arc<str> pointer
+    /// Representation: either inline bytes or a lazily shared heap string.
     repr: SmallTextRepr,
 }
 
 /// Internal representation for SmallText.
-#[derive(Clone)]
 enum SmallTextRepr {
     /// Inline storage: length followed by up to 23 UTF-8 bytes.
     Inline {
         len: u8,
         buf: [u8; SMALL_TEXT_INLINE_CAP],
     },
-    /// Heap storage for strings > 23 bytes.
-    Heap(Arc<str>),
+    /// Heap storage before the first clone.
+    ///
+    /// The `Arc<str>` is materialized lazily on demand so a single-owner value
+    /// pays no refcount cost until it is actually shared.
+    HeapOwned {
+        text: Box<str>,
+        shared: OnceLock<Arc<str>>,
+    },
+    /// Heap storage after the text has been shared.
+    HeapShared(Arc<str>),
+}
+
+impl Clone for SmallText {
+    fn clone(&self) -> Self {
+        Self {
+            repr: self.repr.clone(),
+        }
+    }
+}
+
+impl Clone for SmallTextRepr {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Inline { len, buf } => Self::Inline {
+                len: *len,
+                buf: *buf,
+            },
+            Self::HeapOwned { text, shared } => {
+                let shared = Arc::clone(shared.get_or_init(|| Arc::from(text.clone())));
+                Self::HeapShared(shared)
+            }
+            Self::HeapShared(text) => Self::HeapShared(Arc::clone(text)),
+        }
+    }
 }
 
 impl SmallText {
@@ -196,7 +220,10 @@ impl SmallText {
             }
         } else {
             Self {
-                repr: SmallTextRepr::Heap(Arc::from(s)),
+                repr: SmallTextRepr::HeapOwned {
+                    text: Box::<str>::from(s),
+                    shared: OnceLock::new(),
+                },
             }
         }
     }
@@ -211,7 +238,10 @@ impl SmallText {
             Self::new(s.as_ref())
         } else {
             Self {
-                repr: SmallTextRepr::Heap(Arc::from(s.into())),
+                repr: SmallTextRepr::HeapOwned {
+                    text: s.into().into_boxed_str(),
+                    shared: OnceLock::new(),
+                },
             }
         }
     }
@@ -223,7 +253,7 @@ impl SmallText {
             Self::new(&arc)
         } else {
             Self {
-                repr: SmallTextRepr::Heap(arc),
+                repr: SmallTextRepr::HeapShared(arc),
             }
         }
     }
@@ -234,7 +264,8 @@ impl SmallText {
         match &self.repr {
             SmallTextRepr::Inline { len, buf } => std::str::from_utf8(&buf[..*len as usize])
                 .expect("SmallText inline representation must always contain valid UTF-8"),
-            SmallTextRepr::Heap(arc) => arc,
+            SmallTextRepr::HeapOwned { text, .. } => text,
+            SmallTextRepr::HeapShared(text) => text,
         }
     }
 
@@ -243,7 +274,8 @@ impl SmallText {
     pub fn len(&self) -> usize {
         match &self.repr {
             SmallTextRepr::Inline { len, .. } => *len as usize,
-            SmallTextRepr::Heap(arc) => arc.len(),
+            SmallTextRepr::HeapOwned { text, .. } => text.len(),
+            SmallTextRepr::HeapShared(text) => text.len(),
         }
     }
 
@@ -256,7 +288,7 @@ impl SmallText {
     /// Check if stored inline (no heap allocation).
     #[inline]
     pub fn is_inline(&self) -> bool {
-        matches!(self.repr, SmallTextRepr::Inline { .. })
+        matches!(&self.repr, SmallTextRepr::Inline { .. })
     }
 
     /// Convert to Arc<str>, potentially allocating if currently inline.
@@ -268,7 +300,10 @@ impl SmallText {
                     .expect("SmallText inline representation must always contain valid UTF-8");
                 Arc::from(s)
             }
-            SmallTextRepr::Heap(arc) => arc,
+            SmallTextRepr::HeapOwned { text, shared } => {
+                shared.into_inner().unwrap_or_else(|| Arc::from(text))
+            }
+            SmallTextRepr::HeapShared(text) => text,
         }
     }
 }
@@ -1864,6 +1899,33 @@ mod tests {
                 slab_high_water_mark: WARM_POOL_DEPTH,
             }
         );
+    }
+
+    #[test]
+    fn test_small_text_heap_clone_lazily_promotes_to_shared_arc() {
+        let text = SmallText::new("this string is definitely longer than twenty three bytes");
+        let SmallTextRepr::HeapOwned { shared, .. } = &text.repr else {
+            panic!("long text should start in heap-owned mode");
+        };
+        assert!(
+            shared.get().is_none(),
+            "long text should not allocate Arc eagerly before cloning"
+        );
+
+        let cloned = text.clone();
+
+        let SmallTextRepr::HeapOwned { shared, .. } = &text.repr else {
+            panic!("original text should remain heap-owned after clone");
+        };
+        assert!(
+            shared.get().is_some(),
+            "first clone should materialize a shared Arc lazily"
+        );
+        assert!(
+            matches!(cloned.repr, SmallTextRepr::HeapShared(_)),
+            "cloned text should use the shared Arc representation"
+        );
+        assert_eq!(text.as_str(), cloned.as_str());
     }
 
     #[test]

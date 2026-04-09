@@ -37,6 +37,7 @@ pub use value::{SmallText, SqliteValue};
 
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::{Arc, OnceLock};
 
 /// A page number in the database file.
 ///
@@ -273,34 +274,83 @@ impl fmt::Display for PageSize {
 /// Raw page data as an owned byte buffer.
 ///
 /// The length always matches the database page size.
-/// Uses `Arc` for cheap cloning (Copy-On-Write).
-#[derive(Clone, PartialEq, Eq)]
+/// Fresh pages stay owned until the first clone, then lazily promote to
+/// `Arc<[u8]>` for shared copy-on-write snapshots.
 pub struct PageData {
-    /// Page contents stored as `Arc<[u8]>` (single allocation: Arc header +
-    /// data inline) instead of the previous `Arc<Vec<u8>>` (two allocations:
-    /// Arc header → Vec header → data). This eliminates one pointer
-    /// dereference on every `as_bytes()` call and improves cache locality.
-    data: std::sync::Arc<[u8]>,
+    repr: PageDataRepr,
+}
+
+enum PageDataRepr {
+    /// Single-owner page bytes before the first clone.
+    ///
+    /// The shared `Arc<[u8]>` snapshot is created lazily on the first clone so
+    /// freshly written pages do not pay refcount costs until they are actually
+    /// shared across snapshots or layers.
+    Owned {
+        bytes: Vec<u8>,
+        shared: OnceLock<Arc<[u8]>>,
+    },
+    /// Shared immutable bytes after the page has been cloned.
+    Shared(Arc<[u8]>),
+}
+
+impl Clone for PageData {
+    fn clone(&self) -> Self {
+        match &self.repr {
+            PageDataRepr::Owned { bytes, shared } => {
+                let shared = Arc::clone(
+                    shared.get_or_init(|| Arc::<[u8]>::from(bytes.clone().into_boxed_slice())),
+                );
+                Self {
+                    repr: PageDataRepr::Shared(shared),
+                }
+            }
+            PageDataRepr::Shared(bytes) => Self {
+                repr: PageDataRepr::Shared(Arc::clone(bytes)),
+            },
+        }
+    }
+}
+
+impl PartialEq for PageData {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for PageData {}
+
+impl PageDataRepr {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned { bytes, .. } => bytes.as_slice(),
+            Self::Shared(bytes) => bytes.as_ref(),
+        }
+    }
 }
 
 impl PageData {
     /// Create a zero-filled page of the given size.
     pub fn zeroed(size: PageSize) -> Self {
-        Self {
-            data: vec![0u8; size.as_usize()].into(),
-        }
+        Self::from_vec(vec![0u8; size.as_usize()])
     }
 
     /// Create from existing bytes. The caller must ensure the length matches
     /// the page size.
     pub fn from_vec(data: Vec<u8>) -> Self {
-        Self { data: data.into() }
+        Self {
+            repr: PageDataRepr::Owned {
+                bytes: data,
+                shared: OnceLock::new(),
+            },
+        }
     }
 
     /// Get the page data as a byte slice.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        self.repr.as_bytes()
     }
 
     /// Get the page data as a mutable byte slice.
@@ -308,46 +358,52 @@ impl PageData {
     /// This performs a clone if the data is shared (Copy-On-Write).
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        std::sync::Arc::make_mut(&mut self.data)
+        match &mut self.repr {
+            PageDataRepr::Owned { bytes, .. } => bytes.as_mut_slice(),
+            PageDataRepr::Shared(bytes) => Arc::make_mut(bytes),
+        }
     }
 
     /// Get the length in bytes.
     #[inline]
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.as_bytes().len()
     }
 
     /// Returns true if the page data is empty (should never be true for valid pages).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.as_bytes().is_empty()
     }
 
     /// Consume self and return the inner `Vec<u8>`.
     ///
     /// If the data is shared, this clones into a new Vec.
     pub fn into_vec(self) -> Vec<u8> {
-        self.data.as_ref().to_vec()
+        match self.repr {
+            PageDataRepr::Owned { bytes, .. } => bytes,
+            PageDataRepr::Shared(bytes) => bytes.as_ref().to_vec(),
+        }
     }
 }
 
 impl fmt::Debug for PageData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PageData")
-            .field("len", &self.data.len())
+            .field("len", &self.len())
             .finish()
     }
 }
 
 impl AsRef<[u8]> for PageData {
     fn as_ref(&self) -> &[u8] {
-        &self.data
+        self.as_bytes()
     }
 }
 
 impl AsMut<[u8]> for PageData {
     fn as_mut(&mut self) -> &mut [u8] {
-        std::sync::Arc::make_mut(&mut self.data)
+        self.as_bytes_mut()
     }
 }
 
@@ -1519,6 +1575,54 @@ mod tests {
         assert_eq!(PageSize::MIN.get(), 512);
         assert_eq!(PageSize::MAX.get(), 65536);
         assert_eq!(PageSize::default(), PageSize::DEFAULT);
+    }
+
+    #[test]
+    fn page_data_clone_promotes_owned_bytes_to_shared_snapshot() {
+        let page = PageData::from_vec(vec![1, 2, 3, 4]);
+        let PageDataRepr::Owned { shared, .. } = &page.repr else {
+            panic!("fresh page data should start owned");
+        };
+        assert!(
+            shared.get().is_none(),
+            "fresh page should not allocate Arc eagerly"
+        );
+
+        let cloned = page.clone();
+
+        let PageDataRepr::Owned { shared, .. } = &page.repr else {
+            panic!("original page should remain in owned mode");
+        };
+        assert!(
+            shared.get().is_some(),
+            "first clone should materialize a shared snapshot lazily"
+        );
+        assert!(
+            matches!(cloned.repr, PageDataRepr::Shared(_)),
+            "clone should observe the shared snapshot"
+        );
+    }
+
+    #[test]
+    fn page_data_mutation_reuses_owned_bytes_after_snapshot_clone() {
+        let mut page = PageData::from_vec(vec![9, 8, 7, 6]);
+        let snapshot = page.clone();
+
+        page.as_bytes_mut()[0] = 1;
+
+        assert_eq!(snapshot.as_bytes(), &[9, 8, 7, 6]);
+        assert_eq!(page.as_bytes(), &[1, 8, 7, 6]);
+        assert!(
+            matches!(page.repr, PageDataRepr::Owned { .. }),
+            "mutating the original owner should stay on its owned bytes"
+        );
+        let PageDataRepr::Owned { shared, .. } = &page.repr else {
+            panic!("mutated page should remain in owned mode");
+        };
+        assert!(
+            shared.get().is_some(),
+            "mutating the original owner should reuse its existing owned bytes rather than resetting the shared snapshot"
+        );
     }
 
     fn make_header_for_tests() -> DatabaseHeader {
