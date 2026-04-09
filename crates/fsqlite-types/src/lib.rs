@@ -358,6 +358,28 @@ impl PageData {
     /// This performs a clone if the data is shared (Copy-On-Write).
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        let reset_owned_snapshot_cache = matches!(
+            &self.repr,
+            PageDataRepr::Owned { shared, .. } if shared.get().is_some()
+        );
+        if reset_owned_snapshot_cache {
+            let bytes = match std::mem::replace(
+                &mut self.repr,
+                PageDataRepr::Owned {
+                    bytes: Vec::new(),
+                    shared: OnceLock::new(),
+                },
+            ) {
+                PageDataRepr::Owned { bytes, .. } => bytes,
+                PageDataRepr::Shared(_) => {
+                    unreachable!("owned snapshot cache reset should only run for owned pages")
+                }
+            };
+            self.repr = PageDataRepr::Owned {
+                bytes,
+                shared: OnceLock::new(),
+            };
+        }
         match &mut self.repr {
             PageDataRepr::Owned { bytes, .. } => bytes.as_mut_slice(),
             PageDataRepr::Shared(bytes) => Arc::make_mut(bytes),
@@ -1620,9 +1642,22 @@ mod tests {
             panic!("mutated page should remain in owned mode");
         };
         assert!(
-            shared.get().is_some(),
-            "mutating the original owner should reuse its existing owned bytes rather than resetting the shared snapshot"
+            shared.get().is_none(),
+            "mutating the original owner must invalidate the stale shared snapshot cache so later clones observe the new bytes"
         );
+    }
+
+    #[test]
+    fn page_data_clone_after_owner_mutation_observes_latest_bytes() {
+        let mut page = PageData::from_vec(vec![9, 8, 7, 6]);
+        let first_snapshot = page.clone();
+
+        page.as_bytes_mut()[0] = 1;
+        let second_snapshot = page.clone();
+
+        assert_eq!(first_snapshot.as_bytes(), &[9, 8, 7, 6]);
+        assert_eq!(second_snapshot.as_bytes(), &[1, 8, 7, 6]);
+        assert_eq!(page.as_bytes(), &[1, 8, 7, 6]);
     }
 
     fn make_header_for_tests() -> DatabaseHeader {
