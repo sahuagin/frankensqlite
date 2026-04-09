@@ -3705,8 +3705,7 @@ static FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Test-only count of sideband MakeRecord values that had to become Arc-backed blobs.
 #[cfg(test)]
-static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: AtomicU64 =
-    AtomicU64::new(0);
+static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
 /// bd-7vkes: Count times a full B-tree seek was needed for INSERT.
@@ -4395,8 +4394,7 @@ pub fn reset_vdbe_metrics() {
 
 #[cfg(test)]
 fn reset_vdbe_test_sideband_materialization_count() {
-    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL
-        .store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL.store(0, AtomicOrdering::Relaxed);
 }
 
 #[cfg(test)]
@@ -8525,10 +8523,6 @@ impl VdbeEngine {
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let concurrent_allocator = self.concurrent_rowid_allocator.clone();
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
-                    // take_reg moves the value out (replacing with Null) instead
-                    // of cloning — avoids a heap allocation for Blob/Text records.
-                    // Safe because MakeRecord overwrites the register each iteration.
-                    let record_val = self.take_reg(record_reg);
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
                     let pending_update_restore = if is_update {
@@ -8547,6 +8541,21 @@ impl VdbeEngine {
                     // Arc allocation. Otherwise fall back to register blob.
                     let sideband_active = self.make_record_sideband_reg == record_reg
                         && !self.make_record_buf.is_empty();
+                    // Only move the register value out when there is no active
+                    // MakeRecord sideband. Doing `take_reg()` first would
+                    // eagerly materialize the sideband into an Arc-backed blob
+                    // and defeat the INSERT hot-path optimization.
+                    let record_val = if sideband_active {
+                        if self.has_subtypes {
+                            self.register_subtypes.remove(&record_reg);
+                        }
+                        SqliteValue::Null
+                    } else {
+                        // take_reg moves the value out (replacing with Null)
+                        // instead of cloning — avoids a heap allocation for
+                        // Blob/Text records.
+                        self.take_reg(record_reg)
+                    };
                     let sideband_buf = if sideband_active {
                         self.make_record_sideband_reg = 0;
                         std::mem::take(&mut self.make_record_buf)
@@ -8696,8 +8705,21 @@ impl VdbeEngine {
                         }
                     } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
-                        let values =
-                            decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?;
+                        let values = if sideband_active {
+                            let values = parse_record(&sideband_buf).ok_or_else(|| {
+                                FrankenError::internal("malformed SQLite record blob")
+                            })?;
+                            if self.collect_vdbe_metrics {
+                                FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                for value in &values {
+                                    record_decoded_value_metrics(value);
+                                }
+                            }
+                            values
+                        } else {
+                            decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?
+                        };
                         if let Some(db) = self.db.as_mut() {
                             // Check rowid conflict first.
                             let rowid_conflict = db
@@ -14314,14 +14336,25 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Instant;
 
     use super::*;
     use crate::ProgramBuilder;
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_mvcc::ConcurrentRegistry;
-    use fsqlite_types::Snapshot;
+    use fsqlite_types::limits::MAX_COLUMN;
     use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
+    use fsqlite_types::record::{parse_record, parse_record_into, serialize_record_iter_into};
+    use fsqlite_types::serial_type::{
+        serial_type_for_blob, serial_type_for_integer, serial_type_for_text, varint_len,
+        write_varint,
+    };
+    use fsqlite_types::{SmallText, Snapshot};
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
+    use rusqlite::params_from_iter;
+    use rusqlite::types::Value as RusqliteValue;
 
     struct CancelExecutionFunc {
         cx: Cx,
@@ -15011,6 +15044,615 @@ mod tests {
             .collect()
     }
 
+    fn track_r_log_metrics(
+        test_name: &str,
+        alloc_count: usize,
+        scratch_capacity_bytes: usize,
+        encode_time_ns: u128,
+    ) {
+        eprintln!(
+            "track_r test={test_name} alloc_count={alloc_count} scratch_capacity_bytes={scratch_capacity_bytes} encode_time_ns={encode_time_ns}"
+        );
+    }
+
+    fn track_r_values_bitwise_eq(left: &SqliteValue, right: &SqliteValue) -> bool {
+        match (left, right) {
+            (SqliteValue::Null, SqliteValue::Null) => true,
+            (SqliteValue::Integer(lhs), SqliteValue::Integer(rhs)) => lhs == rhs,
+            (SqliteValue::Float(lhs), SqliteValue::Float(rhs)) => lhs.to_bits() == rhs.to_bits(),
+            (SqliteValue::Text(lhs), SqliteValue::Text(rhs)) => lhs == rhs,
+            (SqliteValue::Blob(lhs), SqliteValue::Blob(rhs)) => lhs == rhs,
+            _ => false,
+        }
+    }
+
+    fn track_r_assert_rows_eq(actual: &[SqliteValue], expected: &[SqliteValue], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: column count mismatch"
+        );
+        for (idx, (actual_value, expected_value)) in actual.iter().zip(expected.iter()).enumerate()
+        {
+            assert!(
+                track_r_values_bitwise_eq(actual_value, expected_value),
+                "{context}: mismatch at column {idx}: actual={actual_value:?} expected={expected_value:?}",
+            );
+        }
+    }
+
+    fn track_r_serialized_value_layout(value: &SqliteValue) -> (u64, usize) {
+        match value {
+            SqliteValue::Null => (0, 0),
+            SqliteValue::Integer(integer) => {
+                let serial_type = serial_type_for_integer(*integer);
+                let payload_len = match serial_type {
+                    8 | 9 => 0,
+                    1 => 1,
+                    2 => 2,
+                    3 => 3,
+                    4 => 4,
+                    5 => 6,
+                    6 => 8,
+                    _ => unreachable!("integer serial type must be in 1..=9"),
+                };
+                (serial_type, payload_len)
+            }
+            SqliteValue::Float(float) => {
+                if float.is_nan() {
+                    (0, 0)
+                } else {
+                    (7, 8)
+                }
+            }
+            SqliteValue::Text(text) => {
+                let len = text.len();
+                (
+                    serial_type_for_text(u64::try_from(len).unwrap_or(u64::MAX)),
+                    len,
+                )
+            }
+            SqliteValue::Blob(blob) => {
+                let len = blob.len();
+                (
+                    serial_type_for_blob(u64::try_from(len).unwrap_or(u64::MAX)),
+                    len,
+                )
+            }
+        }
+    }
+
+    fn track_r_compute_header_size(content_size: usize) -> usize {
+        let mut header_size = content_size + 1;
+        loop {
+            let needed = varint_len(header_size as u64) + content_size;
+            if needed <= header_size {
+                return header_size;
+            }
+            header_size = needed;
+        }
+    }
+
+    fn track_r_encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u8]) {
+        match value {
+            SqliteValue::Null => {}
+            SqliteValue::Integer(integer) => {
+                if payload_len == 0 {
+                    return;
+                }
+                let bytes = integer.to_be_bytes();
+                buf.copy_from_slice(&bytes[8 - payload_len..]);
+            }
+            SqliteValue::Float(float) => {
+                if float.is_nan() {
+                    return;
+                }
+                buf.copy_from_slice(&float.to_bits().to_be_bytes());
+            }
+            SqliteValue::Text(text) => buf.copy_from_slice(text.as_bytes()),
+            SqliteValue::Blob(blob) => buf.copy_from_slice(blob),
+        }
+    }
+
+    fn track_r_reference_three_pass_record(values: &[SqliteValue]) -> Vec<u8> {
+        let layouts: Vec<_> = values.iter().map(track_r_serialized_value_layout).collect();
+        let header_content_size = layouts
+            .iter()
+            .map(|(serial_type, _)| varint_len(*serial_type))
+            .sum::<usize>();
+        let body_size = layouts
+            .iter()
+            .map(|(_, payload_len)| *payload_len)
+            .sum::<usize>();
+        let header_size = track_r_compute_header_size(header_content_size);
+        let total_size = header_size + body_size;
+        let mut buf = vec![0; total_size];
+
+        let mut header_offset = write_varint(
+            buf.as_mut_slice(),
+            u64::try_from(header_size).unwrap_or(u64::MAX),
+        );
+        let mut body_offset = header_size;
+        for (value, (serial_type, payload_len)) in values.iter().zip(layouts.iter().copied()) {
+            header_offset += write_varint(&mut buf[header_offset..], serial_type);
+            track_r_encode_serialized_value(
+                value,
+                payload_len,
+                &mut buf[body_offset..body_offset + payload_len],
+            );
+            body_offset += payload_len;
+        }
+
+        assert_eq!(header_offset, header_size, "reference header width drifted");
+        assert_eq!(body_offset, total_size, "reference body width drifted");
+        buf
+    }
+
+    fn track_r_arb_sqlite_value() -> BoxedStrategy<SqliteValue> {
+        prop_oneof![
+            4 => Just(SqliteValue::Null),
+            8 => any::<i64>().prop_map(SqliteValue::Integer),
+            4 => (-1.0e12_f64..1.0e12_f64).prop_map(SqliteValue::Float),
+            4 => proptest::collection::vec(any::<char>(), 0..64).prop_map(|chars| {
+                let text = chars.into_iter().collect::<String>();
+                SqliteValue::Text(SmallText::from_string(text))
+            }),
+            4 => proptest::collection::vec(any::<u8>(), 0..96)
+                .prop_map(|bytes| SqliteValue::Blob(Arc::<[u8]>::from(bytes))),
+        ]
+        .boxed()
+    }
+
+    fn track_r_generated_record(seed: usize) -> Vec<SqliteValue> {
+        let integer = i64::try_from(seed).unwrap_or(i64::MAX) - 5_000;
+        let tail = match seed % 5 {
+            0 => SqliteValue::Null,
+            1 => SqliteValue::Integer(0),
+            2 => SqliteValue::Integer(1),
+            3 => SqliteValue::Integer(-1),
+            _ => SqliteValue::Integer(i64::try_from(seed % 97).unwrap_or(0) - 48),
+        };
+        let text = match seed % 4 {
+            0 => String::new(),
+            1 => format!("row-{seed:05}"),
+            2 => "x".repeat((seed % 32) + 1),
+            _ => format!("record-{seed:05}-tail"),
+        };
+        let blob_len = match seed % 6 {
+            0 => 0,
+            1 => 1,
+            2 => 7,
+            3 => 19,
+            4 => 33,
+            _ => (seed % 48) + 1,
+        };
+        let blob = (0..blob_len)
+            .map(|offset| {
+                let byte = (seed.wrapping_mul(17)).wrapping_add(offset.wrapping_mul(29)) % 251;
+                u8::try_from(byte).unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+
+        vec![
+            SqliteValue::Integer(integer),
+            SqliteValue::Float((seed as f64 * 1.625) - 777.25),
+            SqliteValue::Text(SmallText::from_string(text)),
+            SqliteValue::Blob(Arc::<[u8]>::from(blob)),
+            tail,
+        ]
+    }
+
+    fn track_r_large_scratch_record(iteration: usize) -> Vec<SqliteValue> {
+        if iteration == 0 {
+            return vec![
+                SqliteValue::Integer(-9_223_372_036_854_775_000),
+                SqliteValue::Text(SmallText::from_string("x".repeat(2_048))),
+                SqliteValue::Blob(Arc::<[u8]>::from(vec![0xAB; 4_096])),
+            ];
+        }
+
+        vec![
+            SqliteValue::Integer(i64::try_from(iteration).unwrap_or(i64::MAX)),
+            SqliteValue::Text(SmallText::from_string(format!("row-{iteration:04}"))),
+            SqliteValue::Blob(Arc::<[u8]>::from(vec![
+                u8::try_from(iteration % 251)
+                    .unwrap_or(0);
+                (iteration % 24) + 1
+            ])),
+        ]
+    }
+
+    fn track_r_make_record_op(source_reg: i32, column_count: usize, target_reg: i32) -> VdbeOp {
+        VdbeOp {
+            opcode: Opcode::MakeRecord,
+            p1: source_reg,
+            p2: i32::try_from(column_count).expect("column count should fit in i32"),
+            p3: target_reg,
+            p4: P4::None,
+            p5: 0,
+        }
+    }
+
+    fn track_r_decode_make_record_buf(engine: &VdbeEngine) -> Vec<SqliteValue> {
+        parse_record(&engine.make_record_buf).expect("MakeRecord sideband should decode")
+    }
+
+    fn track_r_emit_value(builder: &mut ProgramBuilder, reg: i32, value: &SqliteValue) {
+        match value {
+            SqliteValue::Null => {
+                builder.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+            SqliteValue::Integer(integer) => {
+                builder.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*integer), 0);
+            }
+            SqliteValue::Float(float) => {
+                builder.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*float), 0);
+            }
+            SqliteValue::Text(text) => {
+                builder.emit_op(
+                    Opcode::String8,
+                    0,
+                    reg,
+                    0,
+                    P4::Str(text.as_str().to_owned()),
+                    0,
+                );
+            }
+            SqliteValue::Blob(blob) => {
+                builder.emit_op(Opcode::Blob, 0, reg, 0, P4::Blob(blob.to_vec()), 0);
+            }
+        }
+    }
+
+    fn track_r_run_write_with_memdb(
+        db: MemDatabase,
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> (Vec<Vec<SqliteValue>>, MemDatabase) {
+        let mut builder = ProgramBuilder::new();
+        build(&mut builder);
+        let program = builder.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        let outcome = engine.execute(&program).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let results = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect::<Vec<_>>();
+        let final_db = engine.take_database().expect("database should exist");
+        (results, final_db)
+    }
+
+    fn track_r_to_rusqlite_value(value: &SqliteValue) -> RusqliteValue {
+        match value {
+            SqliteValue::Null => RusqliteValue::Null,
+            SqliteValue::Integer(integer) => RusqliteValue::Integer(*integer),
+            SqliteValue::Float(float) => RusqliteValue::Real(*float),
+            SqliteValue::Text(text) => RusqliteValue::Text(text.as_str().to_owned()),
+            SqliteValue::Blob(blob) => RusqliteValue::Blob(blob.to_vec()),
+        }
+    }
+
+    fn track_r_from_rusqlite_value(value: RusqliteValue) -> SqliteValue {
+        match value {
+            RusqliteValue::Null => SqliteValue::Null,
+            RusqliteValue::Integer(integer) => SqliteValue::Integer(integer),
+            RusqliteValue::Real(float) => SqliteValue::Float(float),
+            RusqliteValue::Text(text) => SqliteValue::Text(SmallText::from_string(text)),
+            RusqliteValue::Blob(blob) => SqliteValue::Blob(Arc::<[u8]>::from(blob)),
+        }
+    }
+
+    #[test]
+    fn test_track_r_make_record_scratch_reuse_1000_records_no_realloc_after_first() {
+        let mut engine = VdbeEngine::new(8);
+        let op = track_r_make_record_op(1, 3, 4);
+        let mut scratch_capacity = None;
+        let mut alloc_count = 0usize;
+        let start = Instant::now();
+
+        for iteration in 0..1_000 {
+            let values = track_r_large_scratch_record(iteration);
+            for (offset, value) in values.iter().enumerate() {
+                let reg = i32::try_from(offset + 1).expect("register index should fit in i32");
+                engine.set_reg(reg, value.clone());
+            }
+
+            engine.execute_make_record_hot(&op, false);
+
+            let observed_capacity = engine.make_record_buf.capacity();
+            if let Some(expected_capacity) = scratch_capacity {
+                assert_eq!(
+                    observed_capacity, expected_capacity,
+                    "MakeRecord scratch reallocated after warmup at iteration {iteration}",
+                );
+            } else {
+                assert!(
+                    observed_capacity > 0,
+                    "scratch capacity should grow on first encode"
+                );
+                scratch_capacity = Some(observed_capacity);
+                alloc_count += 1;
+            }
+
+            let decoded = track_r_decode_make_record_buf(&engine);
+            track_r_assert_rows_eq(
+                &decoded,
+                &values,
+                "track_r scratch reuse MakeRecord decode mismatch",
+            );
+        }
+
+        track_r_log_metrics(
+            "test_track_r_make_record_scratch_reuse_1000_records_no_realloc_after_first",
+            alloc_count,
+            scratch_capacity.unwrap_or(0),
+            start.elapsed().as_nanos(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_two_pass_matches_three_pass_proptest_10k_random() {
+        let strategy = proptest::collection::vec(track_r_arb_sqlite_value(), 0..48);
+        let mut runner = TestRunner::new(ProptestConfig {
+            cases: 10_000,
+            ..ProptestConfig::default()
+        });
+        let two_pass = std::cell::RefCell::new(Vec::new());
+        let alloc_count = std::cell::Cell::new(0usize);
+        let encode_time_ns = std::cell::Cell::new(0_u128);
+        let scratch_capacity_bytes = std::cell::Cell::new(0usize);
+
+        runner
+            .run(&strategy, |values| {
+                let start = Instant::now();
+                let mut two_pass_buf = two_pass.borrow_mut();
+                serialize_record_iter_into(values.iter(), &mut two_pass_buf);
+                let current_capacity = two_pass_buf.capacity();
+                if current_capacity != scratch_capacity_bytes.get() {
+                    alloc_count.set(alloc_count.get().saturating_add(1));
+                    scratch_capacity_bytes.set(current_capacity);
+                }
+                let three_pass = track_r_reference_three_pass_record(&values);
+                encode_time_ns.set(
+                    encode_time_ns
+                        .get()
+                        .saturating_add(start.elapsed().as_nanos()),
+                );
+                if *two_pass_buf != three_pass {
+                    return Err(TestCaseError::fail(format!(
+                        "two-pass and three-pass record encoders diverged for values={values:?}"
+                    )));
+                }
+                Ok(())
+            })
+            .expect("two-pass encoder should match the three-pass reference");
+
+        track_r_log_metrics(
+            "test_track_r_two_pass_matches_three_pass_proptest_10k_random",
+            alloc_count.get(),
+            scratch_capacity_bytes.get().max(two_pass.borrow().capacity()),
+            encode_time_ns.get(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_make_record_all_sqlite_types() {
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(-9_223_372_036_854_775_000),
+            SqliteValue::Float(-1234.5),
+            SqliteValue::Text(SmallText::from_string("hello-track-r".to_owned())),
+            SqliteValue::Blob(Arc::<[u8]>::from(vec![0x00, 0x01, 0xFE, 0xFF])),
+        ];
+        let mut engine = VdbeEngine::new(8);
+        let op = track_r_make_record_op(1, values.len(), 7);
+        let start = Instant::now();
+
+        for (offset, value) in values.iter().enumerate() {
+            let reg = i32::try_from(offset + 1).expect("register index should fit in i32");
+            engine.set_reg(reg, value.clone());
+        }
+        engine.execute_make_record_hot(&op, false);
+
+        let decoded = track_r_decode_make_record_buf(&engine);
+        track_r_assert_rows_eq(
+            &decoded,
+            &values,
+            "track_r all-types MakeRecord decode mismatch",
+        );
+        track_r_log_metrics(
+            "test_track_r_make_record_all_sqlite_types",
+            1,
+            engine.make_record_buf.capacity(),
+            start.elapsed().as_nanos(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_make_record_empty_record() {
+        let mut engine = VdbeEngine::new(2);
+        let op = track_r_make_record_op(1, 0, 1);
+        let start = Instant::now();
+
+        engine.execute_make_record_hot(&op, false);
+
+        let decoded = track_r_decode_make_record_buf(&engine);
+        assert!(
+            decoded.is_empty(),
+            "empty MakeRecord should decode to no columns"
+        );
+        track_r_log_metrics(
+            "test_track_r_make_record_empty_record",
+            1,
+            engine.make_record_buf.capacity(),
+            start.elapsed().as_nanos(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_make_record_max_columns() {
+        let max_columns = usize::from(MAX_COLUMN);
+        let mut engine = VdbeEngine::new(i32::try_from(max_columns + 2).expect("register count"));
+        let op = track_r_make_record_op(1, max_columns, i32::try_from(max_columns + 1).unwrap());
+        let expected = (0..max_columns)
+            .map(|idx| SqliteValue::Integer(i64::try_from(idx).unwrap_or(i64::MAX) - 1_000))
+            .collect::<Vec<_>>();
+        let start = Instant::now();
+
+        for (offset, value) in expected.iter().enumerate() {
+            let reg = i32::try_from(offset + 1).expect("register index should fit in i32");
+            engine.set_reg(reg, value.clone());
+        }
+        engine.execute_make_record_hot(&op, false);
+
+        let decoded = track_r_decode_make_record_buf(&engine);
+        track_r_assert_rows_eq(
+            &decoded,
+            &expected,
+            "track_r max-column MakeRecord decode mismatch",
+        );
+        track_r_log_metrics(
+            "test_track_r_make_record_max_columns",
+            1,
+            engine.make_record_buf.capacity(),
+            start.elapsed().as_nanos(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_make_record_insert_10k_oracle() {
+        let row_count = 10_000usize;
+        let expected_rows = (0..row_count)
+            .map(track_r_generated_record)
+            .collect::<Vec<_>>();
+        let mut db = MemDatabase::new();
+        let root = db.create_table(5);
+        let start = Instant::now();
+
+        let (_, final_db) = track_r_run_write_with_memdb(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(5), 0);
+
+            for (idx, row) in expected_rows.iter().enumerate() {
+                let rowid = i64::try_from(idx + 1).expect("rowid should fit in i64");
+                b.emit_op(Opcode::Int64, 0, 1, 0, P4::Int64(rowid), 0);
+                for (offset, value) in row.iter().enumerate() {
+                    let reg = i32::try_from(offset + 2).expect("register index should fit in i32");
+                    track_r_emit_value(b, reg, value);
+                }
+                b.emit_op(Opcode::MakeRecord, 2, 5, 7, P4::None, 0);
+                b.emit_op(Opcode::Insert, 0, 7, 1, P4::None, 0);
+            }
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            row_count,
+            "MakeRecord INSERT path should persist every generated row",
+        );
+        let observed_rows = table
+            .rows
+            .iter()
+            .map(|row| row.values.clone())
+            .collect::<Vec<_>>();
+
+        let oracle = rusqlite::Connection::open_in_memory().expect("oracle should open");
+        oracle
+            .execute(
+                "CREATE TABLE t (c0 INTEGER, c1 REAL, c2 TEXT, c3 BLOB, c4 NUMERIC)",
+                [],
+            )
+            .expect("oracle schema should create");
+        let mut insert = oracle
+            .prepare("INSERT INTO t (c0, c1, c2, c3, c4) VALUES (?1, ?2, ?3, ?4, ?5)")
+            .expect("oracle insert should prepare");
+        for row in &expected_rows {
+            let params = row
+                .iter()
+                .map(track_r_to_rusqlite_value)
+                .collect::<Vec<_>>();
+            insert
+                .execute(params_from_iter(params))
+                .expect("oracle insert should succeed");
+        }
+
+        let mut query = oracle
+            .prepare("SELECT c0, c1, c2, c3, c4 FROM t ORDER BY rowid")
+            .expect("oracle query should prepare");
+        let oracle_rows = query
+            .query_map([], |row| {
+                Ok((0..5)
+                    .map(|idx| {
+                        row.get::<_, RusqliteValue>(idx)
+                            .map(track_r_from_rusqlite_value)
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .expect("oracle query should execute")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("oracle rows should collect");
+
+        assert_eq!(
+            observed_rows.len(),
+            oracle_rows.len(),
+            "VDBE and oracle should expose the same row count",
+        );
+        for (idx, (observed, oracle_row)) in
+            observed_rows.iter().zip(oracle_rows.iter()).enumerate()
+        {
+            track_r_assert_rows_eq(
+                observed,
+                oracle_row,
+                &format!("track_r 10k insert oracle row {idx} mismatch"),
+            );
+        }
+
+        track_r_log_metrics(
+            "test_track_r_make_record_insert_10k_oracle",
+            1,
+            0,
+            start.elapsed().as_nanos(),
+        );
+    }
+
+    #[test]
+    fn test_track_r_make_record_roundtrip_10k_records() {
+        let row_count = 10_000usize;
+        let mut encoded = Vec::new();
+        let mut decoded = Vec::new();
+        let mut alloc_count = 0usize;
+        let mut encoded_capacity = 0usize;
+        let start = Instant::now();
+
+        for seed in 0..row_count {
+            let values = track_r_generated_record(seed);
+            serialize_record_iter_into(values.iter(), &mut encoded);
+            parse_record_into(&encoded, &mut decoded).expect("roundtrip decode should succeed");
+            track_r_assert_rows_eq(&decoded, &values, "track_r roundtrip decode mismatch");
+
+            let current_capacity = encoded.capacity();
+            if current_capacity != encoded_capacity {
+                encoded_capacity = current_capacity;
+                alloc_count = alloc_count.saturating_add(1);
+            }
+        }
+
+        track_r_log_metrics(
+            "test_track_r_make_record_roundtrip_10k_records",
+            alloc_count,
+            encoded_capacity.max(encoded.capacity()),
+            start.elapsed().as_nanos(),
+        );
+    }
+
     #[test]
     fn test_set_bindings_slice_keeps_small_binding_sets_inline() {
         let mut engine = VdbeEngine::new(1);
@@ -15049,6 +15691,272 @@ mod tests {
             SqliteValue::Integer(7),
             "borrowed bindings should not overwrite the cached owned binding set"
         );
+    }
+
+    #[test]
+    fn test_register_value_i64_store_and_retrieve() {
+        let mut engine = VdbeEngine::new(2);
+        engine.set_reg_int(1, -9_876_543_210);
+
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(-9_876_543_210));
+        assert_eq!(engine.take_reg(1), SqliteValue::Integer(-9_876_543_210));
+        assert_eq!(engine.get_reg(1), &SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_register_text_cache_stays_valid_while_storage_cursor_row_is_pinned() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert(1, vec![SqliteValue::Text("alpha-track-s".into())]);
+
+        let mut engine = VdbeEngine::new(2);
+        engine.collect_vdbe_metrics = true;
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, root, false));
+        engine.cursor_root_pages.insert(0, root);
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            assert!(sc.cursor.first(&sc.cx).expect("cursor should rewind"));
+        }
+
+        let before = vdbe_metrics_snapshot();
+        let first = engine
+            .cursor_column(0, 0)
+            .expect("first text decode should succeed");
+        let second = engine
+            .cursor_column(0, 0)
+            .expect("pinned-row cache hit should succeed");
+        let after = vdbe_metrics_snapshot();
+        let sc = engine
+            .storage_cursors
+            .get(&0)
+            .expect("storage cursor should exist");
+
+        assert_eq!(first, SqliteValue::Text("alpha-track-s".into()));
+        assert_eq!(second, first);
+        assert!(sc.row_decode.cached_value_ready(0));
+        assert_eq!(
+            sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
+            Some("alpha-track-s")
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_register_value_make_record_sideband_materializes_into_sqlite_blob_value() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let mut engine = VdbeEngine::new(4);
+        engine.set_reg_int(1, 7);
+        engine.set_reg(2, SqliteValue::Text("payload-track-s".into()));
+
+        let make_record = VdbeOp {
+            opcode: Opcode::MakeRecord,
+            p1: 1,
+            p2: 2,
+            p3: 3,
+            p4: P4::None,
+            p5: 0,
+        };
+        engine.execute_make_record_hot(&make_record, false);
+
+        assert_eq!(
+            engine.get_reg(3),
+            &SqliteValue::Null,
+            "MakeRecord keeps bytes in sideband until a consumer asks for an owned SqliteValue"
+        );
+
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let converted = engine.clone_reg_materialized(3);
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(after - before, 1);
+        assert_eq!(
+            decode_record(&converted).expect("sideband value should decode"),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("payload-track-s".into()),
+            ]
+        );
+        assert_eq!(
+            decode_record(engine.get_reg(3)).expect("register should now hold the blob"),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("payload-track-s".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_register_value_insert_avoids_make_record_blob_materialization() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(2), 0);
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("alpha".to_owned()), 0);
+            b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 1, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 2, 0, P4::None, 0);
+
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(
+            rows,
+            vec![vec![
+                SqliteValue::Integer(42),
+                SqliteValue::Text("alpha".into()),
+            ]]
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "INSERT should consume MakeRecord sideband bytes directly instead of materializing an Arc-backed record blob"
+        );
+    }
+
+    #[test]
+    fn test_register_value_cursor_move_invalidates_cached_text() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Text("alpha-track-s".into())]);
+        table.insert(2, vec![SqliteValue::Text("beta-track-s".into())]);
+
+        let mut engine = VdbeEngine::new(2);
+        engine.collect_vdbe_metrics = true;
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, root, false));
+        engine.cursor_root_pages.insert(0, root);
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            assert!(sc.cursor.first(&sc.cx).expect("cursor should rewind"));
+        }
+
+        let before = vdbe_metrics_snapshot();
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("first text decode should succeed"),
+            SqliteValue::Text("alpha-track-s".into())
+        );
+        {
+            let sc = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("storage cursor should exist");
+            assert!(sc.cursor.next(&sc.cx).expect("cursor should advance"));
+        }
+        assert_eq!(
+            engine
+                .cursor_column(0, 0)
+                .expect("post-move text decode should succeed"),
+            SqliteValue::Text("beta-track-s".into())
+        );
+        let after = vdbe_metrics_snapshot();
+        let sc = engine
+            .storage_cursors
+            .get(&0)
+            .expect("storage cursor should exist");
+
+        assert!(sc.row_decode.cached_value_ready(0));
+        assert_eq!(
+            sc.row_decode.cached_value(0).and_then(SqliteValue::as_text),
+            Some("beta-track-s")
+        );
+        assert_eq!(
+            after.decode_cache_misses_total - before.decode_cache_misses_total,
+            2
+        );
+        assert_eq!(
+            after.decode_cache_hits_total - before.decode_cache_hits_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_position_total
+                - before.decode_cache_invalidations_position_total,
+            1
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_write_total
+                - before.decode_cache_invalidations_write_total,
+            0
+        );
+        assert_eq!(
+            after.decode_cache_invalidations_pseudo_total
+                - before.decode_cache_invalidations_pseudo_total,
+            0
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 
     #[test]
