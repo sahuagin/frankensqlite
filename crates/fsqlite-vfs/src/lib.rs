@@ -84,7 +84,7 @@ pub mod host_fs {
     }
 }
 
-pub use memory::{MemoryFile, MemoryVfs};
+pub use memory::{MemoryFile, MemoryVfs, MemoryVfsConfig, MemoryVfsUsageSnapshot};
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 pub use shm::ShmRegion;
 pub use traits::{Vfs, VfsFile};
