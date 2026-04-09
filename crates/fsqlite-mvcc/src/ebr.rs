@@ -30,7 +30,8 @@ pub static GLOBAL_EBR_METRICS: EbrMetrics = EbrMetrics::new();
 
 /// Atomic counters for EBR version-chain garbage collection telemetry.
 pub struct EbrMetrics {
-    /// Total version objects deferred for retirement via `defer_retire`.
+    /// Total version objects actually deferred through Crossbeam EBR via
+    /// `defer_retire` / `defer_retire_with`.
     pub retirements_deferred_total: AtomicU64,
     /// Total explicit `flush()` calls that push deferred retirements toward
     /// execution.
@@ -74,7 +75,7 @@ impl EbrMetrics {
         }
     }
 
-    /// Record a deferred retirement.
+    /// Record an actual Crossbeam deferred retirement.
     pub fn record_retirement_deferred(&self) {
         self.retirements_deferred_total
             .fetch_add(1, Ordering::Relaxed);
@@ -693,9 +694,6 @@ impl EbrRetireQueue {
         }
         drop(pending);
         self.total_retired.fetch_add(count, Ordering::Relaxed);
-        for _ in 0..count {
-            GLOBAL_EBR_METRICS.record_retirement_deferred();
-        }
     }
 
     /// Drain all pending retirements if it's safe to recycle them.
@@ -720,32 +718,23 @@ impl EbrRetireQueue {
             return Vec::new();
         }
 
-        let safe_epoch = min_pinned_epoch.map_or(current_epoch, |min_epoch| {
-            std::cmp::min(current_epoch, min_epoch)
-        });
-        let drain_batches = pending
-            .iter()
-            .filter(|batch| batch.retire_epoch < safe_epoch)
-            .count();
+        let safe_epoch = reclaim_safe_epoch(current_epoch, min_pinned_epoch);
+        let drain_batches = reclaimable_batch_count(&pending, safe_epoch);
         if drain_batches == 0 {
             return Vec::new();
         }
 
-        let mut drained_batches = Vec::with_capacity(drain_batches);
-        let mut retained_batches = Vec::with_capacity(pending.len().saturating_sub(drain_batches));
-        for batch in pending.drain(..) {
-            if batch.retire_epoch < safe_epoch {
-                drained_batches.push(batch);
-            } else {
-                retained_batches.push(batch);
-            }
-        }
-        *pending = retained_batches;
+        let retained_batches = pending.split_off(drain_batches);
+        let drained_batches = std::mem::replace(&mut *pending, retained_batches);
         drop(pending);
 
-        let mut drained = Vec::new();
-        for batch in drained_batches {
-            drained.extend(batch.indices);
+        let drained_len = drained_batches
+            .iter()
+            .map(|batch| batch.indices.len())
+            .sum::<usize>();
+        let mut drained = Vec::with_capacity(drained_len);
+        for mut batch in drained_batches {
+            drained.append(&mut batch.indices);
         }
 
         let count = u64::try_from(drained.len()).unwrap_or(u64::MAX);
@@ -801,6 +790,18 @@ impl EbrRetireQueue {
     pub fn total_recycled(&self) -> u64 {
         self.total_recycled.load(Ordering::Relaxed)
     }
+}
+
+#[inline]
+fn reclaim_safe_epoch(current_epoch: u64, min_pinned_epoch: Option<u64>) -> u64 {
+    min_pinned_epoch.map_or(current_epoch, |min_epoch| {
+        std::cmp::min(current_epoch, min_epoch)
+    })
+}
+
+#[inline]
+fn reclaimable_batch_count(pending: &[RetiredBatch], safe_epoch: u64) -> usize {
+    pending.partition_point(|batch| batch.retire_epoch < safe_epoch)
 }
 
 impl Default for EbrRetireQueue {
@@ -1334,6 +1335,35 @@ mod tests {
         let drained = queue.drain_if_safe(6, Some(6));
         assert_eq!(drained, vec![VersionIdx::new(0, 0, 0)]);
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn ebr_retire_queue_reclaimable_prefix_tracks_strict_epoch_boundary() {
+        let pending = vec![
+            super::RetiredBatch {
+                retire_epoch: 1,
+                indices: vec![VersionIdx::new(0, 0, 0)],
+            },
+            super::RetiredBatch {
+                retire_epoch: 3,
+                indices: vec![VersionIdx::new(0, 1, 0)],
+            },
+            super::RetiredBatch {
+                retire_epoch: 3,
+                indices: vec![VersionIdx::new(0, 2, 0)],
+            },
+            super::RetiredBatch {
+                retire_epoch: 8,
+                indices: vec![VersionIdx::new(0, 3, 0)],
+            },
+        ];
+
+        assert_eq!(super::reclaim_safe_epoch(9, Some(5)), 5);
+        assert_eq!(super::reclaim_safe_epoch(4, None), 4);
+        assert_eq!(super::reclaimable_batch_count(&pending, 1), 0);
+        assert_eq!(super::reclaimable_batch_count(&pending, 3), 1);
+        assert_eq!(super::reclaimable_batch_count(&pending, 4), 3);
+        assert_eq!(super::reclaimable_batch_count(&pending, 9), 4);
     }
 
     #[test]

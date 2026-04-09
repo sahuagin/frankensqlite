@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, btree_map::Entry as BTreeEntry};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -458,6 +458,19 @@ pub struct TransactionManager {
     active_snapshot_high_counts: Mutex<BTreeMap<CommitSeq, usize>>,
     /// Cached minimum active snapshot high (`NO_GC_HORIZON` when empty).
     cached_gc_horizon: AtomicU64,
+    /// Commit-epoch keyed local snapshot reuse cache.
+    ///
+    /// Repeated `BEGIN` calls on one connection often happen with no
+    /// intervening commit. In that case the published `(commit_seq,
+    /// schema_epoch)` pair is unchanged, so we can reuse the last loaded
+    /// snapshot without running the SHM seqlock read path again.
+    snapshot_reuse_valid: AtomicBool,
+    snapshot_reuse_commit_epoch: AtomicU64,
+    snapshot_reuse_schema_epoch: AtomicU64,
+    #[cfg(test)]
+    snapshot_reuse_hits: AtomicU64,
+    #[cfg(test)]
+    snapshot_reuse_misses: AtomicU64,
     /// Cell-level MVCC visibility log for logical row operations (C4: bd-l9k8e.4).
     ///
     /// Tracks cell-level deltas for INSERT/UPDATE/DELETE operations that don't
@@ -490,8 +503,9 @@ impl TransactionManager {
 
     fn with_shm(page_size: PageSize, shm: SharedMemoryLayout) -> Self {
         let version_guard_registry = Arc::new(VersionGuardRegistry::default());
-        let initial_commit_seq = shm.load_commit_seq().get().saturating_add(1);
-        let initial_schema_epoch = shm.load_schema_epoch();
+        let initial_snapshot = shm.load_consistent_snapshot();
+        let initial_commit_seq = initial_snapshot.commit_seq.get().saturating_add(1);
+        let initial_schema_epoch = initial_snapshot.schema_epoch;
         Self {
             txn_manager: TxnManager::new(1, initial_commit_seq),
             version_store: VersionStore::new_with_guard_registry(
@@ -518,6 +532,13 @@ impl TransactionManager {
             active_snapshot_highs: Mutex::new(HashMap::new()),
             active_snapshot_high_counts: Mutex::new(BTreeMap::new()),
             cached_gc_horizon: AtomicU64::new(NO_GC_HORIZON),
+            snapshot_reuse_valid: AtomicBool::new(true),
+            snapshot_reuse_commit_epoch: AtomicU64::new(initial_snapshot.commit_seq.get()),
+            snapshot_reuse_schema_epoch: AtomicU64::new(initial_snapshot.schema_epoch.get()),
+            #[cfg(test)]
+            snapshot_reuse_hits: AtomicU64::new(0),
+            #[cfg(test)]
+            snapshot_reuse_misses: AtomicU64::new(0),
             // Cell-level MVCC log: budget = 10% of typical 256MB page cache = ~25MB
             cell_log: CellVisibilityLog::new(25 * 1024 * 1024),
         }
@@ -1172,14 +1193,59 @@ impl TransactionManager {
     // -----------------------------------------------------------------------
 
     fn publish_shared_snapshot(&self, commit_seq: CommitSeq) {
-        self.shm
-            .publish_snapshot(commit_seq, self.schema_epoch, self.shm.load_ecs_epoch());
+        let snapshot = Snapshot::new(commit_seq, self.schema_epoch);
+        self.shm.publish_snapshot(
+            snapshot.high,
+            snapshot.schema_epoch,
+            self.shm.load_ecs_epoch(),
+        );
+        self.cache_snapshot_reuse(snapshot);
+    }
+
+    fn cache_snapshot_reuse(&self, snapshot: Snapshot) {
+        self.snapshot_reuse_schema_epoch
+            .store(snapshot.schema_epoch.get(), Ordering::Relaxed);
+        self.snapshot_reuse_commit_epoch
+            .store(snapshot.high.get(), Ordering::Release);
+        self.snapshot_reuse_valid.store(true, Ordering::Release);
+    }
+
+    fn try_reuse_snapshot_from_commit_epoch(&self, commit_epoch: CommitSeq) -> Option<Snapshot> {
+        if !self.snapshot_reuse_valid.load(Ordering::Acquire) {
+            return None;
+        }
+        let cached_commit_epoch = self.snapshot_reuse_commit_epoch.load(Ordering::Acquire);
+        if cached_commit_epoch != commit_epoch.get() {
+            return None;
+        }
+        #[cfg(test)]
+        self.snapshot_reuse_hits.fetch_add(1, Ordering::Relaxed);
+        Some(Snapshot::new(
+            commit_epoch,
+            SchemaEpoch::new(self.snapshot_reuse_schema_epoch.load(Ordering::Relaxed)),
+        ))
     }
 
     /// Load the latest stable snapshot from the shared MVCC header.
     fn load_consistent_snapshot(&self) -> Snapshot {
+        let commit_epoch = self.shm.load_commit_seq();
+        if let Some(snapshot) = self.try_reuse_snapshot_from_commit_epoch(commit_epoch) {
+            return snapshot;
+        }
+        #[cfg(test)]
+        self.snapshot_reuse_misses.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.shm.load_consistent_snapshot();
-        Snapshot::new(snapshot.commit_seq, snapshot.schema_epoch)
+        let snapshot = Snapshot::new(snapshot.commit_seq, snapshot.schema_epoch);
+        self.cache_snapshot_reuse(snapshot);
+        snapshot
+    }
+
+    #[cfg(test)]
+    fn snapshot_reuse_stats(&self) -> (u64, u64) {
+        (
+            self.snapshot_reuse_hits.load(Ordering::Relaxed),
+            self.snapshot_reuse_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Serialized write path.
@@ -1676,9 +1742,7 @@ impl TransactionManager {
         // Unpin the EBR guard — allows epoch advancement so deferred
         // retirements from superseded versions can be reclaimed.
         drop(txn.version_guard.take());
-        let _ = self
-            .version_store
-            .try_recycle_retired_slots(self.version_store.current_epoch());
+        let _ = self.version_store.advance_epoch();
     }
 
     fn resolve_visible_commit_seq(&self, txn: &Transaction, pgno: PageNumber) -> Option<CommitSeq> {
@@ -6412,6 +6476,86 @@ mod tests {
             mgr.cached_gc_horizon().is_none(),
             "cached horizon should clear after all active snapshots release"
         );
+    }
+
+    #[test]
+    fn test_snapshot_reuse_hits_when_commit_epoch_is_unchanged() {
+        let mgr = mgr();
+        assert_eq!(mgr.snapshot_reuse_stats(), (0, 0));
+
+        let mut first = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("first begin should succeed");
+        let first_snapshot = first.snapshot;
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 0),
+            "primed cache should satisfy the first begin without a seqlock reload"
+        );
+        mgr.abort(&mut first);
+
+        let mut second = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("second begin should succeed");
+        assert_eq!(
+            second.snapshot, first_snapshot,
+            "unchanged commit epoch should reuse the previously loaded snapshot"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 0),
+            "repeated begin with no intervening commit should stay on the reuse path"
+        );
+        mgr.abort(&mut second);
+    }
+
+    #[test]
+    fn test_snapshot_reuse_invalidates_once_when_shared_commit_epoch_advances() {
+        let mgr = mgr();
+
+        let mut first = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("first begin should succeed");
+        assert_eq!(mgr.snapshot_reuse_stats(), (1, 0));
+        mgr.abort(&mut first);
+
+        let published_commit_seq = CommitSeq::new(7);
+        let published_schema_epoch = SchemaEpoch::new(3);
+        mgr.shm.publish_snapshot(
+            published_commit_seq,
+            published_schema_epoch,
+            mgr.shm.load_ecs_epoch(),
+        );
+
+        let mut refreshed = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("begin after external publish should succeed");
+        assert_eq!(
+            refreshed.snapshot,
+            Snapshot::new(published_commit_seq, published_schema_epoch),
+            "advanced shared commit epoch must force one fresh snapshot load"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (1, 1),
+            "the first begin after an external commit should miss once and refresh the cache"
+        );
+        mgr.abort(&mut refreshed);
+
+        let mut reused = mgr
+            .begin(BeginKind::Concurrent)
+            .expect("subsequent begin should reuse refreshed snapshot");
+        assert_eq!(
+            reused.snapshot,
+            Snapshot::new(published_commit_seq, published_schema_epoch),
+            "refreshed snapshot should become immediately reusable"
+        );
+        assert_eq!(
+            mgr.snapshot_reuse_stats(),
+            (2, 1),
+            "once refreshed, later begins at the same epoch should hit the reuse path again"
+        );
+        mgr.abort(&mut reused);
     }
 
     #[test]

@@ -883,7 +883,6 @@ pub fn decide_writer_routing_target(
 
     let selected = scores[best_score_index];
     let hint_degradation = match hint_disposition {
-        WriterHomeHintDisposition::Missing => WriterRoutingHintDegradation::None,
         WriterHomeHintDisposition::StaleCommitAge => {
             WriterRoutingHintDegradation::HintIgnoredAsStale
         }
@@ -896,11 +895,7 @@ pub fn decide_writer_routing_target(
             WriterRoutingHintDegradation::HintOverriddenByConflictHistory
         }
         WriterHomeHintDisposition::FreshLaneReducedToNode
-            if preferred_node.is_some() && selected.node != preferred_node =>
-        {
-            WriterRoutingHintDegradation::HintOverriddenByConflictHistory
-        }
-        WriterHomeHintDisposition::FreshNode
+        | WriterHomeHintDisposition::FreshNode
             if preferred_node.is_some() && selected.node != preferred_node =>
         {
             WriterRoutingHintDegradation::HintOverriddenByConflictHistory
@@ -1359,8 +1354,8 @@ fn evaluate_synthetic_selection(
                 .stale_snapshot_rejects
                 .saturating_add(match workload {
                     WriterRoutingSyntheticWorkload::DisjointPages => 0,
-                    WriterRoutingSyntheticWorkload::OverlappingPages => 1,
-                    WriterRoutingSyntheticWorkload::HotPageContention => 1,
+                    WriterRoutingSyntheticWorkload::OverlappingPages
+                    | WriterRoutingSyntheticWorkload::HotPageContention => 1,
                 });
     }
 
@@ -1589,9 +1584,7 @@ fn scale_u64_penalty(count: u64, weight: i64) -> i64 {
 }
 
 fn stable_anchor_index(input: &WriterRoutingTelemetryInput, lane_count: usize) -> usize {
-    let anchor = input
-        .session_id
-        .unwrap_or_else(|| u64::from(input.txn_token.id.get()));
+    let anchor = input.session_id.unwrap_or_else(|| input.txn_token.id.get());
     usize::try_from(anchor).unwrap_or(usize::MAX) % lane_count.max(1)
 }
 

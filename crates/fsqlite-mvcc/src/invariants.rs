@@ -27,6 +27,7 @@ use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::{EbrRetireQueue, VersionGuardRegistry};
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
 use crate::observability::record_cas_attempt;
+use crate::reclamation::{advance_epoch_and_reclaim, reclaim_at_epoch, retire_and_reclaim};
 
 // ---------------------------------------------------------------------------
 // TxnManager — INV-1 (Monotonicity)
@@ -576,8 +577,9 @@ impl VersionStore {
     ///
     /// Returns the number of arena slots recycled.
     pub fn advance_epoch(&self) -> usize {
-        let current_epoch = self.guard_registry.advance_epoch();
-        self.try_recycle_retired_slots(current_epoch)
+        let mut arena = self.arena.write();
+        advance_epoch_and_reclaim(self.guard_registry(), &self.retire_queue, &mut arena)
+            .recycled_slots
     }
 
     /// Total arena slots ever allocated.
@@ -1082,14 +1084,14 @@ impl VersionStore {
     /// A [`GcTickResult`] summarizing what was pruned and whether budgets were exhausted.
     #[allow(clippy::significant_drop_tightening)]
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
-        // Legacy incremental-GC path: advance the EBR epoch once per tick, then
-        // attempt to recycle any batches that became reclaimable.
-        let current_epoch = self.guard_registry.advance_epoch();
-        self.try_recycle_retired_slots(current_epoch);
+        // Phase 0: advance the EBR epoch and recycle any batches that became
+        // reclaimable before this GC pass.
+        let mut arena = self.arena.write();
+        let pre_pass =
+            advance_epoch_and_reclaim(self.guard_registry(), &self.retire_queue, &mut arena);
+        let retire_epoch = pre_pass.observed_epoch;
 
         // Phase 1: Prune chains (arena write lock held).
-        // Uses take_for_retirement() which does NOT add slots to free_list.
-        let mut arena = self.arena.write();
         let result = gc_tick_with_registry(
             todo,
             horizon,
@@ -1109,15 +1111,24 @@ impl VersionStore {
         // Phase 3: Queue pruned slots for deferred recycling (EBR).
         if !result.pruned_indices.is_empty() {
             let retired_slots = result.pruned_indices.len();
-            self.retire_queue
-                .retire_batch(result.pruned_indices.iter().copied(), current_epoch);
+            let mut arena = self.arena.write();
+            let post_pass = retire_and_reclaim(
+                self.guard_registry(),
+                &self.retire_queue,
+                &mut arena,
+                result.pruned_indices.iter().copied(),
+                retire_epoch,
+            );
+            drop(arena);
             tracing::debug!(
                 target: "fsqlite_mvcc::gc",
                 retired_slots,
-                retire_epoch = current_epoch,
+                retire_epoch,
+                recycle_epoch = post_pass.observed_epoch,
+                recycled_slots = post_pass.recycled_slots,
                 pending_recycle_count = self.pending_recycle_count(),
-                min_pinned_epoch = self.guard_registry.min_pinned_epoch(),
-                "queued retired arena slots for deferred recycling"
+                min_pinned_epoch = post_pass.min_pinned_epoch,
+                "processed retired arena slots through EBR recycling"
             );
         }
 
@@ -1141,38 +1152,36 @@ impl VersionStore {
             return 0;
         }
 
-        let observed_epoch = self.guard_registry.advance_epoch_to(current_epoch);
-        let min_pinned_epoch = self.guard_registry.min_pinned_epoch();
+        let mut arena = self.arena.write();
+        let pass = reclaim_at_epoch(
+            self.guard_registry(),
+            &self.retire_queue,
+            &mut arena,
+            current_epoch,
+        );
+        drop(arena);
 
-        let drained = self
-            .retire_queue
-            .drain_if_safe(observed_epoch, min_pinned_epoch);
-        if drained.is_empty() {
+        if pass.recycled_slots == 0 {
             tracing::trace!(
                 target: "fsqlite_mvcc::gc",
-                current_epoch = observed_epoch,
+                current_epoch = pass.observed_epoch,
                 pending_recycle_count,
-                min_pinned_epoch,
+                min_pinned_epoch = pass.min_pinned_epoch,
                 "retired arena slots remain pending until pinned epochs advance"
             );
             return 0;
         }
 
-        let count = drained.len();
-        let mut arena = self.arena.write();
-        arena.recycle_slots(drained);
-        drop(arena);
-
         tracing::debug!(
             target: "fsqlite_mvcc::gc",
-            recycled = count,
-            current_epoch = observed_epoch,
-            min_pinned_epoch,
+            recycled = pass.recycled_slots,
+            current_epoch = pass.observed_epoch,
+            min_pinned_epoch = pass.min_pinned_epoch,
             pending_recycle_count_after = self.pending_recycle_count(),
             "recycled retired arena slots"
         );
 
-        count
+        pass.recycled_slots
     }
 
     /// Force-recycle all retired slots regardless of epoch.
@@ -2527,6 +2536,29 @@ mod tests {
         assert_eq!(reused_idx.chunk(), retired_idx.chunk());
         assert_eq!(reused_idx.offset(), retired_idx.offset());
         assert_ne!(reused_idx.generation(), retired_idx.generation());
+    }
+
+    #[test]
+    fn test_gc_tick_reclaims_retired_slots_in_same_pass_without_reader_guard() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(20).unwrap();
+
+        store.publish(make_version(20, 1, None));
+        store.publish(make_version(20, 2, None));
+        store.publish(make_version(20, 3, None));
+
+        let mut todo = GcTodo::new();
+        todo.enqueue(pgno);
+
+        let result = store.gc_tick(&mut todo, CommitSeq::new(2));
+        assert_eq!(result.versions_freed, 1);
+        assert_eq!(result.pruned_indices.len(), 1);
+        assert_eq!(
+            store.pending_recycle_count(),
+            0,
+            "gc_tick should complete the EBR recycle pass when no reader guard pins the retire epoch"
+        );
+        assert_eq!(store.arena_free_count(), 1);
     }
 
     #[test]

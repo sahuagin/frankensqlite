@@ -27,6 +27,7 @@ pub mod flat_combining;
 pub mod gc;
 pub mod history_compression;
 pub mod hot_witness_index;
+pub mod htm_fast_path;
 pub mod index_regen;
 pub mod invariants;
 pub mod left_right;
@@ -36,6 +37,7 @@ pub mod observability;
 pub mod physical_merge;
 pub mod provenance;
 pub mod rcu;
+pub mod reclamation;
 pub mod regime_monitor;
 pub mod retry_policy;
 pub mod rowid_alloc;
@@ -135,6 +137,7 @@ pub const MVCC_METADATA_PUBLICATION_CONTRACTS: [MvccMetadataPublicationContract;
 mod ssi_anomaly_tests;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod metadata_publication_contract_tests {
     use super::{
         MVCC_METADATA_PUBLICATION_CONTRACTS, MvccMetadataPublicationClass,
