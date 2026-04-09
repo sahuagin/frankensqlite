@@ -17,6 +17,9 @@ const DEFAULT_VERIFY_POLICY_ID: u32 = DEFAULT_DECODE_PROOF_POLICY_ID;
 const DEFAULT_VERIFY_SLACK: u32 = DEFAULT_DECODE_PROOF_SLACK;
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+const ANSI_BOLD_BLUE: &str = "\x1b[1;34m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
 const ANSI_YELLOW: &str = "\x1b[33m";
 const ANSI_DIM: &str = "\x1b[2m";
 
@@ -24,9 +27,11 @@ const ANSI_DIM: &str = "\x1b[2m";
 struct CliOptions {
     db_path: String,
     command: Option<String>,
+    init_path: Option<String>,
     verify_proof_path: Option<String>,
     verify_policy_id: u32,
     verify_slack: u32,
+    force_batch: bool,
     show_help: bool,
 }
 
@@ -65,6 +70,69 @@ impl ShellOptions {
             show_prompts: false,
             colorize_prompts: false,
             fail_on_error: true,
+        }
+    }
+
+    const fn forced_batch(self) -> Self {
+        Self {
+            show_prompts: false,
+            colorize_prompts: false,
+            fail_on_error: true,
+        }
+    }
+
+    const fn nested_script(self) -> Self {
+        Self {
+            show_prompts: false,
+            colorize_prompts: self.colorize_prompts,
+            fail_on_error: self.fail_on_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    List,
+    Column,
+    Csv,
+    Tabs,
+    Line,
+}
+
+impl OutputMode {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "list" => Some(Self::List),
+            "column" | "columns" => Some(Self::Column),
+            "csv" => Some(Self::Csv),
+            "tabs" | "tab" => Some(Self::Tabs),
+            "line" => Some(Self::Line),
+            _ => None,
+        }
+    }
+
+    const fn separator(self) -> &'static str {
+        match self {
+            Self::List => " | ",
+            Self::Column => "  ",
+            Self::Csv => ",",
+            Self::Tabs => "\t",
+            Self::Line => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputOptions {
+    mode: OutputMode,
+    headers: bool,
+}
+
+impl Default for OutputOptions {
+    fn default() -> Self {
+        Self {
+            mode: OutputMode::List,
+            headers: false,
         }
     }
 }
@@ -164,6 +232,11 @@ where
         );
     }
 
+    let shell_options = if options.force_batch {
+        shell_options.forced_batch()
+    } else {
+        shell_options
+    };
     let mut current_db_path = options.db_path.clone();
     let mut connection = match Connection::open(&options.db_path) {
         Ok(connection) => connection,
@@ -172,14 +245,43 @@ where
             return 1;
         }
     };
+    let mut output_options = OutputOptions::default();
+
+    if let Some(path) = options.init_path.as_deref() {
+        let Some(outcome) = execute_script_file(
+            path,
+            &mut connection,
+            &mut current_db_path,
+            &mut output_options,
+            out,
+            err,
+            shell_options.nested_script(),
+        ) else {
+            return 1;
+        };
+        if shell_options.fail_on_error && outcome.had_error {
+            return 1;
+        }
+        if outcome.flow == ShellFlow::Exit {
+            return 0;
+        }
+    }
 
     if let Some(command) = options.command {
-        return run_command(&mut connection, &mut current_db_path, &command, out, err);
+        return run_command(
+            &mut connection,
+            &mut current_db_path,
+            &mut output_options,
+            &command,
+            out,
+            err,
+        );
     }
 
     run_repl(
         &mut connection,
         &mut current_db_path,
+        &mut output_options,
         input,
         out,
         err,
@@ -198,11 +300,13 @@ where
     let mut db_path = String::from(DEFAULT_DB_PATH);
     let mut has_path = false;
     let mut command: Option<String> = None;
+    let mut init_path: Option<String> = None;
     let mut verify_proof_path: Option<String> = None;
     let mut verify_policy_id = DEFAULT_VERIFY_POLICY_ID;
     let mut verify_slack = DEFAULT_VERIFY_SLACK;
     let mut verify_policy_id_set = false;
     let mut verify_slack_set = false;
+    let mut force_batch = false;
     let mut show_help = false;
 
     while let Some(argument) = iter.next() {
@@ -226,6 +330,23 @@ where
                     .next()
                     .ok_or_else(|| String::from("missing SQL argument for `-c/--command`"))?;
                 command = Some(next.to_string_lossy().into_owned());
+            }
+            "-batch" | "--batch" => {
+                force_batch = true;
+            }
+            "-init" | "--init" => {
+                if verify_proof_path.is_some() {
+                    return Err(String::from(
+                        "`-init/--init` cannot be combined with `--verify-proof`",
+                    ));
+                }
+                if init_path.is_some() {
+                    return Err(String::from("`-init/--init` may only be provided once"));
+                }
+                let next = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing file path for `-init/--init`"))?;
+                init_path = Some(next.to_string_lossy().into_owned());
             }
             "--verify-proof" => {
                 if verify_proof_path.is_some() {
@@ -293,6 +414,19 @@ where
                         return Err(String::from("`-c/--command` may only be provided once"));
                     }
                     command = Some(value.to_owned());
+                    continue;
+                }
+
+                if let Some(value) = arg_str.strip_prefix("--init=") {
+                    if verify_proof_path.is_some() {
+                        return Err(String::from(
+                            "`-init/--init` cannot be combined with `--verify-proof`",
+                        ));
+                    }
+                    if init_path.is_some() {
+                        return Err(String::from("`-init/--init` may only be provided once"));
+                    }
+                    init_path = Some(value.to_owned());
                     continue;
                 }
 
@@ -364,9 +498,11 @@ where
     Ok(CliOptions {
         db_path,
         command,
+        init_path,
         verify_proof_path,
         verify_policy_id,
         verify_slack,
+        force_batch,
         show_help,
     })
 }
@@ -443,6 +579,7 @@ where
 fn run_command<W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
+    output_options: &mut OutputOptions,
     command: &str,
     out: &mut W,
     err: &mut E,
@@ -461,6 +598,7 @@ where
     match run_shell(
         connection,
         current_db_path,
+        output_options,
         &mut input,
         out,
         err,
@@ -474,6 +612,7 @@ where
 fn run_repl<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
+    output_options: &mut OutputOptions,
     input: &mut R,
     out: &mut W,
     err: &mut E,
@@ -484,15 +623,56 @@ where
     W: Write,
     E: Write,
 {
-    match run_shell(connection, current_db_path, input, out, err, shell_options) {
+    match run_shell(
+        connection,
+        current_db_path,
+        output_options,
+        input,
+        out,
+        err,
+        shell_options,
+    ) {
         Some(outcome) if !(shell_options.fail_on_error && outcome.had_error) => 0,
         Some(_) | None => 1,
     }
 }
 
+fn execute_script_file<W, E>(
+    path: &str,
+    connection: &mut Connection,
+    current_db_path: &mut String,
+    output_options: &mut OutputOptions,
+    out: &mut W,
+    err: &mut E,
+    shell_options: ShellOptions,
+) -> Option<ShellOutcome>
+where
+    W: Write,
+    E: Write,
+{
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            let _ = writeln!(err, "error: {error}");
+            return None;
+        }
+    };
+    let mut nested = io::Cursor::new(contents.into_bytes());
+    run_shell(
+        connection,
+        current_db_path,
+        output_options,
+        &mut nested,
+        out,
+        err,
+        shell_options,
+    )
+}
+
 fn run_shell<R, W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
+    output_options: &mut OutputOptions,
     input: &mut R,
     out: &mut W,
     err: &mut E,
@@ -509,11 +689,7 @@ where
 
     loop {
         if shell_options.show_prompts {
-            let prompt = render_prompt(
-                current_db_path,
-                pending_sql.trim().is_empty(),
-                shell_options,
-            );
+            let prompt = render_prompt(current_db_path, &pending_sql, shell_options);
             if write!(out, "{prompt}").and_then(|()| out.flush()).is_err() {
                 return None;
             }
@@ -536,7 +712,8 @@ where
 
         if bytes_read == 0 {
             if !pending_sql.trim().is_empty() {
-                had_error |= !execute_sql(connection, pending_sql.trim(), out, err);
+                had_error |=
+                    !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
             }
             return Some(ShellOutcome {
                 flow: ShellFlow::Continue,
@@ -566,6 +743,7 @@ where
                 trimmed,
                 connection,
                 current_db_path,
+                output_options,
                 out,
                 err,
                 shell_options,
@@ -592,21 +770,18 @@ where
         pending_sql.push_str(line);
 
         if statement_complete(&pending_sql) {
-            had_error |= !execute_sql(connection, pending_sql.trim(), out, err);
+            had_error |= !execute_sql(connection, pending_sql.trim(), *output_options, out, err);
             pending_sql.clear();
         }
     }
 }
 
-fn render_prompt(
-    current_db_path: &str,
-    primary_prompt: bool,
-    shell_options: ShellOptions,
-) -> String {
+fn render_prompt(current_db_path: &str, pending_sql: &str, shell_options: ShellOptions) -> String {
+    let primary_prompt = pending_sql.trim().is_empty();
     let is_default_db = current_db_path == DEFAULT_DB_PATH;
     let label = (!is_default_db).then(|| prompt_db_label(current_db_path));
     if primary_prompt {
-        if shell_options.colorize_prompts {
+        return if shell_options.colorize_prompts {
             match label {
                 Some(label) => {
                     format!(
@@ -620,18 +795,21 @@ fn render_prompt(
                 Some(label) => format!("fsqlite[{label}]> "),
                 None => String::from(PROMPT_PRIMARY),
             }
-        }
-    } else if shell_options.colorize_prompts {
+        };
+    }
+
+    let preview = render_pending_sql_preview(pending_sql, shell_options.colorize_prompts);
+    if shell_options.colorize_prompts {
         match label {
             Some(label) => {
-                format!("{ANSI_DIM}...{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}]> ")
+                format!("{ANSI_DIM}...{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}] {preview}> ")
             }
-            None => format!("{ANSI_DIM}...{ANSI_RESET}> "),
+            None => format!("{ANSI_DIM}...{ANSI_RESET} {preview}> "),
         }
     } else {
         match label {
-            Some(label) => format!("...[{label}]> "),
-            None => String::from(PROMPT_CONTINUATION),
+            Some(label) => format!("...[{label}] {preview}> "),
+            None => format!("{PROMPT_CONTINUATION}{preview} "),
         }
     }
 }
@@ -648,14 +826,21 @@ fn prompt_db_label(current_db_path: &str) -> String {
         .to_owned()
 }
 
-fn execute_sql<W, E>(connection: &Connection, sql: &str, out: &mut W, err: &mut E) -> bool
+fn execute_sql<W, E>(
+    connection: &Connection,
+    sql: &str,
+    output_options: OutputOptions,
+    out: &mut W,
+    err: &mut E,
+) -> bool
 where
     W: Write,
     E: Write,
 {
+    let column_names = infer_result_column_names(connection, sql);
     match connection.query(sql) {
         Ok(rows) => {
-            if write_rows(&rows, out).is_err() {
+            if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
                 let _ = writeln!(err, "error: failed writing query results");
                 return false;
             }
@@ -668,22 +853,256 @@ where
     }
 }
 
-fn write_rows<W>(rows: &[Row], out: &mut W) -> io::Result<()>
+fn write_rows<W>(
+    rows: &[Row],
+    column_names: Option<&[String]>,
+    output_options: OutputOptions,
+    out: &mut W,
+) -> io::Result<()>
 where
     W: Write,
 {
+    let column_count = rows
+        .first()
+        .map(|row| row.values().len())
+        .or_else(|| column_names.map(<[String]>::len))
+        .unwrap_or(0);
+    let resolved_column_names = resolved_column_names(column_names, column_count);
+
+    match output_options.mode {
+        OutputMode::List => write_delimited_rows(
+            rows,
+            &resolved_column_names,
+            output_options,
+            OutputMode::List.separator(),
+            out,
+        ),
+        OutputMode::Csv => write_delimited_rows(
+            rows,
+            &resolved_column_names,
+            output_options,
+            OutputMode::Csv.separator(),
+            out,
+        ),
+        OutputMode::Tabs => write_delimited_rows(
+            rows,
+            &resolved_column_names,
+            output_options,
+            OutputMode::Tabs.separator(),
+            out,
+        ),
+        OutputMode::Column => {
+            write_column_rows(rows, &resolved_column_names, output_options.headers, out)
+        }
+        OutputMode::Line => write_line_rows(rows, &resolved_column_names, out),
+    }
+}
+
+#[cfg(test)]
+fn format_row(row: &Row) -> String {
+    row.values()
+        .iter()
+        .map(render_display_value)
+        .collect::<Vec<_>>()
+        .join(OutputMode::List.separator())
+}
+
+fn resolved_column_names(column_names: Option<&[String]>, column_count: usize) -> Vec<String> {
+    let mut resolved: Vec<String> = column_names
+        .map(|names| names.iter().take(column_count).cloned().collect())
+        .unwrap_or_default();
+    while resolved.len() < column_count {
+        resolved.push(format!("column{}", resolved.len() + 1));
+    }
+    resolved
+}
+
+fn write_delimited_rows<W>(
+    rows: &[Row],
+    column_names: &[String],
+    output_options: OutputOptions,
+    separator: &str,
+    out: &mut W,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    if output_options.headers && !column_names.is_empty() {
+        let header = column_names
+            .iter()
+            .map(|name| render_output_header(name, output_options.mode))
+            .collect::<Vec<_>>()
+            .join(separator);
+        writeln!(out, "{header}")?;
+    }
+
     for row in rows {
-        writeln!(out, "{}", format_row(row))?;
+        let rendered = row
+            .values()
+            .iter()
+            .map(|value| render_output_value(value, output_options.mode))
+            .collect::<Vec<_>>()
+            .join(separator);
+        writeln!(out, "{rendered}")?;
     }
     Ok(())
 }
 
-fn format_row(row: &Row) -> String {
-    row.values()
+fn write_column_rows<W>(
+    rows: &[Row],
+    column_names: &[String],
+    show_headers: bool,
+    out: &mut W,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let column_count = rows
+        .first()
+        .map(|row| row.values().len())
+        .unwrap_or(column_names.len());
+    let mut widths = vec![0usize; column_count];
+
+    for (index, name) in column_names.iter().take(column_count).enumerate() {
+        widths[index] = widths[index].max(name.len());
+    }
+
+    let rendered_rows = rows
         .iter()
-        .map(std::string::ToString::to_string)
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(render_display_value)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    for row in &rendered_rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(value.len());
+        }
+    }
+
+    if show_headers && !column_names.is_empty() {
+        writeln!(out, "{}", format_column_line(column_names, &widths))?;
+        let underline = widths
+            .iter()
+            .map(|width| "-".repeat(*width))
+            .collect::<Vec<_>>()
+            .join(OutputMode::Column.separator());
+        writeln!(out, "{underline}")?;
+    }
+
+    for row in rendered_rows {
+        writeln!(out, "{}", format_column_line(&row, &widths))?;
+    }
+
+    Ok(())
+}
+
+fn write_line_rows<W>(rows: &[Row], column_names: &[String], out: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    for (row_index, row) in rows.iter().enumerate() {
+        for (column_index, value) in row.values().iter().enumerate() {
+            let name = column_names
+                .get(column_index)
+                .map(String::as_str)
+                .unwrap_or("column");
+            writeln!(out, "{name} = {}", render_display_value(value))?;
+        }
+        if row_index + 1 < rows.len() {
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+fn format_column_line(values: &[String], widths: &[usize]) -> String {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| format!("{value:<width$}", width = widths[index]))
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join(OutputMode::Column.separator())
+}
+
+fn render_output_header(name: &str, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Csv => render_csv_field(name),
+        OutputMode::Tabs | OutputMode::List | OutputMode::Column | OutputMode::Line => {
+            name.to_owned()
+        }
+    }
+}
+
+fn render_output_value(value: &SqliteValue, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::List | OutputMode::Column | OutputMode::Line => render_display_value(value),
+        OutputMode::Csv => render_csv_field(&render_raw_value(value)),
+        OutputMode::Tabs => render_raw_value(value),
+    }
+}
+
+fn render_display_value(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => String::from("NULL"),
+        SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
+        SqliteValue::Blob(bytes) => {
+            let mut rendered = String::from("X'");
+            for byte in bytes.iter() {
+                let _ = write!(rendered, "{byte:02X}");
+            }
+            rendered.push('\'');
+            rendered
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn render_raw_value(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => String::new(),
+        SqliteValue::Text(text) => text.to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn render_csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn infer_result_column_names(connection: &Connection, sql: &str) -> Option<Vec<String>> {
+    let statement = last_sql_statement(sql)?;
+    let prepared = connection.prepare(statement).ok()?;
+    let column_names = prepared.column_names();
+    (!column_names.is_empty()).then(|| column_names.to_vec())
+}
+
+fn render_pending_sql_preview(pending_sql: &str, colorize: bool) -> String {
+    let preview = last_sql_statement(pending_sql).unwrap_or(pending_sql);
+    let collapsed = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview = truncate_preview(&collapsed, 28);
+    if preview.is_empty() {
+        String::from("...")
+    } else if colorize {
+        highlight_sql(&preview)
+    } else {
+        preview
+    }
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,10 +1139,341 @@ fn is_line_comment_start(bytes: &[u8], i: usize) -> bool {
     true
 }
 
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_identifier_continue(byte: u8) -> bool {
+    is_identifier_start(byte) || byte.is_ascii_digit()
+}
+
+fn last_sql_statement(buffer: &str) -> Option<&str> {
+    let bytes = buffer.as_bytes();
+    let mut state = StatementScanState::Normal;
+    let mut statement_start = 0usize;
+    let mut last_statement = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match state {
+            StatementScanState::Normal => {
+                if is_line_comment_start(bytes, i) {
+                    state = StatementScanState::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if is_block_comment_start(bytes, i) {
+                    state = StatementScanState::BlockComment;
+                    i += 2;
+                    continue;
+                }
+                if byte == b'\'' {
+                    state = StatementScanState::SingleQuote;
+                    i += 1;
+                    continue;
+                }
+                if byte == b'"' {
+                    state = StatementScanState::DoubleQuote;
+                    i += 1;
+                    continue;
+                }
+                if byte == b'`' {
+                    state = StatementScanState::Backtick;
+                    i += 1;
+                    continue;
+                }
+                if byte == b'[' {
+                    state = StatementScanState::BracketIdent;
+                    i += 1;
+                    continue;
+                }
+                if byte == b';' {
+                    let statement = buffer[statement_start..=i].trim();
+                    if sql_segment_has_tokens(statement) {
+                        last_statement = Some(statement);
+                    }
+                    statement_start = i + 1;
+                }
+                i += 1;
+            }
+            StatementScanState::SingleQuote => {
+                if byte == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += buffer[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            StatementScanState::DoubleQuote => {
+                if byte == b'"' {
+                    if bytes.get(i + 1) == Some(&b'"') {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += buffer[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            StatementScanState::Backtick => {
+                if byte == b'`' {
+                    if bytes.get(i + 1) == Some(&b'`') {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += buffer[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            StatementScanState::BracketIdent => {
+                if byte == b']' {
+                    if bytes.get(i + 1) == Some(&b']') {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += buffer[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+            StatementScanState::LineComment => {
+                if byte == b'\n' || byte == b'\r' {
+                    state = StatementScanState::Normal;
+                }
+                i += 1;
+            }
+            StatementScanState::BlockComment => {
+                if is_block_comment_end(bytes, i) {
+                    state = StatementScanState::Normal;
+                    i += 2;
+                } else {
+                    i += buffer[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+        }
+    }
+
+    let trailing = buffer[statement_start..].trim();
+    if sql_segment_has_tokens(trailing) {
+        last_statement = Some(trailing);
+    }
+
+    last_statement
+}
+
+fn sql_segment_has_tokens(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut state = StatementScanState::Normal;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        match state {
+            StatementScanState::Normal => {
+                if byte.is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+                if is_line_comment_start(bytes, i) {
+                    state = StatementScanState::LineComment;
+                    i += 2;
+                    continue;
+                }
+                if is_block_comment_start(bytes, i) {
+                    state = StatementScanState::BlockComment;
+                    i += 2;
+                    continue;
+                }
+                return true;
+            }
+            StatementScanState::SingleQuote => unreachable!(),
+            StatementScanState::DoubleQuote => unreachable!(),
+            StatementScanState::Backtick => unreachable!(),
+            StatementScanState::BracketIdent => unreachable!(),
+            StatementScanState::LineComment => {
+                if byte == b'\n' || byte == b'\r' {
+                    state = StatementScanState::Normal;
+                }
+                i += 1;
+            }
+            StatementScanState::BlockComment => {
+                if is_block_comment_end(bytes, i) {
+                    state = StatementScanState::Normal;
+                    i += 2;
+                } else {
+                    i += segment[i..].chars().next().map_or(1, char::len_utf8);
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn highlight_sql(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut highlighted = String::with_capacity(sql.len() + 32);
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if is_line_comment_start(bytes, i) {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                i += sql[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            push_colored_segment(&mut highlighted, &sql[start..i], ANSI_DIM);
+            continue;
+        }
+
+        if is_block_comment_start(bytes, i) {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && !is_block_comment_end(bytes, i) {
+                i += sql[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            if is_block_comment_end(bytes, i) {
+                i += 2;
+            }
+            push_colored_segment(&mut highlighted, &sql[start..i], ANSI_DIM);
+            continue;
+        }
+
+        match bytes[i] {
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        i += sql[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+                push_colored_segment(&mut highlighted, &sql[start..i], ANSI_GREEN);
+            }
+            byte if byte.is_ascii_digit() => {
+                let start = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || matches!(bytes[i], b'.' | b'+' | b'-' | b'_'))
+                {
+                    i += 1;
+                }
+                push_colored_segment(&mut highlighted, &sql[start..i], ANSI_MAGENTA);
+            }
+            byte if is_identifier_start(byte) => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_identifier_continue(bytes[i]) {
+                    i += 1;
+                }
+                let token = &sql[start..i];
+                if is_sql_keyword(token) {
+                    push_colored_segment(&mut highlighted, token, ANSI_BOLD_BLUE);
+                } else {
+                    highlighted.push_str(token);
+                }
+            }
+            _ => {
+                let ch = sql[i..]
+                    .chars()
+                    .next()
+                    .expect("slice should contain a char");
+                highlighted.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+
+    highlighted
+}
+
+fn push_colored_segment(buffer: &mut String, segment: &str, color: &str) {
+    buffer.push_str(color);
+    buffer.push_str(segment);
+    buffer.push_str(ANSI_RESET);
+}
+
+fn is_sql_keyword(token: &str) -> bool {
+    matches!(
+        token.to_ascii_uppercase().as_str(),
+        "ALTER"
+            | "ANALYZE"
+            | "AND"
+            | "AS"
+            | "ASC"
+            | "ATTACH"
+            | "BEGIN"
+            | "BY"
+            | "CASE"
+            | "CHECK"
+            | "COMMIT"
+            | "CREATE"
+            | "DELETE"
+            | "DESC"
+            | "DETACH"
+            | "DISTINCT"
+            | "DROP"
+            | "ELSE"
+            | "END"
+            | "EXISTS"
+            | "EXPLAIN"
+            | "FROM"
+            | "GROUP"
+            | "HAVING"
+            | "IN"
+            | "INDEX"
+            | "INSERT"
+            | "INTO"
+            | "IS"
+            | "JOIN"
+            | "LEFT"
+            | "LIMIT"
+            | "NOT"
+            | "NULL"
+            | "ON"
+            | "OR"
+            | "ORDER"
+            | "PRIMARY"
+            | "REPLACE"
+            | "RIGHT"
+            | "ROLLBACK"
+            | "SELECT"
+            | "SET"
+            | "TABLE"
+            | "THEN"
+            | "TRANSACTION"
+            | "UNION"
+            | "UNIQUE"
+            | "UPDATE"
+            | "VALUES"
+            | "VIEW"
+            | "WHEN"
+            | "WHERE"
+    )
+}
+
 fn try_execute_dot_command<W, E>(
     trimmed: &str,
     connection: &mut Connection,
     current_db_path: &mut String,
+    output_options: &mut OutputOptions,
     out: &mut W,
     err: &mut E,
     shell_options: ShellOptions,
@@ -740,34 +1490,22 @@ where
             return DotCommandResult::Continue;
         };
 
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let mut nested = io::Cursor::new(contents.into_bytes());
-                match run_shell(
-                    connection,
-                    current_db_path,
-                    &mut nested,
-                    out,
-                    err,
-                    ShellOptions {
-                        show_prompts: false,
-                        colorize_prompts: shell_options.colorize_prompts,
-                        fail_on_error: shell_options.fail_on_error,
-                    },
-                ) {
-                    Some(outcome) => {
-                        *had_error |= outcome.had_error;
-                        if outcome.flow == ShellFlow::Exit {
-                            return DotCommandResult::Exit;
-                        }
-                    }
-                    None => {
-                        *had_error = true;
-                    }
+        match execute_script_file(
+            &path,
+            connection,
+            current_db_path,
+            output_options,
+            out,
+            err,
+            shell_options.nested_script(),
+        ) {
+            Some(outcome) => {
+                *had_error |= outcome.had_error;
+                if outcome.flow == ShellFlow::Exit {
+                    return DotCommandResult::Exit;
                 }
             }
-            Err(error) => {
-                let _ = writeln!(err, "error: {error}");
+            None => {
                 *had_error = true;
             }
         }
@@ -796,7 +1534,12 @@ where
 
     if let Some(arg) = dot_command_arg(trimmed, ".schema") {
         let filter = parse_optional_quoted_arg(arg);
-        if let Err(error) = write_schema(connection, filter.as_deref(), out) {
+        if let Err(error) = write_schema(
+            connection,
+            filter.as_deref(),
+            shell_options.colorize_prompts,
+            out,
+        ) {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
@@ -805,14 +1548,70 @@ where
 
     if let Some(arg) = dot_command_arg(trimmed, ".dump") {
         let filter = parse_optional_quoted_arg(arg);
-        if let Err(error) = write_dump(connection, filter.as_deref(), out) {
+        if let Err(error) = write_dump(
+            connection,
+            filter.as_deref(),
+            shell_options.colorize_prompts,
+            out,
+        ) {
             let _ = writeln!(err, "error: {error}");
             *had_error = true;
         }
         return DotCommandResult::Continue;
     }
 
-    DotCommandResult::NotHandled
+    if let Some(arg) = dot_command_arg(trimmed, ".tables") {
+        let filter = parse_optional_quoted_arg(arg);
+        if let Err(error) = write_tables(connection, filter.as_deref(), out) {
+            let _ = writeln!(err, "error: {error}");
+            *had_error = true;
+        }
+        return DotCommandResult::Continue;
+    }
+
+    if let Some(arg) = dot_command_arg(trimmed, ".mode") {
+        let Some(value) = parse_optional_quoted_arg(arg) else {
+            let _ = writeln!(
+                err,
+                "error: .mode requires one of: list, column, csv, tabs, line"
+            );
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        let Some(mode) = OutputMode::parse(&value) else {
+            let _ = writeln!(
+                err,
+                "error: unknown output mode `{value}`; expected one of: list, column, csv, tabs, line"
+            );
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        output_options.mode = mode;
+        return DotCommandResult::Continue;
+    }
+
+    if let Some(arg) = dot_command_arg(trimmed, ".header") {
+        let Some(value) = parse_optional_quoted_arg(arg) else {
+            let _ = writeln!(err, "error: .header requires `on` or `off`");
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        let Some(headers) = parse_on_off(&value) else {
+            let _ = writeln!(err, "error: .header expects `on` or `off`, got `{value}`");
+            *had_error = true;
+            return DotCommandResult::Continue;
+        };
+        output_options.headers = headers;
+        return DotCommandResult::Continue;
+    }
+
+    if trimmed.starts_with('.') {
+        let _ = writeln!(err, "error: unknown dot command `{trimmed}`");
+        *had_error = true;
+        DotCommandResult::Continue
+    } else {
+        DotCommandResult::NotHandled
+    }
 }
 
 fn dot_command_arg<'a>(trimmed: &'a str, command: &str) -> Option<&'a str> {
@@ -841,7 +1640,57 @@ fn parse_optional_quoted_arg(raw: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
-fn write_schema<W>(connection: &Connection, filter: Option<&str>, out: &mut W) -> Result<(), String>
+fn parse_on_off(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Some(true),
+        "off" | "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn write_tables<W>(connection: &Connection, filter: Option<&str>, out: &mut W) -> Result<(), String>
+where
+    W: Write,
+{
+    let sql = "\
+        SELECT name \
+        FROM sqlite_schema \
+        WHERE type IN ('table', 'view') \
+          AND name NOT LIKE 'sqlite_%' \
+        ORDER BY name";
+    let filtered_sql = "\
+        SELECT name \
+        FROM sqlite_schema \
+        WHERE type IN ('table', 'view') \
+          AND name NOT LIKE 'sqlite_%' \
+          AND name LIKE ?1 \
+        ORDER BY name";
+
+    let rows = match filter {
+        Some(filter) => {
+            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+        }
+        None => connection.query(sql),
+    }
+    .map_err(|error| error.to_string())?;
+
+    let table_names = rows
+        .iter()
+        .filter_map(|row| row.get(0))
+        .filter_map(SqliteValue::as_text)
+        .collect::<Vec<_>>();
+    if !table_names.is_empty() {
+        writeln!(out, "{}", table_names.join(" ")).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_schema<W>(
+    connection: &Connection,
+    filter: Option<&str>,
+    colorize_sql: bool,
+    out: &mut W,
+) -> Result<(), String>
 where
     W: Write,
 {
@@ -885,13 +1734,18 @@ where
         let Some(SqliteValue::Text(statement)) = row.get(0) else {
             continue;
         };
-        write_sql_statement(out, statement).map_err(|error| error.to_string())?;
+        write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
     }
 
     Ok(())
 }
 
-fn write_dump<W>(connection: &Connection, filter: Option<&str>, out: &mut W) -> Result<(), String>
+fn write_dump<W>(
+    connection: &Connection,
+    filter: Option<&str>,
+    colorize_sql: bool,
+    out: &mut W,
+) -> Result<(), String>
 where
     W: Write,
 {
@@ -943,13 +1797,14 @@ where
     }
     .map_err(|error| error.to_string())?;
 
-    writeln!(out, "BEGIN TRANSACTION;").map_err(|error| error.to_string())?;
+    write_sql_statement(out, "BEGIN TRANSACTION;", colorize_sql)
+        .map_err(|error| error.to_string())?;
 
     for row in &table_rows {
         let Some(SqliteValue::Text(statement)) = row.get(1) else {
             continue;
         };
-        write_sql_statement(out, statement).map_err(|error| error.to_string())?;
+        write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
     }
 
     for row in &table_rows {
@@ -985,14 +1840,14 @@ where
         let Some(SqliteValue::Text(statement)) = row.get(0) else {
             continue;
         };
-        write_sql_statement(out, statement).map_err(|error| error.to_string())?;
+        write_sql_statement(out, statement, colorize_sql).map_err(|error| error.to_string())?;
     }
 
-    writeln!(out, "COMMIT;").map_err(|error| error.to_string())?;
+    write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn write_sql_statement<W>(out: &mut W, statement: &str) -> io::Result<()>
+fn write_sql_statement<W>(out: &mut W, statement: &str, colorize_sql: bool) -> io::Result<()>
 where
     W: Write,
 {
@@ -1000,10 +1855,15 @@ where
     if trimmed.is_empty() {
         return Ok(());
     }
-    if trimmed.ends_with(';') {
-        writeln!(out, "{trimmed}")
+    let rendered = if colorize_sql {
+        highlight_sql(trimmed)
     } else {
-        writeln!(out, "{trimmed};")
+        trimmed.to_owned()
+    };
+    if trimmed.ends_with(';') {
+        writeln!(out, "{rendered}")
+    } else {
+        writeln!(out, "{rendered};")
     }
 }
 
@@ -1151,9 +2011,11 @@ where
 {
     writeln!(
         out,
-        "Usage: fsqlite [DB_PATH] [-c|--command SQL]\n\
+        "Usage: fsqlite [DB_PATH] [-c|--command SQL] [-batch|--batch] [-init FILE]\n\
          \n\
          Piped input runs in batch mode automatically (no prompts).\n\
+         `-batch` forces batch mode even on a TTY.\n\
+         `-init FILE` executes a startup script before command mode or the REPL.\n\
          Dot commands in command mode are also supported: `fsqlite -c \".schema\"`.\n\
          \n\
          Verify decode proof JSON:\n\
@@ -1163,6 +2025,7 @@ where
          \n\
          fsqlite\n\
          fsqlite app.db\n\
+         fsqlite --batch --init boot.sql app.db\n\
          fsqlite -c \"SELECT 1 + 2;\"\n\
          fsqlite app.db --command \"SELECT * FROM users;\"\n\
          fsqlite --verify-proof decode_proof.json\n",
@@ -1177,13 +2040,16 @@ where
         out,
         "Dot commands:\n\
          \n\
-         .help      Show this help\n\
-         .open FILE Re-open the shell against another database\n\
-         .schema    Show schema SQL (optionally filtered by pattern)\n\
-         .dump      Emit SQL text for schema + table contents\n\
-         .quit      Exit the shell\n\
-         .exit      Exit the shell\n\
-         .read FILE Execute SQL from file\n\
+         .help         Show this help\n\
+         .open FILE    Re-open the shell against another database\n\
+         .tables ?PAT  List tables and views, optionally filtered by LIKE pattern\n\
+         .schema ?PAT  Show schema SQL, optionally filtered by pattern\n\
+         .dump ?PAT    Emit SQL text for schema + table contents\n\
+         .mode MODE    Set output mode: list, column, csv, tabs, line\n\
+         .header on|off Toggle column headers for row output\n\
+         .quit         Exit the shell\n\
+         .exit         Exit the shell\n\
+         .read FILE    Execute SQL from file\n\
          \n\
          Enter SQL statements terminated by `;`.\n\
          Piped stdin runs in batch mode with prompts disabled.\n",
@@ -1205,7 +2071,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ShellOptions, format_row, parse_args, run, run_with_shell_options, statement_complete,
+        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, ShellOptions, format_row,
+        highlight_sql, parse_args, render_prompt, run, run_with_shell_options, statement_complete,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -1288,6 +2155,15 @@ mod tests {
     fn test_parse_command_equals_form() {
         let options = parse_from(&["fsqlite", "--command=SELECT 2;"]).expect("args should parse");
         assert_eq!(options.command.as_deref(), Some("SELECT 2;"));
+    }
+
+    #[test]
+    fn test_parse_batch_and_init_flags() {
+        let options = parse_from(&["fsqlite", "--batch", "--init", "boot.sql", "demo.db"])
+            .expect("batch and init flags should parse");
+        assert_eq!(options.db_path, "demo.db");
+        assert_eq!(options.init_path.as_deref(), Some("boot.sql"));
+        assert!(options.force_batch);
     }
 
     #[test]
@@ -1581,6 +2457,38 @@ mod tests {
     }
 
     #[test]
+    fn test_init_file_executes_before_command_mode() {
+        let path = unique_temp_path("fsqlite_cli_init", "sql");
+        fs::write(
+            &path,
+            "CREATE TABLE seeded(id INTEGER PRIMARY KEY);\nINSERT INTO seeded VALUES(1);\n",
+        )
+        .expect("startup SQL file should be writable");
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            OsString::from("--init"),
+            path.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("SELECT COUNT(*) AS n FROM seeded;"),
+        ];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert!(
+            stdout.contains('1'),
+            "expected startup script side effects in command mode, got: {stdout}",
+        );
+    }
+
+    #[test]
     fn test_repl_open_command_switches_database() {
         let path = unique_temp_path("fsqlite_cli_open", "db");
         let input_script = format!(
@@ -1602,6 +2510,86 @@ mod tests {
         assert!(
             stdout.contains('0'),
             "expected .open to switch to a fresh database, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_tables_command_lists_tables_and_views() {
+        let mut input = Cursor::new(
+            b"CREATE TABLE widgets(id INTEGER PRIMARY KEY);\n\
+CREATE VIEW widget_names AS SELECT id FROM widgets;\n\
+.tables\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert!(
+            stdout.contains("widget_names") && stdout.contains("widgets"),
+            "expected .tables output to include tables and views, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_mode_and_header_commands_affect_query_rendering() {
+        let mut input = Cursor::new(
+            b".mode column\n\
+.header on\n\
+SELECT 1 AS one, 'x' AS two;\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert!(
+            stdout.contains("one") && stdout.contains("two"),
+            "expected headers in column mode output, got: {stdout}",
+        );
+        assert!(
+            stdout.contains("1") && stdout.contains("'x'"),
+            "expected row data in column mode output, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_mode_csv_uses_raw_text_and_header_row() {
+        let mut input = Cursor::new(
+            b".mode csv\n\
+.header on\n\
+SELECT 1 AS one, 'two,three' AS two;\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert!(
+            stdout.contains("one,two"),
+            "expected CSV header row, got: {stdout}",
+        );
+        assert!(
+            stdout.contains("1,\"two,three\""),
+            "expected CSV value escaping without SQL quotes, got: {stdout}",
         );
     }
 
@@ -1700,6 +2688,32 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
             .expect("query_row should succeed");
         let rendered = format_row(&row);
         assert_eq!(rendered, "10 | 'abc' | NULL");
+    }
+
+    #[test]
+    fn test_highlight_sql_colors_keywords_literals_and_comments() {
+        let highlighted = highlight_sql("SELECT 7, 'x' -- note");
+        assert!(highlighted.contains(&format!("{ANSI_BOLD_BLUE}SELECT{ANSI_RESET}")));
+        assert!(highlighted.contains(&format!("{ANSI_MAGENTA}7{ANSI_RESET}")));
+        assert!(highlighted.contains(&format!("{ANSI_GREEN}'x'{ANSI_RESET}")));
+        assert!(highlighted.contains(&format!("{ANSI_DIM}-- note{ANSI_RESET}")));
+    }
+
+    #[test]
+    fn test_render_prompt_includes_pending_sql_preview() {
+        let prompt = render_prompt(
+            "demo.db",
+            "SELECT 1 FROM widgets",
+            ShellOptions {
+                show_prompts: true,
+                colorize_prompts: false,
+                fail_on_error: false,
+            },
+        );
+        assert!(
+            prompt.contains("SELECT 1 FROM widgets"),
+            "expected continuation prompt preview, got: {prompt}",
+        );
     }
 
     #[test]
