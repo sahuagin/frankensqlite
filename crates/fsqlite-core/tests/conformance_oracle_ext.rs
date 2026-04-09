@@ -107,6 +107,11 @@ const CONFORMANCE_COVERAGE_BUCKETS: &[CoverageBucket] = &[
         minimum_tests: 50,
     },
     CoverageBucket {
+        category: "temporal_and_time_travel",
+        patterns: &["time_travel", "system_time", "commitseq", "temporal"],
+        minimum_tests: 3,
+    },
+    CoverageBucket {
         category: "error_paths",
         patterns: &["error", "check_constraint", "fk_", "constraint"],
         minimum_tests: 8,
@@ -198,6 +203,131 @@ fn assert_both_execute_error(
     );
 }
 
+fn format_fsqlite_value(value: &SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => "NULL".to_owned(),
+        SqliteValue::Integer(n) => n.to_string(),
+        SqliteValue::Float(f) => format!("{f}"),
+        SqliteValue::Text(s) => format!("'{s}'"),
+        SqliteValue::Blob(bytes) => {
+            format!(
+                "X'{}'",
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        }
+    }
+}
+
+fn format_rusqlite_value(value: rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Null => "NULL".to_owned(),
+        rusqlite::types::Value::Integer(n) => n.to_string(),
+        rusqlite::types::Value::Real(f) => format!("{f}"),
+        rusqlite::types::Value::Text(s) => format!("'{s}'"),
+        rusqlite::types::Value::Blob(bytes) => {
+            format!(
+                "X'{}'",
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        }
+    }
+}
+
+fn query_fsqlite_strings(
+    conn: &Connection,
+    query: &str,
+) -> std::result::Result<Vec<Vec<String>>, String> {
+    let rows = conn.query(query).map_err(|error| format!("{error}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| row.values().iter().map(format_fsqlite_value).collect())
+        .collect())
+}
+
+fn query_rusqlite_strings(
+    conn: &rusqlite::Connection,
+    query: &str,
+) -> std::result::Result<Vec<Vec<String>>, String> {
+    let mut stmt = conn
+        .prepare(query)
+        .map_err(|error| format!("prepare: {error}"))?;
+    let col_count = stmt.column_count();
+    stmt.query_map([], |row| {
+        let mut vals = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let value: rusqlite::types::Value = row.get_unwrap(i);
+            vals.push(format_rusqlite_value(value));
+        }
+        Ok(vals)
+    })
+    .map_err(|error| format!("query: {error}"))?
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|error| format!("row: {error}"))
+}
+
+fn compare_query_pair(
+    fconn: &Connection,
+    frank_query: &str,
+    rconn: &rusqlite::Connection,
+    oracle_query: &str,
+    label: &str,
+) -> Option<String> {
+    let frank_result = query_fsqlite_strings(fconn, frank_query);
+    let oracle_result = query_rusqlite_strings(rconn, oracle_query);
+
+    match (frank_result, oracle_result) {
+        (Ok(frank_rows), Ok(oracle_rows)) if frank_rows == oracle_rows => None,
+        (Ok(frank_rows), Ok(oracle_rows)) => Some(format!(
+            "PAIR_MISMATCH[{label}]\n  frank_query: {frank_query}\n  oracle_query: {oracle_query}\n  frank: {frank_rows:?}\n  csql:  {oracle_rows:?}"
+        )),
+        (Ok(frank_rows), Err(oracle_err)) => Some(format!(
+            "PAIR_DIVERGE[{label}]\n  frank_query: {frank_query}\n  oracle_query: {oracle_query}\n  frank: {frank_rows:?}\n  csql:  ERROR({oracle_err})"
+        )),
+        (Err(frank_err), Ok(oracle_rows)) => Some(format!(
+            "PAIR_FRANK_ERROR[{label}]\n  frank_query: {frank_query}\n  oracle_query: {oracle_query}\n  frank: ERROR({frank_err})\n  csql:  {oracle_rows:?}"
+        )),
+        (Err(frank_err), Err(oracle_err)) => Some(format!(
+            "PAIR_BOTH_ERROR[{label}]\n  frank_query: {frank_query}\n  oracle_query: {oracle_query}\n  frank: ERROR({frank_err})\n  csql:  ERROR({oracle_err})"
+        )),
+    }
+}
+
+fn assert_query_pair_matches(
+    fconn: &Connection,
+    frank_query: &str,
+    rconn: &rusqlite::Connection,
+    oracle_query: &str,
+    label: &str,
+) {
+    if let Some(mismatch) = compare_query_pair(fconn, frank_query, rconn, oracle_query, label) {
+        panic!("{mismatch}");
+    }
+}
+
+fn apply_fsqlite_statements(conn: &Connection, statements: &[&str]) {
+    for statement in statements {
+        conn.execute(statement).unwrap();
+    }
+}
+
+fn apply_rusqlite_statements(conn: &rusqlite::Connection, statements: &[&str]) {
+    for statement in statements {
+        conn.execute_batch(statement).unwrap();
+    }
+}
+
+fn build_rusqlite_snapshot(statements: &[&str]) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    apply_rusqlite_statements(&conn, statements);
+    conn
+}
+
 /// Run queries against both FrankenSQLite and C SQLite, returning mismatches.
 fn oracle_compare(
     fconn: &Connection,
@@ -206,79 +336,8 @@ fn oracle_compare(
 ) -> Vec<String> {
     let mut mismatches = Vec::new();
     for query in queries {
-        let frank_result = fconn.query(query);
-        let csql_result: std::result::Result<Vec<Vec<String>>, String> = (|| {
-            let mut stmt = rconn.prepare(query).map_err(|e| format!("prepare: {e}"))?;
-            let col_count = stmt.column_count();
-            let rows: Vec<Vec<String>> = stmt
-                .query_map([], |row| {
-                    let mut vals = Vec::new();
-                    for i in 0..col_count {
-                        let v: rusqlite::types::Value = row.get_unwrap(i);
-                        let s = match v {
-                            rusqlite::types::Value::Null => "NULL".to_owned(),
-                            rusqlite::types::Value::Integer(n) => n.to_string(),
-                            rusqlite::types::Value::Real(f) => format!("{f}"),
-                            rusqlite::types::Value::Text(s) => format!("'{s}'"),
-                            rusqlite::types::Value::Blob(b) => {
-                                format!(
-                                    "X'{}'",
-                                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
-                                )
-                            }
-                        };
-                        vals.push(s);
-                    }
-                    Ok(vals)
-                })
-                .map_err(|e| format!("query: {e}"))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| format!("row: {e}"))?;
-            Ok(rows)
-        })();
-        match (frank_result, csql_result) {
-            (Ok(rows), Ok(csql_rows)) => {
-                let frank_strs: Vec<Vec<String>> = rows
-                    .iter()
-                    .map(|row| {
-                        row.values()
-                            .iter()
-                            .map(|v| match v {
-                                SqliteValue::Null => "NULL".to_owned(),
-                                SqliteValue::Integer(n) => n.to_string(),
-                                SqliteValue::Float(f) => format!("{f}"),
-                                SqliteValue::Text(s) => format!("'{s}'"),
-                                SqliteValue::Blob(b) => {
-                                    format!(
-                                        "X'{}'",
-                                        b.iter().map(|x| format!("{x:02X}")).collect::<String>()
-                                    )
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-                if frank_strs != csql_rows {
-                    mismatches.push(format!(
-                        "MISMATCH: {query}\n  frank: {frank_strs:?}\n  csql:  {csql_rows:?}"
-                    ));
-                }
-            }
-            (Ok(_), Err(csql_err)) => {
-                mismatches.push(format!(
-                    "DIVERGE: {query}\n  frank: OK\n  csql:  ERROR({csql_err})"
-                ));
-            }
-            (Err(e), Ok(csql_rows)) => {
-                mismatches.push(format!(
-                    "FRANK_ERROR: {query}\n  frank: {e}\n  csql:  {csql_rows:?}"
-                ));
-            }
-            (Err(frank_err), Err(csql_err)) => {
-                mismatches.push(format!(
-                    "BOTH_ERROR: {query}\n  frank: ERROR({frank_err})\n  csql:  ERROR({csql_err})"
-                ));
-            }
+        if let Some(mismatch) = compare_query_pair(fconn, query, rconn, query, query) {
+            mismatches.push(mismatch);
         }
     }
     mismatches
@@ -318,6 +377,7 @@ fn test_conformance_corpus_coverage_accounting_gate_s76i() {
 
     assert!(snapshot.contains("\"category\":\"ddl_schema_pragmas\""));
     assert!(snapshot.contains("\"category\":\"windows\""));
+    assert!(snapshot.contains("\"category\":\"temporal_and_time_travel\""));
     assert!(snapshot.contains("\"category\":\"error_paths\""));
 }
 
@@ -32418,7 +32478,10 @@ fn test_conformance_pragma_index_introspection_s76f() {
         for mismatch in &mismatches {
             eprintln!("{mismatch}\n");
         }
-        panic!("{} s76f PRAGMA/index introspection mismatches", mismatches.len());
+        panic!(
+            "{} s76f PRAGMA/index introspection mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -32519,4 +32582,172 @@ fn test_conformance_error_paths_constraint_and_shape_s76h() {
             mismatches.len()
         );
     }
+}
+
+/// s76j: COMMITSEQ-based time travel should return the same historical rows as
+/// replaying the same commit boundary into a shadow C SQLite database.
+#[test]
+fn test_conformance_time_travel_commitseq_historical_state_s76j() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let base = ["CREATE TABLE tt_users (id INTEGER PRIMARY KEY, name TEXT)"];
+    let tx1 = [
+        "BEGIN",
+        "INSERT INTO tt_users VALUES (1, 'Alice')",
+        "COMMIT",
+    ];
+    let tx2 = ["BEGIN", "INSERT INTO tt_users VALUES (2, 'Bob')", "COMMIT"];
+    let tx3 = [
+        "BEGIN",
+        "INSERT INTO tt_users VALUES (3, 'Carol')",
+        "COMMIT",
+    ];
+
+    apply_fsqlite_statements(&fconn, &base);
+    apply_fsqlite_statements(&fconn, &tx1);
+    apply_fsqlite_statements(&fconn, &tx2);
+    apply_fsqlite_statements(&fconn, &tx3);
+
+    let seq2 = build_rusqlite_snapshot(&[base.as_slice(), tx1.as_slice()].concat());
+    let seq3 = build_rusqlite_snapshot(&[base.as_slice(), tx1.as_slice(), tx2.as_slice()].concat());
+    let seq4 = build_rusqlite_snapshot(
+        &[
+            base.as_slice(),
+            tx1.as_slice(),
+            tx2.as_slice(),
+            tx3.as_slice(),
+        ]
+        .concat(),
+    );
+
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_users FOR SYSTEM_TIME AS OF COMMITSEQ 2 ORDER BY id",
+        &seq2,
+        "SELECT name FROM tt_users ORDER BY id",
+        "commitseq_seq2_names",
+    );
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_users FOR SYSTEM_TIME AS OF COMMITSEQ 3 ORDER BY id",
+        &seq3,
+        "SELECT name FROM tt_users ORDER BY id",
+        "commitseq_seq3_names",
+    );
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_users FOR SYSTEM_TIME AS OF COMMITSEQ 4 ORDER BY id",
+        &seq4,
+        "SELECT name FROM tt_users ORDER BY id",
+        "commitseq_seq4_names",
+    );
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_users ORDER BY id",
+        &seq4,
+        "SELECT name FROM tt_users ORDER BY id",
+        "live_state_matches_latest_commit",
+    );
+}
+
+/// s76k: Historical snapshots must preserve deleted rows and pre-update values,
+/// matching a shadow C SQLite database stopped at the earlier commit boundary.
+#[test]
+fn test_conformance_time_travel_delete_update_visibility_s76k() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let base = ["CREATE TABLE tt_items (id INTEGER PRIMARY KEY, val TEXT)"];
+    let tx1 = [
+        "BEGIN",
+        "INSERT INTO tt_items VALUES (1, 'one')",
+        "INSERT INTO tt_items VALUES (2, 'two')",
+        "COMMIT",
+    ];
+    let tx2 = [
+        "BEGIN",
+        "DELETE FROM tt_items WHERE id = 1",
+        "UPDATE tt_items SET val = 'two-new' WHERE id = 2",
+        "COMMIT",
+    ];
+
+    apply_fsqlite_statements(&fconn, &base);
+    apply_fsqlite_statements(&fconn, &tx1);
+    apply_fsqlite_statements(&fconn, &tx2);
+
+    let seq2 = build_rusqlite_snapshot(&[base.as_slice(), tx1.as_slice()].concat());
+    let seq3 = build_rusqlite_snapshot(&[base.as_slice(), tx1.as_slice(), tx2.as_slice()].concat());
+
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT val FROM tt_items FOR SYSTEM_TIME AS OF COMMITSEQ 2 ORDER BY id",
+        &seq2,
+        "SELECT val FROM tt_items ORDER BY id",
+        "delete_visibility_seq2_rows",
+    );
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT val FROM tt_items FOR SYSTEM_TIME AS OF COMMITSEQ 3 ORDER BY id",
+        &seq3,
+        "SELECT val FROM tt_items ORDER BY id",
+        "update_visibility_seq3_rows",
+    );
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT val FROM tt_items ORDER BY id",
+        &seq3,
+        "SELECT val FROM tt_items ORDER BY id",
+        "live_state_after_delete_update",
+    );
+}
+
+/// s76l: Timestamp-based reads should resolve through the retained snapshot ring,
+/// missing timestamps should fail explicitly, and historical SELECTs must not
+/// corrupt the live state after they complete.
+#[test]
+fn test_conformance_time_travel_timestamp_and_live_state_preservation_s76l() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE tt_events (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE tt_audit (id INTEGER PRIMARY KEY, name TEXT)",
+        "BEGIN",
+        "INSERT INTO tt_events VALUES (1, 'boot')",
+        "COMMIT",
+        "BEGIN",
+        "INSERT INTO tt_events VALUES (2, 'steady')",
+        "COMMIT",
+    ];
+    apply_fsqlite_statements(&fconn, &setup);
+    apply_rusqlite_statements(&rconn, &setup);
+
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '9999-12-31 23:59:59' ORDER BY id",
+        &rconn,
+        "SELECT name FROM tt_events ORDER BY id",
+        "timestamp_future_resolves_latest_snapshot",
+    );
+
+    match fconn
+        .query("SELECT name FROM tt_events FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00' ORDER BY id")
+    {
+        Ok(rows) => {
+            panic!("expected missing-snapshot time-travel error, got rows={rows:?}");
+        }
+        Err(error) => {
+            let missing_timestamp_error = format!("{error}");
+            assert!(
+                missing_timestamp_error.contains("time-travel")
+                    || missing_timestamp_error.contains("no snapshot available"),
+                "expected explicit missing-snapshot time-travel error, got: {missing_timestamp_error}"
+            );
+        }
+    }
+
+    assert_query_pair_matches(
+        &fconn,
+        "SELECT name FROM tt_events ORDER BY id",
+        &rconn,
+        "SELECT name FROM tt_events ORDER BY id",
+        "time_travel_select_preserves_live_source_state",
+    );
 }
