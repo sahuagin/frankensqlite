@@ -30,7 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
 
-use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use fsqlite_e2e::benchmark::{
+    BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark,
+};
 use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fixture_metadata::{
     ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
@@ -38,9 +40,11 @@ use fsqlite_e2e::fixture_metadata::{
 };
 use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, BenchmarkArtifactCommand,
-    BenchmarkArtifactToolVersion, BenchmarkMode, PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
+    BenchmarkArtifactProvenanceCapture, BenchmarkArtifactRetentionClass,
+    BenchmarkArtifactToolVersion, BenchmarkMode, ExpandedBenchmarkCell,
+    PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
     PLACEMENT_PROFILE_BASELINE_UNPINNED, PLACEMENT_PROFILE_RECOMMENDED_PINNED,
-    load_beads_benchmark_campaign,
+    build_benchmark_artifact_manifest, load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
@@ -499,6 +503,371 @@ fn canonical_bench_defaults_from_campaign(
         presets,
         concurrency,
     })
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalBenchContext {
+    workspace_root: PathBuf,
+    campaign: BeadsBenchmarkCampaign,
+    run_id: String,
+    source_revision: String,
+    beads_data_hash: String,
+    command_line: String,
+    tool_versions: Vec<BenchmarkArtifactToolVersion>,
+}
+
+fn benchmark_mode_from_engine_label(engine: &str) -> Option<BenchmarkMode> {
+    match engine {
+        "sqlite3" | "sqlite_reference" => Some(BenchmarkMode::SqliteReference),
+        "fsqlite_mvcc" | "fsqlite" => Some(BenchmarkMode::FsqliteMvcc),
+        "fsqlite_single_writer" => Some(BenchmarkMode::FsqliteSingleWriter),
+        _ => None,
+    }
+}
+
+fn canonical_hardware_signature(
+    campaign: &BeadsBenchmarkCampaign,
+    hardware_class_id: &str,
+) -> Option<String> {
+    let hardware_class = campaign
+        .hardware_classes
+        .iter()
+        .find(|hardware| hardware.id == hardware_class_id)?;
+    Some(format!(
+        "{}:{}:{}",
+        hardware_class.id_fields.os_family.as_str(),
+        hardware_class.id_fields.cpu_arch.as_str(),
+        hardware_class.id_fields.topology_class.as_str()
+    ))
+}
+
+fn resolve_canonical_benchmark_cell(
+    campaign: &BeadsBenchmarkCampaign,
+    summary: &BenchmarkSummary,
+    mode: BenchmarkMode,
+) -> Result<ExpandedBenchmarkCell, String> {
+    let matching_rows = campaign
+        .matrix_rows
+        .iter()
+        .filter(|row| {
+            row.workload == summary.workload
+                && row.concurrency == summary.concurrency
+                && row
+                    .fixtures
+                    .iter()
+                    .any(|fixture| fixture == &summary.fixture_id)
+                && row.modes.contains(&mode)
+        })
+        .collect::<Vec<_>>();
+    let row = match matching_rows.as_slice() {
+        [] => {
+            return Err(format!(
+                "no canonical matrix row for fixture={} workload={} concurrency={} mode={}",
+                summary.fixture_id,
+                summary.workload,
+                summary.concurrency,
+                mode.as_str()
+            ));
+        }
+        [row] => *row,
+        rows => {
+            let row_ids = rows
+                .iter()
+                .map(|row| row.row_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "ambiguous canonical matrix rows for fixture={} workload={} concurrency={} mode={}: {row_ids}",
+                summary.fixture_id,
+                summary.workload,
+                summary.concurrency,
+                mode.as_str()
+            ));
+        }
+    };
+    let placement = row
+        .placement_variants
+        .iter()
+        .find(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+        .or_else(|| {
+            row.placement_variants
+                .iter()
+                .find(|variant| variant.required)
+        })
+        .or_else(|| row.placement_variants.first())
+        .ok_or_else(|| format!("row `{}` has no placement variants", row.row_id))?;
+    Ok(ExpandedBenchmarkCell {
+        row_id: row.row_id.clone(),
+        fixture_id: summary.fixture_id.clone(),
+        workload: summary.workload.clone(),
+        concurrency: summary.concurrency,
+        mode,
+        placement_profile_id: placement.placement_profile_id.clone(),
+        hardware_class_id: placement.hardware_class_id.clone(),
+        retry_policy_id: row.retry_policy_id.clone(),
+        build_profile_id: row.build_profile_id.clone(),
+        seed_policy_id: row.seed_policy_id.clone(),
+    })
+}
+
+fn benchmark_run_id() -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("bench-{now_ms}")
+}
+
+fn benchmark_tool_versions() -> Vec<BenchmarkArtifactToolVersion> {
+    let mut tool_versions = Vec::new();
+    for tool in ["cargo", "git", "rch", "rustc"] {
+        push_hot_path_tool_version(&mut tool_versions, tool);
+    }
+    tool_versions.sort_by(|left, right| left.tool.cmp(&right.tool));
+    tool_versions
+}
+
+fn benchmark_command_line(argv: &[String]) -> String {
+    let mut parts = vec!["realdb-e2e".to_owned(), "bench".to_owned()];
+    parts.extend(argv.iter().cloned());
+    parts
+        .iter()
+        .map(|part| shell_escape(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn resolve_bench_source_revision(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &workspace_root.display().to_string(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!revision.is_empty()).then_some(revision)
+}
+
+fn resolve_bench_beads_data_hash(
+    workspace_root: &Path,
+    campaign: &BeadsBenchmarkCampaign,
+) -> Option<String> {
+    let beads_path = workspace_root.join(&campaign.beads_data_relpath);
+    sha256_file(&beads_path).ok()
+}
+
+fn build_canonical_bench_context(
+    workspace_root: &Path,
+    argv: &[String],
+) -> Option<CanonicalBenchContext> {
+    let campaign = load_beads_benchmark_campaign(workspace_root).ok()?;
+    let source_revision = resolve_bench_source_revision(workspace_root)?;
+    let beads_data_hash = resolve_bench_beads_data_hash(workspace_root, &campaign)?;
+    Some(CanonicalBenchContext {
+        workspace_root: workspace_root.to_path_buf(),
+        campaign,
+        run_id: benchmark_run_id(),
+        source_revision,
+        beads_data_hash,
+        command_line: benchmark_command_line(argv),
+        tool_versions: benchmark_tool_versions(),
+    })
+}
+
+fn write_benchmark_artifact_bundle(
+    workspace_root: &Path,
+    summary: &BenchmarkSummary,
+) -> Result<(), String> {
+    let Some(comparison) = summary.comparison.as_ref() else {
+        return Ok(());
+    };
+    let Some(manifest) = comparison.canonical_artifact_manifest.as_ref() else {
+        return Ok(());
+    };
+
+    let bundle_dir = workspace_root.join(&manifest.artifact_bundle_relpath);
+    fs::create_dir_all(&bundle_dir).map_err(|error| {
+        format!(
+            "create benchmark artifact bundle {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+    fs::create_dir_all(bundle_dir.join(&manifest.artifact_names.logs_dir)).map_err(|error| {
+        format!(
+            "create benchmark artifact log dir {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+    fs::create_dir_all(bundle_dir.join(&manifest.artifact_names.profiles_dir)).map_err(
+        |error| {
+            format!(
+                "create benchmark artifact profile dir {}: {error}",
+                bundle_dir.display()
+            )
+        },
+    )?;
+
+    let result_jsonl = summary
+        .to_jsonl()
+        .map_err(|error| format!("serialize canonical benchmark summary: {error}"))?;
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.result_jsonl),
+        format!("{result_jsonl}\n"),
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark artifact result JSONL {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.summary_md),
+        render_benchmark_summaries_markdown(std::slice::from_ref(summary)),
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark artifact markdown {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    let hardware_discovery_bundle = serde_json::json!({
+        "schema_version": "fsqlite-e2e.hardware_discovery_bundle.v1",
+        "fixture_id": summary.fixture_id,
+        "row_id": comparison.row_id,
+        "mode_id": comparison.mode_id,
+        "placement_profile_id": comparison.placement_profile_id,
+        "hardware_class_id": comparison.hardware_class_id,
+        "hardware_signature": comparison.hardware_signature,
+        "cpu_affinity_mask": "unspecified",
+        "smt_policy_state": "host_default",
+        "memory_policy": "host_default",
+        "helper_lane_cpu_set": "undisclosed",
+        "numa_balancing_state": "undisclosed",
+        "environment": summary.environment,
+        "required_environment_disclosures": manifest
+            .provenance
+            .placement_policy
+            .execution_contract
+            .required_environment_disclosures,
+    });
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.hardware_discovery_bundle_json),
+        serde_json::to_vec_pretty(&hardware_discovery_bundle)
+            .map_err(|error| format!("serialize hardware discovery bundle: {error}"))?,
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark hardware discovery bundle {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    let hardware_discovery_summary = format!(
+        "# Hardware Discovery\n\n- Fixture: `{}`\n- Row: `{}`\n- Mode: `{}`\n- Placement profile: `{}`\n- Hardware class: `{}`\n- Hardware signature: `{}`\n- OS: `{}`\n- Arch: `{}`\n- CPU count: `{}`\n- Cargo profile: `{}`\n",
+        summary.fixture_id,
+        comparison.row_id.as_deref().unwrap_or("unknown"),
+        comparison.mode_id,
+        comparison
+            .placement_profile_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        comparison.hardware_class_id.as_deref().unwrap_or("unknown"),
+        comparison
+            .hardware_signature
+            .as_deref()
+            .unwrap_or("unknown"),
+        summary.environment.os,
+        summary.environment.arch,
+        summary.environment.cpu_count,
+        summary.environment.cargo_profile,
+    );
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.hardware_discovery_summary_md),
+        hardware_discovery_summary,
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark hardware discovery summary {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.manifest_json),
+        serde_json::to_vec_pretty(manifest)
+            .map_err(|error| format!("serialize benchmark artifact manifest: {error}"))?,
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark artifact manifest {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn attach_canonical_benchmark_metadata(
+    mut summary: BenchmarkSummary,
+    context: &CanonicalBenchContext,
+) -> Result<BenchmarkSummary, String> {
+    let Some(mode) = benchmark_mode_from_engine_label(&summary.engine) else {
+        return Ok(summary);
+    };
+    let cell = resolve_canonical_benchmark_cell(&context.campaign, &summary, mode)?;
+    let manifest = build_benchmark_artifact_manifest(
+        &context.workspace_root,
+        &context.campaign,
+        &cell,
+        BenchmarkArtifactProvenanceCapture {
+            run_id: context.run_id.clone(),
+            retention_class: BenchmarkArtifactRetentionClass::FullProof,
+            command_entrypoint: "realdb-e2e bench".to_owned(),
+            source_revision: context.source_revision.clone(),
+            beads_data_hash: context.beads_data_hash.clone(),
+            kernel_release: summary.environment.os.clone(),
+            commands: vec![BenchmarkArtifactCommand {
+                tool: "realdb-e2e".to_owned(),
+                command_line: context.command_line.clone(),
+            }],
+            tool_versions: context.tool_versions.clone(),
+            fallback_notes: Vec::new(),
+        },
+    )?;
+    let artifact_manifest_path = format!(
+        "{}/{}",
+        manifest.artifact_bundle_relpath, manifest.artifact_names.manifest_json
+    );
+    summary.comparison = Some(BenchmarkComparisonMetadata {
+        mode_id: mode.as_str().to_owned(),
+        row_id: Some(manifest.row_id.clone()),
+        retry_policy_id: Some(manifest.retry_policy_id.clone()),
+        seed_policy_id: Some(manifest.seed_policy_id.clone()),
+        build_profile_id: Some(manifest.build_profile_id.clone()),
+        placement_profile_id: Some(manifest.placement_profile_id.clone()),
+        hardware_class_id: Some(manifest.hardware_class_id.clone()),
+        hardware_signature: canonical_hardware_signature(
+            &context.campaign,
+            &manifest.hardware_class_id,
+        ),
+        run_id: Some(manifest.run_id.clone()),
+        source_revision: Some(context.source_revision.clone()),
+        beads_data_hash: Some(context.beads_data_hash.clone()),
+        artifact_bundle_key: Some(manifest.artifact_bundle_key.clone()),
+        artifact_bundle_relpath: Some(manifest.artifact_bundle_relpath.clone()),
+        artifact_manifest_path: Some(artifact_manifest_path),
+        canonical_artifact_manifest: Some(manifest),
+    });
+    write_benchmark_artifact_bundle(&context.workspace_root, &summary)?;
+    Ok(summary)
 }
 
 fn resolve_path_from_base(base: &Path, path: &Path) -> PathBuf {
@@ -4263,20 +4632,20 @@ fn cmd_bench(argv: &[String]) -> i32 {
         || !concurrency_overridden
         || presets.is_empty()
         || presets.iter().any(|preset| preset == "all");
+    let workspace_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| find_bench_workspace_root(&cwd));
 
     let canonical_defaults = if needs_canonical_defaults {
-        match std::env::current_dir() {
-            Ok(cwd) => match find_bench_workspace_root(&cwd) {
-                Some(workspace_root) => match canonical_bench_defaults(&workspace_root) {
-                    Ok(defaults) => Some(defaults),
-                    Err(e) => {
-                        eprintln!("error: failed to load canonical Beads benchmark defaults: {e}");
-                        return 1;
-                    }
-                },
-                None => None,
+        match workspace_root.as_deref() {
+            Some(workspace_root) => match canonical_bench_defaults(workspace_root) {
+                Ok(defaults) => Some(defaults),
+                Err(e) => {
+                    eprintln!("error: failed to load canonical Beads benchmark defaults: {e}");
+                    return 1;
+                }
             },
-            Err(_) => None,
+            None => None,
         }
     } else {
         None
@@ -4324,6 +4693,9 @@ fn cmd_bench(argv: &[String]) -> i32 {
     };
 
     let cargo_profile = cargo_profile_name();
+    let canonical_context = workspace_root
+        .as_deref()
+        .and_then(|workspace_root| build_canonical_bench_context(workspace_root, argv));
     let mut summaries: Vec<BenchmarkSummary> = Vec::new();
     let mut any_iteration_error = false;
 
@@ -4407,7 +4779,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
                         ..FsqliteExecConfig::default()
                     };
 
-                    let summary = run_benchmark(&bench_cfg, &meta, |global_idx| {
+                    let mut summary = run_benchmark(&bench_cfg, &meta, |global_idx| {
                         let _ = global_idx; // currently unused, but kept for future run-id tagging.
                         let td = tempfile::tempdir()
                             .map_err(|e| format!("failed to create temp dir: {e}"))?;
@@ -4424,6 +4796,17 @@ fn cmd_bench(argv: &[String]) -> i32 {
                                 .map_err(|e| format!("{e}"))
                         }
                     });
+                    if let Some(ref context) = canonical_context {
+                        match attach_canonical_benchmark_metadata(summary.clone(), context) {
+                            Ok(enriched) => summary = enriched,
+                            Err(error) => {
+                                eprintln!(
+                                    "warning: failed to attach canonical benchmark metadata for {}:{}:{}:c{}: {error}",
+                                    engine_label, preset, fixture_id, c
+                                );
+                            }
+                        }
+                    }
 
                     any_iteration_error |= summary.iterations.iter().any(|it| it.error.is_some());
 

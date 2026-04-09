@@ -728,6 +728,7 @@ fn sample_benchmark_summary(
             aborts: 0,
             error: None,
         }],
+        comparison: None,
     }
 }
 

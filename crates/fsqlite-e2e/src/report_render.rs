@@ -28,6 +28,48 @@ use crate::report::RunRecordV1;
 type FixtureWorkloadConcurrencyKey = (String, String, u16);
 type PerfByFixture<'a> = BTreeMap<&'a str, Vec<(&'a str, u16, Vec<&'a CellOutcome>)>>;
 
+fn benchmark_mode_label(summary: &BenchmarkSummary) -> &str {
+    summary.comparison_mode_id()
+}
+
+fn cell_mode_label(cell: &CellOutcome) -> &str {
+    cell.mode_id
+        .as_deref()
+        .or_else(|| {
+            cell.summary
+                .as_ref()
+                .map(crate::benchmark::BenchmarkSummary::comparison_mode_id)
+        })
+        .unwrap_or(cell.engine.as_str())
+}
+
+fn mode_sort_key(mode: &str) -> (u8, &str) {
+    match mode {
+        "sqlite_reference" | "sqlite3" => (0, mode),
+        "fsqlite_mvcc" => (1, mode),
+        "fsqlite_single_writer" => (2, mode),
+        _ => (3, mode),
+    }
+}
+
+fn mode_display_name(mode: &str) -> &str {
+    match mode {
+        "sqlite_reference" | "sqlite3" => "sqlite_reference",
+        "fsqlite_mvcc" => "fsqlite_mvcc",
+        "fsqlite_single_writer" => "fsqlite_single_writer",
+        _ => mode,
+    }
+}
+
+fn ratio_string(numerator: Option<f64>, denominator: Option<f64>) -> String {
+    match (numerator, denominator) {
+        (Some(num), Some(den)) if den > 0.0 && num.is_finite() && den.is_finite() => {
+            format!("{:.2}x", num / den)
+        }
+        _ => "-".to_owned(),
+    }
+}
+
 // ── Parsing ────────────────────────────────────────────────────────────
 
 /// Parse diagnostic for a malformed JSONL line.
@@ -258,15 +300,76 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
     let _ = writeln!(out, "- **rustc:** {}", env.rustc_version);
     let _ = writeln!(out, "- **Profile:** {}\n", env.cargo_profile);
 
+    let mut comparison_groups: BTreeMap<FixtureWorkloadConcurrencyKey, Vec<&BenchmarkSummary>> =
+        BTreeMap::new();
+    for summary in summaries {
+        let key = (
+            summary.fixture_id.clone(),
+            summary.workload.clone(),
+            summary.concurrency,
+        );
+        comparison_groups.entry(key).or_default().push(summary);
+    }
+
+    let comparison_sections = comparison_groups
+        .iter()
+        .filter(|(_, group)| group.len() > 1)
+        .collect::<Vec<_>>();
+    if !comparison_sections.is_empty() {
+        let _ = writeln!(out, "## Direct Comparison\n");
+        for ((fixture_id, workload, concurrency), group) in comparison_sections {
+            let _ = writeln!(out, "### {fixture_id} / {workload} (c={concurrency})\n");
+            let _ = writeln!(
+                out,
+                "| Mode | Median (ms) | p95 (ms) | Median ops/s | Retries | Aborts | Retry Policy | Placement | Row |"
+            );
+            let _ = writeln!(
+                out,
+                "|------|-------------|----------|--------------|---------|--------|--------------|-----------|-----|"
+            );
+            let mut ordered = group.clone();
+            ordered.sort_by(|left, right| {
+                mode_sort_key(benchmark_mode_label(left))
+                    .cmp(&mode_sort_key(benchmark_mode_label(right)))
+            });
+            for summary in ordered {
+                let comparison = summary.comparison.as_ref();
+                let retry_policy = comparison
+                    .and_then(|meta| meta.retry_policy_id.as_deref())
+                    .unwrap_or("-");
+                let placement = comparison
+                    .and_then(|meta| meta.placement_profile_id.as_deref())
+                    .unwrap_or("-");
+                let row_id = comparison
+                    .and_then(|meta| meta.row_id.as_deref())
+                    .unwrap_or("-");
+                let _ = writeln!(
+                    out,
+                    "| {} | {:.1} | {:.1} | {:.0} | {} | {} | {} | {} | {} |",
+                    mode_display_name(benchmark_mode_label(summary)),
+                    summary.latency.median_ms,
+                    summary.latency.p95_ms,
+                    summary.throughput.median_ops_per_sec,
+                    summary.total_iteration_retries(),
+                    summary.total_iteration_aborts(),
+                    retry_policy,
+                    placement,
+                    row_id,
+                );
+            }
+            let _ = writeln!(out);
+        }
+    }
+
     // Summary table.
     let _ = writeln!(out, "## Summary\n");
     let _ = writeln!(
         out,
-        "| Benchmark | Engine | Iters | Median (ms) | p95 (ms) | p99 (ms) | Stddev (ms) | Median Ops/s | Peak Ops/s |"
+        "| Benchmark | Mode | Iters | Median (ms) | p95 (ms) | p99 (ms) | Stddev (ms) | Median Ops/s | Peak Ops/s |"
     );
     let _ = writeln!(
         out,
-        "|-----------|--------|-------|-------------|----------|----------|-------------|--------------|------------|"
+        "|-----------|------|-------|-------------|----------|----------|-------------|--------------|------------|"
     );
 
     for s in summaries {
@@ -274,7 +377,7 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
             out,
             "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0} |",
             s.benchmark_id,
-            s.engine,
+            mode_display_name(benchmark_mode_label(s)),
             s.measurement_count,
             s.latency.median_ms,
             s.latency.p95_ms,
@@ -290,6 +393,7 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
     // Detailed per-benchmark sections.
     for s in summaries {
         let _ = writeln!(out, "### {}\n", s.benchmark_id);
+        let _ = writeln!(out, "- **Mode:** {}", mode_display_name(benchmark_mode_label(s)));
         let _ = writeln!(out, "- **Fixture:** {}", s.fixture_id);
         let _ = writeln!(out, "- **Workload:** {}", s.workload);
         let _ = writeln!(out, "- **Concurrency:** {}", s.concurrency);
@@ -300,6 +404,24 @@ pub fn render_benchmark_summaries_markdown(summaries: &[BenchmarkSummary]) -> St
             "- **Total measurement time:** {} ms\n",
             s.total_measurement_ms
         );
+        if let Some(ref comparison) = s.comparison {
+            if let Some(ref row_id) = comparison.row_id {
+                let _ = writeln!(out, "- **Canonical row:** {row_id}");
+            }
+            if let Some(ref retry_policy_id) = comparison.retry_policy_id {
+                let _ = writeln!(out, "- **Retry policy:** {retry_policy_id}");
+            }
+            if let Some(ref placement_profile_id) = comparison.placement_profile_id {
+                let _ = writeln!(out, "- **Placement profile:** {placement_profile_id}");
+            }
+            if let Some(ref hardware_class_id) = comparison.hardware_class_id {
+                let _ = writeln!(out, "- **Hardware class:** {hardware_class_id}");
+            }
+            if let Some(ref artifact_manifest_path) = comparison.artifact_manifest_path {
+                let _ = writeln!(out, "- **Artifact manifest:** {artifact_manifest_path}");
+            }
+            let _ = writeln!(out);
+        }
 
         let _ = writeln!(out, "**Latency (ms):**\n");
         let _ = writeln!(out, "| Min | Max | Mean | Median | p95 | p99 | Stddev |");
@@ -452,7 +574,7 @@ pub fn render_perf_report_markdown(result: &PerfResult, config: &PerfReportConfi
             let _ = writeln!(
                 out,
                 "- **{}** / {} / c{}: {}",
-                cell.engine,
+                mode_display_name(cell_mode_label(cell)),
                 cell.workload,
                 cell.concurrency,
                 cell.error.as_deref().unwrap_or("unknown"),
@@ -491,39 +613,38 @@ fn render_baseline_settings(out: &mut String, config: &PerfReportConfig) {
     );
 }
 
-/// Render the speedup summary table comparing fsqlite vs sqlite3.
+/// Render the summary table comparing SQLite, MVCC, and forced single-writer.
 fn render_speedup_summary(
     out: &mut String,
     groups: &BTreeMap<FixtureWorkloadConcurrencyKey, Vec<&CellOutcome>>,
 ) {
-    // Collect pairs where both engines are present.
-    let mut rows: Vec<SpeedupRow> = Vec::new();
+    let mut rows: Vec<ModeComparisonRow> = Vec::new();
 
     for ((fixture_id, workload, concurrency), cells) in groups {
-        let sqlite3 = cells
+        let sqlite = cells
             .iter()
-            .find(|c| c.engine == "sqlite3")
-            .and_then(|c| c.comparable_summary());
-        let fsqlite = cells
+            .find(|cell| matches!(cell_mode_label(cell), "sqlite_reference" | "sqlite3"))
+            .and_then(|cell| cell.comparable_summary());
+        let mvcc = cells
             .iter()
-            .find(|c| c.engine == "fsqlite")
-            .and_then(|c| c.comparable_summary());
+            .find(|cell| cell_mode_label(cell) == "fsqlite_mvcc")
+            .and_then(|cell| cell.comparable_summary());
+        let single_writer = cells
+            .iter()
+            .find(|cell| cell_mode_label(cell) == "fsqlite_single_writer")
+            .and_then(|cell| cell.comparable_summary());
 
-        if let (Some(sq), Some(fs)) = (sqlite3, fsqlite) {
-            let speedup = if fs.latency.median_ms > 0.0 {
-                sq.latency.median_ms / fs.latency.median_ms
-            } else {
-                0.0
-            };
-            rows.push(SpeedupRow {
+        if sqlite.is_some() || mvcc.is_some() || single_writer.is_some() {
+            rows.push(ModeComparisonRow {
                 fixture_id: fixture_id.clone(),
                 workload: workload.clone(),
                 concurrency: *concurrency,
-                sqlite3_median_ms: sq.latency.median_ms,
-                fsqlite_median_ms: fs.latency.median_ms,
-                sqlite3_p95_ms: sq.latency.p95_ms,
-                fsqlite_p95_ms: fs.latency.p95_ms,
-                speedup,
+                sqlite_median_ms: sqlite.map(|summary| summary.latency.median_ms),
+                mvcc_median_ms: mvcc.map(|summary| summary.latency.median_ms),
+                single_writer_median_ms: single_writer.map(|summary| summary.latency.median_ms),
+                sqlite_p95_ms: sqlite.map(|summary| summary.latency.p95_ms),
+                mvcc_p95_ms: mvcc.map(|summary| summary.latency.p95_ms),
+                single_writer_p95_ms: single_writer.map(|summary| summary.latency.p95_ms),
             });
         }
     }
@@ -532,36 +653,38 @@ fn render_speedup_summary(
         return;
     }
 
-    let _ = writeln!(out, "## Speedup Summary (fsqlite vs sqlite3)\n");
+    let _ = writeln!(out, "## Mode Comparison Summary\n");
     let _ = writeln!(
         out,
-        "| Fixture | Workload | c | sqlite3 med (ms) | fsqlite med (ms) | Speedup | sqlite3 p95 | fsqlite p95 |"
+        "| Fixture | Workload | c | sqlite med (ms) | mvcc med (ms) | single-writer med (ms) | sqlite/mvcc | sqlite/single | single/mvcc | sqlite p95 | mvcc p95 | single p95 |"
     );
     let _ = writeln!(
         out,
-        "|---------|----------|---|------------------|------------------|---------|-------------|-------------|"
+        "|---------|----------|---|-----------------|---------------|---------------------|-------------|---------------|-------------|------------|----------|------------|"
     );
 
     for r in &rows {
-        let speedup_str = if r.speedup >= 1.0 {
-            format!("{:.2}x", r.speedup)
-        } else if r.speedup > 0.0 {
-            format!("{:.2}x (slower)", r.speedup)
-        } else {
-            "-".to_owned()
-        };
-
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {:.1} | {:.1} | {} | {:.1} | {:.1} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             r.fixture_id,
             r.workload,
             r.concurrency,
-            r.sqlite3_median_ms,
-            r.fsqlite_median_ms,
-            speedup_str,
-            r.sqlite3_p95_ms,
-            r.fsqlite_p95_ms,
+            r.sqlite_median_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
+            r.mvcc_median_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
+            r.single_writer_median_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
+            ratio_string(r.sqlite_median_ms, r.mvcc_median_ms),
+            ratio_string(r.sqlite_median_ms, r.single_writer_median_ms),
+            ratio_string(r.single_writer_median_ms, r.mvcc_median_ms),
+            r.sqlite_p95_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
+            r.mvcc_p95_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
+            r.single_writer_p95_ms
+                .map_or_else(|| "-".to_owned(), |value| format!("{value:.1}")),
         );
     }
 
@@ -569,15 +692,16 @@ fn render_speedup_summary(
 }
 
 /// Internal row for the speedup table.
-struct SpeedupRow {
+struct ModeComparisonRow {
     fixture_id: String,
     workload: String,
     concurrency: u16,
-    sqlite3_median_ms: f64,
-    fsqlite_median_ms: f64,
-    sqlite3_p95_ms: f64,
-    fsqlite_p95_ms: f64,
-    speedup: f64,
+    sqlite_median_ms: Option<f64>,
+    mvcc_median_ms: Option<f64>,
+    single_writer_median_ms: Option<f64>,
+    sqlite_p95_ms: Option<f64>,
+    mvcc_p95_ms: Option<f64>,
+    single_writer_p95_ms: Option<f64>,
 }
 
 /// Render per-fixture detail sections.
@@ -606,21 +730,20 @@ fn render_fixture_details(
 
         let _ = writeln!(
             out,
-            "| Engine | Workload | c | Median (ms) | p95 (ms) | p99 (ms) | Stddev (ms) | Median ops/s | Retries* |"
+            "| Mode | Workload | c | Median (ms) | p95 (ms) | p99 (ms) | Stddev (ms) | Median ops/s | Retries* |"
         );
         let _ = writeln!(
             out,
-            "|--------|----------|---|-------------|----------|----------|-------------|--------------|----------|"
+            "|------|----------|---|-------------|----------|----------|-------------|--------------|----------|"
         );
 
         for (workload, concurrency, cells) in workloads {
             for cell in cells {
                 if let Some(ref summary) = cell.summary {
-                    let total_retries: u64 = summary.iterations.iter().map(|i| i.retries).sum();
                     let _ = writeln!(
                         out,
                         "| {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} | {} |",
-                        cell.engine,
+                        mode_display_name(cell_mode_label(cell)),
                         workload,
                         concurrency,
                         summary.latency.median_ms,
@@ -628,7 +751,7 @@ fn render_fixture_details(
                         summary.latency.p99_ms,
                         summary.latency.stddev_ms,
                         summary.throughput.median_ops_per_sec,
-                        total_retries,
+                        summary.total_iteration_retries(),
                     );
                 }
             }
@@ -653,7 +776,7 @@ fn render_scaling_analysis(out: &mut String, cells: &[CellOutcome]) {
     for cell in cells {
         if let Some(summary) = cell.comparable_summary() {
             let key = (
-                cell.engine.clone(),
+                mode_display_name(cell_mode_label(cell)).to_owned(),
                 cell.fixture_id.clone(),
                 cell.workload.clone(),
             );
@@ -777,7 +900,9 @@ pub fn render_benchmark_summaries_from_file(path: &Path) -> std::io::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, run_benchmark};
+    use crate::benchmark::{
+        BenchmarkComparisonMetadata, BenchmarkConfig, BenchmarkMeta, run_benchmark,
+    };
     use crate::methodology::EnvironmentMeta;
     use crate::perf_runner::PERF_RESULT_SCHEMA_V1;
     use crate::report::{CorrectnessReport, EngineInfo, EngineRunReport, RunRecordV1Args};
@@ -1032,16 +1157,45 @@ mod tests {
 
         // Use different wall times for different engines to produce distinct stats.
         let wall_ms: u64 = if engine == "sqlite3" { 200 } else { 100 };
-        run_benchmark(&bench_config, &meta, |_| {
+        let mut summary = run_benchmark(&bench_config, &meta, |_| {
             Ok::<_, String>(dummy_engine_report(wall_ms, 1000))
-        })
+        });
+        let mode_id = match engine {
+            "sqlite3" | "sqlite_reference" => "sqlite_reference",
+            "fsqlite_single_writer" => "fsqlite_single_writer",
+            _ => "fsqlite_mvcc",
+        };
+        summary.comparison = Some(BenchmarkComparisonMetadata {
+            mode_id: mode_id.to_owned(),
+            row_id: None,
+            retry_policy_id: None,
+            seed_policy_id: None,
+            build_profile_id: None,
+            placement_profile_id: None,
+            hardware_class_id: None,
+            hardware_signature: None,
+            run_id: None,
+            source_revision: None,
+            beads_data_hash: None,
+            artifact_bundle_key: None,
+            artifact_bundle_relpath: None,
+            artifact_manifest_path: None,
+            canonical_artifact_manifest: None,
+        });
+        summary
     }
 
     fn make_cell_outcome(engine: &str, fixture: &str, workload: &str, c: u16) -> CellOutcome {
+        let mode_id = match engine {
+            "sqlite3" | "sqlite_reference" => "sqlite_reference",
+            "fsqlite_single_writer" => "fsqlite_single_writer",
+            _ => "fsqlite_mvcc",
+        };
         CellOutcome {
             summary: Some(make_benchmark_summary(engine, fixture, workload, c)),
             error: None,
             engine: engine.to_owned(),
+            mode_id: Some(mode_id.to_owned()),
             fixture_id: fixture.to_owned(),
             workload: workload.to_owned(),
             concurrency: c,
@@ -1107,9 +1261,12 @@ mod tests {
             cells,
         };
         let md = render_perf_report_markdown(&result, &default_perf_report_config());
-        assert!(md.contains("## Speedup Summary"), "missing speedup section");
-        assert!(md.contains("sqlite3 med (ms)"), "missing sqlite3 column");
-        assert!(md.contains("fsqlite med (ms)"), "missing fsqlite column");
+        assert!(
+            md.contains("## Mode Comparison Summary"),
+            "missing mode comparison section"
+        );
+        assert!(md.contains("sqlite med (ms)"), "missing sqlite column");
+        assert!(md.contains("mvcc med (ms)"), "missing mvcc column");
     }
 
     #[test]
@@ -1193,6 +1350,7 @@ mod tests {
             summary: None,
             error: Some("unknown preset: bogus".to_owned()),
             engine: "sqlite3".to_owned(),
+            mode_id: Some("sqlite_reference".to_owned()),
             fixture_id: "db-a".to_owned(),
             workload: "bogus".to_owned(),
             concurrency: 1,

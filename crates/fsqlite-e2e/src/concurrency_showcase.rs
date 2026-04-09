@@ -610,7 +610,9 @@ fn ascii_bar(value: f64, max: f64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::benchmark::{IterationRecord, LatencyStats, ThroughputStats};
+    use crate::benchmark::{
+        BenchmarkComparisonMetadata, IterationRecord, LatencyStats, ThroughputStats,
+    };
     use crate::methodology::{EnvironmentMeta, MethodologyMeta};
     use crate::perf_runner::PERF_RESULT_SCHEMA_V1;
 
@@ -625,6 +627,11 @@ mod tests {
     ) -> CellOutcome {
         use crate::benchmark::BenchmarkSummary;
 
+        let mode_id = match engine {
+            "sqlite3" | "sqlite_reference" => "sqlite_reference",
+            "fsqlite_single_writer" => "fsqlite_single_writer",
+            _ => "fsqlite_mvcc",
+        };
         CellOutcome {
             summary: Some(BenchmarkSummary {
                 benchmark_id: format!("{engine}:{workload}:fix:c{concurrency}"),
@@ -680,9 +687,27 @@ mod tests {
                         error: None,
                     },
                 ],
+                comparison: Some(BenchmarkComparisonMetadata {
+                    mode_id: mode_id.to_owned(),
+                    row_id: None,
+                    retry_policy_id: None,
+                    seed_policy_id: None,
+                    build_profile_id: None,
+                    placement_profile_id: None,
+                    hardware_class_id: None,
+                    hardware_signature: None,
+                    run_id: None,
+                    source_revision: None,
+                    beads_data_hash: None,
+                    artifact_bundle_key: None,
+                    artifact_bundle_relpath: None,
+                    artifact_manifest_path: None,
+                    canonical_artifact_manifest: None,
+                }),
             }),
             error: None,
             engine: engine.to_owned(),
+            mode_id: Some(mode_id.to_owned()),
             fixture_id: "synthetic".to_owned(),
             workload: workload.to_owned(),
             concurrency,
