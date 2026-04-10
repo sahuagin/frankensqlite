@@ -154,6 +154,7 @@ The fallback reason taxonomy is fixed by `ParallelWalFallbackReason`:
 - `RecoveryGap`
 - `CheckpointConflict`
 - `ControllerEvidenceLost`
+- `ControllerCalibrationStale`
 
 Any of these forces `Conservative` behavior for the affected interval. The
 parallel path may only re-arm after an explicit clean-state transition verified
@@ -203,6 +204,27 @@ Every adaptive action must emit:
 - counterfactual action
 - counterfactual regret delta
 - fallback-active bit
+
+### Policy artifact identity and calibration telemetry
+
+The controller is policy-as-data. The data-plane must be able to prove which
+policy artifact produced each decision and whether calibration remained valid.
+
+Required policy identity fields:
+
+- `policy_id`
+- `policy_version`
+- `policy_artifact_hash`
+
+Required calibration fields:
+
+- `calibration_window_ms`
+- `calibration_confidence_bps`
+- `calibration_last_ok_ts`
+
+If calibration confidence drops below the contract threshold or the calibration
+window expires without a validated refresh, the controller must emit
+`ControllerCalibrationStale` and force conservative mode.
 
 ## Timescale Separation
 
@@ -257,6 +279,10 @@ envelope fields supplied by the caller:
 - `fallback_reason`
 - `policy_id`
 - `policy_version`
+- `policy_artifact_hash`
+- `calibration_window_ms`
+- `calibration_confidence_bps`
+- `calibration_last_ok_ts`
 - outer envelope: `run_id`, `scenario_id`, `bead_id`, `artifact_path`
 
 ## Validation Surface

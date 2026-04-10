@@ -6592,9 +6592,10 @@ fn resolve_join_output_count(
             ResultColumn::TableStar(name) => tables
                 .iter()
                 .find(|(t, alias)| {
-                    (name.schema.is_none()
-                        && alias.is_some_and(|a| a.eq_ignore_ascii_case(&name.name)))
-                        || t.name.eq_ignore_ascii_case(&name.name)
+                    alias.map_or_else(
+                        || t.name.eq_ignore_ascii_case(&name.name),
+                        |a| a.eq_ignore_ascii_case(&name.name),
+                    )
                 })
                 .map_or(0, |(t, _)| t.columns.len()),
             ResultColumn::Expr { .. } => 1,
@@ -6795,10 +6796,10 @@ fn emit_join_result_columns(
                 }
             }
             ResultColumn::TableStar(table_name) => {
+                let name_lower = table_name.name.to_ascii_lowercase();
                 for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
-                    let matches = (table_name.schema.is_none()
-                        && alias.is_some_and(|a| a.eq_ignore_ascii_case(&table_name.name)))
-                        || table.name.eq_ignore_ascii_case(&table_name.name);
+                    let matches = alias.is_some_and(|a| a.eq_ignore_ascii_case(&name_lower))
+                        || table.name.eq_ignore_ascii_case(&name_lower);
                     if matches {
                         for col_idx in 0..table.columns.len() {
                             let dst = out_regs + reg_offset;
@@ -20033,7 +20034,7 @@ mod tests {
             body: SelectBody {
                 select: SelectCore::Select {
                     distinct: Distinctness::All,
-                    columns: vec![ResultColumn::TableStar(QualifiedName::bare("u"))],
+                    columns: vec![ResultColumn::TableStar("u".to_owned())],
                     from: Some(from_table("t")),
                     where_clause: None,
                     group_by: vec![],
