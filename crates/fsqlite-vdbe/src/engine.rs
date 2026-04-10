@@ -21349,6 +21349,38 @@ mod tests {
     }
 
     #[test]
+    fn test_set_reg_skips_shared_values_without_reusable_backing_storage() {
+        use fsqlite_types::value::{pool_clear, pool_len};
+
+        pool_clear();
+        let mut engine = VdbeEngine::new(2);
+
+        let shared_text =
+            Arc::<str>::from("this string is definitely longer than twenty three bytes");
+        engine.set_reg(
+            1,
+            SqliteValue::Text(SmallText::from_arc(Arc::clone(&shared_text))),
+        );
+        engine.set_reg(1, SqliteValue::Integer(7));
+        assert_eq!(
+            pool_len(),
+            0,
+            "shared text values should not fill the reusable slab on register overwrite",
+        );
+
+        let shared_blob = Arc::<[u8]>::from([0xCA_u8, 0xFE, 0xBA, 0xBE].as_slice());
+        engine.set_reg(1, SqliteValue::Blob(Arc::clone(&shared_blob)));
+        engine.set_reg(1, SqliteValue::Integer(8));
+        assert_eq!(
+            pool_len(),
+            0,
+            "shared blob values should not fill the reusable slab on register overwrite",
+        );
+
+        pool_clear();
+    }
+
+    #[test]
     fn test_make_record_retains_statement_scratch_capacity() {
         let mut builder = ProgramBuilder::new();
         let end = builder.emit_label();

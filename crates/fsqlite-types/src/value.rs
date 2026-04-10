@@ -129,7 +129,7 @@ pub fn pool_return(value: SqliteValue) {
 /// backing allocation is likely to pay off on the next decode/write.
 #[inline]
 pub fn pool_return_reusable(value: SqliteValue) {
-    if matches!(value, SqliteValue::Text(_) | SqliteValue::Blob(_)) {
+    if value_preserves_reusable_heap_storage(&value) {
         pool_return(value);
     }
 }
@@ -149,6 +149,15 @@ pub fn pool_clear() {
 #[inline]
 pub fn pool_len() -> usize {
     VALUE_POOL.with(|pool| pool.borrow().len())
+}
+
+#[inline]
+fn value_preserves_reusable_heap_storage(value: &SqliteValue) -> bool {
+    match value {
+        SqliteValue::Text(text) => matches!(&text.repr, SmallTextRepr::HeapOwned { .. }),
+        SqliteValue::Blob(bytes) => Arc::strong_count(bytes) == 1,
+        _ => false,
+    }
 }
 
 /// Maximum inline string length for `SmallText`.
@@ -282,9 +291,12 @@ impl SmallText {
         }
 
         match &mut self.repr {
-            SmallTextRepr::HeapOwned { text, shared } if shared.get().is_none() => {
+            SmallTextRepr::HeapOwned { text, shared } => {
                 text.clear();
                 text.push_str(s);
+                if shared.get().is_some() {
+                    *shared = OnceLock::new();
+                }
             }
             _ => {
                 self.repr = SmallTextRepr::HeapOwned {
@@ -2081,21 +2093,37 @@ mod tests {
     fn test_small_text_overwrite_detaches_from_shared_arc() {
         let original = "this string is definitely longer than twenty three bytes";
         let mut text = SmallText::new(original);
+        let (original_ptr, original_capacity) = match &text.repr {
+            SmallTextRepr::HeapOwned { text, .. } => (text.as_ptr(), text.capacity()),
+            _ => panic!("long text should start in heap-owned mode"),
+        };
+        let replacement = "replacement text that must not mutate the shared clone";
+        assert!(
+            replacement.len() <= original_capacity,
+            "replacement should fit the original heap allocation for this regression",
+        );
         let clone = text.clone();
 
-        text.overwrite("replacement text that must not mutate the shared clone");
+        text.overwrite(replacement);
 
         assert_eq!(
             clone.as_str(),
             original,
             "existing shared clones must keep the original contents"
         );
-        assert_eq!(
-            text.as_str(),
-            "replacement text that must not mutate the shared clone"
-        );
+        assert_eq!(text.as_str(), replacement);
         match &text.repr {
-            SmallTextRepr::HeapOwned { shared, .. } => {
+            SmallTextRepr::HeapOwned { text, shared } => {
+                assert_eq!(
+                    text.as_ptr(),
+                    original_ptr,
+                    "overwriting a cloned long string should keep the owned buffer",
+                );
+                assert_eq!(
+                    text.capacity(),
+                    original_capacity,
+                    "detaching from the shared cache should preserve capacity",
+                );
                 assert!(
                     shared.get().is_none(),
                     "overwrite should reset the lazy shared cache after detaching"
@@ -2103,6 +2131,56 @@ mod tests {
             }
             _ => panic!("overwrite should restore heap-owned mode"),
         }
+    }
+
+    #[test]
+    fn test_pool_return_reusable_keeps_only_reusable_heap_storage() {
+        let _guard = ValuePoolTestGuard::new();
+
+        pool_return_reusable(SqliteValue::Text(SmallText::new("tiny")));
+        assert_eq!(
+            pool_len(),
+            0,
+            "inline text should not occupy reusable slab slots",
+        );
+
+        let owned_text = SmallText::new("this string is definitely longer than twenty three bytes");
+        let _clone = owned_text.clone();
+        pool_return_reusable(SqliteValue::Text(owned_text));
+        assert_eq!(
+            pool_len(),
+            1,
+            "heap-owned text should stay reusable even after serving shared clones",
+        );
+        assert!(matches!(pool_acquire(), Some(SqliteValue::Text(_))));
+        assert_eq!(pool_len(), 0);
+
+        let shared_text =
+            Arc::<str>::from("this string is definitely longer than twenty three bytes");
+        pool_return_reusable(SqliteValue::Text(SmallText::from_arc(Arc::clone(
+            &shared_text,
+        ))));
+        assert_eq!(
+            pool_len(),
+            0,
+            "arc-backed shared text should not enter the reusable slab",
+        );
+
+        let shared_blob = Arc::<[u8]>::from([0xCA_u8, 0xFE, 0xBA, 0xBE].as_slice());
+        pool_return_reusable(SqliteValue::Blob(Arc::clone(&shared_blob)));
+        assert_eq!(
+            pool_len(),
+            0,
+            "shared blob allocations should not displace reusable slab entries",
+        );
+
+        let unique_blob = Arc::<[u8]>::from([1_u8, 2, 3, 4].as_slice());
+        pool_return_reusable(SqliteValue::Blob(unique_blob));
+        assert_eq!(
+            pool_len(),
+            1,
+            "unique blob allocations should remain eligible for slab reuse",
+        );
     }
 
     #[test]
