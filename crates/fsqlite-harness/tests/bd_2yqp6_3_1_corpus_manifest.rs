@@ -8,11 +8,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fsqlite::Connection;
 use fsqlite_harness::corpus_ingest::{
     CORPUS_SEED_BASE, CorpusBuilder, generate_seed_corpus, ingest_conformance_fixtures_with_report,
+};
+use fsqlite_harness::fixture_root_contract::{
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, FixtureRootContract, load_fixture_root_contract,
 };
 use fsqlite_types::value::SqliteValue;
 use proptest::prelude::*;
@@ -20,9 +23,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BEAD_ID: &str = "bd-2yqp6.3.1";
-const MIN_FIXTURE_FILES: usize = 8;
-const MIN_FIXTURE_ENTRIES: usize = 8;
-const MIN_FIXTURE_SQL_STATEMENTS: usize = 40;
 
 #[derive(Debug, Deserialize)]
 struct CorpusManifestContract {
@@ -92,8 +92,35 @@ struct Shard {
     bundle_hash: String,
 }
 
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root should be canonicalizable")
+}
+
+fn fixture_root_manifest_path() -> PathBuf {
+    workspace_root().join(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH)
+}
+
+fn canonical_fixture_root_contract() -> FixtureRootContract {
+    let workspace_root = workspace_root();
+    load_fixture_root_contract(
+        &workspace_root,
+        Path::new(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "failed to load canonical fixture-root contract from {}: {error}",
+            workspace_root
+                .join(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH)
+                .display()
+        )
+    })
+}
+
 fn load_manifest() -> CorpusManifestContract {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus_manifest.toml");
+    let path = fixture_root_manifest_path();
     let content = fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!("failed to read {}: {error}", path.display());
     });
@@ -166,32 +193,36 @@ fn canonical_shard_hash(manifest: &CorpusManifestContract, shard: &Shard) -> Str
 
 fn ingest_and_normalize(base_seed: u64) -> fsqlite_harness::corpus_ingest::CorpusManifest {
     let mut builder = CorpusBuilder::new(base_seed);
-    let conformance_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
-    let report = ingest_conformance_fixtures_with_report(&conformance_dir, &mut builder)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to ingest conformance fixtures from {}: {error}",
-                conformance_dir.display()
-            )
-        });
+    let fixture_contract = canonical_fixture_root_contract();
+    let report =
+        ingest_conformance_fixtures_with_report(&fixture_contract.fixtures_dir, &mut builder)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to ingest conformance fixtures from {}: {error}",
+                    fixture_contract.fixtures_dir.display()
+                )
+            });
 
     assert!(
-        report.fixture_json_files_seen >= MIN_FIXTURE_FILES,
-        "fixture corpus too small: files_seen={} min={}",
+        report.fixture_json_files_seen >= fixture_contract.min_fixture_json_files,
+        "fixture corpus too small: files_seen={} min={} manifest={}",
         report.fixture_json_files_seen,
-        MIN_FIXTURE_FILES
+        fixture_contract.min_fixture_json_files,
+        fixture_contract.manifest_path.display()
     );
     assert!(
-        report.fixture_entries_ingested >= MIN_FIXTURE_ENTRIES,
-        "fixture corpus too small: entries={} min={}",
+        report.fixture_entries_ingested >= fixture_contract.min_fixture_entries,
+        "fixture corpus too small: entries={} min={} manifest={}",
         report.fixture_entries_ingested,
-        MIN_FIXTURE_ENTRIES
+        fixture_contract.min_fixture_entries,
+        fixture_contract.manifest_path.display()
     );
     assert!(
-        report.sql_statements_ingested >= MIN_FIXTURE_SQL_STATEMENTS,
-        "fixture corpus too small: sql_statements={} min={}",
+        report.sql_statements_ingested >= fixture_contract.min_fixture_sql_statements,
+        "fixture corpus too small: sql_statements={} min={} manifest={}",
         report.sql_statements_ingested,
-        MIN_FIXTURE_SQL_STATEMENTS
+        fixture_contract.min_fixture_sql_statements,
+        fixture_contract.manifest_path.display()
     );
 
     generate_seed_corpus(&mut builder);
@@ -374,6 +405,68 @@ fn fixture_roots_contract_is_present_and_positive() {
             .slt_dir_aliases
             .iter()
             .all(|alias| !alias.trim().is_empty())
+    );
+}
+
+#[test]
+fn fixture_roots_contract_matches_canonical_loader() {
+    let manifest = load_manifest();
+    let fixture_roots = &manifest.fixture_roots;
+    let workspace_root = workspace_root();
+    let contract = canonical_fixture_root_contract();
+    let expected_manifest_hash = sha256_hex(
+        fs::read_to_string(fixture_root_manifest_path())
+            .expect("read fixture-root manifest")
+            .as_bytes(),
+    );
+
+    assert_eq!(contract.manifest_path, fixture_root_manifest_path());
+    assert_eq!(contract.manifest_sha256, expected_manifest_hash);
+    assert_eq!(
+        contract.fixtures_dir,
+        workspace_root.join(&fixture_roots.fixtures_dir)
+    );
+    assert_eq!(
+        contract.fixtures_dir_aliases,
+        fixture_roots
+            .fixtures_dir_aliases
+            .iter()
+            .map(|alias| workspace_root.join(alias))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        contract.slt_dir,
+        workspace_root.join(&fixture_roots.slt_dir)
+    );
+    assert_eq!(
+        contract.slt_dir_aliases,
+        fixture_roots
+            .slt_dir_aliases
+            .iter()
+            .map(|alias| workspace_root.join(alias))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        contract.min_fixture_json_files,
+        fixture_roots.min_fixture_json_files
+    );
+    assert_eq!(
+        contract.min_fixture_entries,
+        fixture_roots.min_fixture_entries
+    );
+    assert_eq!(
+        contract.min_fixture_sql_statements,
+        fixture_roots.min_fixture_sql_statements
+    );
+    assert_eq!(contract.min_slt_files, fixture_roots.min_slt_files);
+    assert_eq!(contract.min_slt_entries, fixture_roots.min_slt_entries);
+    assert_eq!(
+        contract.min_slt_sql_statements,
+        fixture_roots.min_slt_sql_statements
+    );
+    assert_eq!(
+        contract.required_category_families,
+        fixture_roots.required_category_families
     );
 }
 

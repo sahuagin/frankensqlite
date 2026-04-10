@@ -174,7 +174,9 @@ pub fn canonical_certification_policy() -> CertificationPolicy {
             gate_id: format!("required_suite_pass::{}", lane.as_str()),
             blocking: true,
             required_lane: Some(lane.as_str().to_owned()),
-            pass_condition: "Lane must pass at 100.0% with zero terminal failures and zero blocking flakes.".to_owned(),
+            pass_condition:
+                "Lane must pass at 100.0% with zero terminal failures and zero blocking flakes."
+                    .to_owned(),
         });
     }
     gates.push(CertificationGateSpec {
@@ -268,7 +270,10 @@ mod tests {
 
         for lane in REQUIRED_CERTIFICATION_LANES {
             assert!(
-                policy.required_ci_lanes.iter().any(|entry| entry == lane.as_str()),
+                policy
+                    .required_ci_lanes
+                    .iter()
+                    .any(|entry| entry == lane.as_str()),
                 "missing required lane {}",
                 lane.as_str(),
             );

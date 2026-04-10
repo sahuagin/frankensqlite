@@ -10,7 +10,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fsqlite_harness::corpus_ingest::{
     CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, classify_family,
@@ -20,11 +20,34 @@ use fsqlite_harness::corpus_ingest::{
 };
 use fsqlite_harness::differential_v2::{StatementDivergence, StmtOutcome};
 use fsqlite_harness::fixture_root_contract::{
-    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, load_fixture_root_contract,
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, FixtureRootContract, load_fixture_root_contract,
 };
 use fsqlite_harness::mismatch_minimizer::MinimizerConfig;
 use proptest::prelude::*;
 use tempfile::tempdir;
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root should be canonicalizable")
+}
+
+fn canonical_fixture_root_contract() -> FixtureRootContract {
+    let workspace_root = workspace_root();
+    load_fixture_root_contract(
+        &workspace_root,
+        Path::new(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "failed to load canonical fixture-root contract from {}: {error}",
+            workspace_root
+                .join(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH)
+                .display()
+        )
+    })
+}
 
 // ─── Family Classification Tests ─────────────────────────────────────────
 
@@ -411,29 +434,36 @@ fn seed_corpus_entries_have_unique_seeds() {
 
 #[test]
 fn ingest_conformance_fixtures_from_directory() {
-    let conformance_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
-    if !conformance_dir.exists() {
+    let fixture_contract = canonical_fixture_root_contract();
+    if !fixture_contract.fixtures_dir.exists() {
         eprintln!("bead_id=bd-1dp9.2.1 test=conformance_ingest skip=no_conformance_dir");
         return;
     }
 
     let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
-    let report = ingest_conformance_fixtures_with_report(&conformance_dir, &mut builder)
-        .expect("ingest fixtures");
+    let report =
+        ingest_conformance_fixtures_with_report(&fixture_contract.fixtures_dir, &mut builder)
+            .expect("ingest fixtures");
 
     assert!(
-        report.fixture_json_files_seen >= 8,
-        "expected at least 8 fixture JSON files, found {}",
+        report.fixture_json_files_seen >= fixture_contract.min_fixture_json_files,
+        "expected at least {} fixture JSON files from {}, found {}",
+        fixture_contract.min_fixture_json_files,
+        fixture_contract.manifest_path.display(),
         report.fixture_json_files_seen
     );
     assert!(
-        report.fixture_entries_ingested >= 8,
-        "expected at least 8 ingested fixtures, found {}",
+        report.fixture_entries_ingested >= fixture_contract.min_fixture_entries,
+        "expected at least {} ingested fixtures from {}, found {}",
+        fixture_contract.min_fixture_entries,
+        fixture_contract.manifest_path.display(),
         report.fixture_entries_ingested
     );
     assert!(
-        report.sql_statements_ingested >= 40,
-        "expected at least 40 SQL statements from fixtures, found {}",
+        report.sql_statements_ingested >= fixture_contract.min_fixture_sql_statements,
+        "expected at least {} SQL statements from fixtures via {}, found {}",
+        fixture_contract.min_fixture_sql_statements,
+        fixture_contract.manifest_path.display(),
         report.sql_statements_ingested
     );
 

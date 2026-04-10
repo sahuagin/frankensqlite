@@ -153,15 +153,24 @@ fn canonical_policy_matches_track_g_requirements() {
     let policy = canonical_certification_policy();
 
     assert_eq!(policy.policy_id, CERTIFICATION_POLICY_ID);
-    assert_eq!(policy.min_verification_pct, CERTIFICATION_MIN_VERIFICATION_PCT);
-    assert_eq!(policy.max_evidence_age_hours, CERTIFICATION_MAX_EVIDENCE_AGE_HOURS);
+    assert_eq!(
+        policy.min_verification_pct,
+        CERTIFICATION_MIN_VERIFICATION_PCT
+    );
+    assert_eq!(
+        policy.max_evidence_age_hours,
+        CERTIFICATION_MAX_EVIDENCE_AGE_HOURS
+    );
     assert_eq!(policy.gate_config.category_min_verification_pct, 100.0);
     assert_eq!(policy.ratchet_policy.regression_tolerance, 0.0);
     assert!(!policy.ratchet_policy.quarantine_enabled);
     assert!(!policy.ratchet_policy.waivers_enabled);
     for lane in REQUIRED_CERTIFICATION_LANES {
         assert!(
-            policy.required_ci_lanes.iter().any(|entry| entry == lane.as_str()),
+            policy
+                .required_ci_lanes
+                .iter()
+                .any(|entry| entry == lane.as_str()),
             "bead_id={BEAD_ID} case=missing_lane lane={}",
             lane.as_str(),
         );
@@ -192,7 +201,10 @@ fn release_certificate_embeds_feature_test_run_artifact_chain() {
         entry.proof_summary[0].test_path,
         "fsqlite_e2e::oracle::insert_certification",
     );
-    assert_eq!(entry.run.as_ref().map(|run| run.run_id.as_str()), Some("run-cert-001"));
+    assert_eq!(
+        entry.run.as_ref().map(|run| run.run_id.as_str()),
+        Some("run-cert-001")
+    );
     assert_eq!(entry.artifacts.len(), 1);
     assert_eq!(
         entry.artifacts[0].content_hash,
@@ -241,9 +253,9 @@ fn release_certificate_rejects_manifest_missing_verification_contract() {
     let cert = build_certificate(&inputs, &config);
     assert_eq!(cert.verdict, CertificateVerdict::Rejected);
     assert!(
-        cert.unresolved_risks
-            .iter()
-            .any(|risk| risk.description.contains("verification-contract evidence is missing")),
+        cert.unresolved_risks.iter().any(|risk| risk
+            .description
+            .contains("verification-contract evidence is missing")),
         "bead_id={BEAD_ID} case=missing_contract_evidence",
     );
 }

@@ -35,9 +35,12 @@ use crate::confidence_gates::{
 };
 use crate::drift_monitor::{ParityDriftConfig, ParityDriftMonitor, ParityDriftSnapshot};
 use crate::parity_invariant_catalog::{
-    CatalogStats, InvariantId, ProofSummaryEntry, ReleaseTraceabilityReport, build_canonical_catalog,
+    CatalogStats, InvariantId, ProofSummaryEntry, ReleaseTraceabilityReport,
+    build_canonical_catalog,
 };
-use crate::parity_taxonomy::{FeatureCategory, FeatureId, build_canonical_universe, truncate_score};
+use crate::parity_taxonomy::{
+    FeatureCategory, FeatureId, build_canonical_universe, truncate_score,
+};
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.8.4";
@@ -722,7 +725,9 @@ pub fn build_certificate(
         unresolved_risks.push(UnresolvedRisk {
             source: "verification_contract".to_owned(),
             severity: "High".to_owned(),
-            description: "Artifact manifest is present but verification-contract evidence is missing.".to_owned(),
+            description:
+                "Artifact manifest is present but verification-contract evidence is missing."
+                    .to_owned(),
         });
     }
 
@@ -784,7 +789,10 @@ pub fn build_certificate(
         counterexample_count: campaign.counterexamples.len(),
         high_severity_count,
         ci_flake_budget_passed: inputs.ci_flake_budget.as_ref().map(|fb| fb.pipeline_pass),
-        artifact_hash_count: inputs.artifact_manifest.as_ref().map_or(0, |m| m.artifacts.len()),
+        artifact_hash_count: inputs
+            .artifact_manifest
+            .as_ref()
+            .map_or(0, |m| m.artifacts.len()),
         certification_evidence,
         evidence_chain,
         certification_traceability,

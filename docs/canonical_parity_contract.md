@@ -18,10 +18,31 @@ The machine-readable sources of truth are:
    Per-component feature decomposition, lifecycle, and evidence links.
 4. [`parity_score_contract.toml`](../parity_score_contract.toml)  
    Exact meaning of a "100% parity" claim.
+5. [`crates/fsqlite-harness/src/canonical_parity_contract.rs`](../crates/fsqlite-harness/src/canonical_parity_contract.rs)  
+   Executable bundle loader and drift validator for the four Track A authority files.
 
 If this document and those files diverge, the repo is in contract drift and the
 drift must be fixed. The correct response is to reconcile the files, not to
 reinterpret the contract ad hoc.
+
+## Validation Surface
+
+Track A contract drift is guarded by deterministic harness tests:
+
+- [`crates/fsqlite-harness/tests/bd_2yqp6_1_1_supported_surface_matrix.rs`](../crates/fsqlite-harness/tests/bd_2yqp6_1_1_supported_surface_matrix.rs)
+- [`crates/fsqlite-harness/tests/bd_2yqp6_1_2_feature_universe_ledger.rs`](../crates/fsqlite-harness/tests/bd_2yqp6_1_2_feature_universe_ledger.rs)
+- [`crates/fsqlite-harness/tests/bd_2yqp6_1_3_sqlite_version_contract.rs`](../crates/fsqlite-harness/tests/bd_2yqp6_1_3_sqlite_version_contract.rs)
+- [`crates/fsqlite-harness/tests/bd_2yqp6_1_4_parity_score_contract.rs`](../crates/fsqlite-harness/tests/bd_2yqp6_1_4_parity_score_contract.rs)
+
+These tests are part of the contract itself. Any Track A doc or TOML update
+must keep them green rather than relying on manual interpretation.
+
+For the built-in SQL function surface, the runtime-authoritative inventory lives
+in
+[`crates/fsqlite-func/src/lib.rs`](../crates/fsqlite-func/src/lib.rs) via
+`builtin_function_surface_inventory()`. Track E function parity work should
+derive scalar/aggregate/window coverage from that inventory rather than from a
+hand-maintained matrix copy.
 
 ## Boundary
 
@@ -77,19 +98,19 @@ Contract rule:
 
 These surfaces are currently inside the canonical parity contract.
 
-| Surface | State | Contract Meaning |
-| --- | --- | --- |
-| Core SQL DDL/DML | `supported` | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` are first-class parity surface. |
-| Compound queries and nested subqueries | `supported` | `UNION`, `INTERSECT`, `EXCEPT`, and nested `SELECT` behavior are part of parity work. |
-| Page-level MVCC concurrent writers | `supported` | FrankenSQLite-specific default concurrency behavior is part of the contract and must remain on by default. |
-| WAL crash recovery and checkpoint behavior | `supported` | Recovery semantics and WAL maintenance are parity-critical storage behavior. |
-| Core built-in scalar and aggregate functions | `supported` | Baseline SQL function behavior is in scope. |
-| Native Rust differential conformance harness | `supported` | This is the required proof mechanism for parity, not an optional extra. |
-| Core SQLite-compatible PRAGMA subset | `partial` | Only the explicitly named PRAGMAs below are in scope today. |
-| Window-function parity | `partial` | Tracked inside parity work, but not yet claim-clean. |
-| JSON1 extension | `partial` | Inside the contract, but not yet closure-complete. |
-| R-Tree extension | `partial` | Inside the contract, but still needs broader evidence. |
-| sqlite3-like CLI behavior | `partial` | Tracked for parity, but not yet a full sqlite3 shell contract. |
+| Feature ID | Surface | State | Contract Meaning |
+| --- | --- | --- | --- |
+| `SURF-SQL-CORE-001` | Core SQL DDL/DML | `supported` | `CREATE TABLE`, `INSERT`, `UPDATE`, `DELETE`, `SELECT` are first-class parity surface. |
+| `SURF-SQL-COMPOUND-002` | Compound queries and nested subqueries | `supported` | `UNION`, `INTERSECT`, `EXCEPT`, and nested `SELECT` behavior are part of parity work. |
+| `SURF-TXN-MVCC-CONCURRENT-006` | Page-level MVCC concurrent writers | `supported` | FrankenSQLite-specific default concurrency behavior is part of the contract and must remain on by default. |
+| `SURF-WAL-CRASH-RECOVERY-008` | WAL crash recovery and checkpoint behavior | `supported` | Recovery semantics and WAL maintenance are parity-critical storage behavior. |
+| `SURF-FUNC-CORE-011` | Core built-in scalar and aggregate functions | `supported` | Baseline SQL function behavior is in scope. |
+| `SURF-CONFORMANCE-NATIVE-019` | Native Rust differential conformance harness | `supported` | This is the required proof mechanism for parity, not an optional extra. |
+| `SURF-PRAGMA-CORE-009` | Core SQLite-compatible PRAGMA subset | `partial` | Only the explicitly named PRAGMAs below are in scope today. |
+| `SURF-FUNC-WINDOW-012` | Window-function parity | `partial` | Tracked inside parity work, but not yet claim-clean. |
+| `SURF-EXT-JSON1-013` | JSON1 extension | `partial` | Inside the contract, but not yet closure-complete. |
+| `SURF-EXT-RTREE-016` | R-Tree extension | `partial` | Inside the contract, but still needs broader evidence. |
+| `SURF-CLI-COMPAT-018` | sqlite3-like CLI behavior | `partial` | Tracked for parity, but not yet a full sqlite3 shell contract. |
 
 ## SQLite-Compatible PRAGMAs In Scope Today
 
@@ -119,15 +140,15 @@ Rules for PRAGMAs:
 These surfaces are explicitly excluded from the canonical parity contract until
 they are promoted in the surface matrix:
 
-- `WITHOUT ROWID` tables
-- `STRICT` tables
-- Generated columns (`VIRTUAL` and `STORED`)
-- Full legacy and edge-case SQLite PRAGMA compatibility beyond the named subset
-- SQLite-style single-writer serialized file-lock escalation
-- FTS3
-- FTS5
-- Session / changeset extension
-- Direct upstream TCL harness execution parity
+- `SURF-SQL-WITHOUT-ROWID-003`: `WITHOUT ROWID` tables
+- `SURF-SQL-STRICT-004`: `STRICT` tables
+- `SURF-SQL-GENERATED-COLUMNS-005`: Generated columns (`VIRTUAL` and `STORED`)
+- `SURF-PRAGMA-LEGACY-010`: Full legacy and edge-case SQLite PRAGMA compatibility beyond the named subset
+- `SURF-TXN-SERIALIZED-WRITER-LOCK-007`: SQLite-style single-writer serialized file-lock escalation
+- `SURF-EXT-FTS3-014`: FTS3
+- `SURF-EXT-FTS5-015`: FTS5
+- `SURF-EXT-SESSION-017`: Session / changeset extension
+- `SURF-CONFORMANCE-TCL-020`: Direct upstream TCL harness execution parity
 
 Additional interpretation rules:
 

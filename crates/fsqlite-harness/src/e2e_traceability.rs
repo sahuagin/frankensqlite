@@ -980,6 +980,8 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .build(),
     );
 
+    add_additional_rust_e2e_tests(&mut scripts);
+
     // ── Key Rust harness tests (crates/fsqlite-harness/tests/) ──────
     add_harness_tests(&mut scripts);
 
@@ -995,6 +997,518 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         scripts,
         gaps,
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn add_additional_rust_e2e_tests(scripts: &mut Vec<ScriptEntry>) {
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_1lsfu_1_generate_baseline.rs",
+            ScriptKind::RustE2eTest,
+            "Operation baseline generation artifact",
+        )
+        .bead("bd-1lsfu.1")
+        .command("cargo test -p fsqlite-e2e --test bd_1lsfu_1_generate_baseline")
+        .scenarios(&["BASELINE-GENERATE-1"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_1lsfu_1_operation_baselines.rs",
+            ScriptKind::RustE2eTest,
+            "Operation baseline capture and regression detection",
+        )
+        .bead("bd-1lsfu.1")
+        .command("cargo test -p fsqlite-e2e --test bd_1lsfu_1_operation_baselines")
+        .scenarios(&["BASELINE-OPS-1"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_1r0ha_3_concurrent_writer_e2e.rs",
+            ScriptKind::RustE2eTest,
+            "Deterministic concurrent-writer fairness and no-serialization matrix",
+        )
+        .bead("bd-1r0ha.3")
+        .command("cargo test -p fsqlite-e2e --test bd_1r0ha_3_concurrent_writer_e2e")
+        .scenarios(&[
+            "MVCC-E2E-RW10W10-DISJOINT",
+            "MVCC-E2E-HOT-WRITE-CONTENTION",
+            "MVCC-E2E-NO-GLOBAL-SERIALIZATION",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_1rw_3_jit_hot_query_replay.rs",
+            ScriptKind::RustE2eTest,
+            "JIT hot-query replay, fallback, and artifact emission",
+        )
+        .bead("bd-1rw.3")
+        .command("cargo test -p fsqlite-e2e --test bd_1rw_3_jit_hot_query_replay")
+        .env("FSQLITE_JIT_E2E_ARTIFACT")
+        .scenarios(&[
+            "JIT-HOT-QUERY",
+            "JIT-FALLBACK-UNSUPPORTED",
+            "JIT-HOT-QUERY-E2E-REPLAY",
+        ])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2y306_2_chain_length_controls.rs",
+            ScriptKind::RustE2eTest,
+            "Chain-length bounds, backpressure, and replay artifact coverage",
+        )
+        .bead("bd-2y306.2")
+        .command("cargo test -p fsqlite-e2e --test bd_2y306_2_chain_length_controls")
+        .env("FSQLITE_CHAIN_LENGTH_E2E_ARTIFACT")
+        .scenarios(&[
+            "CHAIN-LENGTH-HOT-PAGE-BOUND",
+            "CHAIN-LENGTH-BACKPRESSURE",
+            "CHAIN-LENGTH-CONTROLS-E2E-REPLAY",
+        ])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential, ConcurrencyMode::MvccIsolation])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2y306_4_chain_memory_benchmarks.rs",
+            ScriptKind::RustE2eTest,
+            "Chain-memory plateau and long-reader recovery benchmarks",
+        )
+        .bead("bd-2y306.4")
+        .command("cargo test -p fsqlite-e2e --test bd_2y306_4_chain_memory_benchmarks")
+        .env("FSQLITE_CHAIN_MEMORY_BENCH_ARTIFACT")
+        .scenarios(&[
+            "CHAIN-MEMORY-BENCH-WORKLOADS",
+            "CHAIN-MEMORY-BENCH-LONG-READER",
+            "CHAIN-MEMORY-BENCH-E2E",
+        ])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential, ConcurrencyMode::MvccIsolation])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2yqp6_6_1_ssi_serialization_anomaly_differential.rs",
+            ScriptKind::RustE2eTest,
+            "Deterministic SSI serialization anomaly differential suite",
+        )
+        .bead("bd-2yqp6.6.1")
+        .command(
+            "cargo test -p fsqlite-e2e --test bd_2yqp6_6_1_ssi_serialization_anomaly_differential",
+        )
+        .env("FSQLITE_SSI_ANOMALY_ARTIFACT")
+        .scenarios(&[
+            "SSI-WRITE-SKEW-GUARD",
+            "SSI-DISJOINT-WRITES",
+            "SSI-HOT-ROW-CONFLICT",
+        ])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Ssi, ConcurrencyMode::ConcurrentWriters])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2yqp6_6_2_busy_retry_error_semantics_matrix.rs",
+            ScriptKind::RustE2eTest,
+            "BUSY and BUSY_SNAPSHOT parity matrix with default-mode guard",
+        )
+        .bead("bd-2yqp6.6.2")
+        .command("cargo test -p fsqlite-e2e --test bd_2yqp6_6_2_busy_retry_error_semantics_matrix")
+        .env("FSQLITE_BUSY_MATRIX_ARTIFACT")
+        .scenarios(&[
+            "BUSY-SNAPSHOT-CONFLICT",
+            "BUSY-LOCK-IMMEDIATE",
+            "CONCURRENT-MODE-DEFAULT-GUARD",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2yqp6_6_3_crash_recovery_corruption_matrix.rs",
+            ScriptKind::RustE2eTest,
+            "Crash-recovery and corruption differential matrix",
+        )
+        .bead("bd-2yqp6.6.3")
+        .command("cargo test -p fsqlite-e2e --test bd_2yqp6_6_3_crash_recovery_corruption_matrix")
+        .env("FSQLITE_CRASH_MATRIX_ARTIFACT")
+        .scenarios(&["CRASH-MATRIX-DB", "CRASH-MATRIX-WAL"])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_2yqp6_6_5_concurrent_mode_defaults.rs",
+            ScriptKind::RustE2eTest,
+            "Concurrent-mode default anti-regression checks",
+        )
+        .bead("bd-2yqp6.6.5")
+        .command("cargo test -p fsqlite-e2e --test bd_2yqp6_6_5_concurrent_mode_defaults")
+        .scenarios(&["CONCURRENT-DEFAULTS-F5"])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
+        .timeout(120)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_3plop_5_ssi_serialization_correctness.rs",
+            ScriptKind::RustE2eTest,
+            "SSI serialization correctness under concurrent writers",
+        )
+        .bead("bd-3plop.5")
+        .command("cargo test -p fsqlite-e2e --test bd_3plop_5_ssi_serialization_correctness")
+        .scenarios(&[
+            "SSI-CI-SCALE",
+            "SSI-SINGLE-WRITER-SMOKE",
+            "SSI-STRESS-PROFILE",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[ConcurrencyMode::Ssi, ConcurrencyMode::ConcurrentWriters])
+        .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_3plop_6_raptorq_self_healing.rs",
+            ScriptKind::RustE2eTest,
+            "RaptorQ self-healing corruption and repair showcase",
+        )
+        .bead("bd-3plop.6")
+        .command("cargo test -p fsqlite-e2e --test bd_3plop_6_raptorq_self_healing")
+        .scenarios(&[
+            "RAPTORQ-REPAIR-5PCT",
+            "RAPTORQ-REPAIR-10PCT",
+            "RAPTORQ-GRACEFUL-DEGRADATION",
+            "RAPTORQ-WITNESS-VARIANTS",
+        ])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_3wop3_7_contention_elimination.rs",
+            ScriptKind::RustE2eTest,
+            "Historical contention-elimination and split-lock scaffolding",
+        )
+        .bead("bd-3wop3.7")
+        .command("cargo test -p fsqlite-e2e --test bd_3wop3_7_contention_elimination")
+        .scenarios(&["CONTENTION-ELIMINATION-HISTORICAL"])
+        .storage(&[
+            StorageMode::InMemory,
+            StorageMode::FileBacked,
+            StorageMode::Wal,
+        ])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
+        .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_aztlm_flat_hash_page_cache.rs",
+            ScriptKind::RustE2eTest,
+            "Flat-hash page-cache oracle and concurrent-writer evidence",
+        )
+        .bead("bd-aztlm")
+        .command("cargo test -p fsqlite-e2e --test bd_aztlm_flat_hash_page_cache")
+        .scenarios(&[
+            "TRACK-Q-INSERT-10K-CORRECTNESS",
+            "TRACK-Q-FOUR-WRITER-NO-DATA-LOSS",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_db300_5_5_3_writer_routing_protocol.rs",
+            ScriptKind::RustE2eTest,
+            "Synthetic writer-routing protocol evidence and conflict reduction",
+        )
+        .bead("bd-db300.5.5.3")
+        .command("cargo test -p fsqlite-e2e --test bd_db300_5_5_3_writer_routing_protocol")
+        .scenarios(&[
+            "WRITER-ROUTING-DISJOINT",
+            "WRITER-ROUTING-OVERLAP",
+            "WRITER-ROUTING-HOT-PAGE",
+        ])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::ConcurrentWriters])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_ezg4p_prefetch.rs",
+            ScriptKind::RustE2eTest,
+            "Prefetch correctness and lookup-latency improvement proofs",
+        )
+        .bead("bd-ezg4p")
+        .command("cargo test -p fsqlite-e2e --test bd_ezg4p_prefetch")
+        .scenarios(&["TRACK-P-INSERT-10K-CORRECTNESS", "TRACK-P-LATENCY-LOOKUP"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_mblr_2_3_fault_injection_reliability.rs",
+            ScriptKind::RustE2eTest,
+            "Fault-injection reliability checks for disk, read, and sync failures",
+        )
+        .bead("bd-mblr.2.3")
+        .command("cargo test -p fsqlite-e2e --test bd_mblr_2_3_fault_injection_reliability")
+        .scenarios(&[
+            "FAULT-INJECTION-DISK-FULL",
+            "FAULT-INJECTION-IO-ERROR",
+            "FAULT-INJECTION-PARTIAL-READ",
+            "FAULT-INJECTION-FSYNC",
+        ])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_n0g4q_6_repair_matrix.rs",
+            ScriptKind::RustE2eTest,
+            "Deterministic corruption and repair matrix with evidence validation",
+        )
+        .bead("bd-n0g4q.6")
+        .command("cargo test -p fsqlite-e2e --test bd_n0g4q_6_repair_matrix")
+        .scenarios(&["REPAIR-MATRIX-1"])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_qayid_track_t_append_path.rs",
+            ScriptKind::RustE2eTest,
+            "Append-path oracle, sequential-vs-gapped metrics, and throughput probe",
+        )
+        .bead("bd-qayid")
+        .command("cargo test -p fsqlite-e2e --test bd_qayid_track_t_append_path")
+        .env("FSQLITE_TRACK_T_E2E_ARTIFACT")
+        .scenarios(&[
+            "TRACK-T-ORACLE-10K-SEQ",
+            "TRACK-T-SEQ-VS-INTERLEAVED",
+            "TRACK-T-APPEND-THROUGHPUT",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_rjc_deterministic_hot_row_sum_probe.rs",
+            ScriptKind::RustE2eTest,
+            "Deterministic hot-row conservation and integrity probe",
+        )
+        .bead("bd-rjc")
+        .command("cargo test -p fsqlite-e2e --test bd_rjc_deterministic_hot_row_sum_probe")
+        .scenarios(&["HOT-ROW-SUM-PROBE"])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[ConcurrencyMode::ConcurrentWriters])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/bd_zjisk_1_backend_wiring_modes.rs",
+            ScriptKind::RustE2eTest,
+            "Backend wiring mode checks across runtime and certifying modes",
+        )
+        .bead("bd-zjisk.1")
+        .command("cargo test -p fsqlite-e2e --test bd_zjisk_1_backend_wiring_modes")
+        .scenarios(&["BACKEND-WIRING-MODES"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(120)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/complete_benchmark_matrix.rs",
+            ScriptKind::RustE2eTest,
+            "Complete benchmark matrix runner and artifact bundle validation",
+        )
+        .command("cargo test -p fsqlite-e2e --test complete_benchmark_matrix")
+        .env("FSQLITE_MATRIX_ARTIFACT_DIR")
+        .env("FSQLITE_MATRIX_BASELINE_JSONL")
+        .scenarios(&["BENCH-MATRIX-1", "HOT-PROFILE-DIAGNOSIS"])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
+        .timeout(1800)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/cross_conn_upsert_visibility.rs",
+            ScriptKind::RustE2eTest,
+            "Cross-connection UPSERT visibility and conflict refresh checks",
+        )
+        .command("cargo test -p fsqlite-e2e --test cross_conn_upsert_visibility")
+        .scenarios(&["UPSERT-CROSS-CONNECTION-1"])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(120)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+            ScriptKind::RustE2eTest,
+            "JSON1 and FTS scalar extension parity checks",
+        )
+        .bead("bd-1dp9.5.2")
+        .command("cargo test -p fsqlite-e2e --test extension_json_fts_parity")
+        .scenarios(&["EXT-JSON1-SCALAR", "EXT-FTS5-SCALAR"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs",
+            ScriptKind::RustE2eTest,
+            "RTREE, session, ICU, and misc extension parity closure wave",
+        )
+        .bead("bd-1dp9.5.3")
+        .command("cargo test -p fsqlite-e2e --test extension_rtree_session_icu_misc_parity")
+        .scenarios(&["EXT-RTREE-1", "EXT-SESSION-1", "EXT-SESSION-CONFLICT-1"])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["target/bd_1dp9_5_3_e2e_runtime/"])
+        .timeout(600)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/interop_integrity.rs",
+            ScriptKind::RustE2eTest,
+            "Interop integrity checks against stock SQLite integrity_check",
+        )
+        .command("cargo test -p fsqlite-e2e --test interop_integrity")
+        .scenarios(&[
+            "INTEROP-INTEGRITY-1",
+            "INTEROP-INTEGRITY-ISSUE54",
+            "INTEROP-INTEGRITY-ISSUE55",
+        ])
+        .storage(&[StorageMode::FileBacked, StorageMode::Wal])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/strict_table_type_enforcement.rs",
+            ScriptKind::RustE2eTest,
+            "STRICT table type-enforcement surface checks",
+        )
+        .bead("bd-xr8t1")
+        .command("cargo test -p fsqlite-e2e --test strict_table_type_enforcement")
+        .scenarios(&["STRICT-TABLE-TYPE-ENFORCEMENT"])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(120)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "crates/fsqlite-e2e/tests/upsert_on_conflict.rs",
+            ScriptKind::RustE2eTest,
+            "UPSERT and INSERT ... ON CONFLICT end-to-end coverage",
+        )
+        .bead("bd-nyami")
+        .command("cargo test -p fsqlite-e2e --test upsert_on_conflict")
+        .scenarios(&["UPSERT-ON-CONFLICT-1"])
+        .storage(&[StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .timeout(120)
+        .build(),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1778,8 +2292,11 @@ fn build_gap_annotations() -> Vec<GapAnnotation> {
         },
         GapAnnotation {
             area: "PERF-regression-suite".to_owned(),
-            rationale: "Full performance regression suite planned in bd-mblr.7.3; \
-                        current PERF scenarios cover warmup and SSI only"
+            rationale: "The honest overlay gate and no-regression detector now cover \
+                        the canonical c1 and persistent 8t/16t truth surfaces. The \
+                        remaining gap is a fully automated provenance-backed release \
+                        perf suite beyond the current canonical matrix and scorecard \
+                        harnesses."
                 .to_owned(),
             intentional: false,
         },
@@ -1817,6 +2334,45 @@ fn build_gap_annotations() -> Vec<GapAnnotation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::Path};
+
+    fn workspace_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("workspace root should resolve")
+    }
+
+    fn directory_file_set(relative_dir: &str) -> BTreeSet<String> {
+        let dir = workspace_root().join(relative_dir);
+        fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read_dir failed for {}: {e}", dir.display()))
+            .map(|entry| {
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("dir entry failed for {}: {e}", dir.display()));
+                let file_type = entry.file_type().unwrap_or_else(|e| {
+                    panic!("file_type failed for {}: {e}", entry.path().display())
+                });
+                assert!(
+                    file_type.is_file(),
+                    "expected only files under {} but found {}",
+                    dir.display(),
+                    entry.path().display()
+                );
+                let relative = entry
+                    .path()
+                    .strip_prefix(workspace_root())
+                    .unwrap_or_else(|e| {
+                        panic!("strip_prefix failed for {}: {e}", entry.path().display())
+                    })
+                    .to_path_buf();
+                relative
+                    .to_str()
+                    .unwrap_or_else(|| panic!("non-utf8 path in {}", dir.display()))
+                    .to_owned()
+            })
+            .collect()
+    }
 
     #[test]
     fn canonical_inventory_builds() {
@@ -1996,6 +2552,28 @@ mod tests {
         let s2 = m2.coverage_stats();
         assert_eq!(s1.total_scripts, s2.total_scripts);
         assert_eq!(s1.unique_scenario_count, s2.unique_scenario_count);
+    }
+
+    #[test]
+    fn e2e_directories_are_fully_cataloged() {
+        let matrix = build_canonical_inventory();
+        let matrix_paths: BTreeSet<String> =
+            matrix.scripts.iter().map(|s| s.path.clone()).collect();
+
+        let e2e_files = directory_file_set("e2e");
+        let rust_e2e_files = directory_file_set("crates/fsqlite-e2e/tests");
+
+        let missing_e2e: Vec<_> = e2e_files.difference(&matrix_paths).cloned().collect();
+        let missing_rust_e2e: Vec<_> = rust_e2e_files.difference(&matrix_paths).cloned().collect();
+
+        assert!(
+            missing_e2e.is_empty(),
+            "uncataloged e2e files: {missing_e2e:?}"
+        );
+        assert!(
+            missing_rust_e2e.is_empty(),
+            "uncataloged Rust e2e tests: {missing_rust_e2e:?}"
+        );
     }
 
     #[test]

@@ -222,3 +222,34 @@ fn readme_documents_contract_reference() {
         contract.contract.contract_reference_path
     );
 }
+
+#[test]
+fn canonical_doc_lists_track_a_artifacts_and_validation_gates() {
+    let contract = load_version_contract();
+    let doc_path = workspace_root().join("docs/canonical_parity_contract.md");
+    let doc = read_text(&doc_path);
+
+    for artifact in [
+        contract.contract.contract_reference_path.as_str(),
+        contract.references.surface_matrix.as_str(),
+        contract.references.feature_ledger.as_str(),
+        "parity_score_contract.toml",
+    ] {
+        assert!(
+            doc.contains(artifact),
+            "canonical parity doc missing artifact reference {artifact}"
+        );
+    }
+
+    for validation_gate in [
+        "bd_2yqp6_1_1_supported_surface_matrix.rs",
+        "bd_2yqp6_1_2_feature_universe_ledger.rs",
+        "bd_2yqp6_1_3_sqlite_version_contract.rs",
+        "bd_2yqp6_1_4_parity_score_contract.rs",
+    ] {
+        assert!(
+            doc.contains(validation_gate),
+            "canonical parity doc missing validation gate {validation_gate}"
+        );
+    }
+}

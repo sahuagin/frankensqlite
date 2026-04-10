@@ -49,6 +49,7 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Current differential metadata schema version.
 pub const DIFFERENTIAL_METADATA_SCHEMA_VERSION: &str = "1.0.0";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-UNKNOWN";
+const DIAGNOSTIC_UNKNOWN_REFERENCE_IDENTITY_LABEL: &str = "diagnostic-unknown-reference";
 
 fn default_target_sqlite_version() -> String {
     TARGET_SQLITE_VERSION.to_owned()
@@ -542,7 +543,7 @@ pub struct DifferentialMetadata {
     pub scenario_id: String,
     /// Deterministic seed used for the run.
     pub seed: u64,
-    /// Oracle identity label (for example `csqlite-oracle`).
+    /// Observed reference-executor identity label.
     pub oracle_identity: String,
     /// Oracle version string.
     pub oracle_version: String,
@@ -1010,11 +1011,13 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     mode: DifferentialMode,
 ) -> DifferentialResult {
     let started_at = Instant::now();
+    let observed_reference_identity = reference_identity_label(csqlite_exec.engine_identity());
 
     if matches!(mode, DifferentialMode::Parity) {
         if let Some(first_error) = envelope.validate_parity_contract().first() {
             return parity_contract_violation(
                 envelope,
+                observed_reference_identity,
                 &format!("parity_contract_violation: {first_error}"),
                 parity_reason_code_from_envelope_error(first_error),
                 elapsed_millis(started_at.elapsed()),
@@ -1023,6 +1026,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
         if fsqlite_exec.engine_identity() != EngineIdentity::FrankenSqlite {
             return parity_contract_violation(
                 envelope,
+                observed_reference_identity,
                 "parity_contract_violation: subject executor must identify as FrankenSqlite",
                 "subject_executor_identity_mismatch",
                 elapsed_millis(started_at.elapsed()),
@@ -1031,6 +1035,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
         if csqlite_exec.engine_identity() != EngineIdentity::CSqliteOracle {
             return parity_contract_violation(
                 envelope,
+                observed_reference_identity,
                 "parity_contract_violation: reference executor must identify as CSqliteOracle",
                 "reference_executor_identity_mismatch",
                 elapsed_millis(started_at.elapsed()),
@@ -1119,6 +1124,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     });
     let metadata = build_differential_metadata(
         envelope,
+        observed_reference_identity,
         outcome,
         first_failure,
         elapsed_millis(started_at.elapsed()),
@@ -1153,6 +1159,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
 
 fn build_differential_metadata(
     envelope: &ExecutionEnvelope,
+    observed_reference_identity: &str,
     outcome: Outcome,
     first_failure: Option<DifferentialFirstFailure>,
     timing_ms: u64,
@@ -1171,12 +1178,7 @@ fn build_differential_metadata(
     } else {
         scenario_id.to_owned()
     };
-    let oracle_identity = envelope.engines.reference_identity.trim();
-    let oracle_identity = if is_missing_identity_metadata(oracle_identity) {
-        "csqlite-oracle-unspecified".to_owned()
-    } else {
-        oracle_identity.to_owned()
-    };
+    let oracle_identity = observed_reference_identity.to_owned();
     let oracle_version = envelope.engines.csqlite.trim();
     let oracle_version = if is_missing_oracle_metadata(oracle_version) || oracle_version.is_empty()
     {
@@ -1211,16 +1213,18 @@ fn build_differential_metadata(
 
 fn parity_contract_violation(
     envelope: &ExecutionEnvelope,
+    observed_reference_identity: &str,
     message: &str,
     reason_code: &str,
     timing_ms: u64,
 ) -> DifferentialResult {
     log_identity_check(envelope, "fail", reason_code);
-    parity_contract_error_result(envelope, message, timing_ms)
+    parity_contract_error_result(envelope, observed_reference_identity, message, timing_ms)
 }
 
 fn parity_contract_error_result(
     envelope: &ExecutionEnvelope,
+    observed_reference_identity: &str,
     message: &str,
     timing_ms: u64,
 ) -> DifferentialResult {
@@ -1237,7 +1241,13 @@ fn parity_contract_error_result(
         sha256_hex(combined.as_bytes())
     };
     let error_state_hash = sha256_hex(message.as_bytes());
-    let metadata = build_differential_metadata(envelope, Outcome::Error, None, timing_ms);
+    let metadata = build_differential_metadata(
+        envelope,
+        observed_reference_identity,
+        Outcome::Error,
+        None,
+        timing_ms,
+    );
 
     let mut result = DifferentialResult {
         bead_id: BEAD_ID.to_owned(),
@@ -1338,6 +1348,14 @@ fn is_missing_identity_metadata(value: &str) -> bool {
         normalized.as_str(),
         "" | "unknown" | "n/a" | "na" | "unset" | "none" | "null" | "missing"
     )
+}
+
+fn reference_identity_label(identity: EngineIdentity) -> &'static str {
+    match identity {
+        EngineIdentity::FrankenSqlite => SUBJECT_IDENTITY_LABEL,
+        EngineIdentity::CSqliteOracle => REFERENCE_IDENTITY_LABEL,
+        EngineIdentity::Unknown => DIAGNOSTIC_UNKNOWN_REFERENCE_IDENTITY_LABEL,
+    }
 }
 
 fn is_missing_oracle_metadata(value: &str) -> bool {
@@ -1953,6 +1971,10 @@ mod tests {
         let result = run_differential_diagnostic(&envelope, &f, &c);
         assert_eq!(result.outcome, Outcome::Pass);
         assert_eq!(result.metadata.normalized_outcome, "pass");
+        assert_eq!(
+            result.metadata.oracle_identity,
+            DIAGNOSTIC_UNKNOWN_REFERENCE_IDENTITY_LABEL
+        );
     }
 
     #[test]

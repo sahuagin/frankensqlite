@@ -63,6 +63,17 @@ fn load_manifest() -> SurfaceManifest {
     })
 }
 
+fn load_canonical_parity_doc() -> String {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/canonical_parity_contract.md");
+    fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read canonical_parity_contract.md at {}: {e}",
+            path.display()
+        )
+    })
+}
+
 #[test]
 fn manifest_meta_is_pinned_to_track_a_contract() {
     let manifest = load_manifest();
@@ -199,4 +210,18 @@ fn concurrent_writer_design_is_preserved_in_scope_lock() {
         .find(|entry| entry.feature_id == "SURF-TXN-SERIALIZED-WRITER-LOCK-007")
         .expect("missing serialized lock exclusion entry");
     assert_eq!(serialized.support_state, SupportState::Excluded);
+}
+
+#[test]
+fn canonical_doc_names_every_surface_feature_id() {
+    let manifest = load_manifest();
+    let doc = load_canonical_parity_doc();
+
+    for entry in &manifest.surface {
+        assert!(
+            doc.contains(&entry.feature_id),
+            "canonical parity doc is missing feature id {}",
+            entry.feature_id
+        );
+    }
 }

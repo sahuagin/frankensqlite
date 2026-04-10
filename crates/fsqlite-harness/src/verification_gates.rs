@@ -1287,12 +1287,15 @@ fn late_phase_gate_specs() -> Vec<GateSpec> {
         },
         GateSpec {
             gate_id: "phase9.benchmark_3x",
-            gate_name: "Phase 9 gate: single-writer 3x benchmark gate is still missing",
+            gate_name: "Phase 9 gate: overlay honesty scorecards replace stale single-writer 3x placeholder",
             scope: GateScope::Phase9,
             command: &[
-                "bash",
-                "-lc",
-                "echo 'phase9.benchmark_3x is unimplemented; see PERF-regression-suite gap in crates/fsqlite-harness/src/e2e_traceability.rs' >&2; exit 1",
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-e2e",
+                "--lib",
+                "overlay_honesty_gate_",
             ],
             env: &[],
             expected_exit_code: 0,
@@ -1995,6 +1998,18 @@ mod tests {
         assert_eq!(gate.scope, GateScope::Phase9);
         assert!(command.contains("bd_m0l2_raptorq_e2e_integration"));
         assert!(command.contains("test_e2e_replication_decode_with_partial_loss"));
+    }
+
+    #[test]
+    fn test_phase9_gate_benchmark_3x_now_targets_overlay_honesty_gate() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase9.benchmark_3x");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase9);
+        assert!(command.contains("cargo test -p fsqlite-e2e --lib overlay_honesty_gate_"));
+        assert!(!command.contains("exit 1"));
+        assert!(!command.contains("unimplemented"));
     }
 
     #[test]

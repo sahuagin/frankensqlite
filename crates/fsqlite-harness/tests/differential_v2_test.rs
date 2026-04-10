@@ -582,6 +582,7 @@ fn parity_rejects_non_csqlite_reference_executor() {
 
     let result = differential_v2::run_differential(&envelope, &f, &not_oracle);
     assert_eq!(result.outcome, Outcome::Error);
+    assert_eq!(result.metadata.oracle_identity, "frankensqlite");
     assert!(
         result.metadata.validate().is_empty(),
         "error metadata must still satisfy schema validator"
@@ -596,6 +597,11 @@ fn diagnostic_mode_allows_explicit_self_compare() {
 
     let result = differential_v2::run_differential_diagnostic(&envelope, &left, &right);
     assert_eq!(result.outcome, Outcome::Pass);
+    assert_eq!(result.metadata.oracle_identity, "frankensqlite");
+    assert!(
+        result.metadata.validate().is_empty(),
+        "diagnostic self-compare metadata must remain schema-valid"
+    );
 }
 
 #[test]
