@@ -23845,7 +23845,14 @@ mod tests {
         let r_found_text = b.alloc_reg();
         let r_found_rowid = b.alloc_reg();
 
-        b.emit_op(Opcode::String8, 0, r_text, 0, P4::Str("alpha".to_owned()), 0);
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_text,
+            0,
+            P4::Str("alpha".to_owned()),
+            0,
+        );
         b.emit_op(Opcode::Integer, 1, r_rowid, 0, P4::None, 0);
         b.emit_op(Opcode::MakeRecord, r_text, 2, r_seek_key, P4::None, 0);
         b.emit_jump_to_label(Opcode::SeekGT, 0, r_seek_key, done, P4::None, 0);
@@ -23888,7 +23895,14 @@ mod tests {
         let r_found_text = b.alloc_reg();
         let r_found_rowid = b.alloc_reg();
 
-        b.emit_op(Opcode::String8, 0, r_text, 0, P4::Str("ALPHA".to_owned()), 0);
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_text,
+            0,
+            P4::Str("ALPHA".to_owned()),
+            0,
+        );
         b.emit_op(Opcode::Integer, 2, r_rowid, 0, P4::None, 0);
         b.emit_op(Opcode::MakeRecord, r_text, 2, r_seek_key, P4::None, 0);
         b.emit_jump_to_label(Opcode::SeekLT, 0, r_seek_key, done, P4::None, 0);
