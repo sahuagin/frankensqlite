@@ -653,6 +653,7 @@ impl Vfs for UnixVfs {
         flags: VfsOpenFlags,
     ) -> Result<(Self::File, VfsOpenFlags)> {
         let is_temp = path.is_none();
+        let delete_on_close = flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_temp;
         let resolved = if let Some(p) = path {
             p.to_path_buf()
         } else {
@@ -686,7 +687,7 @@ impl Vfs for UnixVfs {
                         file,
                         path: resolved,
                         lock_level: LockLevel::None,
-                        delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+                        delete_on_close,
                         closed: false,
                         inode_key,
                         inode_info,
@@ -759,7 +760,7 @@ impl Vfs for UnixVfs {
             file,
             path: resolved,
             lock_level: LockLevel::None,
-            delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+            delete_on_close,
             closed: false,
             inode_key,
             inode_info,
@@ -3102,6 +3103,30 @@ mod tests {
         assert_eq!(&buf, b"temp data");
 
         file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_anonymous_temp_file_auto_deletes_on_close() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let (mut file, out_flags) = vfs.open(&cx, None, flags).unwrap();
+        let temp_path = file.path.clone();
+        assert!(out_flags.contains(VfsOpenFlags::READWRITE));
+        assert!(file.delete_on_close);
+        assert!(
+            temp_path.exists(),
+            "anonymous temp path should exist while open"
+        );
+
+        file.write(&cx, b"temp data", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(
+            !temp_path.exists(),
+            "anonymous temp files must be deleted on close even without DELETEONCLOSE"
+        );
     }
 
     #[test]
