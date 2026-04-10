@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
+#[cfg(not(target_arch = "wasm32"))]
+use asupersync::runtime::{BlockingTaskHandle, RuntimeHandle};
+use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx};
 
 use crate::per_core_buffer::{
     AppendOutcome, BufferConfig, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig, EpochFlushBatch,
@@ -765,8 +767,11 @@ pub struct ParallelWalCoordinator {
     running: Arc<AtomicBool>,
     /// Epoch batches drained from memory but not yet durably written.
     pending_batches: Arc<Mutex<VecDeque<EpochFlushBatch>>>,
-    /// Epoch ticker handle (spawned on start).
-    ticker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Child cancellation scope for the background ticker task.
+    ticker_cx: Mutex<Option<Cx>>,
+    /// Epoch ticker handle (spawned on an asupersync runtime).
+    #[cfg(not(target_arch = "wasm32"))]
+    ticker_handle: Mutex<Option<BlockingTaskHandle>>,
 }
 
 impl std::fmt::Debug for ParallelWalCoordinator {
@@ -801,6 +806,8 @@ impl ParallelWalCoordinator {
             config,
             running: Arc::new(AtomicBool::new(false)),
             pending_batches: Arc::new(Mutex::new(VecDeque::new())),
+            ticker_cx: Mutex::new(None),
+            #[cfg(not(target_arch = "wasm32"))]
             ticker_handle: Mutex::new(None),
         }
     }
@@ -862,43 +869,85 @@ impl ParallelWalCoordinator {
         self.inner.wait_until_epoch_durable(epoch, timeout)
     }
 
-    /// Start the background epoch ticker thread.
+    /// Start the background epoch ticker on a caller-owned asupersync runtime.
     ///
-    /// The ticker thread advances the epoch at the configured interval (default 10ms),
+    /// The ticker task advances the epoch at the configured interval (default 10ms),
     /// sealing and flushing all per-thread buffers. This implements the Silo/Aether
     /// group commit pattern where transactions wait for their epoch to become durable.
-    pub fn start(&self) -> Result<(), String> {
-        self.start_with_fsync(FsyncPolicy::default())
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_on_runtime(&self, runtime: &RuntimeHandle, parent_cx: &Cx) -> Result<(), String> {
+        self.start_on_runtime_with_fsync(runtime, parent_cx, FsyncPolicy::default())
     }
 
-    /// Start the background epoch ticker thread with a specific fsync policy.
-    pub fn start_with_fsync(&self, fsync_policy: FsyncPolicy) -> Result<(), String> {
-        if self.running.swap(true, Ordering::SeqCst) {
+    /// Start the background epoch ticker with a specific fsync policy.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_on_runtime_with_fsync(
+        &self,
+        runtime: &RuntimeHandle,
+        parent_cx: &Cx,
+        fsync_policy: FsyncPolicy,
+    ) -> Result<(), String> {
+        if self.running.load(Ordering::Acquire) {
             return Err("coordinator already running".to_string());
         }
 
-        // Clone Arc handles for the ticker thread.
+        if let Some(ticker_cx) = self
+            .ticker_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            ticker_cx.cancel();
+        }
+        if let Some(handle) = self
+            .ticker_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            handle.wait();
+        }
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("coordinator already running".to_string());
+        }
+
+        let ticker_cx = parent_cx.create_child();
+
+        // Clone Arc handles for the ticker task.
         let running = Arc::clone(&self.running);
         let inner = Arc::clone(&self.inner);
         let db_path = self.db_path.clone();
         let pending_batches = Arc::clone(&self.pending_batches);
         let interval = Duration::from_millis(self.config.epoch_interval_ms);
         let flush_timeout = Duration::from_millis(self.config.epoch_interval_ms * 10);
+        let loop_cx = ticker_cx.clone();
 
-        let handle = std::thread::Builder::new()
-            .name("wal-epoch-ticker".to_string())
-            .spawn(move || {
-                epoch_ticker_loop(
-                    running,
-                    inner,
-                    db_path,
-                    pending_batches,
-                    interval,
-                    flush_timeout,
-                    fsync_policy,
-                );
-            })
-            .map_err(|e| format!("failed to spawn epoch ticker thread: {e}"))?;
+        let Some(handle) = runtime.spawn_blocking(move || {
+            epoch_ticker_loop(
+                running,
+                inner,
+                db_path,
+                pending_batches,
+                interval,
+                flush_timeout,
+                fsync_policy,
+                loop_cx,
+            );
+        }) else {
+            self.running.store(false, Ordering::Release);
+            return Err(
+                "failed to spawn epoch ticker task: runtime has no blocking pool".to_string(),
+            );
+        };
+
+        *self
+            .ticker_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ticker_cx);
 
         let mut ticker_handle = self
             .ticker_handle
@@ -909,21 +958,29 @@ impl ParallelWalCoordinator {
         Ok(())
     }
 
-    /// Stop the background epoch ticker thread.
+    /// Stop the background epoch ticker task.
     ///
     /// Signals the ticker to stop and waits for it to complete its current
     /// flush cycle before returning.
     pub fn stop(&self) {
-        // Signal the ticker to stop.
         self.running.store(false, Ordering::Release);
+        if let Some(ticker_cx) = self
+            .ticker_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            ticker_cx.cancel();
+        }
 
-        // Join the ticker thread if running.
+        #[cfg(not(target_arch = "wasm32"))]
         let mut handle = self
             .ticker_handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(h) = handle.take() {
-            let _ = h.join();
+            h.wait();
         }
     }
 
@@ -1017,7 +1074,7 @@ fn flush_pending_batches(
 // Epoch Ticker Loop
 // ---------------------------------------------------------------------------
 
-/// Background thread loop that advances epochs and flushes WAL buffers.
+/// Background task loop that advances epochs and flushes WAL buffers.
 ///
 /// This implements an epoch-based group commit pattern:
 /// 1. Sleep for the configured interval (default 10ms).
@@ -1027,7 +1084,7 @@ fn flush_pending_batches(
 /// 5. Write the batch to a segment file.
 /// 6. Mark the epoch as durable.
 ///
-/// The loop exits when `running` is set to false.
+/// The loop exits when `running` is cleared or the task `Cx` is cancelled.
 fn epoch_ticker_loop(
     running: Arc<AtomicBool>,
     inner: Arc<EpochOrderCoordinator>,
@@ -1036,13 +1093,18 @@ fn epoch_ticker_loop(
     interval: Duration,
     flush_timeout: Duration,
     fsync_policy: FsyncPolicy,
+    ticker_cx: Cx,
 ) {
     while running.load(Ordering::Acquire) {
+        if ticker_cx.checkpoint().is_err() {
+            break;
+        }
+
         // Sleep for the epoch interval.
         std::thread::sleep(interval);
 
         // Check if we should stop before doing work.
-        if !running.load(Ordering::Acquire) {
+        if !running.load(Ordering::Acquire) || ticker_cx.is_cancel_requested() {
             break;
         }
 
@@ -1083,6 +1145,8 @@ fn epoch_ticker_loop(
             }
         }
     }
+
+    running.store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1196,19 @@ pub fn remove_parallel_wal_coordinator(db_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use std::path::PathBuf;
+
+    fn test_runtime() -> asupersync::runtime::Runtime {
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime should build")
+    }
+
+    fn test_cx() -> Cx {
+        Cx::default()
+    }
 
     fn sample_batch(txn_id: u64, commit_seq: u64) -> ParallelWalBatch {
         ParallelWalBatch::new(
@@ -1203,16 +1279,24 @@ mod tests {
             ..ParallelWalConfig::default()
         };
         let coordinator = ParallelWalCoordinator::new(&path, config);
+        let runtime = test_runtime();
+        let cx = test_cx();
 
         // Initially not running.
         assert!(!coordinator.is_running());
 
         // Start the ticker.
-        coordinator.start().expect("start should succeed");
+        coordinator
+            .start_on_runtime(&runtime.handle(), &cx)
+            .expect("start should succeed");
         assert!(coordinator.is_running());
 
         // Starting again should fail.
-        assert!(coordinator.start().is_err());
+        assert!(
+            coordinator
+                .start_on_runtime(&runtime.handle(), &cx)
+                .is_err()
+        );
 
         // Let the ticker run for a few epochs.
         std::thread::sleep(Duration::from_millis(25));
@@ -1238,11 +1322,15 @@ mod tests {
             ..ParallelWalConfig::default()
         };
         let coordinator = ParallelWalCoordinator::new(&path, config);
+        let runtime = test_runtime();
+        let cx = test_cx();
 
         let initial_epoch = coordinator.current_epoch();
 
         // Start the ticker and wait for several epochs.
-        coordinator.start().expect("start should succeed");
+        coordinator
+            .start_on_runtime(&runtime.handle(), &cx)
+            .expect("start should succeed");
         std::thread::sleep(Duration::from_millis(50));
         coordinator.stop();
 
@@ -1252,6 +1340,34 @@ mod tests {
             final_epoch > initial_epoch,
             "epoch ticker should advance without stalling on inactive slots: initial={initial_epoch}, final={final_epoch}"
         );
+    }
+
+    #[test]
+    fn test_epoch_ticker_restart_after_parent_cancellation() {
+        let path = PathBuf::from("/tmp/test_ticker_restart.db");
+        let config = ParallelWalConfig {
+            slot_count: 2,
+            epoch_interval_ms: 5,
+            ..ParallelWalConfig::default()
+        };
+        let coordinator = ParallelWalCoordinator::new(&path, config);
+        let runtime = test_runtime();
+        let parent_cx = test_cx();
+
+        coordinator
+            .start_on_runtime(&runtime.handle(), &parent_cx)
+            .expect("initial start should succeed");
+        parent_cx.cancel();
+        std::thread::sleep(Duration::from_millis(15));
+
+        let replacement_cx = test_cx();
+        coordinator
+            .start_on_runtime(&runtime.handle(), &replacement_cx)
+            .expect("restart after parent cancellation should drain prior task");
+        assert!(coordinator.is_running());
+
+        coordinator.stop();
+        assert!(!coordinator.is_running());
     }
 
     #[test]

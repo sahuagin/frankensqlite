@@ -1,9 +1,9 @@
 //! Async-native wrapper around [`Connection`] for use with asupersync's `Cx` capability context.
 //!
 //! Because [`Connection`] is `!Send` (it uses `Rc<RefCell<..>>` internally), this module
-//! provides an [`AsyncConnection`] that spawns a dedicated worker thread owning the
+//! provides an [`AsyncConnection`] that runs a dedicated worker task owning the
 //! `Connection`. All SQL operations are dispatched to the worker via a command channel
-//! and results are returned through oneshot channels.
+//! and results are returned through response channels.
 //!
 //! Every async method accepts a `&Cx` and calls [`Cx::checkpoint()`] before dispatching,
 //! ensuring cancel-correctness: if the context has been cancelled, the operation fails
@@ -34,19 +34,24 @@
 //! ```
 
 use crate::{Connection, ConnectionEnv, FrankenError, Row, SqliteValue};
+use asupersync::channel::oneshot;
+use asupersync::cx::Cx as NativeCx;
+use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder, RuntimeHandle};
 use fsqlite_types::cx::Cx;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::thread;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
-// Command protocol between async methods and the worker thread
+// Command protocol between async methods and the worker task
 // ---------------------------------------------------------------------------
 
 type Responder<T> = std::sync::mpsc::SyncSender<Result<T, FrankenError>>;
 
-/// A command sent from an async method to the worker thread.
+const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// A command sent from an async method to the worker task.
 enum Command {
     Query {
         sql: String,
@@ -94,114 +99,81 @@ enum Command {
     Shutdown,
 }
 
-// ---------------------------------------------------------------------------
-// Oneshot future for receiving from std::sync::mpsc in an async context
-// ---------------------------------------------------------------------------
-
-/// A `Future` that polls an `mpsc::Receiver` for a single value.
-///
-/// Uses `try_recv` to avoid blocking the async runtime. When the value is not
-/// yet available, a single background waker thread is spawned that blocks on
-/// the receiver and wakes the task when the value arrives. Subsequent polls
-/// before the value is ready simply update the stored waker (in case the
-/// executor migrated the task to a new waker) without spawning additional
-/// threads.
-struct OneshotFuture<T> {
-    rx: Option<mpsc::Receiver<T>>,
-    /// Shared waker slot: the waker thread reads from this so it always wakes
-    /// the most-recently-registered waker (handles executor waker rotation).
-    /// `None` before the first `Empty` poll; `Some` once the waker thread has
-    /// been spawned.
-    shared_waker: Option<Arc<std::sync::Mutex<Option<std::task::Waker>>>>,
+fn worker_open_err() -> FrankenError {
+    FrankenError::Internal("async worker task terminated during open".to_owned())
 }
 
-impl<T> OneshotFuture<T> {
-    fn new(rx: mpsc::Receiver<T>) -> Self {
-        Self {
-            rx: Some(rx),
-            shared_waker: None,
-        }
-    }
+fn worker_dead_err() -> FrankenError {
+    FrankenError::Internal("async worker task terminated unexpectedly".to_owned())
 }
 
-impl<T> std::future::Future for OneshotFuture<T>
-where
+fn requires_runtime_err() -> FrankenError {
+    FrankenError::Internal(
+        "AsyncConnection async methods require an asupersync runtime with a blocking pool"
+            .to_owned(),
+    )
+}
+
+fn worker_spawn_err() -> FrankenError {
+    FrankenError::Internal(
+        "failed to spawn async worker task: runtime has no blocking pool".to_owned(),
+    )
+}
+
+fn blocking_wait_send_err<T>(_: oneshot::SendError<Result<T, FrankenError>>) {}
+
+fn native_cx_for_local<Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>>(
+    cx: &Cx<Caps>,
+) -> NativeCx {
+    cx.attached_native_cx()
+        .unwrap_or_else(NativeCx::for_request)
+}
+
+async fn recv_sync_response<
+    Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
     T: Send + 'static,
-{
-    type Output = Result<T, FrankenError>;
+>(
+    cx: &Cx<Caps>,
+    rx: mpsc::Receiver<T>,
+) -> Result<T, FrankenError> {
+    let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
+    let pool = runtime.blocking_handle().ok_or_else(requires_runtime_err)?;
+    let native_cx = native_cx_for_local(cx);
+    let waiter_cx = native_cx.clone();
+    let (result_tx, mut result_rx) = oneshot::channel::<Result<T, FrankenError>>();
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        task_cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let this = self.get_mut();
-        let rx = this.rx.as_ref().expect("polled after completion");
+    pool.spawn(move || {
+        let result = rx.recv().map_err(|_| worker_dead_err());
+        let _ = result_tx
+            .send(&waiter_cx, result)
+            .map_err(blocking_wait_send_err);
+    });
 
-        match rx.try_recv() {
-            Ok(val) => {
-                this.rx = None;
-                std::task::Poll::Ready(Ok(val))
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                this.rx = None;
-                std::task::Poll::Ready(Err(FrankenError::Internal(
-                    "async worker thread terminated unexpectedly".to_owned(),
-                )))
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                if let Some(ref shared) = this.shared_waker {
-                    // Waker thread already running — just update the waker in
-                    // case the executor rotated it (common with work-stealing
-                    // schedulers).
-                    let mut guard = shared.lock().expect("waker mutex poisoned");
-                    *guard = Some(task_cx.waker().clone());
-                } else {
-                    // First time we see Empty — spawn one helper thread that
-                    // blocks on the receiver and wakes the task when the value
-                    // arrives or the sender disconnects.
-                    let shared = Arc::new(std::sync::Mutex::new(Some(task_cx.waker().clone())));
-                    this.shared_waker = Some(Arc::clone(&shared));
-
-                    let rx_taken = this.rx.take().unwrap();
-                    let (ready_tx, ready_rx) = mpsc::sync_channel::<T>(1);
-
-                    thread::Builder::new()
-                        .name("fsqlite-async-waker".into())
-                        .spawn(move || {
-                            // Block until the worker sends the result.
-                            match rx_taken.recv() {
-                                Ok(val) => {
-                                    let _ = ready_tx.send(val);
-                                }
-                                Err(_) => {
-                                    // Sender dropped — will surface as
-                                    // Disconnected on next poll.
-                                }
-                            }
-                            // Wake the latest waker (may differ from the one
-                            // captured at spawn time if the executor rotated).
-                            if let Some(w) = shared.lock().expect("waker mutex poisoned").take() {
-                                w.wake();
-                            }
-                        })
-                        .expect("failed to spawn async waker thread");
-
-                    // Replace our receiver with the forwarding channel so the
-                    // next poll reads from it.
-                    this.rx = Some(ready_rx);
-                }
-                std::task::Poll::Pending
-            }
+    match result_rx.recv(&native_cx).await {
+        Ok(result) => result,
+        Err(oneshot::RecvError::Cancelled) => Err(FrankenError::Interrupt),
+        Err(oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion) => {
+            Err(worker_dead_err())
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread
+// Worker task
 // ---------------------------------------------------------------------------
 
-fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
-    while let Ok(cmd) = rx.recv() {
+fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>, worker_cx: NativeCx) {
+    loop {
+        if worker_cx.checkpoint().is_err() {
+            return;
+        }
+
+        let cmd = match rx.recv_timeout(WORKER_POLL_INTERVAL) {
+            Ok(cmd) => cmd,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
         match cmd {
             Command::Query { sql, tx } => {
                 let _ = tx.send(conn.query(&sql));
@@ -244,7 +216,58 @@ fn worker_loop(mut conn: Connection, rx: mpsc::Receiver<Command>) {
             }
         }
     }
-    // Channel closed — connection will be dropped here.
+}
+
+fn spawn_worker_task(
+    runtime: &RuntimeHandle,
+    worker_cx: NativeCx,
+    path: String,
+    env: ConnectionEnv,
+    cmd_rx: mpsc::Receiver<Command>,
+    open_tx: mpsc::SyncSender<Result<(), FrankenError>>,
+) -> Result<BlockingTaskHandle, FrankenError> {
+    runtime
+        .spawn_blocking(move || match Connection::open_with_env(path, env) {
+            Ok(conn) => {
+                let _ = open_tx.send(Ok(()));
+                worker_loop(conn, cmd_rx, worker_cx);
+            }
+            Err(error) => {
+                let _ = open_tx.send(Err(error));
+            }
+        })
+        .ok_or_else(worker_spawn_err)
+}
+
+fn build_owned_runtime() -> Result<Runtime, FrankenError> {
+    RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .map_err(|error| {
+            FrankenError::Internal(format!("failed to build async-api runtime: {error}"))
+        })
+}
+
+fn current_or_owned_runtime() -> Result<(Option<Runtime>, RuntimeHandle), FrankenError> {
+    if let Some(handle) = Runtime::current_handle()
+        && handle.blocking_handle().is_some()
+    {
+        return Ok((None, handle));
+    }
+
+    let runtime = build_owned_runtime()?;
+    let handle = runtime.handle();
+    Ok((Some(runtime), handle))
+}
+
+fn wait_for_worker_open(
+    open_rx: mpsc::Receiver<Result<(), FrankenError>>,
+) -> Result<(), FrankenError> {
+    open_rx.recv().map_err(|_| worker_open_err())?
+}
+
+fn join_worker_task(handle: BlockingTaskHandle) {
+    handle.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +283,7 @@ fn checkpoint_or_interrupt<Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types:
 
 /// Map a send error (worker died) to a `FrankenError::Internal`.
 fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
-    FrankenError::Internal("async worker thread is no longer running".to_owned())
+    FrankenError::Internal("async worker task is no longer running".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -275,21 +298,23 @@ fn send_err<T>(_: mpsc::SendError<T>) -> FrankenError {
 /// method returns `FrankenError::Interrupt` immediately without touching the
 /// underlying connection.
 ///
-/// The connection itself lives on a dedicated worker thread (because
+/// The connection itself lives on a dedicated worker task (because
 /// [`Connection`] is `!Send`). Commands are dispatched via an internal channel
-/// and results flow back through oneshot channels.
+/// and results flow back through response waiters owned by the caller runtime.
 ///
 /// # Shutdown
 ///
-/// When `AsyncConnection` is dropped, the worker thread is signalled to shut
-/// down. The underlying [`Connection`] is closed on the worker thread as part
+/// When `AsyncConnection` is dropped, the worker task is signalled to shut
+/// down. The underlying [`Connection`] is closed on the worker task as part
 /// of its normal drop sequence.
 ///
 /// For explicit, error-checked shutdown use [`close`](Self::close).
 pub struct AsyncConnection {
     cmd_tx: Option<mpsc::SyncSender<Command>>,
-    worker: Option<thread::JoinHandle<()>>,
-    /// Tracks whether the worker thread's connection has an active transaction.
+    worker: Option<BlockingTaskHandle>,
+    worker_cx: Option<NativeCx>,
+    owned_runtime: Option<Runtime>,
+    /// Tracks whether the worker task's connection has an active transaction.
     /// Updated by `begin_transaction`, `commit_transaction`, and
     /// `rollback_transaction` to allow `in_transaction()` to be a cheap local
     /// read without a round-trip to the worker.
@@ -300,7 +325,7 @@ impl AsyncConnection {
     /// Open a database connection asynchronously with `Cx` integration.
     ///
     /// The `Cx` is checkpointed before the blocking open. On success, a
-    /// dedicated worker thread is spawned to own the `Connection`.
+    /// dedicated worker task is spawned to own the `Connection`.
     pub async fn open<Caps>(cx: &Cx<Caps>, path: impl Into<String>) -> Result<Self, FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
@@ -325,30 +350,30 @@ impl AsyncConnection {
         let path = path.into();
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
+        let worker_cx = NativeCx::for_request();
+        let (owned_runtime, runtime_handle) = current_or_owned_runtime()?;
+        let worker = spawn_worker_task(
+            &runtime_handle,
+            worker_cx.clone(),
+            path,
+            env,
+            cmd_rx,
+            open_tx,
+        )?;
 
-        let thread_name = format!("fsqlite-async-worker:{path}");
-        let worker = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || match Connection::open_with_env(path, env) {
-                Ok(conn) => {
-                    let _ = open_tx.send(Ok(()));
-                    worker_loop(conn, cmd_rx);
-                }
-                Err(e) => {
-                    let _ = open_tx.send(Err(e));
-                }
-            })
-            .map_err(|e| FrankenError::Internal(format!("failed to spawn worker thread: {e}")))?;
-
-        // Block on the open result (sync path, no async executor needed).
-        open_rx
-            .recv()
-            .map_err(|_| FrankenError::Internal("worker thread terminated during open".to_owned()))?
-            .map(|()| Self {
+        match wait_for_worker_open(open_rx) {
+            Ok(()) => Ok(Self {
                 cmd_tx: Some(cmd_tx),
                 worker: Some(worker),
+                worker_cx: Some(worker_cx),
+                owned_runtime,
                 in_txn: Arc::new(AtomicBool::new(false)),
-            })
+            }),
+            Err(error) => {
+                join_worker_task(worker);
+                Err(error)
+            }
+        }
     }
 
     /// Open a database connection with an explicit [`ConnectionEnv`].
@@ -364,32 +389,25 @@ impl AsyncConnection {
 
         let path = path.into();
 
-        // Open the connection on a background thread (it is !Send, so it
-        // must be born on and stay on the worker thread).
+        // Open the connection on a runtime-owned blocking task (it is !Send,
+        // so it must be born on and stay on the worker task's thread).
         let (open_tx, open_rx) = mpsc::sync_channel::<Result<(), FrankenError>>(1);
         let (cmd_tx, cmd_rx) = mpsc::sync_channel::<Command>(32);
-
-        let thread_name = format!("fsqlite-async-worker:{path}");
-        let worker = thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || match Connection::open_with_env(path, env) {
-                Ok(conn) => {
-                    let _ = open_tx.send(Ok(()));
-                    worker_loop(conn, cmd_rx);
-                }
-                Err(e) => {
-                    let _ = open_tx.send(Err(e));
-                }
-            })
-            .map_err(|e| FrankenError::Internal(format!("failed to spawn worker thread: {e}")))?;
+        let runtime = Runtime::current_handle().ok_or_else(requires_runtime_err)?;
+        let worker_cx = NativeCx::for_request();
+        let worker = spawn_worker_task(&runtime, worker_cx.clone(), path, env, cmd_rx, open_tx)?;
 
         // Wait for the open result.
-        let result = OneshotFuture::new(open_rx).await?;
-        result?;
+        if let Err(error) = recv_sync_response(cx, open_rx).await? {
+            join_worker_task(worker);
+            return Err(error);
+        }
 
         Ok(Self {
             cmd_tx: Some(cmd_tx),
             worker: Some(worker),
+            worker_cx: Some(worker_cx),
+            owned_runtime: None,
             in_txn: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -414,7 +432,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute a query with bound parameters and return all result rows.
@@ -436,7 +454,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute a query and return exactly one row.
@@ -452,7 +470,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute a query with parameters and return exactly one row.
@@ -474,7 +492,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute SQL and return the number of affected/output rows.
@@ -490,7 +508,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute SQL with bound parameters and return the number of affected/output rows.
@@ -512,7 +530,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Execute zero or more SQL statements separated by semicolons.
@@ -528,7 +546,7 @@ impl AsyncConnection {
                 tx,
             })
             .map_err(send_err)?;
-        OneshotFuture::new(rx).await?
+        recv_sync_response(cx, rx).await?
     }
 
     /// Begin a transaction.
@@ -541,7 +559,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::BeginTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
         if result.is_ok() {
             self.in_txn.store(true, Ordering::Release);
         }
@@ -558,7 +576,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::CommitTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
         if result.is_ok() {
             self.in_txn.store(false, Ordering::Release);
         }
@@ -575,7 +593,7 @@ impl AsyncConnection {
         self.sender()?
             .send(Command::RollbackTransaction { tx })
             .map_err(send_err)?;
-        let result: Result<(), FrankenError> = OneshotFuture::new(rx).await?;
+        let result: Result<(), FrankenError> = recv_sync_response(cx, rx).await?;
         if result.is_ok() {
             self.in_txn.store(false, Ordering::Release);
         }
@@ -584,7 +602,7 @@ impl AsyncConnection {
 
     /// Returns `true` if an explicit transaction is currently active.
     ///
-    /// This is a cheap local read — no round-trip to the worker thread.
+    /// This is a cheap local read — no round-trip to the worker task.
     #[must_use]
     pub fn in_transaction(&self) -> bool {
         self.in_txn.load(Ordering::Acquire)
@@ -593,7 +611,7 @@ impl AsyncConnection {
     /// Explicitly close the connection, returning any error from the close operation.
     ///
     /// After this call, all subsequent operations will return an error.
-    /// The worker thread is joined before returning.
+    /// The worker task is joined before returning.
     pub async fn close<Caps>(&mut self, cx: &Cx<Caps>) -> Result<(), FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
@@ -603,12 +621,15 @@ impl AsyncConnection {
         if let Some(cmd_tx) = self.cmd_tx.take() {
             let (tx, rx) = mpsc::sync_channel(1);
             cmd_tx.send(Command::Close { tx }).map_err(send_err)?;
-            let result = OneshotFuture::new(rx).await?;
+            let result = recv_sync_response(cx, rx).await?;
 
-            // Join the worker thread.
-            if let Some(handle) = self.worker.take() {
-                let _ = handle.join();
+            if let Some(worker_cx) = self.worker_cx.take() {
+                worker_cx.cancel();
             }
+            if let Some(handle) = self.worker.take() {
+                join_worker_task(handle);
+            }
+            self.owned_runtime = None;
 
             result
         } else {
@@ -620,48 +641,35 @@ impl AsyncConnection {
 
 impl Drop for AsyncConnection {
     fn drop(&mut self) {
-        // Signal the worker to shut down.
         if let Some(cmd_tx) = self.cmd_tx.take() {
             let _ = cmd_tx.send(Command::Shutdown);
         }
-        // Wait for the worker to finish (best-effort, don't block indefinitely).
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
+        if let Some(worker_cx) = self.worker_cx.take() {
+            worker_cx.cancel();
         }
+        if let Some(handle) = self.worker.take() {
+            join_worker_task(handle);
+        }
+        self.owned_runtime = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
     use fsqlite_types::cx::Cx;
 
-    /// Minimal runtime-free test: verify that open + basic queries work
-    /// through the async wrapper using a simple block_on executor.
+    fn test_runtime() -> Runtime {
+        RuntimeBuilder::current_thread()
+            .blocking_threads(2, 2)
+            .build()
+            .expect("test runtime should build")
+    }
+
     #[test]
     fn test_async_connection_basic() {
-        fn block_on<F: std::future::Future>(f: F) -> F::Output {
-            use std::pin::pin;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct ThreadWaker;
-            impl Wake for ThreadWaker {
-                fn wake(self: std::sync::Arc<Self>) {}
-            }
-
-            let waker = Waker::from(std::sync::Arc::new(ThreadWaker));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = pin!(f);
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(val) => return val,
-                    Poll::Pending => std::thread::yield_now(),
-                }
-            }
-        }
-
-        block_on(async {
+        test_runtime().block_on(async {
             let cx = Cx::new();
             let conn = AsyncConnection::open(&cx, ":memory:")
                 .await
@@ -703,28 +711,7 @@ mod tests {
 
     #[test]
     fn test_async_connection_transaction() {
-        fn block_on<F: std::future::Future>(f: F) -> F::Output {
-            use std::pin::pin;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct ThreadWaker;
-            impl Wake for ThreadWaker {
-                fn wake(self: std::sync::Arc<Self>) {}
-            }
-
-            let waker = Waker::from(std::sync::Arc::new(ThreadWaker));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = pin!(f);
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(val) => return val,
-                    Poll::Pending => std::thread::yield_now(),
-                }
-            }
-        }
-
-        block_on(async {
+        test_runtime().block_on(async {
             let cx = Cx::new();
             let conn = AsyncConnection::open(&cx, ":memory:")
                 .await
@@ -758,28 +745,7 @@ mod tests {
 
     #[test]
     fn test_async_connection_cancel() {
-        fn block_on<F: std::future::Future>(f: F) -> F::Output {
-            use std::pin::pin;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct ThreadWaker;
-            impl Wake for ThreadWaker {
-                fn wake(self: std::sync::Arc<Self>) {}
-            }
-
-            let waker = Waker::from(std::sync::Arc::new(ThreadWaker));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = pin!(f);
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(val) => return val,
-                    Poll::Pending => std::thread::yield_now(),
-                }
-            }
-        }
-
-        block_on(async {
+        test_runtime().block_on(async {
             let cx = Cx::new();
             let conn = AsyncConnection::open(&cx, ":memory:")
                 .await
@@ -799,28 +765,7 @@ mod tests {
 
     #[test]
     fn test_async_connection_execute_batch() {
-        fn block_on<F: std::future::Future>(f: F) -> F::Output {
-            use std::pin::pin;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct ThreadWaker;
-            impl Wake for ThreadWaker {
-                fn wake(self: std::sync::Arc<Self>) {}
-            }
-
-            let waker = Waker::from(std::sync::Arc::new(ThreadWaker));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = pin!(f);
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(val) => return val,
-                    Poll::Pending => std::thread::yield_now(),
-                }
-            }
-        }
-
-        block_on(async {
+        test_runtime().block_on(async {
             let cx = Cx::new();
             let conn = AsyncConnection::open(&cx, ":memory:")
                 .await
@@ -838,28 +783,7 @@ mod tests {
 
     #[test]
     fn test_async_connection_close() {
-        fn block_on<F: std::future::Future>(f: F) -> F::Output {
-            use std::pin::pin;
-            use std::task::{Context, Poll, Wake, Waker};
-
-            struct ThreadWaker;
-            impl Wake for ThreadWaker {
-                fn wake(self: std::sync::Arc<Self>) {}
-            }
-
-            let waker = Waker::from(std::sync::Arc::new(ThreadWaker));
-            let mut cx = Context::from_waker(&waker);
-            let mut fut = pin!(f);
-
-            loop {
-                match fut.as_mut().poll(&mut cx) {
-                    Poll::Ready(val) => return val,
-                    Poll::Pending => std::thread::yield_now(),
-                }
-            }
-        }
-
-        block_on(async {
+        test_runtime().block_on(async {
             let cx = Cx::new();
             let mut conn = AsyncConnection::open(&cx, ":memory:")
                 .await
