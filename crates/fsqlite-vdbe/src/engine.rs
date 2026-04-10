@@ -6301,13 +6301,12 @@ impl VdbeEngine {
                     && let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
                     && sc.writable
                 {
-                        sc.cursor.delete(&sc.cx)?;
-                        invalidate_storage_cursor_row_cache_with_reason(
-                            sc,
-                            self.collect_vdbe_metrics,
-                            DecodeCacheInvalidationReason::WriteMutation,
-                        );
-                    }
+                    sc.cursor.delete(&sc.cx)?;
+                    invalidate_storage_cursor_row_cache_with_reason(
+                        sc,
+                        self.collect_vdbe_metrics,
+                        DecodeCacheInvalidationReason::WriteMutation,
+                    );
                 }
             }
         }
