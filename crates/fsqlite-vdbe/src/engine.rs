@@ -173,7 +173,10 @@ use fsqlite_types::{
     SchemaEpoch, StrictColumnType, TableId, WitnessKey,
 };
 
-use crate::{TableIndexMetaMap, VdbeProgram, opcode_register_spans};
+use crate::{
+    TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
+    enter_vdbe_execute_profile_stage, opcode_register_spans,
+};
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
@@ -477,6 +480,110 @@ struct MemRow {
 
 /// In-memory table storage (Phase 4 backend).
 #[derive(Debug, Clone)]
+struct UniqueConstraintState {
+    columns: Vec<usize>,
+    collations: Vec<Option<String>>,
+    index: Option<BTreeMap<Vec<u8>, BTreeSet<i64>>>,
+}
+
+fn unique_constraint_collation_is_indexable(collation: Option<&str>) -> bool {
+    match collation {
+        None => true,
+        Some(name)
+            if name.eq_ignore_ascii_case("BINARY")
+                || name.eq_ignore_ascii_case("NOCASE")
+                || name.eq_ignore_ascii_case("RTRIM") =>
+        {
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+fn unique_constraint_supports_index(collations: &[Option<String>]) -> bool {
+    collations
+        .iter()
+        .all(|collation| unique_constraint_collation_is_indexable(collation.as_deref()))
+}
+
+fn append_unique_constraint_key_component(
+    key: &mut Vec<u8>,
+    value: &SqliteValue,
+    collation: Option<&str>,
+) -> bool {
+    if !unique_constraint_collation_is_indexable(collation) {
+        return false;
+    }
+
+    let is_nocase = collation.is_some_and(|name| name.eq_ignore_ascii_case("NOCASE"));
+    let is_rtrim = collation.is_some_and(|name| name.eq_ignore_ascii_case("RTRIM"));
+
+    match value {
+        SqliteValue::Null => return false,
+        SqliteValue::Integer(i) => {
+            key.push(1);
+            key.extend_from_slice(&i.to_le_bytes());
+        }
+        SqliteValue::Float(f) => {
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) {
+                #[allow(clippy::cast_possible_truncation)]
+                let i = *f as i64;
+                #[allow(clippy::cast_precision_loss)]
+                if (i as f64) == *f {
+                    key.push(1);
+                    key.extend_from_slice(&i.to_le_bytes());
+                    return true;
+                }
+            }
+            key.push(2);
+            key.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        SqliteValue::Text(text) => {
+            key.push(3);
+            if is_nocase {
+                let folded = text.to_ascii_lowercase();
+                #[allow(clippy::cast_possible_truncation)]
+                key.extend_from_slice(&(folded.len() as u64).to_le_bytes());
+                key.extend_from_slice(folded.as_bytes());
+            } else if is_rtrim {
+                let trimmed = trim_rtrim_collation_text(text.as_bytes());
+                #[allow(clippy::cast_possible_truncation)]
+                key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
+                key.extend_from_slice(trimmed);
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                key.extend_from_slice(&(text.len() as u64).to_le_bytes());
+                key.extend_from_slice(text.as_bytes());
+            }
+        }
+        SqliteValue::Blob(bytes) => {
+            key.push(4);
+            #[allow(clippy::cast_possible_truncation)]
+            key.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            key.extend_from_slice(bytes);
+        }
+    }
+
+    true
+}
+
+impl UniqueConstraintState {
+    fn new(columns: Vec<usize>, mut collations: Vec<Option<String>>) -> Self {
+        if collations.len() < columns.len() {
+            collations.resize(columns.len(), None);
+        } else if collations.len() > columns.len() {
+            collations.truncate(columns.len());
+        }
+        let index = unique_constraint_supports_index(&collations).then(BTreeMap::new);
+        Self {
+            columns,
+            collations,
+            index,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct MemTable {
     /// Column count for this table (used when creating the table;
     /// actual row widths may vary).
@@ -485,16 +592,14 @@ pub struct MemTable {
     rows: Vec<MemRow>,
     /// Next auto-increment rowid.
     next_rowid: i64,
-    /// Groups of column indices forming UNIQUE constraints (including
-    /// non-IPK PRIMARY KEY). Each inner `Vec<usize>` is one UNIQUE
-    /// constraint; a conflict occurs when all columns in a group match
-    /// an existing row. Used by the Insert opcode to enforce unique
-    /// constraints in MemDatabase mode (where indexes are no-ops).
-    unique_column_groups: Vec<Vec<usize>>,
-    /// Per-constraint in-memory unique index keyed by the participating
-    /// column values. NULL-containing keys are intentionally omitted because
-    /// SQLite UNIQUE constraints treat NULL as distinct/non-conflicting.
-    unique_indexes: Vec<BTreeMap<Vec<SqliteValue>, BTreeSet<i64>>>,
+    /// UNIQUE constraints tracked for MemDatabase-side enforcement. Builtin
+    /// collations (`BINARY`, `NOCASE`, `RTRIM`) use canonical byte-key
+    /// indexes; other collations fall back to an exact row scan through the
+    /// shared collation registry.
+    unique_constraints: Vec<UniqueConstraintState>,
+    /// Shared collation registry consulted when a UNIQUE constraint uses a
+    /// non-builtin collation that cannot be normalized into a byte key.
+    collation_registry: Arc<Mutex<CollationRegistry>>,
 }
 
 impl MemTable {
@@ -504,36 +609,75 @@ impl MemTable {
             num_columns,
             rows: Vec::new(),
             next_rowid: 1,
-            unique_column_groups: Vec::new(),
-            unique_indexes: Vec::new(),
+            unique_constraints: Vec::new(),
+            collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
         }
+    }
+
+    pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
+        self.collation_registry = registry;
     }
 
     /// Register a group of columns that together form a UNIQUE constraint.
     pub fn add_unique_column_group(&mut self, cols: Vec<usize>) {
-        self.unique_column_groups.push(cols);
-        let group = self
-            .unique_column_groups
-            .last()
-            .expect("just pushed UNIQUE column group");
-        let mut index: BTreeMap<Vec<SqliteValue>, BTreeSet<i64>> = BTreeMap::new();
-        for row in &self.rows {
-            if let Some(key) = Self::unique_key_for_group(&row.values, group) {
-                index.entry(key).or_default().insert(row.rowid);
+        self.add_unique_column_group_with_collations(cols, Vec::new());
+    }
+
+    /// Register a group of columns that together form a UNIQUE constraint
+    /// with explicit per-column collation metadata.
+    pub fn add_unique_column_group_with_collations(
+        &mut self,
+        cols: Vec<usize>,
+        collations: Vec<Option<String>>,
+    ) {
+        let mut constraint = UniqueConstraintState::new(cols, collations);
+        if let Some(index) = constraint.index.as_mut() {
+            for row in &self.rows {
+                if let Some(key) = Self::unique_key_for_constraint(
+                    &row.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                ) {
+                    index.entry(key).or_default().insert(row.rowid);
+                }
             }
         }
-        self.unique_indexes.push(index);
+        self.unique_constraints.push(constraint);
     }
 
     /// Find rows that conflict with `new_values` on any UNIQUE constraint.
     /// Returns the rowids of all conflicting rows.
     pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
         let mut conflicts = BTreeSet::new();
-        for (group, index) in self.unique_column_groups.iter().zip(&self.unique_indexes) {
-            if let Some(key) = Self::unique_key_for_group(new_values, group)
-                && let Some(rowids) = index.get(&key)
-            {
-                conflicts.extend(rowids.iter().copied());
+        let mut collations = None;
+        for constraint in &self.unique_constraints {
+            if let Some(index) = &constraint.index {
+                if let Some(key) = Self::unique_key_for_constraint(
+                    new_values,
+                    &constraint.columns,
+                    &constraint.collations,
+                ) && let Some(rowids) = index.get(&key)
+                {
+                    conflicts.extend(rowids.iter().copied());
+                }
+                continue;
+            }
+
+            let registry = collations.get_or_insert_with(|| {
+                self.collation_registry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            for row in &self.rows {
+                if Self::unique_constraint_matches_row(
+                    &row.values,
+                    new_values,
+                    &constraint.columns,
+                    &constraint.collations,
+                    registry,
+                ) {
+                    conflicts.insert(row.rowid);
+                }
             }
         }
         conflicts.into_iter().collect()
@@ -611,8 +755,10 @@ impl MemTable {
     /// Remove all rows from the table.
     pub fn clear(&mut self) {
         self.rows.clear();
-        for index in &mut self.unique_indexes {
-            index.clear();
+        for constraint in &mut self.unique_constraints {
+            if let Some(index) = constraint.index.as_mut() {
+                index.clear();
+            }
         }
     }
 
@@ -702,25 +848,62 @@ impl MemTable {
         self.insert(rowid, values);
     }
 
-    fn unique_key_for_group(values: &[SqliteValue], group: &[usize]) -> Option<Vec<SqliteValue>> {
-        let mut key = Vec::with_capacity(group.len());
-        for &col_idx in group {
+    fn unique_key_for_constraint(
+        values: &[SqliteValue],
+        columns: &[usize],
+        collations: &[Option<String>],
+    ) -> Option<Vec<u8>> {
+        let mut key = Vec::new();
+        for (position, &col_idx) in columns.iter().enumerate() {
             let value = values.get(col_idx)?;
             if matches!(value, SqliteValue::Null) {
                 return None;
             }
-            key.push(value.clone());
+            let collation = collations.get(position).and_then(|c| c.as_deref());
+            if !append_unique_constraint_key_component(&mut key, value, collation) {
+                return None;
+            }
         }
         Some(key)
     }
 
+    fn unique_constraint_matches_row(
+        existing_values: &[SqliteValue],
+        new_values: &[SqliteValue],
+        columns: &[usize],
+        collations: &[Option<String>],
+        registry: &CollationRegistry,
+    ) -> bool {
+        for (position, &col_idx) in columns.iter().enumerate() {
+            let Some(existing_value) = existing_values.get(col_idx) else {
+                return false;
+            };
+            let Some(new_value) = new_values.get(col_idx) else {
+                return false;
+            };
+            if existing_value.is_null() || new_value.is_null() {
+                return false;
+            }
+            let collation = collations.get(position).and_then(|c| c.as_deref());
+            if cmp_values_collated(existing_value, new_value, collation, registry)
+                != Ordering::Equal
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn remove_unique_entries(&mut self, rowid: i64, values: &[SqliteValue]) {
-        for (group, index) in self
-            .unique_column_groups
-            .iter()
-            .zip(&mut self.unique_indexes)
-        {
-            let Some(key) = Self::unique_key_for_group(values, group) else {
+        for constraint in &mut self.unique_constraints {
+            let Some(index) = constraint.index.as_mut() else {
+                continue;
+            };
+            let Some(key) = Self::unique_key_for_constraint(
+                values,
+                &constraint.columns,
+                &constraint.collations,
+            ) else {
                 continue;
             };
             let remove_entry = if let Some(rowids) = index.get_mut(&key) {
@@ -735,34 +918,45 @@ impl MemTable {
         }
     }
 
-    fn unique_keys_for_values(&self, values: &[SqliteValue]) -> Vec<Option<Vec<SqliteValue>>> {
-        self.unique_column_groups
+    fn unique_keys_for_values(&self, values: &[SqliteValue]) -> Vec<Option<Vec<u8>>> {
+        self.unique_constraints
             .iter()
-            .map(|group| Self::unique_key_for_group(values, group))
+            .map(|constraint| {
+                constraint.index.as_ref().and_then(|_| {
+                    Self::unique_key_for_constraint(
+                        values,
+                        &constraint.columns,
+                        &constraint.collations,
+                    )
+                })
+            })
             .collect()
     }
 
-    fn insert_unique_keys(&mut self, rowid: i64, keys: &[Option<Vec<SqliteValue>>]) {
-        for (maybe_key, index) in keys.iter().zip(&mut self.unique_indexes) {
-            if let Some(key) = maybe_key {
+    fn insert_unique_keys(&mut self, rowid: i64, keys: &[Option<Vec<u8>>]) {
+        for (maybe_key, constraint) in keys.iter().zip(&mut self.unique_constraints) {
+            if let (Some(key), Some(index)) = (maybe_key, constraint.index.as_mut()) {
                 index.entry(key.clone()).or_default().insert(rowid);
             }
         }
     }
 
     fn rebuild_unique_indexes(&mut self) {
-        self.unique_indexes = self
-            .unique_column_groups
-            .iter()
-            .map(|_| BTreeMap::new())
-            .collect();
+        for constraint in &mut self.unique_constraints {
+            if let Some(index) = constraint.index.as_mut() {
+                index.clear();
+            }
+        }
         for row in &self.rows {
-            for (group, index) in self
-                .unique_column_groups
-                .iter()
-                .zip(&mut self.unique_indexes)
-            {
-                if let Some(key) = Self::unique_key_for_group(&row.values, group) {
+            for constraint in &mut self.unique_constraints {
+                let Some(index) = constraint.index.as_mut() else {
+                    continue;
+                };
+                if let Some(key) = Self::unique_key_for_constraint(
+                    &row.values,
+                    &constraint.columns,
+                    &constraint.collations,
+                ) {
                     index.entry(key).or_default().insert(row.rowid);
                 }
             }
@@ -3436,6 +3630,13 @@ impl MemDatabase {
         }
     }
 
+    /// Propagate a shared collation registry to all tracked MemTables.
+    pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
+        for (_, table) in self.tables.iter_mut() {
+            table.set_collation_registry(Arc::clone(&registry));
+        }
+    }
+
     /// Returns the number of tables in the database.
     #[must_use]
     pub fn table_count(&self) -> i32 {
@@ -5807,7 +6008,7 @@ impl VdbeEngine {
         let collation_registry_changed =
             !Arc::ptr_eq(&self.collation_registry, &collation_registry);
         if collation_registry_changed {
-            self.collation_registry = collation_registry;
+            self.set_collation_registry(collation_registry);
         }
         note_rebind(collation_registry_changed);
 
@@ -6188,7 +6389,8 @@ impl VdbeEngine {
     }
 
     /// Attach an in-memory database for cursor operations.
-    pub fn set_database(&mut self, db: MemDatabase) {
+    pub fn set_database(&mut self, mut db: MemDatabase) {
+        db.set_collation_registry(Arc::clone(&self.collation_registry));
         self.db = Some(db);
     }
 
@@ -6570,7 +6772,10 @@ impl VdbeEngine {
 
     /// Attach a shared collation registry for compare and sorting opcodes.
     pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
-        self.collation_registry = registry;
+        self.collation_registry = Arc::clone(&registry);
+        if let Some(db) = self.db.as_mut() {
+            db.set_collation_registry(registry);
+        }
     }
 
     /// Acquire a read-lock on the collation registry.  Callers should hold
@@ -6742,6 +6947,7 @@ impl VdbeEngine {
         mut row_handler: Option<&mut ResultRowCallback<'_>>,
     ) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
+        let _pipeline_profile_stage = enter_vdbe_execute_profile_stage();
         let estimated_make_record_capacity =
             estimate_make_record_buffer_capacity(program, self.page_size);
         self.make_record_lookaside
@@ -8685,13 +8891,21 @@ impl VdbeEngine {
                     // bd-perf: Sideband buffer — if MakeRecord stored bytes in
                     // the MakeRecord sideband lookaside, take ownership here to avoid
                     // Arc allocation. Otherwise fall back to register blob.
-                    let sideband_active =
-                        self.make_record_lookaside.sideband_is_armed_for(record_reg);
+                    let preformatted_record = match &op.p4 {
+                        P4::Blob(bytes) => Some(bytes.as_slice()),
+                        _ => None,
+                    };
+                    let sideband_active = preformatted_record.is_none()
+                        && self.make_record_lookaside.sideband_is_armed_for(record_reg);
                     // Only move the register value out when there is no active
                     // MakeRecord sideband. Doing `take_reg()` first would
                     // eagerly materialize the sideband into an Arc-backed blob
                     // and defeat the INSERT hot-path optimization.
-                    let record_val = if sideband_active {
+                    let record_val = if preformatted_record.is_some() {
+                        self.clear_register_subtype(record_reg);
+                        self.set_reg(record_reg, SqliteValue::Null);
+                        SqliteValue::Null
+                    } else if sideband_active {
                         self.clear_register_subtype(record_reg);
                         SqliteValue::Null
                     } else {
@@ -8714,7 +8928,9 @@ impl VdbeEngine {
                             let root_page = sc.root_page;
                             let autoinc_max = sc.autoincrement_high_water;
                             let rowid_mode = sc.rowid_mode;
-                            let blob = if sideband_active {
+                            let blob = if let Some(record) = preformatted_record {
+                                record
+                            } else if sideband_active {
                                 &sideband_buf[..]
                             } else {
                                 record_blob_bytes(&record_val)
@@ -8849,7 +9065,19 @@ impl VdbeEngine {
                         }
                     } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
-                        let values = if sideband_active {
+                        let values = if let Some(record) = preformatted_record {
+                            let values = parse_record(record).ok_or_else(|| {
+                                FrankenError::internal("malformed SQLite record blob")
+                            })?;
+                            if self.collect_vdbe_metrics {
+                                FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                for value in &values {
+                                    record_decoded_value_metrics(value);
+                                }
+                            }
+                            values
+                        } else if sideband_active {
                             let values = parse_record(&sideband_buf).ok_or_else(|| {
                                 FrankenError::internal("malformed SQLite record blob")
                             })?;
@@ -13994,6 +14222,7 @@ fn decode_record_with_metrics(
         return Ok(Vec::new());
     };
 
+    let _profile_stage = enter_vdbe_decode_profile_stage();
     let values = parse_record(bytes)
         .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
     if collect_vdbe_metrics {
@@ -17916,6 +18145,11 @@ mod tests {
             let prog = b.finish().expect("program should build");
 
             let asm = prog.disassemble();
+            let insert = prog
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("program should contain Insert");
             assert!(asm.contains("Init"), "should have Init opcode");
             assert!(asm.contains("OpenWrite"), "should have OpenWrite opcode");
             assert!(asm.contains("NewRowid"), "should have NewRowid opcode");
@@ -17928,12 +18162,16 @@ mod tests {
                 "should have String8 opcode for literal 'test'"
             );
             assert!(
-                asm.contains("Blob"),
-                "should have Blob opcode for preformatted table record"
+                !prog.ops().iter().any(|op| op.opcode == Opcode::Blob),
+                "preformatted table records should avoid a standalone Blob opcode"
             );
             assert!(
                 !asm.contains("MakeRecord"),
                 "literal-only INSERT should not execute MakeRecord for the table record"
+            );
+            assert!(
+                matches!(&insert.p4, P4::Blob(record) if !record.is_empty()),
+                "Insert should carry the preformatted table record directly in P4"
             );
             assert!(asm.contains("Insert"), "should have Insert opcode");
             assert!(asm.contains("Halt"), "should have Halt opcode");
@@ -18003,6 +18241,112 @@ mod tests {
             );
 
             set_vdbe_metrics_enabled(prev_metrics_enabled);
+        }
+
+        #[test]
+        fn test_codegen_insert_large_literal_blob_round_trips_via_preformatted_insert() {
+            let schema = vec![TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                        is_ipk: false,
+                        type_name: None,
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'A',
+                        is_ipk: false,
+                        type_name: None,
+                        notnull: false,
+                        unique: false,
+                        default_value: None,
+                        strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
+                        collation: None,
+                    },
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            }];
+            let large_blob = vec![0xAB; 5_000];
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::Integer(7), span()),
+                    Expr::Literal(Literal::Blob(large_blob.clone()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![ResultColumn::Star],
+            };
+            let ctx = CodegenContext::default();
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let insert = prog
+                .ops()
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .expect("program should contain Insert");
+            assert!(
+                !prog
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Blob && op.p2 == insert.p2),
+                "preformatted literal rows should not materialize the table record into a Blob register"
+            );
+            assert!(
+                matches!(&insert.p4, P4::Blob(record) if record.len() > 4_096),
+                "Insert should carry the full preformatted record, including large overflow-bound payloads"
+            );
+
+            let mut db = MemDatabase::new();
+            let root = db.create_table(2);
+            assert_eq!(root, 2);
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            engine.enable_storage_cursors(true);
+            engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+
+            let rows: Vec<_> = engine
+                .take_results()
+                .into_iter()
+                .map(|row| row.into_vec())
+                .collect();
+            assert_eq!(
+                rows,
+                vec![vec![
+                    SqliteValue::Integer(7),
+                    SqliteValue::Blob(large_blob.into()),
+                ]],
+                "large literal blob should round-trip through storage even when the record is preformatted on Insert"
+            );
         }
 
         /// Verify emit_expr handles arithmetic BinaryOp in INSERT values.
@@ -21080,6 +21424,72 @@ mod tests {
                 .find_unique_conflicts(&[SqliteValue::Null, SqliteValue::Integer(999)])
                 .is_empty(),
             "NULL keys must remain non-conflicting under SQLite UNIQUE semantics"
+        );
+    }
+
+    #[test]
+    fn test_memtable_unique_conflict_index_honors_nocase_collation() {
+        let mut table = MemTable::new(1);
+        table.add_unique_column_group_with_collations(vec![0], vec![Some("NOCASE".to_owned())]);
+        table.insert(1, vec![SqliteValue::Text("Alice".into())]);
+
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Text("alice".into())]),
+            vec![1],
+            "builtin NOCASE unique indexes must normalize case-equivalent text"
+        );
+    }
+
+    #[test]
+    fn test_engine_database_attachment_propagates_custom_collation_registry_for_memtable_uniques() {
+        struct DashlessNoCaseCollation;
+
+        impl fsqlite_func::collation::CollationFunction for DashlessNoCaseCollation {
+            fn name(&self) -> &str {
+                "DASHLESS_NOCASE"
+            }
+
+            fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
+                let normalize = |bytes: &[u8]| {
+                    bytes
+                        .iter()
+                        .filter(|&&byte| byte != b'-' && byte != b'_' && byte != b' ')
+                        .map(u8::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                };
+                normalize(left).cmp(&normalize(right))
+            }
+        }
+
+        let registry = Arc::new(Mutex::new(CollationRegistry::new()));
+        registry
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .register(DashlessNoCaseCollation);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        {
+            let table = db.get_table_mut(root).expect("table should exist");
+            table.add_unique_column_group_with_collations(
+                vec![0],
+                vec![Some("DASHLESS_NOCASE".to_owned())],
+            );
+            table.insert(1, vec![SqliteValue::Text("Alpha-Beta".into())]);
+        }
+
+        let mut engine = VdbeEngine::new(1);
+        engine.set_database(db);
+        engine.set_collation_registry(Arc::clone(&registry));
+
+        let db = engine
+            .take_database()
+            .expect("database should still be attached");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.find_unique_conflicts(&[SqliteValue::Text("alpha beta".into())]),
+            vec![1],
+            "custom-collation UNIQUE fallback must use the engine-provided registry"
         );
     }
 

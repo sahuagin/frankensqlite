@@ -9783,7 +9783,7 @@ fn codegen_insert_values(
 
                 // --- No conflict path: normal insert ---
                 b.resolve_label(insert_label);
-                emit_table_insert_record(
+                let insert_p4 = emit_table_insert_record(
                     b,
                     val_regs,
                     n_cols_i32,
@@ -9797,7 +9797,7 @@ fn codegen_insert_values(
                     cursor,
                     rec_reg,
                     rowid_reg,
-                    P4::Table(table.name.clone()),
+                    insert_p4,
                     oe_flag,
                 );
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
@@ -9809,7 +9809,7 @@ fn codegen_insert_values(
                 b.resolve_label(done_label);
             } else {
                 // DO NOTHING — oe_flag is already OE_IGNORE, just do normal insert.
-                emit_table_insert_record(
+                let insert_p4 = emit_table_insert_record(
                     b,
                     val_regs,
                     n_cols_i32,
@@ -9823,7 +9823,7 @@ fn codegen_insert_values(
                     cursor,
                     rec_reg,
                     rowid_reg,
-                    P4::Table(table.name.clone()),
+                    insert_p4,
                     oe_flag,
                 );
                 emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
@@ -9833,7 +9833,7 @@ fn codegen_insert_values(
             }
         } else {
             // No upsert — normal insert path.
-            emit_table_insert_record(
+            let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
                 n_cols_i32,
@@ -9847,7 +9847,7 @@ fn codegen_insert_values(
                 cursor,
                 rec_reg,
                 rowid_reg,
-                P4::Table(table.name.clone()),
+                insert_p4,
                 oe_flag,
             );
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
@@ -9873,17 +9873,11 @@ fn emit_table_insert_record(
     table: &TableSchema,
     affinity: &str,
     preformatted_record: Option<&[u8]>,
-) {
+) -> P4 {
     if let Some(record) = preformatted_record {
-        #[allow(clippy::cast_possible_truncation)]
-        b.emit_op(
-            Opcode::Blob,
-            record.len() as i32,
-            target_reg,
-            0,
-            P4::Blob(record.to_vec()),
-            0,
-        );
+        // Keep the preformatted record off the register file entirely.
+        // INSERT can consume the baked row image directly from P4.
+        P4::Blob(record.to_vec())
     } else {
         b.emit_op(
             Opcode::MakeRecord,
@@ -9893,6 +9887,7 @@ fn emit_table_insert_record(
             make_insert_record_p4(table, affinity),
             0,
         );
+        P4::Table(table.name.clone())
     }
 }
 
@@ -18340,11 +18335,23 @@ mod tests {
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
         let ops = opcode_sequence(&prog);
+        let insert = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("literal INSERT should emit Insert");
 
-        assert!(ops.contains(&Opcode::Blob));
+        assert!(
+            !ops.contains(&Opcode::Blob),
+            "literal-only INSERT VALUES should not need a standalone Blob opcode"
+        );
         assert!(
             !ops.contains(&Opcode::MakeRecord),
             "literal-only INSERT VALUES should preformat the table record"
+        );
+        assert!(
+            matches!(&insert.p4, P4::Blob(record) if !record.is_empty()),
+            "Insert should carry the preformatted table record directly in P4"
         );
     }
 
