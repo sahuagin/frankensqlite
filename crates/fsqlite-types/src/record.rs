@@ -1058,10 +1058,9 @@ fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
     let eq_one = values.simd_eq(Simd::splat(1));
     let fits_i8 = values.simd_ge(Simd::splat(-128)) & values.simd_le(Simd::splat(127));
     let fits_i16 = values.simd_ge(Simd::splat(-32_768)) & values.simd_le(Simd::splat(32_767));
-    let fits_i24 =
-        values.simd_ge(Simd::splat(-8_388_608)) & values.simd_le(Simd::splat(8_388_607));
-    let fits_i32 = values.simd_ge(Simd::splat(-2_147_483_648))
-        & values.simd_le(Simd::splat(2_147_483_647));
+    let fits_i24 = values.simd_ge(Simd::splat(-8_388_608)) & values.simd_le(Simd::splat(8_388_607));
+    let fits_i32 =
+        values.simd_ge(Simd::splat(-2_147_483_648)) & values.simd_le(Simd::splat(2_147_483_647));
     let fits_i48 = values.simd_ge(Simd::splat(-140_737_488_355_328))
         & values.simd_le(Simd::splat(140_737_488_355_327));
 
@@ -1138,16 +1137,14 @@ fn write_classified_integer_block(
     }
 }
 
-/// Serialize an all-integer record using a safe 4-lane classifier.
-///
-/// On x86_64 hosts with AVX2 available at runtime, the serial-type
-/// classification step uses nightly `portable_simd`; other hosts fall back to
-/// the same scalar encoding logic.
-pub fn simd_serialize_integer_record<'a, I>(values: I, buf: &mut Vec<u8>) -> bool
+fn serialize_integer_record_with_classifier<'a, I>(
+    values: I,
+    buf: &mut Vec<u8>,
+    use_simd: bool,
+) -> bool
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    let use_simd = avx2_available();
     let mut body_size = 0usize;
     let mut column_count = 0usize;
     let mut block_values = [0_i64; 4];
@@ -1227,6 +1224,18 @@ where
     debug_assert_eq!(header_offset, header_size);
     debug_assert_eq!(body_offset, total_size);
     true
+}
+
+/// Serialize an all-integer record using a safe 4-lane classifier.
+///
+/// On x86_64 hosts with AVX2 available at runtime, the serial-type
+/// classification step uses nightly `portable_simd`; other hosts fall back to
+/// the same scalar encoding logic.
+pub fn simd_serialize_integer_record<'a, I>(values: I, buf: &mut Vec<u8>) -> bool
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    serialize_integer_record_with_classifier(values, buf, avx2_available())
 }
 
 /// Serialize a list of `SqliteValue` into the SQLite record format.
@@ -2275,6 +2284,28 @@ mod tests {
     }
 
     #[test]
+    fn simd_integer_record_scalar_fallback_matches_scalar_record_bytes() {
+        let row = vec![
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-128),
+            SqliteValue::Integer(32_767),
+            SqliteValue::Integer(32_768),
+            SqliteValue::Integer(8_388_607),
+            SqliteValue::Integer(8_388_608),
+            SqliteValue::Integer(i64::MIN),
+        ];
+
+        let mut scalar_fallback = Vec::new();
+        assert!(serialize_integer_record_with_classifier(
+            row.iter(),
+            &mut scalar_fallback,
+            false,
+        ));
+        assert_eq!(scalar_fallback, serialize_record(&row));
+    }
+
+    #[test]
     fn simd_integer_record_rejects_non_integer_rows_without_mutating_buffer() {
         let row = vec![
             SqliteValue::Integer(7),
@@ -2285,6 +2316,15 @@ mod tests {
         let mut fast = Vec::from([0xAA, 0xBB]);
         assert!(!simd_serialize_integer_record(row.iter(), &mut fast));
         assert_eq!(fast, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn simd_integer_record_handles_empty_rows() {
+        let row = Vec::<SqliteValue>::new();
+
+        let mut fast = Vec::new();
+        assert!(simd_serialize_integer_record(row.iter(), &mut fast));
+        assert_eq!(fast, serialize_record(&row));
     }
 
     #[test]

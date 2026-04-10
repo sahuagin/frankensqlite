@@ -67,10 +67,10 @@ harness = false
 name = "pipeline_stages"
 harness = false
 
-# Cannot inherit workspace lints because workspace forbids unsafe_code
-# and the SIMD MakeRecord helper requires a tightly scoped unsafe island.
+# Keep VDBE aligned with the workspace-wide unsafe ban. The SIMD MakeRecord
+# path now uses safe `portable_simd` code in `fsqlite-types`.
 [lints.rust]
-unsafe_code = "allow"
+unsafe_code = "forbid"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }
