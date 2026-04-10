@@ -189,6 +189,45 @@ fn test_v2_sequential_explicit_rowid_inserts_keep_append_path_hot() {
 }
 
 #[test]
+fn test_v2_plain_execute_sequential_inserts_keep_append_path_hot_across_statements() {
+    let _guard = v2_test_guard();
+    let conn = new_mem_conn();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, score INTEGER)")
+        .unwrap();
+
+    let (_result, metrics) = capture_vdbe_metrics(|| {
+        conn.execute("BEGIN").unwrap();
+        for rowid in 1..=128_i64 {
+            conn.execute(&format!(
+                "INSERT INTO t VALUES ({rowid}, lower('V{rowid}'), abs(-{rowid}))"
+            ))
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+    });
+
+    let count = conn.query_row("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(count.values()[0].to_integer(), 128);
+    log_track_t_metrics("plain_execute_sequential_across_statements", &metrics);
+
+    assert!(
+        metrics.insert_append_count >= 120,
+        "repeated reusable-lane INSERT statements should reuse the append path across statements, got {:?}",
+        metrics
+    );
+    assert!(
+        metrics.insert_seek_count <= 8,
+        "repeated reusable-lane INSERT statements should avoid repeated existence seeks, got {:?}",
+        metrics
+    );
+    assert_eq!(
+        metrics.insert_append_hint_clear_count, 0,
+        "repeated reusable-lane INSERT statements should preserve the append hint across statements, got {:?}",
+        metrics
+    );
+}
+
+#[test]
 fn test_v2_midstream_insert_clears_append_hint_until_right_edge_reestablished() {
     let _guard = v2_test_guard();
     let conn = new_mem_conn();
