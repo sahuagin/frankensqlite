@@ -992,6 +992,7 @@ fn parse_primary(
 
 /// A posting in the inverted index.
 type Positions = SmallVec<[u32; 4]>;
+type PostingList = SmallVec<[Posting; 1]>;
 
 #[derive(Debug, Clone)]
 pub struct Posting {
@@ -1004,7 +1005,7 @@ pub struct Posting {
 #[derive(Debug, Default, Clone)]
 pub struct InvertedIndex {
     /// term -> list of postings
-    index: HashMap<String, Vec<Posting>>,
+    index: HashMap<String, PostingList>,
     /// Total number of documents
     doc_count: u64,
     /// Total token count per document (for BM25 avgdl)
@@ -1073,11 +1074,11 @@ impl InvertedIndex {
                 positions.push(position);
                 self.index.insert(
                     term.to_owned(),
-                    vec![Posting {
+                    SmallVec::from_buf([Posting {
                         docid,
                         column,
                         positions,
-                    }],
+                    }]),
                 );
             }
         });
@@ -1098,7 +1099,7 @@ impl InvertedIndex {
     /// Look up postings for a term.
     #[must_use]
     pub fn get_postings(&self, term: &str) -> &[Posting] {
-        self.index.get(term).map_or(&[], Vec::as_slice)
+        self.index.get(term).map_or(&[], SmallVec::as_slice)
     }
 
     /// Look up postings for terms matching a prefix.
@@ -1284,6 +1285,23 @@ fn search_rows_with_weights_from_parts(
             let row = documents.get(&docid).cloned().unwrap_or_default();
             (docid, score, row)
         })
+        .collect();
+
+    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(results)
+}
+
+fn search_docids_with_weights_from_parts(
+    index: &InvertedIndex,
+    columns: &[String],
+    queries: &[&str],
+    weights: &[f64],
+) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
+    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries)?;
+
+    let mut results: Vec<(i64, f64)> = matching_docs
+        .into_iter()
+        .map(|docid| (docid, bm25_score(index, docid, &query_terms, weights)))
         .collect();
 
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1801,17 +1819,7 @@ impl Fts5Table {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        let rows = search_rows_with_weights_from_parts(
-            &self.index,
-            &self.columns,
-            &self.documents,
-            queries,
-            weights,
-        )?;
-        Ok(rows
-            .into_iter()
-            .map(|(rowid, score, _columns)| (rowid, score))
-            .collect())
+        search_docids_with_weights_from_parts(&self.index, &self.columns, queries, weights)
     }
 
     pub fn search_rows(
@@ -2117,8 +2125,8 @@ impl VirtualTable for Fts5Table {
 /// FTS5 cursor for scanning query results.
 #[derive(Debug)]
 pub struct Fts5Cursor {
-    /// Matching (rowid, score, column_values) tuples.
-    results: Vec<(i64, f64, Vec<String>)>,
+    /// Matching (rowid, score) tuples.
+    results: Vec<(i64, f64)>,
     /// Current position in results.
     position: usize,
     /// Column names.
@@ -2147,10 +2155,9 @@ impl VirtualTableCursor for Fts5Cursor {
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
                 let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-                self.results = search_rows_with_weights_from_parts(
+                self.results = search_docids_with_weights_from_parts(
                     &self.index,
                     &self.columns,
-                    &self.documents,
                     &query_refs,
                     &weights,
                 )
@@ -2158,12 +2165,13 @@ impl VirtualTableCursor for Fts5Cursor {
             }
         } else {
             // Full table scan (idx_num == 0): return all documents.
-            let mut rows: Vec<(i64, f64, Vec<String>)> = self
+            let mut rows: Vec<(i64, f64)> = self
                 .documents
-                .iter()
-                .map(|(rowid, cols)| (*rowid, 0.0, cols.clone()))
+                .keys()
+                .copied()
+                .map(|rowid| (rowid, 0.0))
                 .collect();
-            rows.sort_by_key(|(rowid, _, _)| *rowid);
+            rows.sort_by_key(|(rowid, _)| *rowid);
             self.results = rows;
         }
 
@@ -2180,14 +2188,16 @@ impl VirtualTableCursor for Fts5Cursor {
     }
 
     fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
-        if let Some((_, score, cols)) = self.results.get(self.position) {
+        if let Some((rowid, score)) = self.results.get(self.position) {
             #[allow(clippy::cast_sign_loss)]
             let col_idx = col as usize;
 
             // Column -1 or column == num_columns is the rank.
             if col < 0 || col_idx >= self.columns.len() {
                 ctx.set_value(SqliteValue::Float(*score));
-            } else if let Some(val) = cols.get(col_idx) {
+            } else if let Some(cols) = self.documents.get(rowid)
+                && let Some(val) = cols.get(col_idx)
+            {
                 ctx.set_value(SqliteValue::Text(SmallText::new(val.as_str())));
             } else {
                 ctx.set_value(SqliteValue::Null);
@@ -2199,14 +2209,21 @@ impl VirtualTableCursor for Fts5Cursor {
     fn rowid(&self) -> Result<i64> {
         self.results
             .get(self.position)
-            .map_or(Ok(0), |(rowid, _, _)| Ok(*rowid))
+            .map_or(Ok(0), |(rowid, _)| Ok(*rowid))
     }
 }
 
 impl Fts5Cursor {
     /// Set the query results for this cursor (used in integrated search).
     pub fn set_results(&mut self, results: Vec<(i64, f64, Vec<String>)>) {
-        self.results = results;
+        self.documents = results
+            .iter()
+            .map(|(rowid, _, columns)| (*rowid, columns.clone()))
+            .collect();
+        self.results = results
+            .into_iter()
+            .map(|(rowid, score, _columns)| (rowid, score))
+            .collect();
         self.position = 0;
     }
 }
