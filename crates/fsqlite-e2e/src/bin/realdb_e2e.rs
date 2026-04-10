@@ -2405,6 +2405,7 @@ fn benchmark_all_mode_lanes() -> [BenchExecutionLane; 3] {
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_bench_matrix_selection(
     mut golden_dir: PathBuf,
     golden_dir_overridden: bool,
