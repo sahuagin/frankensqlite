@@ -1019,27 +1019,38 @@ impl InvertedIndex {
     /// Index a raw text value directly from a tokenizer, avoiding a temporary
     /// `Vec<Fts5Token>` on hot ingest paths.
     pub fn add_text(&mut self, docid: i64, column: u32, tokenizer: &dyn Fts5Tokenizer, text: &str) {
-        let mut term_positions: HashMap<String, Positions> = HashMap::new();
         let mut token_count = 0_u32;
         tokenizer.visit_tokens(text, &mut |term, _start, _end, _| {
             let position = token_count;
             token_count = token_count.saturating_add(1);
-            if let Some(positions) = term_positions.get_mut(term) {
-                positions.push(position);
+            if let Some(postings) = self.index.get_mut(term) {
+                if let Some(last_posting) = postings.last_mut()
+                    && last_posting.docid == docid
+                    && last_posting.column == column
+                {
+                    last_posting.positions.push(position);
+                } else {
+                    let mut positions = Positions::new();
+                    positions.push(position);
+                    postings.push(Posting {
+                        docid,
+                        column,
+                        positions,
+                    });
+                }
             } else {
                 let mut positions = Positions::new();
                 positions.push(position);
-                term_positions.insert(term.to_owned(), positions);
+                self.index.insert(
+                    term.to_owned(),
+                    vec![Posting {
+                        docid,
+                        column,
+                        positions,
+                    }],
+                );
             }
         });
-
-        for (term, positions) in term_positions {
-            self.index.entry(term).or_default().push(Posting {
-                docid,
-                column,
-                positions,
-            });
-        }
 
         *self.doc_lengths.entry(docid).or_insert(0) += token_count;
         self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
@@ -2655,7 +2666,7 @@ mod tests {
     #[test]
     fn test_inverted_index_add_text_matches_tokenized_path() {
         let tok = Unicode61Tokenizer::new();
-        let text = "hello hello world";
+        let text = "hello world hello";
 
         let mut via_tokens = InvertedIndex::new();
         via_tokens.add_document(1, 0, &tok.tokenize(text));
