@@ -240,12 +240,12 @@ fn parse_timestring(s: &str) -> Option<f64> {
 }
 
 fn parse_iso8601(s: &str) -> Option<f64> {
-    // YYYY-MM-DD HH:MM:SS.SSS  or  YYYY-MM-DDTHH:MM:SS.SSS
-    // YYYY-MM-DD HH:MM:SS  or  YYYY-MM-DD HH:MM
+    // YYYY-MM-DD HH:MM:SS.SSS[Z|±HH:MM]  or  YYYY-MM-DDTHH:MM:SS.SSS[Z|±HH:MM]
+    // YYYY-MM-DD HH:MM:SS[Z|±HH:MM]  or  YYYY-MM-DD HH:MM[Z|±HH:MM]
     // YYYY-MM-DD
-    // HH:MM:SS.SSS  (bare time → 2000-01-01)
-    // HH:MM:SS
-    // HH:MM
+    // HH:MM:SS.SSS[Z|±HH:MM]  (bare time → 2000-01-01)
+    // HH:MM:SS[Z|±HH:MM]
+    // HH:MM[Z|±HH:MM]
 
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -267,19 +267,107 @@ fn parse_iso8601(s: &str) -> Option<f64> {
         // Separator: space or 'T'.
         if len > 10 && (bytes[10] == b' ' || bytes[10] == b'T') {
             let time_part = &s[11..];
-            let (h, mi, sec, frac) = parse_time_part(time_part)?;
-            return Some(ymdhms_to_jdn(y, m, d, h, mi, sec, frac));
+            let (h, mi, sec, frac, tz_offset_min) = parse_time_part_with_tz(time_part)?;
+            let jdn = ymdhms_to_jdn(y, m, d, h, mi, sec, frac);
+            // Apply TZ offset: subtract the offset to convert local → UTC.
+            // For "+01:00", local = UTC + 1h, so UTC = local - 1h.
+            return Some(jdn - (tz_offset_min as f64) / 1440.0);
         }
         return None;
     }
 
-    // Bare time: HH:MM:SS or HH:MM:SS.SSS or HH:MM
+    // Bare time: HH:MM:SS or HH:MM:SS.SSS or HH:MM, optionally with TZ suffix.
     if len >= 5 && bytes[2] == b':' {
-        let (h, mi, sec, frac) = parse_time_part(s)?;
-        return Some(ymdhms_to_jdn(2000, 1, 1, h, mi, sec, frac));
+        let (h, mi, sec, frac, tz_offset_min) = parse_time_part_with_tz(s)?;
+        let jdn = ymdhms_to_jdn(2000, 1, 1, h, mi, sec, frac);
+        return Some(jdn - (tz_offset_min as f64) / 1440.0);
     }
 
     None
+}
+
+/// Split an optional trailing ISO-8601 timezone suffix (`Z`, `+HH:MM`, `-HH:MM`,
+/// or the compact `±HHMM` / `±HH` forms) from a time string.
+///
+/// Returns the time string without the suffix and the offset in minutes east
+/// of UTC.  `+01:00` returns `60`, `-05:30` returns `-330`, `Z` returns `0`.
+///
+/// If no recognised suffix is present, returns `(s, 0)`.
+fn split_tz_suffix(s: &str) -> Option<(&str, i64)> {
+    // Trailing 'Z' or 'z' → UTC.
+    if let Some(stripped) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        return Some((stripped, 0));
+    }
+
+    // Find the last '+' or '-' that could plausibly start a tz offset.
+    // The sign must appear AFTER the seconds (or minutes) portion — i.e.
+    // after the last ':' or after a '.' fractional seconds block — so we
+    // never confuse a negative fractional value with a tz sign.
+    //
+    // Scan from the right: the first '+' or '-' we hit *before* any
+    // alphanumeric mismatch is the tz sign, provided the remainder is a
+    // well-formed HH[:MM] / HHMM offset.
+    let bytes = s.as_bytes();
+    // Look at the trailing 6 chars ("+HH:MM"), 5 chars ("+HHMM"), or 3 chars ("+HH").
+    for width in [6usize, 5, 3] {
+        if bytes.len() < width + 1 {
+            continue;
+        }
+        let split_at = bytes.len() - width;
+        let sign_byte = bytes[split_at];
+        if sign_byte != b'+' && sign_byte != b'-' {
+            continue;
+        }
+        let tz_part = &s[split_at..];
+        if let Some(offset) = parse_tz_offset(tz_part) {
+            return Some((&s[..split_at], offset));
+        }
+    }
+
+    // No recognised TZ suffix.
+    Some((s, 0))
+}
+
+/// Parse an ISO-8601 timezone offset like `+01:00`, `-05:30`, `+0100`, or `+05`.
+/// Returns the offset in minutes east of UTC, or None if not a valid offset.
+fn parse_tz_offset(tz: &str) -> Option<i64> {
+    let bytes = tz.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let sign: i64 = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &tz[1..];
+    let (hours, minutes) = match rest.len() {
+        // ±HH:MM
+        5 if rest.as_bytes()[2] == b':' => (
+            rest[0..2].parse::<i64>().ok()?,
+            rest[3..5].parse::<i64>().ok()?,
+        ),
+        // ±HHMM
+        4 => (
+            rest[0..2].parse::<i64>().ok()?,
+            rest[2..4].parse::<i64>().ok()?,
+        ),
+        // ±HH
+        2 => (rest.parse::<i64>().ok()?, 0),
+        _ => return None,
+    };
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+/// Parse "HH:MM:SS.SSS" or "HH:MM:SS" or "HH:MM", optionally followed by a
+/// timezone suffix.  Returns `(h, mi, sec, frac, tz_offset_minutes)`.
+fn parse_time_part_with_tz(s: &str) -> Option<(i64, i64, i64, f64, i64)> {
+    let (time_only, tz_offset_min) = split_tz_suffix(s)?;
+    let (h, mi, sec, frac) = parse_time_part(time_only)?;
+    Some((h, mi, sec, frac, tz_offset_min))
 }
 
 /// Parse "HH:MM:SS.SSS" or "HH:MM:SS" or "HH:MM".
@@ -1030,6 +1118,175 @@ mod tests {
                 assert!((jdn - 2_460_384.5).abs() < 0.01, "unexpected JDN: {jdn}");
             }
             other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    // ── RFC3339 / ISO-8601 timezone suffix parsing ────────────────────
+    //
+    // Regression coverage for issue #64: julianday() must accept
+    // Z / ±HH:MM / ±HHMM / ±HH timezone-bearing timestamps and convert
+    // them to UTC before computing the Julian day.  The expected JDN
+    // values below match the C SQLite reference implementation.
+
+    fn julianday_float(input: &str) -> f64 {
+        match JuliandayFunc.invoke(&[text(input)]).unwrap() {
+            SqliteValue::Float(v) => v,
+            other => panic!("expected Float, got {other:?} for input {input:?}"),
+        }
+    }
+
+    fn assert_jdn_close(actual: f64, expected: f64, ctx: &str) {
+        // 1 µs precision (86400e6 µs / day) is well within float epsilon.
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "JDN mismatch for {ctx}: got {actual}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_z_suffix() {
+        // Zulu (UTC) — should match the equivalent naive form exactly.
+        let naive = julianday_float("2026-04-07 16:00:00");
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00Z"),
+            naive,
+            "T...Z",
+        );
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00z"),
+            naive,
+            "lowercase z",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_zero_offset() {
+        let naive = julianday_float("2026-04-07 16:00:00");
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00+00:00"),
+            naive,
+            "+00:00",
+        );
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00-00:00"),
+            naive,
+            "-00:00",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_positive_offset() {
+        // 16:00 +01:00 = 15:00 UTC → JDN is 1 hour (1/24) earlier.
+        let base = julianday_float("2026-04-07 16:00:00");
+        let expected = base - 1.0 / 24.0;
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00+01:00"),
+            expected,
+            "+01:00",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_negative_offset() {
+        // 16:00 -05:00 = 21:00 UTC → JDN is 5 hours later.
+        let base = julianday_float("2026-04-07 16:00:00");
+        let expected = base + 5.0 / 24.0;
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00-05:00"),
+            expected,
+            "-05:00",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_half_hour_offset() {
+        // India Standard Time is UTC+05:30.
+        let base = julianday_float("2026-04-07 16:00:00");
+        let expected = base - 5.5 / 24.0;
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00+05:30"),
+            expected,
+            "+05:30",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_compact_offsets() {
+        // Compact ISO-8601 offsets: ±HHMM and ±HH.
+        let base = julianday_float("2026-04-07 16:00:00");
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00+0100"),
+            base - 1.0 / 24.0,
+            "+0100",
+        );
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00-0530"),
+            base + 5.5 / 24.0,
+            "-0530",
+        );
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00+09"),
+            base - 9.0 / 24.0,
+            "+09",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_fractional_seconds_with_tz() {
+        // Fractional seconds must play nicely with the TZ suffix split.
+        let base = julianday_float("2026-04-07 16:00:00.500");
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00.500Z"),
+            base,
+            "fractional + Z",
+        );
+        assert_jdn_close(
+            julianday_float("2026-04-07T16:00:00.500+01:00"),
+            base - 1.0 / 24.0,
+            "fractional + +01:00",
+        );
+    }
+
+    #[test]
+    fn test_date_and_time_rfc3339_round_trip() {
+        // date()/time()/datetime() all flow through parse_timestring, so
+        // they should agree with the timezone conversion above.
+        assert_text(
+            &DateFunc
+                .invoke(&[text("2026-04-07T16:00:00+05:00")])
+                .unwrap(),
+            // 16:00 +05:00 = 11:00 UTC on the same date.
+            "2026-04-07",
+        );
+        assert_text(
+            &TimeFunc
+                .invoke(&[text("2026-04-07T16:00:00+05:00")])
+                .unwrap(),
+            "11:00:00",
+        );
+        assert_text(
+            &DateTimeFunc
+                .invoke(&[text("2026-04-07T16:00:00+05:00")])
+                .unwrap(),
+            "2026-04-07 11:00:00",
+        );
+    }
+
+    #[test]
+    fn test_julianday_rfc3339_invalid_offsets_return_null() {
+        // Malformed offsets fall through and return NULL (invalid input).
+        for bad in &[
+            "2026-04-07T16:00:00+25:00", // hour out of range
+            "2026-04-07T16:00:00+01:99", // minute out of range
+            "2026-04-07T16:00:00+1",     // too short
+            "2026-04-07T16:00:00+123",   // wrong width
+        ] {
+            let result = JuliandayFunc.invoke(&[text(bad)]).unwrap();
+            assert_eq!(
+                result,
+                SqliteValue::Null,
+                "expected NULL for malformed offset {bad:?}, got {result:?}"
+            );
         }
     }
 
