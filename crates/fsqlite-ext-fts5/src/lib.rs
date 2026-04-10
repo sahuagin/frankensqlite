@@ -1661,16 +1661,24 @@ impl Fts5Table {
         self.next_rowid = snapshot.next_rowid;
     }
 
+    fn index_document_with_tokenizer(
+        &mut self,
+        rowid: i64,
+        column_values: &[String],
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        #[allow(clippy::cast_possible_truncation)]
+        for (col_idx, text) in column_values.iter().enumerate() {
+            self.index.add_text(rowid, col_idx as u32, tokenizer, text);
+        }
+    }
+
     /// Insert a document into the FTS5 table.
     pub fn insert_document(&mut self, rowid: i64, column_values: &[String]) {
         let tokenizer = create_tokenizer(&self.tokenizer_name)
             .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
 
-        #[allow(clippy::cast_possible_truncation)]
-        for (col_idx, text) in column_values.iter().enumerate() {
-            self.index
-                .add_text(rowid, col_idx as u32, tokenizer.as_ref(), text);
-        }
+        self.index_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
 
         self.documents.insert(rowid, column_values.to_vec());
         debug!(rowid, cols = column_values.len(), "fts5: indexed document");
@@ -1684,13 +1692,20 @@ impl Fts5Table {
     }
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
-    pub fn rebuild_documents(&mut self, rows: &[(i64, Vec<String>)]) {
-        self.index = InvertedIndex::new();
-        self.documents.clear();
+    pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
+        self.index = InvertedIndex {
+            index: HashMap::new(),
+            doc_count: 0,
+            doc_lengths: HashMap::with_capacity(rows.len()),
+        };
+        self.documents = HashMap::with_capacity(rows.len());
         self.next_rowid = 1;
+        let tokenizer = create_tokenizer(&self.tokenizer_name)
+            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
         for (rowid, columns) in rows {
-            self.insert_document(*rowid, columns);
+            self.index_document_with_tokenizer(rowid, &columns, tokenizer.as_ref());
             self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+            self.documents.insert(rowid, columns);
         }
     }
 
@@ -3762,6 +3777,37 @@ mod tests {
         let cx = Cx::new();
         let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
         assert!(vtab.update(&cx, &[]).is_err());
+    }
+
+    #[test]
+    fn test_fts5_rebuild_documents_preserves_documents_and_next_rowid() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["stale".to_owned()]);
+
+        table.rebuild_documents(vec![
+            (3, vec!["hello world".to_owned()]),
+            (7, vec!["second doc".to_owned()]),
+        ]);
+
+        let expected_doc_3 = vec!["hello world".to_owned()];
+        let expected_doc_7 = vec!["second doc".to_owned()];
+        assert_eq!(table.get_document(3), Some(expected_doc_3.as_slice()));
+        assert_eq!(table.get_document(7), Some(expected_doc_7.as_slice()));
+        assert!(table.get_document(1).is_none());
+
+        let cx = Cx::new();
+        let rowid = table
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text(SmallText::from_string("third doc")),
+                ],
+            )
+            .expect("insert after rebuild")
+            .expect("rowid");
+        assert_eq!(rowid, 8);
     }
 
     #[test]
