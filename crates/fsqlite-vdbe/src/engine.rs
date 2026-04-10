@@ -16909,6 +16909,60 @@ mod tests {
     }
 
     #[test]
+    fn test_register_value_take_reg_materializes_sideband_once_and_clears_slot() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let mut engine = VdbeEngine::new(4);
+        engine.set_reg_int(1, 17);
+        engine.set_reg(2, SqliteValue::Text("take-track-s".into()));
+
+        let make_record = VdbeOp {
+            opcode: Opcode::MakeRecord,
+            p1: 1,
+            p2: 2,
+            p3: 3,
+            p4: P4::None,
+            p5: 0,
+        };
+        engine.execute_make_record_hot(&make_record, false);
+
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let taken = engine.take_reg(3);
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(
+            after - before,
+            1,
+            "taking a sideband-backed register should materialize it exactly once"
+        );
+        assert_eq!(
+            decode_record(&taken).expect("taken register value should decode"),
+            vec![
+                SqliteValue::Integer(17),
+                SqliteValue::Text("take-track-s".into()),
+            ]
+        );
+        assert_eq!(
+            engine.get_reg(3),
+            &SqliteValue::Null,
+            "take_reg must clear the register slot after moving the value out"
+        );
+        assert_eq!(
+            engine.take_reg(3),
+            SqliteValue::Null,
+            "subsequent reads after take_reg should observe the cleared slot"
+        );
+        assert_eq!(
+            vdbe_test_sideband_materialization_count_snapshot(),
+            after,
+            "cleared register should not trigger a second sideband materialization"
+        );
+    }
+
+    #[test]
     fn test_register_value_insert_avoids_make_record_blob_materialization() {
         let _guard = VDBE_OBSERVABILITY_LOCK
             .lock()

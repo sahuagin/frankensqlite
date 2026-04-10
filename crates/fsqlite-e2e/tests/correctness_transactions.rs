@@ -1219,6 +1219,92 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
 }
 
 #[test]
+fn txn_file_backed_retained_autocommit_schema_change_boundary_matches_rusqlite() {
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp
+        .path()
+        .join("oracle_retained_autocommit_schema_change.db");
+    let f_path = tmp
+        .path()
+        .join("candidate_retained_autocommit_schema_change.db");
+    let f_path_string = f_path.to_string_lossy().into_owned();
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn = fsqlite::Connection::open(&f_path_string).expect("open fsqlite db");
+    f_conn
+        .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+        .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+
+    let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
+    c_conn.execute(schema_sql, []).expect("csqlite schema");
+    f_conn.execute(schema_sql).expect("fsqlite schema");
+
+    c_conn
+        .execute("INSERT INTO msgs VALUES (1, 'alpha');", [])
+        .expect("csqlite insert");
+    f_conn
+        .execute("INSERT INTO msgs VALUES (1, 'alpha');")
+        .expect("fsqlite insert");
+    assert_eq!(
+        csqlite_query_values(&c_conn, "SELECT id, val FROM msgs ORDER BY id;"),
+        fsqlite_query_values(&f_conn, "SELECT id, val FROM msgs ORDER BY id;"),
+        "same-connection retained read-after-write should match before the schema boundary"
+    );
+
+    let ddl_sql = "CREATE TABLE aux_msgs(id INTEGER PRIMARY KEY, note TEXT NOT NULL);";
+    c_conn
+        .execute(ddl_sql, [])
+        .expect("csqlite schema boundary");
+    f_conn.execute(ddl_sql).expect("fsqlite schema boundary");
+    assert_eq!(
+        csqlite_query_values(
+            &c_conn,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'aux_msgs';",
+        ),
+        fsqlite_query_values(
+            &f_conn,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'aux_msgs';",
+        ),
+        "schema boundary should preserve the same table catalog view as the oracle"
+    );
+    assert_eq!(
+        csqlite_query_values(&c_conn, "SELECT id, val FROM msgs ORDER BY id;"),
+        fsqlite_query_values(&f_conn, "SELECT id, val FROM msgs ORDER BY id;"),
+        "schema boundary should preserve previously retained rows"
+    );
+
+    c_conn
+        .execute("INSERT INTO aux_msgs VALUES (1, 'schema');", [])
+        .expect("csqlite aux insert");
+    f_conn
+        .execute("INSERT INTO aux_msgs VALUES (1, 'schema');")
+        .expect("fsqlite aux insert");
+    assert_eq!(
+        csqlite_query_values(&c_conn, "SELECT id, note FROM aux_msgs ORDER BY id;"),
+        fsqlite_query_values(&f_conn, "SELECT id, note FROM aux_msgs ORDER BY id;"),
+        "new table writes after the schema boundary should match the oracle"
+    );
+
+    let msgs_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
+    let aux_dump_sql = "SELECT id, note FROM aux_msgs ORDER BY id;";
+    f_conn.close().expect("close fsqlite connection");
+    drop(c_conn);
+
+    let reopened_c = rusqlite::Connection::open(&c_path).expect("reopen csqlite db");
+    let reopened_f = fsqlite::Connection::open(&f_path_string).expect("reopen fsqlite db");
+    assert_eq!(
+        csqlite_query_values(&reopened_c, msgs_dump_sql),
+        fsqlite_query_values(&reopened_f, msgs_dump_sql),
+        "schema-boundary retained-autocommit state must match after close+reopen"
+    );
+    assert_eq!(
+        csqlite_query_values(&reopened_c, aux_dump_sql),
+        fsqlite_query_values(&reopened_f, aux_dump_sql),
+        "post-boundary writes must remain durable after close+reopen"
+    );
+}
+
+#[test]
 fn txn_file_backed_retained_autocommit_10k_profile_matches_rusqlite_after_close_reopen() {
     const ROW_COUNT: i64 = 10_000;
 

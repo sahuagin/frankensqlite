@@ -14,6 +14,7 @@ use fsqlite_func::vtab::{
 };
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::{SmallText, SqliteValue};
+use smallvec::SmallVec;
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -179,8 +180,23 @@ pub trait Fts5Tokenizer: Send + Sync {
     /// Return the tokenizer name.
     fn name(&self) -> &'static str;
 
+    /// Visit each token in the input text without forcing callers to materialize
+    /// an intermediate token vector.
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool));
+
     /// Tokenize the input text, producing a list of tokens.
-    fn tokenize(&self, text: &str) -> Vec<Fts5Token>;
+    fn tokenize(&self, text: &str) -> Vec<Fts5Token> {
+        let mut tokens = Vec::new();
+        self.visit_tokens(text, &mut |term, start, end, colocated| {
+            tokens.push(Fts5Token {
+                term: term.to_owned(),
+                start,
+                end,
+                colocated,
+            });
+        });
+        tokens
+    }
 }
 
 /// Unicode61 tokenizer: splits on non-alphanumeric characters, lowercases.
@@ -216,8 +232,7 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
         "unicode61"
     }
 
-    fn tokenize(&self, text: &str) -> Vec<Fts5Token> {
-        let mut tokens = Vec::new();
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
         let mut current_term = String::new();
 
@@ -232,12 +247,8 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
                 }
             } else if let Some(start) = token_start.take() {
                 if !current_term.is_empty() {
-                    tokens.push(Fts5Token {
-                        term: current_term.clone(),
-                        start,
-                        end: byte_idx,
-                        colocated: false,
-                    });
+                    sink(current_term.as_str(), start, byte_idx, false);
+                    current_term.clear();
                 }
             }
         }
@@ -245,16 +256,9 @@ impl Fts5Tokenizer for Unicode61Tokenizer {
         // Flush trailing token.
         if let Some(start) = token_start {
             if !current_term.is_empty() {
-                tokens.push(Fts5Token {
-                    term: current_term,
-                    start,
-                    end: text.len(),
-                    colocated: false,
-                });
+                sink(current_term.as_str(), start, text.len(), false);
             }
         }
-
-        tokens
     }
 }
 
@@ -267,8 +271,7 @@ impl Fts5Tokenizer for AsciiTokenizer {
         "ascii"
     }
 
-    fn tokenize(&self, text: &str) -> Vec<Fts5Token> {
-        let mut tokens = Vec::new();
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let mut token_start = None;
         let mut current_term = String::new();
 
@@ -281,28 +284,17 @@ impl Fts5Tokenizer for AsciiTokenizer {
                 current_term.push(ch.to_ascii_lowercase());
             } else if let Some(start) = token_start.take() {
                 if !current_term.is_empty() {
-                    tokens.push(Fts5Token {
-                        term: current_term.clone(),
-                        start,
-                        end: byte_idx,
-                        colocated: false,
-                    });
+                    sink(current_term.as_str(), start, byte_idx, false);
+                    current_term.clear();
                 }
             }
         }
 
         if let Some(start) = token_start {
             if !current_term.is_empty() {
-                tokens.push(Fts5Token {
-                    term: current_term,
-                    start,
-                    end: text.len(),
-                    colocated: false,
-                });
+                sink(current_term.as_str(), start, text.len(), false);
             }
         }
-
-        tokens
     }
 }
 
@@ -331,12 +323,12 @@ impl Fts5Tokenizer for PorterTokenizer {
         "porter"
     }
 
-    fn tokenize(&self, text: &str) -> Vec<Fts5Token> {
-        let mut tokens = self.inner.tokenize(text);
-        for token in &mut tokens {
-            token.term = porter_stem(&token.term);
-        }
-        tokens
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
+        self.inner
+            .visit_tokens(text, &mut |term, start, end, colocated| {
+                let stemmed = porter_stem(term);
+                sink(stemmed.as_str(), start, end, colocated);
+            });
     }
 }
 
@@ -480,13 +472,12 @@ impl Fts5Tokenizer for TrigramTokenizer {
         "trigram"
     }
 
-    fn tokenize(&self, text: &str) -> Vec<Fts5Token> {
+    fn visit_tokens(&self, text: &str, sink: &mut dyn FnMut(&str, usize, usize, bool)) {
         let chars: Vec<(usize, char)> = text.char_indices().collect();
         if chars.len() < 3 {
-            return Vec::new();
+            return;
         }
 
-        let mut tokens = Vec::new();
         for window in chars.windows(3) {
             let start = window[0].0;
             let end_char = window[2];
@@ -496,14 +487,8 @@ impl Fts5Tokenizer for TrigramTokenizer {
             } else {
                 window.iter().flat_map(|(_, c)| c.to_lowercase()).collect()
             };
-            tokens.push(Fts5Token {
-                term,
-                start,
-                end,
-                colocated: false,
-            });
+            sink(term.as_str(), start, end, false);
         }
-        tokens
     }
 }
 
@@ -976,11 +961,13 @@ fn parse_primary(
 // ---------------------------------------------------------------------------
 
 /// A posting in the inverted index.
+type Positions = SmallVec<[u32; 4]>;
+
 #[derive(Debug, Clone)]
 pub struct Posting {
     pub docid: i64,
     pub column: u32,
-    pub positions: Vec<u32>,
+    pub positions: Positions,
 }
 
 /// In-memory inverted index for FTS5.
@@ -1003,7 +990,7 @@ impl InvertedIndex {
     /// Index a document's tokens for a given column.
     pub fn add_document(&mut self, docid: i64, column: u32, tokens: &[Fts5Token]) {
         // Build term -> positions map for this document+column.
-        let mut term_positions: HashMap<&str, Vec<u32>> = HashMap::new();
+        let mut term_positions: HashMap<&str, Positions> = HashMap::new();
         #[allow(clippy::cast_possible_truncation)]
         for (pos, token) in tokens.iter().enumerate() {
             term_positions
@@ -1026,6 +1013,32 @@ impl InvertedIndex {
         #[allow(clippy::cast_possible_truncation)]
         let new_len = tokens.len() as u32;
         *self.doc_lengths.entry(docid).or_insert(0) += new_len;
+        self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
+    }
+
+    /// Index a raw text value directly from a tokenizer, avoiding a temporary
+    /// `Vec<Fts5Token>` on hot ingest paths.
+    pub fn add_text(&mut self, docid: i64, column: u32, tokenizer: &dyn Fts5Tokenizer, text: &str) {
+        let mut term_positions: HashMap<String, Positions> = HashMap::new();
+        let mut token_count = 0_u32;
+        tokenizer.visit_tokens(text, &mut |term, _, _, _| {
+            let position = token_count;
+            token_count = token_count.saturating_add(1);
+            term_positions
+                .entry(term.to_owned())
+                .or_default()
+                .push(position);
+        });
+
+        for (term, positions) in term_positions {
+            self.index.entry(term).or_default().push(Posting {
+                docid,
+                column,
+                positions,
+            });
+        }
+
+        *self.doc_lengths.entry(docid).or_insert(0) += token_count;
         self.doc_count = u64::try_from(self.doc_lengths.len()).unwrap_or(u64::MAX);
     }
 
@@ -1655,8 +1668,8 @@ impl Fts5Table {
 
         #[allow(clippy::cast_possible_truncation)]
         for (col_idx, text) in column_values.iter().enumerate() {
-            let tokens = tokenizer.tokenize(text);
-            self.index.add_document(rowid, col_idx as u32, &tokens);
+            self.index
+                .add_text(rowid, col_idx as u32, tokenizer.as_ref(), text);
         }
 
         self.documents.insert(rowid, column_values.to_vec());
@@ -2585,6 +2598,41 @@ mod tests {
         assert_eq!(index.doc_frequency("world"), 1);
         assert_eq!(index.doc_frequency("rust"), 1);
         assert_eq!(index.term_frequency("hello", 1), 1);
+    }
+
+    #[test]
+    fn test_inverted_index_add_text_matches_tokenized_path() {
+        let tok = Unicode61Tokenizer::new();
+        let text = "hello hello world";
+
+        let mut via_tokens = InvertedIndex::new();
+        via_tokens.add_document(1, 0, &tok.tokenize(text));
+
+        let mut via_stream = InvertedIndex::new();
+        via_stream.add_text(1, 0, &tok, text);
+
+        assert_eq!(via_stream.total_docs(), via_tokens.total_docs());
+        assert_eq!(
+            via_stream.doc_frequency("hello"),
+            via_tokens.doc_frequency("hello")
+        );
+        assert_eq!(
+            via_stream.term_frequency("hello", 1),
+            via_tokens.term_frequency("hello", 1)
+        );
+        assert_eq!(via_stream.doc_length(1), via_tokens.doc_length(1));
+
+        let expected_positions: Vec<u32> = via_tokens.get_postings("hello")[0]
+            .positions
+            .iter()
+            .copied()
+            .collect();
+        let actual_positions: Vec<u32> = via_stream.get_postings("hello")[0]
+            .positions
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(actual_positions, expected_positions);
     }
 
     #[test]

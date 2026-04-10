@@ -14,6 +14,9 @@
 //! The generator maintains a deterministic state machine (seeded RNG) that
 //! ensures UPDATE and DELETE only target rows that currently exist.
 
+use std::env;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -22,6 +25,8 @@ use fsqlite_e2e::comparison::{ComparisonRunner, NormalizedOutcome, SqlBackend, S
 use tempfile::tempdir;
 
 const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
+const TRACK_U_CRASH_HELPER_DB_PATH_ENV: &str = "FSQLITE_TRACK_U_CRASH_DB_PATH";
+const TRACK_U_CRASH_HELPER_TEST: &str = "bd_c9pxw_crash_helper_entrypoint";
 
 /// Default mixed-DML workload size used in regular test runs.
 ///
@@ -215,6 +220,28 @@ fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlVal
                 })
                 .collect()
         })
+        .collect()
+}
+
+fn spawn_track_u_crash_helper(db_path: &Path) {
+    let helper_status = Command::new(env::current_exe().expect("current_exe"))
+        .arg("--exact")
+        .arg(TRACK_U_CRASH_HELPER_TEST)
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(TRACK_U_CRASH_HELPER_DB_PATH_ENV, db_path.as_os_str())
+        .status()
+        .expect("spawn track u crash helper");
+
+    assert!(
+        !helper_status.success(),
+        "bead_id={TRACK_U_BEAD_ID} case=crash_helper_should_abort"
+    );
+}
+
+fn expected_track_u_rows(row_count: i64) -> Vec<Vec<SqlValue>> {
+    (1..=row_count)
+        .map(|id| vec![SqlValue::Integer(id), SqlValue::Integer(id)])
         .collect()
 }
 
@@ -695,6 +722,114 @@ fn bd_c9pxw_delete_5k_rows_matches_oracle() {
 }
 
 #[test]
+fn bd_c9pxw_crash_recovery_discards_unflushed_update_delete_batch() {
+    const ROW_COUNT: i64 = 10_000;
+    const ORDERED_ROWS_SQL: &str = "SELECT id, val FROM dml_test ORDER BY id";
+    const SUMMARY_SQL: &str = "SELECT COUNT(*), MIN(id), MAX(id), MIN(val), MAX(val) FROM dml_test";
+
+    let tmp = tempdir().expect("tempdir");
+    let db_path = tmp.path().join("track_u_dirty_bitmap_crash.db");
+    let db_path_string = db_path.to_string_lossy().into_owned();
+
+    spawn_track_u_crash_helper(&db_path);
+
+    let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
+    let integrity: String = reopened_c
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .expect("csqlite integrity_check");
+    assert_eq!(
+        integrity, "ok",
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_integrity_check"
+    );
+    let actual_c = csqlite_query_values(&reopened_c, ORDERED_ROWS_SQL);
+
+    let reopened_f = fsqlite::Connection::open(&db_path_string).expect("reopen fsqlite db");
+    assert!(
+        reopened_f.is_concurrent_mode_default(),
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_keeps_default_concurrent_mode"
+    );
+    let actual_f = fsqlite_query_values(&reopened_f, ORDERED_ROWS_SQL);
+    let summary_f = fsqlite_query_values(&reopened_f, SUMMARY_SQL);
+
+    let expected_rows = expected_track_u_rows(ROW_COUNT);
+    assert_eq!(
+        actual_c, expected_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_csqlite_restores_committed_prefix_only"
+    );
+    assert_eq!(
+        actual_f, expected_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_fsqlite_restores_committed_prefix_only"
+    );
+    assert_eq!(
+        actual_f, actual_c,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_matches_oracle"
+    );
+    assert_eq!(
+        summary_f,
+        vec![vec![
+            SqlValue::Integer(ROW_COUNT),
+            SqlValue::Integer(1),
+            SqlValue::Integer(ROW_COUNT),
+            SqlValue::Integer(1),
+            SqlValue::Integer(ROW_COUNT),
+        ]],
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_summary_matches_seeded_state"
+    );
+
+    eprintln!(
+        "INFO bead_id={TRACK_U_BEAD_ID} case=crash_recovery_unflushed_update_delete_batch rows={ROW_COUNT}"
+    );
+}
+
+#[test]
+#[ignore = "invoked via subprocess by bd-c9pxw crash-recovery test"]
+fn bd_c9pxw_crash_helper_entrypoint() {
+    let Ok(db_path) = env::var(TRACK_U_CRASH_HELPER_DB_PATH_ENV) else {
+        return;
+    };
+
+    const ROW_COUNT: i64 = 10_000;
+    const CREATE_SQL: &str =
+        "CREATE TABLE dml_test (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)";
+    const UPDATE_SQL: &str = "UPDATE dml_test SET val = val + 100000 WHERE id BETWEEN 1 AND 10000";
+    const DELETE_SQL: &str = "DELETE FROM dml_test WHERE id BETWEEN 1 AND 5000";
+
+    let conn = fsqlite::Connection::open(&db_path).expect("open track u crash db");
+    assert!(
+        conn.is_concurrent_mode_default(),
+        "bead_id={TRACK_U_BEAD_ID} case=crash_helper_default_concurrent_mode_starts_on"
+    );
+    conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+        .expect("disable concurrent mode for deterministic retained-autocommit coverage");
+    conn.execute("PRAGMA synchronous=FULL;")
+        .expect("force full durability");
+    conn.execute("PRAGMA wal_autocheckpoint=0;")
+        .expect("disable autocheckpoint");
+    let journal_mode = conn
+        .query("PRAGMA journal_mode=WAL;")
+        .expect("enable WAL mode");
+    assert_eq!(journal_mode.len(), 1);
+    assert_eq!(
+        journal_mode[0].values()[0],
+        fsqlite_types::SqliteValue::Text("wal".into())
+    );
+
+    conn.execute(CREATE_SQL).expect("create dml_test");
+    conn.execute("BEGIN;").expect("begin seed transaction");
+    for stmt in generate_batched_insert_statements("dml_test", ROW_COUNT, 250) {
+        conn.execute(&stmt).expect("seed committed rows");
+    }
+    conn.execute("COMMIT;").expect("commit seed transaction");
+
+    conn.execute(UPDATE_SQL)
+        .expect("queue retained 10k update batch");
+    conn.execute(DELETE_SQL)
+        .expect("queue retained 5k delete batch");
+
+    std::process::abort();
+}
+
+#[test]
 fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
     const ROW_COUNT: i64 = 5_000;
     const UPDATE_SQL: &str = "UPDATE dml_a SET val = val + 100000 WHERE id BETWEEN 1 AND 5000";
@@ -720,8 +855,12 @@ fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
     let insert_b = generate_batched_insert_statements("dml_b", ROW_COUNT, 250);
 
     let oracle = rusqlite::Connection::open(&oracle_path).expect("open oracle db");
-    oracle.execute(CREATE_A_SQL, []).expect("oracle create table a");
-    oracle.execute(CREATE_B_SQL, []).expect("oracle create table b");
+    oracle
+        .execute(CREATE_A_SQL, [])
+        .expect("oracle create table a");
+    oracle
+        .execute(CREATE_B_SQL, [])
+        .expect("oracle create table b");
     for stmt in insert_a.iter().chain(insert_b.iter()) {
         oracle.execute(stmt, []).expect("oracle seed rows");
     }
@@ -739,8 +878,12 @@ fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
         setup.is_concurrent_mode_default(),
         "bead_id={TRACK_U_BEAD_ID} case=concurrent_disjoint_writes_require_default_concurrent_mode"
     );
-    setup.execute(CREATE_A_SQL).expect("candidate create table a");
-    setup.execute(CREATE_B_SQL).expect("candidate create table b");
+    setup
+        .execute(CREATE_A_SQL)
+        .expect("candidate create table a");
+    setup
+        .execute(CREATE_B_SQL)
+        .expect("candidate create table b");
     for stmt in insert_a.iter().chain(insert_b.iter()) {
         setup.execute(stmt).expect("candidate seed rows");
     }
@@ -783,9 +926,7 @@ fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
                 thread::sleep(Duration::from_millis(2));
             }
 
-            panic!(
-                "bead_id={TRACK_U_BEAD_ID} case={worker}_exhausted_retries error={last_error}"
-            );
+            panic!("bead_id={TRACK_U_BEAD_ID} case={worker}_exhausted_retries error={last_error}");
         })
     };
 
@@ -803,7 +944,9 @@ fn bd_c9pxw_concurrent_disjoint_table_writes_match_oracle_after_reopen() {
     let actual_a = fsqlite_query_values(&reopened, "SELECT id, val FROM dml_a ORDER BY id");
     let actual_b = fsqlite_query_values(&reopened, "SELECT id, val FROM dml_b ORDER BY id");
     let actual_summary = fsqlite_query_values(&reopened, SUMMARY_SQL);
-    reopened.close().expect("close reopened candidate connection");
+    reopened
+        .close()
+        .expect("close reopened candidate connection");
 
     assert_eq!(
         actual_a, expected_a,

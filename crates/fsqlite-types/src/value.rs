@@ -1760,9 +1760,23 @@ mod tests {
         }
     }
 
+    fn log_value_pool_test_stats(test_name: &str) -> ValuePoolStats {
+        let stats = value_pool_test_stats_snapshot();
+        eprintln!(
+            "bead_id=bd-nsvud test={test_name} slab_alloc_count={} slab_return_count={} global_alloc_fallback_count={} slab_high_water_mark={} pool_len={}",
+            stats.slab_alloc_count,
+            stats.slab_return_count,
+            stats.global_alloc_fallback_count,
+            stats.slab_high_water_mark,
+            pool_len(),
+        );
+        stats
+    }
+
     #[test]
     fn test_slab_basic_alloc_dealloc() {
         let _guard = ValuePoolTestGuard::new();
+        const ROUND_TRIP_COUNT: usize = 100;
 
         assert_eq!(pool_len(), 0);
         assert_eq!(pool_acquire(), None);
@@ -1777,25 +1791,29 @@ mod tests {
         );
 
         reset_value_pool_test_stats();
-        pool_return(SqliteValue::Integer(42));
-        assert_eq!(pool_len(), 1);
+        for value in 0..ROUND_TRIP_COUNT {
+            pool_return(SqliteValue::Integer(value as i64));
+        }
+        assert_eq!(pool_len(), ROUND_TRIP_COUNT);
         assert_eq!(
             value_pool_test_stats_snapshot(),
             ValuePoolStats {
                 slab_alloc_count: 0,
-                slab_return_count: 1,
+                slab_return_count: ROUND_TRIP_COUNT,
                 global_alloc_fallback_count: 0,
-                slab_high_water_mark: 1,
+                slab_high_water_mark: ROUND_TRIP_COUNT,
             }
         );
 
         reset_value_pool_test_stats();
-        assert_eq!(pool_acquire(), Some(SqliteValue::Integer(42)));
+        for expected in (0..ROUND_TRIP_COUNT).rev() {
+            assert_eq!(pool_acquire(), Some(SqliteValue::Integer(expected as i64)));
+        }
         assert_eq!(pool_len(), 0);
         assert_eq!(
-            value_pool_test_stats_snapshot(),
+            log_value_pool_test_stats("test_slab_basic_alloc_dealloc"),
             ValuePoolStats {
-                slab_alloc_count: 1,
+                slab_alloc_count: ROUND_TRIP_COUNT,
                 slab_return_count: 0,
                 global_alloc_fallback_count: 0,
                 slab_high_water_mark: 0,
@@ -1828,7 +1846,7 @@ mod tests {
         assert_eq!(pool_acquire(), None);
         assert_eq!(pool_len(), 0);
         assert_eq!(
-            value_pool_test_stats_snapshot(),
+            log_value_pool_test_stats("test_slab_exhaustion_fallback"),
             ValuePoolStats {
                 slab_alloc_count: VALUE_POOL_CAP,
                 slab_return_count: 0,
@@ -1841,6 +1859,7 @@ mod tests {
     #[test]
     fn test_slab_no_leak() {
         let _guard = ValuePoolTestGuard::new();
+        const ITERATIONS: usize = 10_000;
 
         let (weak_tx, weak_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1849,25 +1868,59 @@ mod tests {
             pool_clear();
             reset_value_pool_test_stats();
 
-            let payload: Arc<[u8]> = Arc::from([0xAB_u8; 64].as_slice());
-            let weak = Arc::downgrade(&payload);
-            pool_return(SqliteValue::Blob(payload));
+            let mut pooled_weak = None;
+            let mut overflow_weak = None;
+            for value in 0..ITERATIONS {
+                let payload: Arc<[u8]> =
+                    Arc::from(vec![(value % 251) as u8; 64].into_boxed_slice());
+                if value == 0 {
+                    pooled_weak = Some(Arc::downgrade(&payload));
+                } else if value == ITERATIONS - 1 {
+                    overflow_weak = Some(Arc::downgrade(&payload));
+                }
+                pool_return(SqliteValue::Blob(payload));
+            }
 
-            weak_tx.send(weak).expect("send weak blob handle");
+            assert_eq!(
+                pool_len(),
+                VALUE_POOL_CAP,
+                "the slab must retain at most VALUE_POOL_CAP entries",
+            );
+            weak_tx
+                .send((
+                    pooled_weak.expect("capture pooled weak handle"),
+                    overflow_weak.expect("capture overflow weak handle"),
+                    log_value_pool_test_stats("test_slab_no_leak"),
+                ))
+                .expect("send slab leak stats");
             release_rx.recv().expect("wait for release");
         });
 
-        let weak = weak_rx.recv().expect("receive weak blob handle");
+        let (pooled_weak, overflow_weak, stats) =
+            weak_rx.recv().expect("receive weak blob handles");
         assert!(
-            weak.upgrade().is_some(),
+            pooled_weak.upgrade().is_some(),
             "pooled blob should remain alive while the owning thread is running"
+        );
+        assert!(
+            overflow_weak.upgrade().is_none(),
+            "values beyond VALUE_POOL_CAP should fall back to normal drop instead of staying pooled"
+        );
+        assert_eq!(
+            stats,
+            ValuePoolStats {
+                slab_alloc_count: 0,
+                slab_return_count: VALUE_POOL_CAP,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: VALUE_POOL_CAP,
+            }
         );
 
         release_tx.send(()).expect("release worker thread");
         worker.join().expect("join worker");
 
         assert!(
-            weak.upgrade().is_none(),
+            pooled_weak.upgrade().is_none(),
             "thread-local slab contents must be dropped when the thread exits"
         );
     }
@@ -1907,28 +1960,57 @@ mod tests {
         );
         assert_eq!(pool_acquire(), Some(SqliteValue::Integer(11)));
         assert_eq!(pool_len(), 0);
+        let stats = log_value_pool_test_stats("test_slab_thread_local_isolation");
+        assert_eq!(
+            stats,
+            ValuePoolStats {
+                slab_alloc_count: 1,
+                slab_return_count: 1,
+                global_alloc_fallback_count: 0,
+                slab_high_water_mark: 1,
+            }
+        );
     }
 
     #[test]
     fn test_slab_zero_malloc_steady_state() {
         let _guard = ValuePoolTestGuard::new();
-        const WARM_POOL_DEPTH: usize = 64;
-        const ITERATIONS: usize = 10_000;
+        const WARM_POOL_DEPTH: usize = VALUE_POOL_CAP;
+        const ITERATIONS: usize = 1_000;
+        const INITIAL_TEXT: &str =
+            "steady-state pooled string backing store for bd-nsvud warmup payload";
+        const REUSED_TEXT: &str = "steady-state pooled overwrite stays in-buffer";
 
-        for value in 0..WARM_POOL_DEPTH {
-            pool_return(SqliteValue::Integer(value as i64));
+        assert!(
+            REUSED_TEXT.len() <= INITIAL_TEXT.len(),
+            "steady-state overwrite must fit within the warmed heap allocation"
+        );
+
+        for _ in 0..WARM_POOL_DEPTH {
+            pool_return(SqliteValue::Text(SmallText::new(INITIAL_TEXT)));
         }
         assert_eq!(pool_len(), WARM_POOL_DEPTH);
 
         reset_value_pool_test_stats();
-        for value in 0..ITERATIONS {
-            let _reused = pool_acquire().unwrap_or(SqliteValue::Null);
-            pool_return(SqliteValue::Integer(value as i64));
+        for _ in 0..ITERATIONS {
+            let mut reused = pool_acquire().unwrap_or(SqliteValue::Null);
+            let SqliteValue::Text(existing) = &mut reused else {
+                panic!("warmed slab entry should remain a text value");
+            };
+            let original_ptr = existing.as_str().as_ptr();
+            existing.overwrite(REUSED_TEXT);
+            assert_eq!(
+                existing.as_str().as_ptr(),
+                original_ptr,
+                "steady-state overwrite should reuse the warmed heap buffer",
+            );
+            assert_eq!(existing.as_str(), REUSED_TEXT);
+            pool_return(reused);
         }
 
         assert_eq!(pool_len(), WARM_POOL_DEPTH);
         assert_eq!(
-            value_pool_test_stats_snapshot(),
+            log_value_pool_test_stats("test_slab_zero_malloc_steady_state"),
             ValuePoolStats {
                 slab_alloc_count: ITERATIONS,
                 slab_return_count: ITERATIONS,
@@ -2021,6 +2103,56 @@ mod tests {
             }
             _ => panic!("overwrite should restore heap-owned mode"),
         }
+    }
+
+    #[test]
+    fn test_small_text_concurrent_clone_promotion_keeps_contents_stable() {
+        let text = Arc::new(SmallText::new(
+            "this string is definitely longer than twenty three bytes",
+        ));
+        let expected = text.as_str().to_owned();
+        let SmallTextRepr::HeapOwned { shared, .. } = &text.repr else {
+            panic!("long text should start in heap-owned mode");
+        };
+        assert!(
+            shared.get().is_none(),
+            "shared Arc should still be lazy before concurrent clones"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let text = Arc::clone(&text);
+            let barrier = Arc::clone(&barrier);
+            let expected = expected.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..64 {
+                    let cloned = (*text).clone();
+                    assert_eq!(cloned.as_str(), expected);
+                    assert!(
+                        matches!(cloned.repr, SmallTextRepr::HeapShared(_)),
+                        "concurrent clone should reuse the shared Arc representation"
+                    );
+                }
+            }));
+        }
+
+        barrier.wait();
+        for worker in workers {
+            worker
+                .join()
+                .expect("join concurrent small-text clone worker");
+        }
+
+        let SmallTextRepr::HeapOwned { shared, .. } = &text.repr else {
+            panic!("original text should remain heap-owned after clone promotion");
+        };
+        let shared = shared
+            .get()
+            .expect("concurrent clones should promote the lazy shared Arc");
+        assert_eq!(shared.as_ref(), expected);
+        assert_eq!(text.as_str(), expected);
     }
 
     #[test]
