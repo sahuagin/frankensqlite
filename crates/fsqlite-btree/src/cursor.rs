@@ -2547,7 +2547,10 @@ impl<P: PageReader> BtCursor<P> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
-            let coll_name = self.index_collations.get(idx).and_then(|coll| coll.as_deref());
+            let coll_name = self
+                .index_collations
+                .get(idx)
+                .and_then(|coll| coll.as_deref());
             let mut ord =
                 self.cmp_index_values_collated(&lhs[idx], &rhs[idx], coll_name, &registry_guard)?;
             if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
@@ -8725,21 +8728,12 @@ mod tests {
             Arc::new(Mutex::new(CollationRegistry::new())),
         );
 
-        let alpha = serialize_record(&[
-            SqliteValue::Text("alpha".into()),
-            SqliteValue::Integer(1),
-        ]);
-        let beta = serialize_record(&[
-            SqliteValue::Text("beta".into()),
-            SqliteValue::Integer(2),
-        ]);
+        let alpha = serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]);
+        let beta = serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(2)]);
         cursor.index_insert(&cx, &alpha).unwrap();
         cursor.index_insert(&cx, &beta).unwrap();
 
-        let probe = serialize_record(&[
-            SqliteValue::Text("ALPHA".into()),
-            SqliteValue::Integer(1),
-        ]);
+        let probe = serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(1)]);
         assert!(
             cursor.index_move_to(&cx, &probe).unwrap().is_found(),
             "full-record index seek should honor NOCASE collation on the indexed text term"
@@ -8760,18 +8754,9 @@ mod tests {
         );
 
         for key in [
-            serialize_record(&[
-                SqliteValue::Text("alpha".into()),
-                SqliteValue::Integer(1),
-            ]),
-            serialize_record(&[
-                SqliteValue::Text("ALPHA".into()),
-                SqliteValue::Integer(2),
-            ]),
-            serialize_record(&[
-                SqliteValue::Text("beta".into()),
-                SqliteValue::Integer(3),
-            ]),
+            serialize_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]),
+            serialize_record(&[SqliteValue::Text("ALPHA".into()), SqliteValue::Integer(2)]),
+            serialize_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]),
         ] {
             cursor.index_insert(&cx, &key).unwrap();
         }
