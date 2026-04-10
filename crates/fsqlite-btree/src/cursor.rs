@@ -1403,8 +1403,9 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// bd-wwqen.1: Read the cell pointer at index `cell_idx` directly from
-    /// raw page bytes without allocating a Vec<u16>. The cell pointer array
-    /// starts right after the page header.
+    /// raw page bytes without allocating a Vec<u16> copy. The cell pointer
+    /// array starts right after the page header, so staying on the page image
+    /// keeps the descent hot path on the node's contiguous prefix.
     fn read_cell_pointer_inline(
         page: &[u8],
         page_no: PageNumber,
@@ -1419,6 +1420,41 @@ impl<P: PageReader> BtCursor<P> {
             });
         }
         Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))
+    }
+
+    #[inline]
+    fn read_stack_entry_cell_pointer_inline(entry: &StackEntry, cell_idx: u16) -> Result<u16> {
+        if cell_idx >= entry.header.cell_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    cell_idx, entry.header.cell_count
+                ),
+            });
+        }
+
+        let header_size = usize::from(entry.header.page_type.header_size());
+        Self::read_cell_pointer_inline(
+            entry.page_data.as_bytes(),
+            entry.page_no,
+            header_size,
+            cell_idx,
+        )
+    }
+
+    #[inline]
+    fn read_interior_child_inline(entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
+        if cell_idx >= entry.header.cell_count {
+            return entry
+                .header
+                .right_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior page has no right child".to_owned(),
+                });
+        }
+
+        let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, cell_idx)?);
+        Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
     }
 
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
@@ -1660,12 +1696,7 @@ impl<P: PageReader> BtCursor<P> {
                 self.issue_prefetch_hint(cx, right);
                 current_page = right;
             } else {
-                let cell = self.parse_cell_at(&entry, 0)?;
-                let child = cell
-                    .left_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior cell has no left child".to_owned(),
-                    })?;
+                let child = Self::read_interior_child_inline(&entry, 0)?;
                 entry.cell_idx = 0;
                 self.stack.push(entry);
                 self.issue_prefetch_hint(cx, child);
@@ -1920,7 +1951,7 @@ impl<P: PageReader> BtCursor<P> {
 
             // Interior table page: binary search to find which child to descend.
             let child_idx = Self::binary_search_table_interior(cx, &entry, target_rowid)?;
-            let child = self.child_page_at(&entry, child_idx)?;
+            let child = Self::read_interior_child_inline(&entry, child_idx)?;
             let mut entry = entry;
             entry.cell_idx = child_idx;
             self.stack.push(entry);
@@ -2239,7 +2270,7 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let offset = entry.cell_pointers[mid as usize] as usize;
+            let offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, mid)?);
             let cell_data = &entry.page_data.as_bytes()[offset..];
             if cell_data.len() < 4 {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -2376,7 +2407,7 @@ impl<P: PageReader> BtCursor<P> {
                     return Ok(SeekResult::Found);
                 }
                 BinarySearchResult::NotFound(idx) => {
-                    let child = self.child_page_at(&entry, idx)?;
+                    let child = Self::read_interior_child_inline(&entry, idx)?;
                     let mut entry = entry;
                     entry.cell_idx = idx;
                     self.stack.push(entry);
@@ -2492,7 +2523,13 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let cell = self.parse_cell_at(entry, mid)?;
+            let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, mid)?);
+            let cell = CellRef::parse(
+                entry.page_data.as_bytes(),
+                cell_offset,
+                entry.header.page_type,
+                self.usable_size,
+            )?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
             let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
 
@@ -10158,6 +10195,55 @@ mod tests {
                 "prefetching page.as_ptr() should warm the entire header cache line: type={page_type:?} header_bytes={header_bytes}"
             );
         }
+    }
+
+    #[test]
+    fn test_table_interior_descent_uses_inline_page_pointer_reads() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_table(&[(pn(3), 20), (pn(4), 40), (pn(5), 60)], pn(6)),
+        );
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut entry = cursor.load_page(&cx, pn(2)).unwrap();
+        entry.cell_pointers.clear();
+
+        let child_idx =
+            BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 35).unwrap();
+        assert_eq!(child_idx, 1);
+        assert_eq!(
+            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, child_idx).unwrap(),
+            pn(4)
+        );
+    }
+
+    #[test]
+    fn test_index_interior_descent_uses_inline_page_pointer_reads() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let mut entry = cursor.load_page(&cx, pn(2)).unwrap();
+        entry.cell_pointers.clear();
+
+        let search = cursor
+            .binary_search_index_interior(&cx, &entry, b"c")
+            .unwrap();
+        assert_eq!(search, BinarySearchResult::NotFound(1));
+        assert_eq!(
+            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 1).unwrap(),
+            pn(4)
+        );
+        assert_eq!(
+            BtCursor::<MemPageStore>::read_interior_child_inline(&entry, 2).unwrap(),
+            pn(5)
+        );
     }
 
     #[test]
