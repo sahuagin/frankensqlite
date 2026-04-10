@@ -11,6 +11,7 @@
 
 pub mod codegen;
 pub mod decision_contract;
+pub mod differential;
 pub mod stats;
 
 use decision_contract::access_path_kind_label;
@@ -1196,9 +1197,15 @@ fn best_access_path_internal(
         candidates_considered += 1;
 
         let is_covering = needed_columns.is_some_and(|needed| {
-            needed
-                .iter()
-                .all(|c| idx.columns.iter().any(|ic| ic.eq_ignore_ascii_case(c)))
+            needed.iter().all(|column| {
+                idx.columns
+                    .iter()
+                    .any(|index_column| index_column.eq_ignore_ascii_case(column))
+                    // Ordinary SQLite indexes carry the rowid payload, so
+                    // rowid projections remain index-only even if the rowid
+                    // alias is not listed in idx.columns.
+                    || is_rowid_alias_name(column)
+            })
         });
 
         let mut cost_multiplier: f64 = 1.0;
@@ -1674,6 +1681,14 @@ struct SkipScanCandidate {
     per_probe_selectivity: f64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IndexColumnTermSummary {
+    has_equality: bool,
+    first_in_probe_count: Option<usize>,
+    has_range: bool,
+    first_like_prefix: Option<(String, Option<String>)>,
+}
+
 /// A decomposed WHERE term with the column it references (if any).
 #[derive(Debug, Clone)]
 pub struct WhereTerm<'a> {
@@ -2027,8 +2042,7 @@ fn extract_where_column(expr: &Expr) -> Option<WhereColumn> {
 
 /// Check if a `WhereColumn` is a rowid alias.
 fn is_rowid_column(wc: &WhereColumn) -> bool {
-    let name = wc.column.to_ascii_lowercase();
-    name == "rowid" || name == "_rowid_" || name == "oid"
+    is_rowid_alias_name(&wc.column)
 }
 
 /// Check if any WHERE term has a rowid equality constraint.
@@ -2172,23 +2186,61 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
                 .is_none_or(|t| t.eq_ignore_ascii_case(&index.table))
     };
 
-    let leftmost = &index.columns[0];
+    let mut column_summaries = vec![IndexColumnTermSummary::default(); index.columns.len()];
+    let mut leftmost_first_constraint = None;
+
+    for term in terms {
+        let Some(wc) = term.column.as_ref() else {
+            continue;
+        };
+        for (column_index, index_column) in index.columns.iter().enumerate() {
+            if !col_matches(wc, index_column) {
+                continue;
+            }
+            let summary = &mut column_summaries[column_index];
+            match &term.kind {
+                WhereTermKind::Equality => {
+                    summary.has_equality = true;
+                    if column_index == 0 && leftmost_first_constraint.is_none() {
+                        leftmost_first_constraint = Some(IndexUsability::Equality);
+                    }
+                }
+                WhereTermKind::InList { count } => {
+                    summary.first_in_probe_count.get_or_insert(*count);
+                    if column_index == 0 && leftmost_first_constraint.is_none() {
+                        leftmost_first_constraint = Some(IndexUsability::InExpansion {
+                            probe_count: *count,
+                        });
+                    }
+                }
+                WhereTermKind::LikePrefix {
+                    prefix,
+                    upper_bound,
+                } => {
+                    summary
+                        .first_like_prefix
+                        .get_or_insert_with(|| (prefix.clone(), upper_bound.clone()));
+                    if column_index == 0 && leftmost_first_constraint.is_none() {
+                        leftmost_first_constraint = Some(IndexUsability::LikePrefix {
+                            low: prefix.clone(),
+                            high: upper_bound.clone(),
+                        });
+                    }
+                }
+                WhereTermKind::Range | WhereTermKind::Between => {
+                    summary.has_range = true;
+                }
+                WhereTermKind::RowidEquality | WhereTermKind::Other => {}
+            }
+        }
+    }
 
     // --- Multi-column equality prefix ---
     // Walk index columns left-to-right, counting how many have equality terms.
-    let mut eq_columns = 0;
-    for idx_col in &index.columns {
-        let has_eq = terms.iter().any(|t| {
-            t.column.as_ref().is_some_and(|wc| {
-                col_matches(wc, idx_col) && matches!(t.kind, WhereTermKind::Equality)
-            })
-        });
-        if has_eq {
-            eq_columns += 1;
-        } else {
-            break;
-        }
-    }
+    let eq_columns = column_summaries
+        .iter()
+        .take_while(|summary| summary.has_equality)
+        .count();
 
     // Preserve the composite shape when we have either:
     // - equality on 2+ consecutive index columns, or
@@ -2196,24 +2248,10 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     //   column.
     if eq_columns >= 1 {
         let trailing_constraint = if eq_columns < index.columns.len() {
-            let next_col = &index.columns[eq_columns];
-            if let Some(probe_count) = terms.iter().find_map(|t| {
-                let matches_next = t
-                    .column
-                    .as_ref()
-                    .is_some_and(|wc| col_matches(wc, next_col));
-                match (matches_next, &t.kind) {
-                    (true, WhereTermKind::InList { count }) => Some(*count),
-                    _ => None,
-                }
-            }) {
+            let summary = &column_summaries[eq_columns];
+            if let Some(probe_count) = summary.first_in_probe_count {
                 MultiColumnTrailingConstraint::InExpansion { probe_count }
-            } else if terms.iter().any(|t| {
-                t.column.as_ref().is_some_and(|wc| {
-                    col_matches(wc, next_col)
-                        && matches!(t.kind, WhereTermKind::Range | WhereTermKind::Between)
-                })
-            }) {
+            } else if summary.has_range {
                 MultiColumnTrailingConstraint::Range
             } else {
                 MultiColumnTrailingConstraint::None
@@ -2231,43 +2269,14 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     }
 
     // --- Single leftmost column checks (original logic) ---
-    // Check for equality on the leftmost column.
-    for term in terms {
-        if let Some(ref wc) = term.column {
-            if col_matches(wc, leftmost) {
-                match &term.kind {
-                    WhereTermKind::Equality => return IndexUsability::Equality,
-                    WhereTermKind::InList { count } => {
-                        return IndexUsability::InExpansion {
-                            probe_count: *count,
-                        };
-                    }
-                    WhereTermKind::LikePrefix {
-                        prefix,
-                        upper_bound,
-                    } => {
-                        return IndexUsability::LikePrefix {
-                            low: prefix.clone(),
-                            high: upper_bound.clone(),
-                        };
-                    }
-                    _ => {}
-                }
-            }
-        }
+    if let Some(usability) = leftmost_first_constraint {
+        return usability;
     }
 
-    // Check for range on the leftmost column.
-    for term in terms {
-        if let Some(ref wc) = term.column {
-            if col_matches(wc, leftmost)
-                && matches!(term.kind, WhereTermKind::Range | WhereTermKind::Between)
-            {
-                return IndexUsability::Range {
-                    selectivity: DEFAULT_RANGE_SELECTIVITY,
-                };
-            }
-        }
+    if column_summaries[0].has_range {
+        return IndexUsability::Range {
+            selectivity: DEFAULT_RANGE_SELECTIVITY,
+        };
     }
 
     IndexUsability::NotUsable
@@ -4987,6 +4996,32 @@ mod tests {
     }
 
     #[test]
+    fn test_index_usability_leftmost_preserves_first_non_range_probe_order() {
+        let idx = index_info("idx_name", "t1", &["name"], false, 50);
+        let terms = [glob_term("name", "Jo*"), in_term("name", 3)];
+        let result = analyze_index_usability(&idx, &terms);
+
+        assert!(matches!(
+            result,
+            IndexUsability::LikePrefix {
+                ref low,
+                high: Some(ref high)
+            } if low == "Jo" && high == "Jp"
+        ));
+    }
+
+    #[test]
+    fn test_index_usability_equality_beats_range_on_same_leftmost_column() {
+        let idx = index_info("idx_a", "t1", &["a"], false, 50);
+        let terms = [range_term("a"), eq_term("a")];
+
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::Equality
+        ));
+    }
+
+    #[test]
     fn test_classify_where_term_equality() {
         let term = eq_term("x");
         assert!(matches!(term.kind, WhereTermKind::Equality));
@@ -5520,6 +5555,16 @@ mod tests {
         let idx = index_info("idx_t1_ab", "t1", &["a", "b"], false, 100);
         let terms = [eq_term("a")];
         let needed = ["a".to_owned(), "b".to_owned()];
+        let ap = best_access_path(&table, &[idx], &terms, Some(&needed));
+        assert!(matches!(ap.kind, AccessPathKind::CoveringIndexScan { .. }));
+    }
+
+    #[test]
+    fn test_planner_treats_rowid_projection_as_covering_index_payload() {
+        let table = table_stats("t1", 1000, 50000);
+        let idx = index_info("idx_t1_a", "t1", &["a"], false, 100);
+        let terms = [eq_term("a")];
+        let needed = ["rowid".to_owned()];
         let ap = best_access_path(&table, &[idx], &terms, Some(&needed));
         assert!(matches!(ap.kind, AccessPathKind::CoveringIndexScan { .. }));
     }
