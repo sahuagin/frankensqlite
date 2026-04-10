@@ -202,6 +202,17 @@ require_publication_trace_contract \
 TRACE_SAME_SALT_ROLLOVER="present"
 
 run_phase \
+  "truncate_checkpoint_publication" \
+  "${ARTIFACT_DIR}/truncate_checkpoint_publication.log" \
+  rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${CORE_TARGET_DIR}" \
+    cargo test -p fsqlite-core test_truncate_checkpoint_republishes_empty_generation_snapshot -- --nocapture
+require_publication_trace_contract \
+  "truncate_checkpoint_publication" \
+  "${ARTIFACT_DIR}/truncate_checkpoint_publication.log" \
+  "truncate checkpoint publication"
+TRACE_TRUNCATE_CHECKPOINT_PUBLICATION="present"
+
+run_phase \
   "wal_refresh_generation_identity" \
   "${ARTIFACT_DIR}/wal_refresh_generation_identity.log" \
   rch exec -- env RUST_LOG="${RUST_LOG}" RUST_TEST_THREADS="${RUST_TEST_THREADS}" NO_COLOR="${NO_COLOR}" CARGO_TARGET_DIR="${WAL_TARGET_DIR}" \

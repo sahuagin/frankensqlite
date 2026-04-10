@@ -25,7 +25,7 @@ use fsqlite_vfs::MemoryVfs;
 use fsqlite_vfs::UnixVfs;
 #[cfg(target_os = "windows")]
 use fsqlite_vfs::WindowsVfs;
-use fsqlite_wal::checksum::WalChecksumTransform;
+use fsqlite_wal::{WalGenerationIdentity, checksum::WalChecksumTransform};
 
 // ---------------------------------------------------------------------------
 // Sealed trait discipline
@@ -103,6 +103,33 @@ pub struct CheckpointResult {
     pub wal_was_reset: bool,
 }
 
+/// Public summary of the commit-published WAL visibility plane.
+///
+/// This lets callers bind to generation-stamped WAL metadata without reaching
+/// into backend-specific page-index storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalPublicationSnapshot {
+    /// Monotonic publication sequence for this backend handle.
+    pub publication_seq: u64,
+    /// WAL generation visible through this publication.
+    pub generation: WalGenerationIdentity,
+    /// Latest visible commit frame for this generation, if any.
+    pub last_commit_frame: Option<usize>,
+    /// Number of committed transactions visible through this publication.
+    pub commit_count: u64,
+    /// Number of latest-frame entries published in the visibility map.
+    pub latest_frame_entries: usize,
+    /// Whether the page index is partial and may fall back to bounded scans.
+    pub index_is_partial: bool,
+}
+
+impl WalPublicationSnapshot {
+    #[must_use]
+    pub const fn lookup_contract_is_authoritative(self) -> bool {
+        !self.index_is_partial
+    }
+}
+
 /// Backend interface for WAL operations consumed by the pager.
 ///
 /// This trait breaks the `pager ↔ wal` circular dependency: it is defined
@@ -118,6 +145,33 @@ pub trait WalBackend: Send + Sync {
     /// this transaction see a coherent view without per-page refresh costs.
     fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
+    }
+
+    /// Capture the currently published WAL visibility summary for this handle.
+    ///
+    /// Backends that do not maintain a commit-published visibility plane may
+    /// return `None`.
+    #[must_use]
+    fn published_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        None
+    }
+
+    /// Capture the currently pinned read snapshot for this handle, if any.
+    ///
+    /// Backends that do not pin generation-stamped read snapshots may return
+    /// `None`.
+    #[must_use]
+    fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        None
+    }
+
+    /// Refresh the published WAL visibility summary without pinning a new
+    /// read transaction.
+    ///
+    /// The default implementation reports the current published snapshot
+    /// unchanged.
+    fn refresh_published_snapshot(&mut self, _cx: &Cx) -> Result<Option<WalPublicationSnapshot>> {
+        Ok(self.published_snapshot())
     }
 
     /// Append a single frame to the WAL.

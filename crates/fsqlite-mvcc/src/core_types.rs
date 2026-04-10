@@ -2764,7 +2764,7 @@ mod tests {
         slot.pid_birth.store(9_999, Ordering::Release);
         slot.begin_seq.store(50, Ordering::Release);
 
-        let (_, logs) = with_tracing_capture(|| {
+        let ((), logs) = with_tracing_capture(|| {
             let stats =
                 cleanup_orphaned_slots(std::slice::from_ref(&slot), 100, |_, _| false, |_| {});
             assert_eq!(stats.orphans_found, 1);

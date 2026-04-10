@@ -1426,19 +1426,58 @@ mod tests {
         };
         let original_ptr = Arc::as_ptr(existing);
 
-        decode_value_into(
-            serial_type_for_blob(4).into(),
-            &[9_u8, 8, 7, 6],
-            &mut slot,
-            false,
-        )
-        .expect("decode succeeds");
+        decode_value_into(serial_type_for_blob(4), &[9_u8, 8, 7, 6], &mut slot, false)
+            .expect("decode succeeds");
 
         let SqliteValue::Blob(updated) = &slot else {
             panic!("slot should remain blob");
         };
         assert_eq!(Arc::as_ptr(updated), original_ptr);
         assert_eq!(updated.as_ref(), &[9_u8, 8, 7, 6]);
+    }
+
+    #[test]
+    fn decode_column_from_offset_reuse_reuses_matching_text_hint() {
+        let text = "this text is long enough to force shared heap storage";
+        let record = serialize_record(&[SqliteValue::Text(SmallText::new(text))]);
+        let mut offsets = Vec::new();
+        assert_eq!(parse_record_header_into(&record, &mut offsets), Some(1));
+
+        let hint = SqliteValue::Text(SmallText::from_arc(Arc::<str>::from(text)));
+        let SqliteValue::Text(existing) = &hint else {
+            panic!("expected text hint");
+        };
+        let original_ptr = existing.as_str().as_ptr();
+
+        let decoded = decode_column_from_offset_reuse(&record, &offsets[0], Some(&hint), false)
+            .expect("decode succeeds");
+        let SqliteValue::Text(reused) = decoded else {
+            panic!("decoded value should remain text");
+        };
+        assert_eq!(reused.as_str().as_ptr(), original_ptr);
+        assert_eq!(reused.as_str(), text);
+    }
+
+    #[test]
+    fn decode_column_from_offset_reuse_reuses_matching_blob_hint() {
+        let blob = [0xDE_u8, 0xAD, 0xBE, 0xEF, 0xFA, 0xCE];
+        let record = serialize_record(&[SqliteValue::Blob(Arc::from(blob.as_slice()))]);
+        let mut offsets = Vec::new();
+        assert_eq!(parse_record_header_into(&record, &mut offsets), Some(1));
+
+        let hint = SqliteValue::Blob(Arc::from(blob.as_slice()));
+        let SqliteValue::Blob(existing) = &hint else {
+            panic!("expected blob hint");
+        };
+        let original_ptr = Arc::as_ptr(existing);
+
+        let decoded = decode_column_from_offset_reuse(&record, &offsets[0], Some(&hint), false)
+            .expect("decode succeeds");
+        let SqliteValue::Blob(reused) = decoded else {
+            panic!("decoded value should remain blob");
+        };
+        assert_eq!(Arc::as_ptr(&reused), original_ptr);
+        assert_eq!(reused.as_ref(), blob.as_slice());
     }
 
     #[test]

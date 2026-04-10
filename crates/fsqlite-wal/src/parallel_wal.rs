@@ -19,11 +19,12 @@
 //! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
 
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hash::BuildHasher;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ use std::time::Duration;
 use asupersync::runtime::{BlockingTaskHandle, RuntimeHandle};
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken, cx::Cx};
 
+use crate::group_commit::TransactionFrameBatchContext;
 use crate::per_core_buffer::{
     AppendOutcome, BufferConfig, DEFAULT_BUFFER_SLOT_COUNT, EpochConfig, EpochFlushBatch,
     EpochOrderCoordinator, WalRecord, thread_buffer_slot,
@@ -136,6 +138,254 @@ impl Default for ParallelWalControlSurface {
             shadow_compare_sampling_per_mille: None,
         }
     }
+}
+
+/// Telemetry schema version for lane-local append staging.
+pub const PARALLEL_WAL_LANE_POLICY_VERSION: &str = "thread_slot_v1";
+/// Compatibility selector bundle required by `bd-db300.7.5.3` / `G5.3`.
+pub const PARALLEL_WAL_COMPATIBILITY_SELECTOR: &str = "wal_invariant,integrity_check,row_level";
+/// Structured-log scenario id for queue submission.
+pub const PARALLEL_WAL_STAGE_SCENARIO_ID: &str = "parallel_wal_lane_stage";
+/// Structured-log scenario id for flush-time lane telemetry.
+pub const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
+
+/// Verdict emitted by shadow-compare lane validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelWalShadowVerdict {
+    #[default]
+    NotRun,
+    Clean,
+    Diverged,
+}
+
+/// Staged lane-local payload awaiting ordered flush consumption.
+#[derive(Debug, Clone)]
+pub struct ParallelWalLaneBatch<T> {
+    /// Monotonic identifier used to correlate queue submission with flush.
+    pub batch_id: u64,
+    /// Stable lane identity chosen for the submitting writer.
+    pub lane_id: u16,
+    /// Number of frames staged for this batch.
+    pub staged_frame_count: u32,
+    /// Time spent staging locally before queue submission.
+    pub staging_elapsed_ns: u64,
+    /// Shadow-compare outcome for this batch.
+    pub shadow_verdict: ParallelWalShadowVerdict,
+    /// Caller-owned payload preserved until the ordered residue consumes it.
+    pub payload: T,
+}
+
+/// Production lane-local staging state for ordinary parallel WAL appends.
+///
+/// This keeps batch ownership, backlog accounting, and same-lane drain order
+/// inside `fsqlite-wal` instead of scattering the logic across pager-only
+/// callers. The caller still owns the final ordered durability residue.
+#[derive(Debug)]
+pub struct ParallelWalLaneStager<T> {
+    control: ParallelWalControlSurface,
+    next_batch_id: AtomicU64,
+    lane_batches: Mutex<HashMap<u16, VecDeque<ParallelWalLaneBatch<T>>>>,
+    lane_backlog_frames: Mutex<HashMap<u16, usize>>,
+}
+
+impl<T> ParallelWalLaneStager<T> {
+    #[must_use]
+    pub fn new(control: ParallelWalControlSurface) -> Self {
+        Self {
+            control,
+            next_batch_id: AtomicU64::new(1),
+            lane_batches: Mutex::new(HashMap::new()),
+            lane_backlog_frames: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn control(&self) -> &ParallelWalControlSurface {
+        &self.control
+    }
+
+    #[must_use]
+    pub fn next_batch_id(&self) -> u64 {
+        self.next_batch_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn lane_count(&self) -> usize {
+        match self.control.mode {
+            ParallelWalOperatingMode::Conservative => 1,
+            _ => self
+                .control
+                .lane_count_override
+                .unwrap_or_else(default_parallel_wal_lane_count)
+                .max(1),
+        }
+    }
+
+    #[must_use]
+    pub fn current_lane_id(&self) -> u16 {
+        u16::try_from(thread_buffer_slot(self.lane_count())).unwrap_or(u16::MAX)
+    }
+
+    #[must_use]
+    pub fn current_lane_backlog(&self, lane_id: u16) -> usize {
+        self.lane_backlog_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&lane_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn record_batch(&self, batch: ParallelWalLaneBatch<T>) -> usize {
+        let lane_id = batch.lane_id;
+        let staged_frame_count = usize::try_from(batch.staged_frame_count).unwrap_or(0);
+
+        {
+            let mut lane_batches = self
+                .lane_batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lane_batches.entry(lane_id).or_default().push_back(batch);
+        }
+
+        let mut lane_backlog = self
+            .lane_backlog_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let backlog = lane_backlog.entry(lane_id).or_insert(0);
+        *backlog = backlog.saturating_add(staged_frame_count);
+        *backlog
+    }
+
+    pub fn take_batches_for_flush(
+        &self,
+        contexts: &[TransactionFrameBatchContext],
+    ) -> Option<HashMap<u64, ParallelWalLaneBatch<T>>> {
+        let mut lane_batches = self
+            .lane_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut expected_offsets = HashMap::<u16, usize>::new();
+        for context in contexts {
+            let offset = expected_offsets.entry(context.lane_id).or_insert(0);
+            let candidate = lane_batches
+                .get(&context.lane_id)
+                .and_then(|queue| queue.get(*offset))
+                .filter(|candidate| candidate.batch_id == context.batch_id)?;
+            let _ = candidate;
+            *offset = offset.saturating_add(1);
+        }
+
+        let mut by_batch_id = HashMap::with_capacity(contexts.len());
+        let mut lane_backlog = self
+            .lane_backlog_frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for context in contexts {
+            let candidate = lane_batches
+                .get_mut(&context.lane_id)
+                .and_then(VecDeque::pop_front)
+                .expect("verified lane-local batch must still exist");
+            let backlog = lane_backlog.entry(context.lane_id).or_insert(0);
+            *backlog = backlog.saturating_sub(
+                usize::try_from(candidate.staged_frame_count).unwrap_or(usize::MAX),
+            );
+            if *backlog == 0 {
+                lane_backlog.remove(&context.lane_id);
+            }
+            if lane_batches
+                .get(&context.lane_id)
+                .is_some_and(VecDeque::is_empty)
+            {
+                lane_batches.remove(&context.lane_id);
+            }
+            by_batch_id.insert(candidate.batch_id, candidate);
+        }
+
+        Some(by_batch_id)
+    }
+}
+
+#[must_use]
+pub fn parallel_wal_mode_name(mode: ParallelWalOperatingMode) -> &'static str {
+    match mode {
+        ParallelWalOperatingMode::Auto => "auto",
+        ParallelWalOperatingMode::Conservative => "conservative",
+        ParallelWalOperatingMode::ShadowCompare => "shadow_compare",
+    }
+}
+
+#[must_use]
+pub fn parallel_wal_fallback_reason_name(
+    reason: Option<ParallelWalFallbackReason>,
+) -> &'static str {
+    match reason {
+        None => "none",
+        Some(ParallelWalFallbackReason::OperatorForced) => "operator_forced",
+        Some(ParallelWalFallbackReason::LaneOverflow) => "lane_overflow",
+        Some(ParallelWalFallbackReason::CertificateGap) => "certificate_gap",
+        Some(ParallelWalFallbackReason::CertificateChecksumMismatch) => {
+            "certificate_checksum_mismatch"
+        }
+        Some(ParallelWalFallbackReason::PublicationMismatch) => "publication_mismatch",
+        Some(ParallelWalFallbackReason::RecoveryGap) => "recovery_gap",
+        Some(ParallelWalFallbackReason::CheckpointConflict) => "checkpoint_conflict",
+        Some(ParallelWalFallbackReason::ControllerEvidenceLost) => "controller_evidence_lost",
+    }
+}
+
+#[must_use]
+pub fn parallel_wal_shadow_verdict_name(verdict: ParallelWalShadowVerdict) -> &'static str {
+    match verdict {
+        ParallelWalShadowVerdict::NotRun => "not_run",
+        ParallelWalShadowVerdict::Clean => "clean",
+        ParallelWalShadowVerdict::Diverged => "diverged",
+    }
+}
+
+#[must_use]
+pub fn default_parallel_wal_lane_count() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[must_use]
+pub fn resolve_parallel_wal_control_surface_from_env() -> ParallelWalControlSurface {
+    let mut control = ParallelWalControlSurface::default();
+
+    if let Ok(mode) = env::var("FSQLITE_PARALLEL_WAL_MODE") {
+        control.mode = match mode.trim().to_ascii_lowercase().as_str() {
+            "auto" => ParallelWalOperatingMode::Auto,
+            "conservative" | "serialized" | "single_lane" => ParallelWalOperatingMode::Conservative,
+            "shadow" | "shadow_compare" => ParallelWalOperatingMode::ShadowCompare,
+            _ => control.mode,
+        };
+    }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_LANES") {
+        if let Ok(value) = raw.trim().parse::<usize>() {
+            control.lane_count_override = Some(value.max(1));
+        }
+    }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_BATCH_BYTES") {
+        if let Ok(value) = raw.trim().parse::<u64>() {
+            control.max_parallel_commit_bytes = Some(value.max(1));
+        }
+    }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS") {
+        if let Ok(value) = raw.trim().parse::<u64>() {
+            control.max_flush_delay_ms = Some(value);
+        }
+    }
+    if let Ok(raw) = env::var("FSQLITE_PARALLEL_WAL_SHADOW_COMPARE_PER_MILLE") {
+        if let Ok(value) = raw.trim().parse::<u16>() {
+            control.shadow_compare_sampling_per_mille = Some(value);
+        }
+    }
+
+    control
 }
 
 /// Commit-certificate proof object for the parallel WAL data plane.
@@ -1233,6 +1483,31 @@ mod tests {
         )
     }
 
+    fn sample_lane_batch(
+        batch_id: u64,
+        lane_id: u16,
+        staged_frame_count: u32,
+        payload: u32,
+    ) -> ParallelWalLaneBatch<u32> {
+        ParallelWalLaneBatch {
+            batch_id,
+            lane_id,
+            staged_frame_count,
+            staging_elapsed_ns: u64::from(staged_frame_count) * 10,
+            shadow_verdict: ParallelWalShadowVerdict::NotRun,
+            payload,
+        }
+    }
+
+    fn sample_lane_context(batch_id: u64, lane_id: u16) -> TransactionFrameBatchContext {
+        TransactionFrameBatchContext {
+            batch_id,
+            lane_id,
+            staged_frame_count: 1,
+            staging_elapsed_ns: 10,
+        }
+    }
+
     #[test]
     fn test_parallel_wal_coordinator_creation() {
         let path = PathBuf::from("/tmp/test.db");
@@ -1256,6 +1531,98 @@ mod tests {
         let slot2 = coordinator.thread_slot();
         assert_eq!(slot1, slot2);
         assert!(slot1 < 4);
+    }
+
+    #[test]
+    fn test_lane_stager_identity_is_stable_within_thread() {
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(4),
+            ..ParallelWalControlSurface::default()
+        });
+
+        let first = stager.current_lane_id();
+        let second = stager.current_lane_id();
+        assert_eq!(first, second);
+        assert!(usize::from(first) < 4);
+    }
+
+    #[test]
+    fn test_lane_stager_reuses_lanes_after_worker_churn() {
+        let stager = Arc::new(ParallelWalLaneStager::<u32>::new(
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+
+        let spawn_wave = || {
+            let mut lanes = Vec::new();
+            for _ in 0..2 {
+                let stager = Arc::clone(&stager);
+                lanes.push(std::thread::spawn(move || stager.current_lane_id()));
+            }
+            let mut observed = lanes
+                .into_iter()
+                .map(|handle| handle.join().expect("lane thread should join"))
+                .collect::<Vec<_>>();
+            observed.sort_unstable();
+            observed
+        };
+
+        assert_eq!(spawn_wave(), vec![0, 1]);
+        assert_eq!(spawn_wave(), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_lane_stager_conservative_mode_collapses_to_single_lane() {
+        let stager = Arc::new(ParallelWalLaneStager::<u32>::new(
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Conservative,
+                lane_count_override: Some(8),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+
+        assert_eq!(stager.lane_count(), 1);
+
+        let mut lanes = Vec::new();
+        for _ in 0..2 {
+            let stager = Arc::clone(&stager);
+            lanes.push(std::thread::spawn(move || stager.current_lane_id()));
+        }
+
+        let observed = lanes
+            .into_iter()
+            .map(|handle| handle.join().expect("lane thread should join"))
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_lane_stager_same_lane_order_mismatch_returns_none_without_drain() {
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(2),
+            ..ParallelWalControlSurface::default()
+        });
+
+        assert_eq!(stager.record_batch(sample_lane_batch(10, 0, 1, 10)), 1);
+        assert_eq!(stager.record_batch(sample_lane_batch(11, 0, 1, 11)), 2);
+
+        let out_of_order = [sample_lane_context(11, 0), sample_lane_context(10, 0)];
+        assert!(stager.take_batches_for_flush(&out_of_order).is_none());
+        assert_eq!(stager.current_lane_backlog(0), 2);
+
+        let in_order = [sample_lane_context(10, 0), sample_lane_context(11, 0)];
+        let drained = stager
+            .take_batches_for_flush(&in_order)
+            .expect("verified in-order batches should drain");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.get(&10).map(|batch| batch.payload), Some(10));
+        assert_eq!(drained.get(&11).map(|batch| batch.payload), Some(11));
+        assert_eq!(stager.current_lane_backlog(0), 0);
     }
 
     #[test]

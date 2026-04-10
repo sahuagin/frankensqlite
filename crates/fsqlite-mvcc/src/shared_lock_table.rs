@@ -1414,7 +1414,7 @@ mod tests {
     fn test_rebuild_lease_logs_pid_birth_and_expiry() {
         let table = SharedPageLockTable::new(TEST_CAP);
 
-        let (_, logs) = with_tracing_capture(|| {
+        let ((), logs) = with_tracing_capture(|| {
             table
                 .acquire_rebuild_lease(1234, 5678, 100)
                 .expect("lease acquisition must succeed");

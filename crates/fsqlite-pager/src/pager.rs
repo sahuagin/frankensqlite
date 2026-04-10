@@ -7,7 +7,7 @@
 #[cfg(target_arch = "x86_64")]
 use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
@@ -35,8 +35,13 @@ use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, Transaction
 
 use fsqlite_wal::{
     FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
-    ParallelWalControlSurface, ParallelWalFallbackReason, ParallelWalOperatingMode, SubmitOutcome,
-    TransactionFrameBatch, TransactionFrameBatchContext, WalFile, thread_buffer_slot,
+    PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
+    PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
+    ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
+    ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionFrameBatch,
+    TransactionFrameBatchContext, WalFile, parallel_wal_fallback_reason_name,
+    parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -92,10 +97,6 @@ const PUBLISHED_SEQUENCE_WAIT_PATH_MODE: WaitPathMode = WaitPathMode::KeyedEvent
 const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
 const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
-const PARALLEL_WAL_LANE_POLICY_VERSION: &str = "thread_slot_v1";
-const PARALLEL_WAL_COMPATIBILITY_SELECTOR: &str = "wal_invariant,integrity_check,row_level";
-const PARALLEL_WAL_STAGE_SCENARIO_ID: &str = "parallel_wal_lane_stage";
-const PARALLEL_WAL_FLUSH_SCENARIO_ID: &str = "parallel_wal_lane_flush";
 // Flush busy handoff: retry on-CPU with a bounded spin budget and yield only
 // every `FLUSH_BUSY_HANDOFF_YIELD_EVERY` attempts. The owner-handoff rule is
 // that a losing flusher yields rarely and otherwise stays hot so the current
@@ -326,32 +327,11 @@ struct GroupCommitQueue {
     failed_epochs: Mutex<HashMap<u64, GroupCommitEpochFailure>>,
     /// Narrow per-target-epoch wake slots for waiter coordination.
     epoch_waiters: KeyedWaitRegistry,
-    /// Explicit operator/test control surface for lane-local staging.
-    parallel_wal_control: ParallelWalControlSurface,
-    /// Monotonic batch id for correlating lane-local staging with flush order.
-    next_parallel_wal_batch_id: AtomicU64,
-    /// Lane-local prepared batches waiting for a flush epoch to consume them.
-    lane_prepared_batches: Mutex<HashMap<u16, VecDeque<LaneStagedPreparedBatch>>>,
-    /// Approximate per-lane backlog in staged frames.
-    lane_backlog_frames: Mutex<HashMap<u16, usize>>,
+    /// WAL-owned lane-local staging state for prepared batches.
+    parallel_wal_lanes: ParallelWalLaneStager<traits::PreparedWalFrameBatch>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParallelWalShadowVerdict {
-    NotRun,
-    Clean,
-    Diverged,
-}
-
-#[derive(Debug, Clone)]
-struct LaneStagedPreparedBatch {
-    batch_id: u64,
-    lane_id: u16,
-    staged_frame_count: u32,
-    staging_elapsed_ns: u64,
-    shadow_verdict: ParallelWalShadowVerdict,
-    prepared: traits::PreparedWalFrameBatch,
-}
+type LaneStagedPreparedBatch = ParallelWalLaneBatch<traits::PreparedWalFrameBatch>;
 
 #[derive(Debug)]
 enum WaitForEpochOutcome {
@@ -396,92 +376,23 @@ impl GroupCommitEpochFailure {
     }
 }
 
-fn parallel_wal_mode_name(mode: ParallelWalOperatingMode) -> &'static str {
-    match mode {
-        ParallelWalOperatingMode::Auto => "auto",
-        ParallelWalOperatingMode::Conservative => "conservative",
-        ParallelWalOperatingMode::ShadowCompare => "shadow_compare",
-    }
-}
-
-fn parallel_wal_fallback_reason_name(reason: Option<ParallelWalFallbackReason>) -> &'static str {
-    match reason {
-        None => "none",
-        Some(ParallelWalFallbackReason::OperatorForced) => "operator_forced",
-        Some(ParallelWalFallbackReason::LaneOverflow) => "lane_overflow",
-        Some(ParallelWalFallbackReason::CertificateGap) => "certificate_gap",
-        Some(ParallelWalFallbackReason::CertificateChecksumMismatch) => {
-            "certificate_checksum_mismatch"
-        }
-        Some(ParallelWalFallbackReason::PublicationMismatch) => "publication_mismatch",
-        Some(ParallelWalFallbackReason::RecoveryGap) => "recovery_gap",
-        Some(ParallelWalFallbackReason::CheckpointConflict) => "checkpoint_conflict",
-        Some(ParallelWalFallbackReason::ControllerEvidenceLost) => "controller_evidence_lost",
-    }
-}
-
-fn parallel_wal_shadow_verdict_name(verdict: ParallelWalShadowVerdict) -> &'static str {
-    match verdict {
-        ParallelWalShadowVerdict::NotRun => "not_run",
-        ParallelWalShadowVerdict::Clean => "clean",
-        ParallelWalShadowVerdict::Diverged => "diverged",
-    }
-}
-
-fn default_parallel_wal_lane_count() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
-        .max(1)
-}
-
 #[cfg(test)]
 static PARALLEL_WAL_CONTROL_OVERRIDE: OnceLock<Mutex<Option<ParallelWalControlSurface>>> =
     OnceLock::new();
 
 fn resolve_parallel_wal_control_surface() -> ParallelWalControlSurface {
     #[cfg(test)]
-    if let Some(control) = PARALLEL_WAL_CONTROL_OVERRIDE
+    let test_override = PARALLEL_WAL_CONTROL_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-    {
+        .clone();
+    #[cfg(test)]
+    if let Some(control) = test_override {
         return control;
     }
 
-    let mut control = ParallelWalControlSurface::default();
-
-    if let Ok(mode) = std::env::var("FSQLITE_PARALLEL_WAL_MODE") {
-        control.mode = match mode.trim().to_ascii_lowercase().as_str() {
-            "auto" => ParallelWalOperatingMode::Auto,
-            "conservative" | "serialized" | "single_lane" => ParallelWalOperatingMode::Conservative,
-            "shadow" | "shadow_compare" => ParallelWalOperatingMode::ShadowCompare,
-            _ => control.mode,
-        };
-    }
-    if let Ok(raw) = std::env::var("FSQLITE_PARALLEL_WAL_LANES") {
-        if let Ok(value) = raw.trim().parse::<usize>() {
-            control.lane_count_override = Some(value.max(1));
-        }
-    }
-    if let Ok(raw) = std::env::var("FSQLITE_PARALLEL_WAL_MAX_BATCH_BYTES") {
-        if let Ok(value) = raw.trim().parse::<u64>() {
-            control.max_parallel_commit_bytes = Some(value.max(1));
-        }
-    }
-    if let Ok(raw) = std::env::var("FSQLITE_PARALLEL_WAL_MAX_FLUSH_DELAY_MS") {
-        if let Ok(value) = raw.trim().parse::<u64>() {
-            control.max_flush_delay_ms = Some(value);
-        }
-    }
-    if let Ok(raw) = std::env::var("FSQLITE_PARALLEL_WAL_SHADOW_COMPARE_PER_MILLE") {
-        if let Ok(value) = raw.trim().parse::<u16>() {
-            control.shadow_compare_sampling_per_mille = Some(value);
-        }
-    }
-
-    control
+    resolve_parallel_wal_control_surface_from_env()
 }
 
 #[cfg(test)]
@@ -507,116 +418,39 @@ impl GroupCommitQueue {
             completed_epoch: AtomicU64::new(0),
             failed_epochs: Mutex::new(HashMap::new()),
             epoch_waiters: KeyedWaitRegistry::new(),
-            parallel_wal_control,
-            next_parallel_wal_batch_id: AtomicU64::new(1),
-            lane_prepared_batches: Mutex::new(HashMap::new()),
-            lane_backlog_frames: Mutex::new(HashMap::new()),
+            parallel_wal_lanes: ParallelWalLaneStager::new(parallel_wal_control),
         }
     }
 
     fn parallel_wal_control(&self) -> &ParallelWalControlSurface {
-        &self.parallel_wal_control
+        self.parallel_wal_lanes.control()
     }
 
     fn next_parallel_wal_batch_id(&self) -> u64 {
-        self.next_parallel_wal_batch_id
-            .fetch_add(1, AtomicOrdering::Relaxed)
-    }
-
-    fn parallel_wal_lane_count(&self) -> usize {
-        match self.parallel_wal_control.mode {
-            ParallelWalOperatingMode::Conservative => 1,
-            _ => self
-                .parallel_wal_control
-                .lane_count_override
-                .unwrap_or_else(default_parallel_wal_lane_count)
-                .max(1),
-        }
+        self.parallel_wal_lanes.next_batch_id()
     }
 
     fn current_parallel_wal_lane_id(&self) -> u16 {
-        u16::try_from(thread_buffer_slot(self.parallel_wal_lane_count())).unwrap_or(u16::MAX)
+        self.parallel_wal_lanes.current_lane_id()
     }
 
     fn current_lane_backlog(&self, lane_id: u16) -> usize {
-        self.lane_backlog_frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&lane_id)
-            .copied()
-            .unwrap_or(0)
+        self.parallel_wal_lanes.current_lane_backlog(lane_id)
     }
 
     fn record_prepared_batch(&self, prepared_batch: LaneStagedPreparedBatch) -> usize {
-        let lane_id = prepared_batch.lane_id;
-        let staged_frame_count = usize::try_from(prepared_batch.staged_frame_count).unwrap_or(0);
-
-        {
-            let mut lane_batches = self
-                .lane_prepared_batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            lane_batches
-                .entry(lane_id)
-                .or_default()
-                .push_back(prepared_batch);
-        }
-
-        let mut lane_backlog = self
-            .lane_backlog_frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let backlog = lane_backlog.entry(lane_id).or_insert(0);
-        *backlog = backlog.saturating_add(staged_frame_count);
-        *backlog
+        self.parallel_wal_lanes.record_batch(prepared_batch)
     }
 
     fn take_prepared_batches_for_flush(
         &self,
         batches: &[TransactionFrameBatch],
     ) -> Option<HashMap<u64, LaneStagedPreparedBatch>> {
-        let mut lane_batches = self
-            .lane_prepared_batches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let mut expected_offsets = HashMap::<u16, usize>::new();
-        for batch in batches {
-            let lane_id = batch.context.lane_id;
-            let offset = expected_offsets.entry(lane_id).or_insert(0);
-            let candidate = lane_batches
-                .get(&lane_id)
-                .and_then(|queue| queue.get(*offset))
-                .filter(|candidate| candidate.batch_id == batch.context.batch_id)?;
-            let _ = candidate;
-            *offset = offset.saturating_add(1);
-        }
-
-        let mut by_batch_id = HashMap::with_capacity(batches.len());
-        let mut lane_backlog = self
-            .lane_backlog_frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for batch in batches {
-            let lane_id = batch.context.lane_id;
-            let candidate = lane_batches
-                .get_mut(&lane_id)
-                .and_then(VecDeque::pop_front)
-                .expect("verified lane-local prepared batch must still exist");
-            let backlog = lane_backlog.entry(lane_id).or_insert(0);
-            *backlog = backlog.saturating_sub(
-                usize::try_from(candidate.staged_frame_count).unwrap_or(usize::MAX),
-            );
-            if *backlog == 0 {
-                lane_backlog.remove(&lane_id);
-            }
-            if lane_batches.get(&lane_id).is_some_and(VecDeque::is_empty) {
-                lane_batches.remove(&lane_id);
-            }
-            by_batch_id.insert(candidate.batch_id, candidate);
-        }
-
-        Some(by_batch_id)
+        let contexts = batches
+            .iter()
+            .map(|batch| batch.context)
+            .collect::<Vec<_>>();
+        self.parallel_wal_lanes.take_batches_for_flush(&contexts)
     }
 
     /// Publish a completed epoch and wake all waiters.
@@ -1927,7 +1761,7 @@ fn prepare_group_commit_batch_for_lane(
         staged_frame_count: u32::try_from(frame_refs.len()).unwrap_or(u32::MAX),
         staging_elapsed_ns: u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         shadow_verdict: ParallelWalShadowVerdict::NotRun,
-        prepared,
+        payload: prepared,
     }))
 }
 
@@ -1943,17 +1777,17 @@ fn merge_prepared_group_commit_batches(
 
     let total_frames = prepared_batches
         .iter()
-        .map(|batch| batch.prepared.frame_count())
+        .map(|batch| batch.payload.frame_count())
         .sum::<usize>();
     let total_bytes = prepared_batches
         .iter()
-        .map(|batch| batch.prepared.frame_bytes.len())
+        .map(|batch| batch.payload.frame_bytes.len())
         .sum::<usize>();
 
     let mut merged = traits::PreparedWalFrameBatch {
-        frame_size: first.prepared.frame_size,
-        page_data_offset: first.prepared.page_data_offset,
-        big_endian_checksum: first.prepared.big_endian_checksum,
+        frame_size: first.payload.frame_size,
+        page_data_offset: first.payload.page_data_offset,
+        big_endian_checksum: first.payload.big_endian_checksum,
         frame_metas: Vec::with_capacity(total_frames),
         checksum_transforms: Vec::with_capacity(total_frames),
         frame_bytes: Vec::with_capacity(total_bytes),
@@ -1964,7 +1798,7 @@ fn merge_prepared_group_commit_batches(
 
     let mut saw_commit = false;
     for staged in prepared_batches {
-        let prepared = &staged.prepared;
+        let prepared = &staged.payload;
         if prepared.frame_size != merged.frame_size
             || prepared.page_data_offset != merged.page_data_offset
             || prepared.big_endian_checksum != merged.big_endian_checksum
@@ -1977,7 +1811,7 @@ fn merge_prepared_group_commit_batches(
 
         merged
             .frame_metas
-            .extend(prepared.frame_metas.iter().cloned().map(|mut meta| {
+            .extend(prepared.frame_metas.iter().copied().map(|mut meta| {
                 saw_commit |= meta.db_size_if_commit != 0;
                 meta.db_size_if_commit = 0;
                 meta
@@ -5753,13 +5587,15 @@ where
                 lane_id,
                 &parallel_wal_control,
             )? {
+                let staged_frame_count = staged_prepared.staged_frame_count;
+                let staging_elapsed_ns = staged_prepared.staging_elapsed_ns;
                 lane_shadow_verdict = staged_prepared.shadow_verdict;
-                lane_backlog = queue.record_prepared_batch(staged_prepared.clone());
+                lane_backlog = queue.record_prepared_batch(staged_prepared);
                 batch = batch.with_context(TransactionFrameBatchContext {
                     batch_id,
                     lane_id,
-                    staged_frame_count: staged_prepared.staged_frame_count,
-                    staging_elapsed_ns: staged_prepared.staging_elapsed_ns,
+                    staged_frame_count,
+                    staging_elapsed_ns,
                 });
             } else {
                 staging_fallback_reason = Some(ParallelWalFallbackReason::ControllerEvidenceLost);
@@ -10859,7 +10695,9 @@ mod tests {
     use fsqlite_wal::wal::WalAppendFrameRef;
     use fsqlite_wal::{WalFile, WalSalts};
     use serde_json::json;
-    use std::sync::{Arc as StdArc, Condvar as StdCondvar, Mutex as StdMutex};
+    use std::sync::{
+        Arc as StdArc, Condvar as StdCondvar, LazyLock as StdLazyLock, Mutex as StdMutex,
+    };
     use std::time::Instant;
 
     /// (page_number, page_data, db_size_if_commit)
@@ -10867,6 +10705,8 @@ mod tests {
     type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
     type SharedCounter = StdArc<StdMutex<usize>>;
     type SharedLockLevels = StdArc<StdMutex<Vec<LockLevel>>>;
+    static PARALLEL_WAL_LANE_TEST_LOCK: StdLazyLock<StdMutex<()>> =
+        StdLazyLock::new(|| StdMutex::new(()));
 
     fn prepared_batch_from_frame_refs(
         frames: &[crate::traits::WalFrameRef<'_>],
@@ -10922,7 +10762,7 @@ mod tests {
             staged_frame_count: u32::try_from(frames.len()).unwrap_or(u32::MAX),
             staging_elapsed_ns: u64::try_from(frames.len()).unwrap_or(u64::MAX) * 10,
             shadow_verdict: ParallelWalShadowVerdict::NotRun,
-            prepared: prepared_batch_from_frame_refs(frames, false),
+            payload: prepared_batch_from_frame_refs(frames, false),
         }
     }
 
@@ -13515,6 +13355,7 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_lane_identity_is_stable_within_thread() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
         let queue = GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface {
@@ -13538,6 +13379,7 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_lane_reuse_after_worker_churn() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
         let queue = StdArc::new(GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface {
@@ -13860,6 +13702,7 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_concurrent_writers_on_disjoint_lanes_commit_successfully() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/parallel_wal_disjoint_lane_commit.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();

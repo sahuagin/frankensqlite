@@ -1021,13 +1021,16 @@ impl InvertedIndex {
     pub fn add_text(&mut self, docid: i64, column: u32, tokenizer: &dyn Fts5Tokenizer, text: &str) {
         let mut term_positions: HashMap<String, Positions> = HashMap::new();
         let mut token_count = 0_u32;
-        tokenizer.visit_tokens(text, &mut |term, _, _, _| {
+        tokenizer.visit_tokens(text, &mut |term, _start, _end, _| {
             let position = token_count;
             token_count = token_count.saturating_add(1);
-            term_positions
-                .entry(term.to_owned())
-                .or_default()
-                .push(position);
+            if let Some(positions) = term_positions.get_mut(term) {
+                positions.push(position);
+            } else {
+                let mut positions = Positions::new();
+                positions.push(position);
+                term_positions.insert(term.to_owned(), positions);
+            }
         });
 
         for (term, positions) in term_positions {
@@ -1673,15 +1676,51 @@ impl Fts5Table {
         }
     }
 
+    fn store_document_with_tokenizer(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
+        self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
+        self.documents.insert(rowid, column_values);
+        debug!(rowid, "fts5: indexed document");
+    }
+
+    pub fn create_tokenizer_instance(&self) -> Box<dyn Fts5Tokenizer> {
+        create_tokenizer(&self.tokenizer_name)
+            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()))
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+
+    pub fn allocate_rowid(&mut self) -> i64 {
+        let rowid = self.next_rowid;
+        self.next_rowid = self.next_rowid.saturating_add(1);
+        rowid
+    }
+
+    pub fn insert_document_owned_with_tokenizer(
+        &mut self,
+        rowid: i64,
+        column_values: Vec<String>,
+        tokenizer: &dyn Fts5Tokenizer,
+    ) {
+        self.store_document_with_tokenizer(rowid, column_values, tokenizer);
+    }
+
+    fn insert_document_owned(&mut self, rowid: i64, column_values: Vec<String>) {
+        let tokenizer = self.create_tokenizer_instance();
+        self.store_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
+    }
+
     /// Insert a document into the FTS5 table.
     pub fn insert_document(&mut self, rowid: i64, column_values: &[String]) {
-        let tokenizer = create_tokenizer(&self.tokenizer_name)
-            .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
-
-        self.index_document_with_tokenizer(rowid, column_values, tokenizer.as_ref());
-
-        self.documents.insert(rowid, column_values.to_vec());
-        debug!(rowid, cols = column_values.len(), "fts5: indexed document");
+        self.insert_document_owned(rowid, column_values.to_vec());
     }
 
     /// Delete a document from the FTS5 table.
@@ -1985,8 +2024,7 @@ impl VirtualTable for Fts5Table {
             };
 
             let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-
-            self.insert_document(rowid, &col_values);
+            self.insert_document_owned(rowid, col_values);
             return Ok(Some(rowid));
         }
 
@@ -2001,8 +2039,7 @@ impl VirtualTable for Fts5Table {
         };
 
         let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
-
-        self.insert_document(new_rowid, &col_values);
+        self.insert_document_owned(new_rowid, col_values);
         Ok(None)
     }
 
@@ -2648,6 +2685,48 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(actual_positions, expected_positions);
+    }
+
+    #[test]
+    fn test_inverted_index_add_text_preserves_case_folded_terms() {
+        let tok = Unicode61Tokenizer::new();
+        let text = "HELLO hello";
+
+        let mut via_tokens = InvertedIndex::new();
+        via_tokens.add_document(1, 0, &tok.tokenize(text));
+
+        let mut via_stream = InvertedIndex::new();
+        via_stream.add_text(1, 0, &tok, text);
+
+        assert_eq!(
+            via_stream.doc_frequency("hello"),
+            via_tokens.doc_frequency("hello")
+        );
+        assert_eq!(
+            via_stream.term_frequency("hello", 1),
+            via_tokens.term_frequency("hello", 1)
+        );
+    }
+
+    #[test]
+    fn test_inverted_index_add_text_preserves_porter_terms() {
+        let tok = PorterTokenizer::new(Box::new(Unicode61Tokenizer::new()));
+        let text = "CATS cats";
+
+        let mut via_tokens = InvertedIndex::new();
+        via_tokens.add_document(1, 0, &tok.tokenize(text));
+
+        let mut via_stream = InvertedIndex::new();
+        via_stream.add_text(1, 0, &tok, text);
+
+        assert_eq!(
+            via_stream.doc_frequency("cat"),
+            via_tokens.doc_frequency("cat")
+        );
+        assert_eq!(
+            via_stream.term_frequency("cat", 1),
+            via_tokens.term_frequency("cat", 1)
+        );
     }
 
     #[test]

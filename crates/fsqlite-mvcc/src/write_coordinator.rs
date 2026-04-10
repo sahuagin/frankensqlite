@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn test_coordinator_lease_logging_includes_timestamps() {
         let coord = WriteCoordinator::new(CoordinatorMode::Native);
-        let (_, logs) = with_tracing_capture(|| {
+        let ((), logs) = with_tracing_capture(|| {
             assert!(coord.acquire_lease(100, 55));
             assert!(coord.release_lease(100));
         });

@@ -16,7 +16,9 @@ use fsqlite_pager::traits::{
     PreparedWalChecksumSeed, PreparedWalFinalizationState, PreparedWalFrameBatch,
     PreparedWalFrameMeta, WalFrameRef,
 };
-use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
+use fsqlite_pager::{
+    CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend, WalPublicationSnapshot,
+};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
@@ -124,6 +126,20 @@ impl WalPublishedSnapshot {
     }
 }
 
+#[must_use]
+fn wal_publication_snapshot_from_published(
+    snapshot: &WalPublishedSnapshot,
+) -> WalPublicationSnapshot {
+    WalPublicationSnapshot {
+        publication_seq: snapshot.publication_seq,
+        generation: snapshot.generation,
+        last_commit_frame: snapshot.last_commit_frame,
+        commit_count: snapshot.commit_count,
+        latest_frame_entries: snapshot.page_index.len(),
+        index_is_partial: snapshot.index_is_partial,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PendingPublicationFrame {
     page_number: u32,
@@ -211,6 +227,32 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     pub fn inner_mut(&mut self) -> &mut WalFile<F> {
         self.invalidate_publication();
         &mut self.wal
+    }
+
+    /// Capture the currently published WAL visibility summary for this handle.
+    ///
+    /// This is a cheap snapshot of the publication plane the adapter has
+    /// already materialized. Call [`Self::refresh_published_snapshot`] first if
+    /// the caller needs to bind to the latest on-disk committed prefix.
+    #[must_use]
+    pub fn published_snapshot(&self) -> WalPublicationSnapshot {
+        wal_publication_snapshot_from_published(&self.published_snapshot)
+    }
+
+    /// Capture the currently pinned read snapshot, if this handle has one.
+    #[must_use]
+    pub fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        self.read_snapshot
+            .as_ref()
+            .map(wal_publication_snapshot_from_published)
+    }
+
+    /// Refresh this handle from disk and republish the latest committed WAL
+    /// visibility summary without pinning a read transaction.
+    pub fn refresh_published_snapshot(&mut self, cx: &Cx) -> Result<WalPublicationSnapshot> {
+        self.wal.refresh(cx)?;
+        self.publish_latest_committed_snapshot(cx, "refresh_published_snapshot")?;
+        Ok(self.published_snapshot())
     }
 
     /// Discard published and pinned snapshots after external WAL mutation.
@@ -756,6 +798,18 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         self.read_snapshot = Some(self.published_snapshot.clone());
         self.refresh_before_append = true;
         Ok(())
+    }
+
+    fn published_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        Some(Self::published_snapshot(self))
+    }
+
+    fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+        Self::pinned_read_snapshot(self)
+    }
+
+    fn refresh_published_snapshot(&mut self, cx: &Cx) -> Result<Option<WalPublicationSnapshot>> {
+        Self::refresh_published_snapshot(self, cx).map(Some)
     }
 
     fn append_frame(
@@ -1766,6 +1820,13 @@ mod tests {
         reader
             .begin_transaction(&cx)
             .expect("begin reader snapshot 1");
+        let pinned_v1 = reader
+            .pinned_read_snapshot()
+            .expect("reader pins publication snapshot");
+        assert_eq!(pinned_v1.last_commit_frame, Some(0));
+        assert_eq!(pinned_v1.commit_count, 1);
+        assert_eq!(pinned_v1.latest_frame_entries, 1);
+        assert!(pinned_v1.lookup_contract_is_authoritative());
         assert_eq!(
             reader.read_page(&cx, 3).expect("reader sees v1"),
             Some(v1.clone())
@@ -1782,11 +1843,24 @@ mod tests {
                 .expect("reader remains on pinned snapshot"),
             Some(v1.clone())
         );
+        assert_eq!(
+            reader
+                .pinned_read_snapshot()
+                .expect("reader keeps the same pinned snapshot"),
+            pinned_v1,
+            "pinned publication metadata must stay stable until the next begin"
+        );
 
         // A new transaction snapshot should pick up the latest commit.
         reader
             .begin_transaction(&cx)
             .expect("begin reader snapshot 2");
+        let pinned_v2 = reader
+            .pinned_read_snapshot()
+            .expect("reader repins publication snapshot");
+        assert!(pinned_v2.publication_seq > pinned_v1.publication_seq);
+        assert_eq!(pinned_v2.commit_count, 2);
+        assert_eq!(pinned_v2.latest_frame_entries, 1);
         assert_eq!(reader.read_page(&cx, 3).expect("reader sees v2"), Some(v2));
     }
 
@@ -1881,6 +1955,50 @@ mod tests {
 
         let page = backend.read_page(&cx, 1).expect("read via dyn");
         assert_eq!(page, Some(sample_page(0x77)));
+    }
+
+    #[test]
+    fn test_publication_snapshots_are_visible_through_wal_backend_trait() {
+        init_wal_publication_test_tracing();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+
+        let file_writer = open_wal_file(&vfs, &cx);
+        let wal_writer =
+            WalFile::create(&cx, file_writer, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut writer = WalBackendAdapter::new(wal_writer);
+
+        writer
+            .append_frame(&cx, 4, &sample_page(0x84), 4)
+            .expect("append committed frame");
+        writer.sync(&cx).expect("sync committed frame");
+
+        let file_reader = open_wal_file(&vfs, &cx);
+        let wal_reader = WalFile::open(&cx, file_reader).expect("open WAL");
+        let mut reader = WalBackendAdapter::new(wal_reader);
+        let backend: &mut dyn WalBackend = &mut reader;
+
+        let published_before = backend
+            .published_snapshot()
+            .expect("trait should expose the adapter publication summary");
+        assert_eq!(published_before.last_commit_frame, None);
+        assert_eq!(published_before.commit_count, 0);
+
+        let refreshed = backend
+            .refresh_published_snapshot(&cx)
+            .expect("refresh through trait should succeed")
+            .expect("adapter should republish an existing committed prefix");
+        assert_eq!(refreshed.last_commit_frame, Some(0));
+        assert_eq!(refreshed.commit_count, 1);
+        assert_eq!(refreshed.latest_frame_entries, 1);
+
+        backend
+            .begin_transaction(&cx)
+            .expect("begin_transaction through trait should pin snapshot");
+        let pinned = backend
+            .pinned_read_snapshot()
+            .expect("trait should expose the pinned read snapshot");
+        assert_eq!(pinned, refreshed);
     }
 
     // -- Page index O(1) lookup tests --
@@ -2011,6 +2129,14 @@ mod tests {
         adapter
             .append_frame(&cx, 2, &new_data, 2)
             .expect("append new generation commit");
+        let refreshed = adapter
+            .refresh_published_snapshot(&cx)
+            .expect("refresh published snapshot after same-salt reset");
+        assert_eq!(refreshed.generation.checkpoint_seq, 1);
+        assert_eq!(refreshed.generation.salts, reused_salts);
+        assert_eq!(refreshed.last_commit_frame, Some(0));
+        assert_eq!(refreshed.commit_count, 1);
+        assert_eq!(refreshed.latest_frame_entries, 1);
 
         assert_eq!(
             adapter.read_page(&cx, 1).expect("old page should be gone"),
@@ -2022,6 +2148,45 @@ mod tests {
             Some(new_data),
             "adapter must resolve pages from the new generation even when salts are reused"
         );
+    }
+
+    #[test]
+    fn test_refresh_published_snapshot_materializes_existing_committed_prefix() {
+        init_wal_publication_test_tracing();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+
+        let file_writer = open_wal_file(&vfs, &cx);
+        let wal_writer =
+            WalFile::create(&cx, file_writer, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut writer = WalBackendAdapter::new(wal_writer);
+
+        let p1 = sample_page(0x71);
+        let p2 = sample_page(0x72);
+        writer.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        writer
+            .append_frame(&cx, 2, &p2, 2)
+            .expect("append p2 commit");
+        writer.sync(&cx).expect("sync writer");
+
+        let file_reader = open_wal_file(&vfs, &cx);
+        let wal_reader = WalFile::open(&cx, file_reader).expect("open reader WAL");
+        let mut reader = WalBackendAdapter::new(wal_reader);
+
+        let before = reader.published_snapshot();
+        assert_eq!(before.last_commit_frame, None);
+        assert_eq!(before.commit_count, 0);
+        assert_eq!(before.latest_frame_entries, 0);
+
+        let refreshed = reader
+            .refresh_published_snapshot(&cx)
+            .expect("refresh published snapshot");
+        assert_eq!(refreshed.last_commit_frame, Some(1));
+        assert_eq!(refreshed.commit_count, 1);
+        assert_eq!(refreshed.latest_frame_entries, 2);
+        assert!(refreshed.lookup_contract_is_authoritative());
+        assert_eq!(reader.read_page(&cx, 1).expect("read p1"), Some(p1));
+        assert_eq!(reader.read_page(&cx, 2).expect("read p2"), Some(p2));
     }
 
     #[test]
@@ -2202,6 +2367,39 @@ mod tests {
         assert_eq!(follower.read_page(&cx, 1).expect("read p1"), Some(p1));
         assert_eq!(follower.read_page(&cx, 2).expect("read p2"), Some(p2));
         assert_eq!(follower.read_page(&cx, 3).expect("read p3"), Some(p3));
+    }
+
+    #[test]
+    fn test_truncate_checkpoint_republishes_empty_generation_snapshot() {
+        init_wal_publication_test_tracing();
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+        let mut writer = MockCheckpointPageWriter;
+
+        adapter
+            .append_frame(&cx, 1, &sample_page(0x61), 1)
+            .expect("append committed frame");
+        let before = adapter.published_snapshot();
+        assert_eq!(before.last_commit_frame, Some(0));
+        assert_eq!(before.commit_count, 1);
+        assert_eq!(before.latest_frame_entries, 1);
+
+        let result = adapter
+            .checkpoint(&cx, CheckpointMode::Truncate, &mut writer, 0, None)
+            .expect("truncate checkpoint");
+        assert!(result.completed);
+        assert!(result.wal_was_reset);
+
+        let after = adapter.published_snapshot();
+        assert_ne!(
+            before.generation, after.generation,
+            "truncate checkpoint should publish a new WAL generation"
+        );
+        assert_eq!(after.last_commit_frame, None);
+        assert_eq!(after.commit_count, 0);
+        assert_eq!(after.latest_frame_entries, 0);
+        assert!(after.lookup_contract_is_authoritative());
     }
 
     // -- Partial index fallback tests --

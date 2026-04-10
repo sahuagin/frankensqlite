@@ -445,7 +445,7 @@ fn bd_3wop3_1_2_parallel_wal_staging_lane_overflow_falls_back_without_row_drift(
 }
 
 #[test]
-#[ignore]
+#[ignore = "helper entrypoint for the parent test harness; not meant to run directly"]
 fn bd_3wop3_1_2_parallel_wal_staging_child_entrypoint() {
     let run_dir = PathBuf::from(
         env::var(CHILD_RUN_DIR_ENV)
