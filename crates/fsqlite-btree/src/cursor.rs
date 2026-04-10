@@ -25,6 +25,7 @@ use crate::instrumentation::{self, BtreeOpRuntimeStats, BtreeOpType};
 use crate::overflow;
 use crate::traits::{BtreeCursorOps, SeekResult, sealed};
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::collation::CollationRegistry;
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
@@ -32,10 +33,11 @@ use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, pars
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
-use fsqlite_types::{PageData, PageNumber, WitnessKey};
+use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use std::borrow::Cow;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
+use std::sync::{Arc, Mutex};
 use tracing::{Level, debug, trace, warn};
 
 #[inline]
@@ -581,6 +583,12 @@ pub struct BtCursor<P> {
     /// The implicit trailing rowid suffix always sorts ascending, so this
     /// vector covers only the logical key terms before the rowid.
     index_desc_flags: Vec<bool>,
+    /// Per-key collation names for index cursors.
+    ///
+    /// Missing or `None` entries imply BINARY collation.
+    index_collations: Vec<Option<String>>,
+    /// Shared collation registry used by text-key comparisons.
+    collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Page stack from root to current leaf.
     stack: Vec<StackEntry>,
     /// Whether the cursor is at EOF (past the last entry).
@@ -1071,6 +1079,8 @@ impl<P: PageReader> BtCursor<P> {
             page_size: usable_size,
             is_table,
             index_desc_flags,
+            index_collations: Vec::new(),
+            collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             // Most cursor lifetimes never approach the theoretical max depth,
             // and the prepared direct-insert append lane can complete without
             // ever pushing a stack entry. Avoid paying a heap allocation up
@@ -1086,6 +1096,16 @@ impl<P: PageReader> BtCursor<P> {
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
             row_image_epoch: 0,
         }
+    }
+
+    /// Attach per-index collation metadata and a shared registry.
+    pub fn set_index_collation_context(
+        &mut self,
+        index_collations: Vec<Option<String>>,
+        collation_registry: Arc<Mutex<CollationRegistry>>,
+    ) {
+        self.index_collations = index_collations;
+        self.collation_registry = collation_registry;
     }
 
     /// Returns the read witness keys captured by the cursor.
@@ -2521,9 +2541,15 @@ impl<P: PageReader> BtCursor<P> {
         lhs: &[fsqlite_types::SqliteValue],
         rhs: &[fsqlite_types::SqliteValue],
     ) -> Option<std::cmp::Ordering> {
+        let registry_guard = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let shared_len = lhs.len().min(rhs.len());
         for idx in 0..shared_len {
-            let mut ord = lhs[idx].partial_cmp(&rhs[idx])?;
+            let coll_name = self.index_collations.get(idx).and_then(|coll| coll.as_deref());
+            let mut ord =
+                self.cmp_index_values_collated(&lhs[idx], &rhs[idx], coll_name, &registry_guard)?;
             if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
                 ord = ord.reverse();
             }
@@ -2532,6 +2558,39 @@ impl<P: PageReader> BtCursor<P> {
             }
         }
         Some(lhs.len().cmp(&rhs.len()))
+    }
+
+    fn cmp_index_values_collated(
+        &self,
+        lhs: &SqliteValue,
+        rhs: &SqliteValue,
+        coll_name: Option<&str>,
+        registry: &CollationRegistry,
+    ) -> Option<std::cmp::Ordering> {
+        if let (Some(coll_name), SqliteValue::Text(left), SqliteValue::Text(right)) =
+            (coll_name, lhs, rhs)
+        {
+            return Some(self.compare_text_with_collation(
+                left.as_bytes(),
+                right.as_bytes(),
+                coll_name,
+                registry,
+            ));
+        }
+        lhs.partial_cmp(rhs)
+    }
+
+    fn compare_text_with_collation(
+        &self,
+        left: &[u8],
+        right: &[u8],
+        coll_name: &str,
+        registry: &CollationRegistry,
+    ) -> std::cmp::Ordering {
+        registry
+            .find(coll_name)
+            .map(|collation| collation.compare(left, right))
+            .unwrap_or_else(|| left.cmp(right))
     }
 
     /// Advance to the next entry. Returns false if at EOF.
@@ -8652,6 +8711,91 @@ mod tests {
         }
 
         assert_eq!(seen_rowids, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn test_cursor_index_seek_honors_nocase_collation_on_full_record_key() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
+        cursor.set_index_collation_context(
+            vec![Some("NOCASE".to_owned())],
+            Arc::new(Mutex::new(CollationRegistry::new())),
+        );
+
+        let alpha = serialize_record(&[
+            SqliteValue::Text("alpha".into()),
+            SqliteValue::Integer(1),
+        ]);
+        let beta = serialize_record(&[
+            SqliteValue::Text("beta".into()),
+            SqliteValue::Integer(2),
+        ]);
+        cursor.index_insert(&cx, &alpha).unwrap();
+        cursor.index_insert(&cx, &beta).unwrap();
+
+        let probe = serialize_record(&[
+            SqliteValue::Text("ALPHA".into()),
+            SqliteValue::Integer(1),
+        ]);
+        assert!(
+            cursor.index_move_to(&cx, &probe).unwrap().is_found(),
+            "full-record index seek should honor NOCASE collation on the indexed text term"
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_cursor_index_iteration_honors_nocase_collation_order() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new_with_index_desc(store, pn(2), USABLE, false, Vec::new());
+        cursor.set_index_collation_context(
+            vec![Some("NOCASE".to_owned())],
+            Arc::new(Mutex::new(CollationRegistry::new())),
+        );
+
+        for key in [
+            serialize_record(&[
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Integer(1),
+            ]),
+            serialize_record(&[
+                SqliteValue::Text("ALPHA".into()),
+                SqliteValue::Integer(2),
+            ]),
+            serialize_record(&[
+                SqliteValue::Text("beta".into()),
+                SqliteValue::Integer(3),
+            ]),
+        ] {
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                let fields = parse_record(&cursor.payload(&cx).unwrap()).unwrap();
+                seen.push((fields[0].clone(), cursor.rowid(&cx).unwrap()));
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (SqliteValue::Text("alpha".into()), 1),
+                (SqliteValue::Text("ALPHA".into()), 2),
+                (SqliteValue::Text("beta".into()), 3),
+            ],
+            "index scan order should follow NOCASE collation with rowid as the tie-breaker"
+        );
     }
 
     #[test]

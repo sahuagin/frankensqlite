@@ -12086,6 +12086,12 @@ impl VdbeEngine {
             is_table_btree,
             index_desc_flags,
         );
+        if !is_table_btree {
+            new_cursor.set_index_collation_context(
+                self.index_collations_for_root(root_page),
+                Arc::clone(&self.collation_registry),
+            );
+        }
         configure_btree_cursor_page_size(&mut new_cursor, page_layout);
         self.storage_cursors.insert(
             cursor_id,
@@ -12953,6 +12959,12 @@ impl VdbeEngine {
                             self.index_desc_flags_for_root(root_page)
                         },
                     );
+                    if !is_table_btree {
+                        cursor.set_index_collation_context(
+                            self.index_collations_for_root(root_page),
+                            Arc::clone(&self.collation_registry),
+                        );
+                    }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
                     self.storage_cursors.insert(
                         cursor_id,
@@ -13059,6 +13071,12 @@ impl VdbeEngine {
                             self.index_desc_flags_for_root(root_page)
                         },
                     );
+                    if !is_table_btree {
+                        cursor.set_index_collation_context(
+                            self.index_collations_for_root(root_page),
+                            Arc::clone(&self.collation_registry),
+                        );
+                    }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
                     self.storage_cursors.insert(
                         cursor_id,
@@ -13176,6 +13194,12 @@ impl VdbeEngine {
                 self.index_desc_flags_for_root(root_page)
             },
         );
+        if !is_table_btree {
+            cursor.set_index_collation_context(
+                self.index_collations_for_root(root_page),
+                Arc::clone(&self.collation_registry),
+            );
+        }
         // Populate cursor from MemDatabase if available.
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))

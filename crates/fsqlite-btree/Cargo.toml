@@ -15,6 +15,7 @@ wasm = ["fsqlite-pager/wasm"]
 [dependencies]
 fsqlite-types = { path = "../fsqlite-types", version = "0.1", default-features = false }
 fsqlite-error = { workspace = true }
+fsqlite-func = { workspace = true }
 fsqlite-pager = { version = "0.1.2", path = "../fsqlite-pager", default-features = false }
 tracing = { workspace = true }
 hashbrown = { workspace = true }
