@@ -7,7 +7,7 @@
 
 Focused delta in this session:
 
-- While this session was in progress, `main` advanced to [`1577f3ce`](/data/projects/frankensqlite/.git/COMMIT_EDITMSG), which already contains the bead-scoped implementation in the tracked code paths:
+- While this session was in progress, `main` advanced to `1577f3ce`, which already contains the bead-scoped implementation in the tracked code paths:
   - [`crates/fsqlite-pager/src/traits.rs`](/data/projects/frankensqlite/crates/fsqlite-pager/src/traits.rs) now exposes a public `WalPublicationSnapshot` surface and corresponding `WalBackend` snapshot hooks.
   - [`crates/fsqlite-core/src/wal_adapter.rs`](/data/projects/frankensqlite/crates/fsqlite-core/src/wal_adapter.rs) now publishes/refreshes/pins generation-stamped snapshots through that trait surface and includes the trait-boundary regression test.
   - [`scripts/verify_t6_7_wal_publication_plane.sh`](/data/projects/frankensqlite/scripts/verify_t6_7_wal_publication_plane.sh) now includes the truncate-checkpoint publication phase.
@@ -21,4 +21,4 @@ Verification:
 - `rch exec -- cargo check --workspace --all-targets` passed.
 - `rch exec -- cargo clippy --workspace --all-targets -- -D warnings` passed on the current `HEAD` implementation.
 - `cargo fmt --check` passed.
-- `ubs crates/fsqlite-core/src/wal_adapter.rs crates/fsqlite-pager/src/traits.rs crates/fsqlite-pager/src/lib.rs scripts/verify_t6_7_wal_publication_plane.sh` completed but returned non-zero on long-standing findings already present in touched files, especially existing test/helper panic surfaces in `crates/fsqlite-pager/src/traits.rs`; no new bead-local issue was identified beyond the clippy item fixed above.
+- `ubs crates/fsqlite-core/src/wal_adapter.rs crates/fsqlite-pager/src/traits.rs crates/fsqlite-pager/src/lib.rs scripts/verify_t6_7_wal_publication_plane.sh` completed but returned non-zero on long-standing findings already present in touched files, especially existing test/helper panic surfaces in `crates/fsqlite-pager/src/traits.rs`; no new bead-local issue was identified in the publication-snapshot implementation itself.
