@@ -6601,28 +6601,26 @@ fn codegen_multi_join_lookup_select(
                     index_cursors[i].expect("index lookup step must have an index cursor");
                 // Probe the secondary index for `probe = X`, then
                 // SeekRowid on the data cursor using the resulting
-                // rowid.  Unlike the single-join codegen we only need
-                // the *first* match for each outer row: index lookups
-                // on unique keys have at most one row, and the planner
-                // should not hit this path for non-unique keys.
+                // rowid.  The resolver guarantees non-unique indexes
+                // have been rejected, so the first matching key row
+                // is the only one.
+                //
+                // `probe_base` was the last alloc_regs call and
+                // `min_rowid_reg` is the very next alloc_reg, so they
+                // are guaranteed adjacent — MakeRecord can read the
+                // 2-register run [probe_base, probe_base+1] directly
+                // without copying into a separate block.
                 let min_rowid_reg = b.alloc_reg();
+                debug_assert_eq!(
+                    min_rowid_reg,
+                    probe_base + 1,
+                    "probe_base and min_rowid_reg must be adjacent for MakeRecord"
+                );
                 b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
                 let probe_record_reg = b.alloc_reg();
-                // probe_base and min_rowid_reg are NOT adjacent, so we
-                // need to copy them into a 2-register run before MakeRecord.
-                let record_base = b.alloc_regs(2);
-                b.emit_op(Opcode::SCopy, probe_base, record_base, 0, P4::None, 0);
-                b.emit_op(
-                    Opcode::SCopy,
-                    min_rowid_reg,
-                    record_base + 1,
-                    0,
-                    P4::None,
-                    0,
-                );
                 b.emit_op(
                     Opcode::MakeRecord,
-                    record_base,
+                    probe_base,
                     2,
                     probe_record_reg,
                     P4::None,
