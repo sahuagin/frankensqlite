@@ -891,20 +891,20 @@ impl ParallelWalCoordinator {
             return Err("coordinator already running".to_string());
         }
 
-        if let Some(ticker_cx) = self
+        let prior_ticker_cx = self
             .ticker_cx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(ticker_cx) = prior_ticker_cx {
             ticker_cx.cancel();
         }
-        if let Some(handle) = self
+        let prior_handle = self
             .ticker_handle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(handle) = prior_handle {
             handle.wait();
         }
         if self
@@ -964,12 +964,12 @@ impl ParallelWalCoordinator {
     /// flush cycle before returning.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
-        if let Some(ticker_cx) = self
+        let prior_ticker_cx = self
             .ticker_cx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
+            .take();
+        if let Some(ticker_cx) = prior_ticker_cx {
             ticker_cx.cancel();
         }
 
@@ -1085,6 +1085,7 @@ fn flush_pending_batches(
 /// 6. Mark the epoch as durable.
 ///
 /// The loop exits when `running` is cleared or the task `Cx` is cancelled.
+#[allow(clippy::too_many_arguments)]
 fn epoch_ticker_loop(
     running: Arc<AtomicBool>,
     inner: Arc<EpochOrderCoordinator>,
