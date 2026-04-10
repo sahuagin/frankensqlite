@@ -376,6 +376,17 @@ fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
     if parts.len() < 2 {
         return None;
     }
+    // Reject fields with leading signs (`+01`, `-01`): Rust's i64 parser
+    // accepts those, but C SQLite's computeHMS requires bare decimal
+    // digits.  Without this check, `julianday('+01:00')` would return a
+    // non-NULL JDN (01:00 on 2000-01-01) instead of NULL.
+    if parts[0].starts_with('+')
+        || parts[0].starts_with('-')
+        || parts[1].starts_with('+')
+        || parts[1].starts_with('-')
+    {
+        return None;
+    }
     let h = parts[0].parse::<i64>().ok()?;
     let mi = parts[1].parse::<i64>().ok()?;
     if !(0..=23).contains(&h) || !(0..=59).contains(&mi) {
@@ -1282,6 +1293,27 @@ mod tests {
                 result,
                 SqliteValue::Null,
                 "expected NULL for malformed offset {bad:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_julianday_rejects_signed_time_fields() {
+        // C SQLite's computeHMS requires bare decimal digits for HH and
+        // MM fields.  Rust's i64::from_str accepts leading +/- signs, so
+        // without an explicit rejection guard in parse_time_part, these
+        // inputs would be treated as valid bare times instead of NULL.
+        for bad in &[
+            "+01:00",      // bare time with leading +
+            "-05:30",      // bare time with leading - (looks like a tz offset)
+            "+12:30:00",   // signed hour
+            "12:+30:00",   // signed minute
+        ] {
+            let result = JuliandayFunc.invoke(&[text(bad)]).unwrap();
+            assert_eq!(
+                result,
+                SqliteValue::Null,
+                "expected NULL for signed time field {bad:?}, got {result:?}"
             );
         }
     }
