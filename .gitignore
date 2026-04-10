@@ -255,6 +255,13 @@ __PATCHSET__
 db300_*.toml
 librust_out.rlib
 
+# Codex scratch directory — self-documenting "do not commit" marker, appears during codex sessions
+.codex_tmp_do_not_commit/
+.codex_tmp_do_not_commit
+
+# Oracle / verification evidence dumps (regenerated per run, can be huge)
+evidence/
+
 # NTM agent session directories
 .ntm/
 
