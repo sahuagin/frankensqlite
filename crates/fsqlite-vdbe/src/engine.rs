@@ -163,6 +163,7 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
     parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
+    simd_serialize_integer_record,
 };
 use fsqlite_types::serial_type::{read_varint, serial_type_len};
 use fsqlite_types::value::{
@@ -11926,10 +11927,7 @@ impl VdbeEngine {
                             })
                     };
                     let used_integer_fast_path = n_cols >= 4
-                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
-                            make_iter(),
-                            &mut rec_buf,
-                        );
+                        && simd_serialize_integer_record(make_iter(), &mut rec_buf);
                     if !used_integer_fast_path
                         && !serialize_record_iter_with_precomputed_header_into(
                             make_iter(),
@@ -11954,10 +11952,7 @@ impl VdbeEngine {
                         this.get_reg(reg)
                     });
                     if n_cols >= 4
-                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
-                            iter.clone(),
-                            &mut rec_buf,
-                        )
+                        && simd_serialize_integer_record(iter.clone(), &mut rec_buf)
                     {
                         // Integer-only row used the SIMD/scalar fixed-width fast path.
                     } else {
@@ -11976,10 +11971,7 @@ impl VdbeEngine {
                         }
                     });
                     if n_cols >= 4
-                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
-                            iter.clone(),
-                            &mut rec_buf,
-                        )
+                        && simd_serialize_integer_record(iter.clone(), &mut rec_buf)
                     {
                         // Integer-only row used the SIMD/scalar fixed-width fast path.
                     } else {
@@ -11993,10 +11985,7 @@ impl VdbeEngine {
                         this.get_reg(reg)
                     });
                     if n_cols >= 4
-                        && crate::make_record_simd::try_serialize_integer_record_iter_into(
-                            iter.clone(),
-                            &mut rec_buf,
-                        )
+                        && simd_serialize_integer_record(iter.clone(), &mut rec_buf)
                     {
                         // Integer-only row used the SIMD/scalar fixed-width fast path.
                     } else {

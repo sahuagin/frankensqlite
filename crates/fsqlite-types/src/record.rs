@@ -12,6 +12,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
+#[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
+use std::simd::{
+    Simd,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+};
+
 use crate::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
     serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
@@ -998,6 +1004,229 @@ pub struct PrecomputedSerialTypeSlot {
     /// Offset within [`PrecomputedRecordHeader::template`] where this slot's
     /// serial-type varint begins.
     pub header_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IntegerEncoding {
+    serial_type: u8,
+    payload_len: u8,
+}
+
+impl IntegerEncoding {
+    #[inline]
+    fn from_serial_type(serial_type: u8) -> Self {
+        let payload_len = match serial_type {
+            8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 => 8,
+            _ => unreachable!("integer serial type must be in 1..=9"),
+        };
+        Self {
+            serial_type,
+            payload_len,
+        }
+    }
+}
+
+#[inline]
+fn scalar_integer_encoding(value: i64) -> IntegerEncoding {
+    let serial_type = u8::try_from(serial_type_for_integer(value)).unwrap_or(0);
+    IntegerEncoding::from_serial_type(serial_type)
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
+#[inline]
+fn avx2_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(not(all(target_arch = "x86_64", not(target_arch = "wasm32"))))]
+#[inline]
+const fn avx2_available() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
+#[inline]
+fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
+    let values = Simd::<i64, 4>::from_array(values);
+    let eq_zero = values.simd_eq(Simd::splat(0));
+    let eq_one = values.simd_eq(Simd::splat(1));
+    let fits_i8 = values.simd_ge(Simd::splat(-128)) & values.simd_le(Simd::splat(127));
+    let fits_i16 = values.simd_ge(Simd::splat(-32_768)) & values.simd_le(Simd::splat(32_767));
+    let fits_i24 =
+        values.simd_ge(Simd::splat(-8_388_608)) & values.simd_le(Simd::splat(8_388_607));
+    let fits_i32 = values.simd_ge(Simd::splat(-2_147_483_648))
+        & values.simd_le(Simd::splat(2_147_483_647));
+    let fits_i48 = values.simd_ge(Simd::splat(-140_737_488_355_328))
+        & values.simd_le(Simd::splat(140_737_488_355_327));
+
+    let eq_zero = eq_zero.to_array();
+    let eq_one = eq_one.to_array();
+    let fits_i8 = fits_i8.to_array();
+    let fits_i16 = fits_i16.to_array();
+    let fits_i24 = fits_i24.to_array();
+    let fits_i32 = fits_i32.to_array();
+    let fits_i48 = fits_i48.to_array();
+
+    std::array::from_fn(|idx| {
+        let serial_type = if eq_zero[idx] {
+            8
+        } else if eq_one[idx] {
+            9
+        } else if fits_i8[idx] {
+            1
+        } else if fits_i16[idx] {
+            2
+        } else if fits_i24[idx] {
+            3
+        } else if fits_i32[idx] {
+            4
+        } else if fits_i48[idx] {
+            5
+        } else {
+            6
+        };
+        IntegerEncoding::from_serial_type(serial_type)
+    })
+}
+
+#[cfg(not(all(target_arch = "x86_64", not(target_arch = "wasm32"))))]
+#[inline]
+fn classify_integer_block_simd(values: [i64; 4]) -> [IntegerEncoding; 4] {
+    values.map(scalar_integer_encoding)
+}
+
+#[inline]
+fn classify_integer_block(values: [i64; 4], use_simd: bool) -> [IntegerEncoding; 4] {
+    if use_simd {
+        classify_integer_block_simd(values)
+    } else {
+        values.map(scalar_integer_encoding)
+    }
+}
+
+#[inline]
+fn write_integer_payload(value: i64, payload_len: usize, dst: &mut [u8]) {
+    if payload_len == 0 {
+        return;
+    }
+    let bytes = value.to_be_bytes();
+    dst.copy_from_slice(&bytes[8 - payload_len..]);
+}
+
+#[inline]
+fn write_classified_integer_block(
+    values: &[i64],
+    layouts: &[IntegerEncoding],
+    buf: &mut [u8],
+    header_offset: &mut usize,
+    body_offset: &mut usize,
+) {
+    for (value, layout) in values.iter().zip(layouts.iter()) {
+        buf[*header_offset] = layout.serial_type;
+        *header_offset += 1;
+
+        let payload_len = usize::from(layout.payload_len);
+        let body_end = *body_offset + payload_len;
+        write_integer_payload(*value, payload_len, &mut buf[*body_offset..body_end]);
+        *body_offset = body_end;
+    }
+}
+
+/// Serialize an all-integer record using a safe 4-lane classifier.
+///
+/// On x86_64 hosts with AVX2 available at runtime, the serial-type
+/// classification step uses nightly `portable_simd`; other hosts fall back to
+/// the same scalar encoding logic.
+pub fn simd_serialize_integer_record<'a, I>(values: I, buf: &mut Vec<u8>) -> bool
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    let use_simd = avx2_available();
+    let mut body_size = 0usize;
+    let mut column_count = 0usize;
+    let mut block_values = [0_i64; 4];
+    let mut block_len = 0usize;
+
+    for value in values.clone() {
+        let SqliteValue::Integer(integer) = value else {
+            return false;
+        };
+
+        block_values[block_len] = *integer;
+        block_len += 1;
+        column_count += 1;
+
+        if block_len == 4 {
+            let layouts = classify_integer_block(block_values, use_simd);
+            body_size += layouts
+                .iter()
+                .map(|layout| usize::from(layout.payload_len))
+                .sum::<usize>();
+            block_len = 0;
+        }
+    }
+
+    for value in block_values.iter().take(block_len) {
+        body_size += usize::from(scalar_integer_encoding(*value).payload_len);
+    }
+
+    let header_size = compute_header_size(column_count);
+    let total_size = header_size + body_size;
+    buf.clear();
+    buf.resize(total_size, 0);
+
+    let mut header_offset = write_varint(
+        buf.as_mut_slice(),
+        u64::try_from(header_size).unwrap_or(u64::MAX),
+    );
+    let mut body_offset = header_size;
+    let mut encode_block_values = [0_i64; 4];
+    let mut encode_block_len = 0usize;
+
+    for value in values {
+        let SqliteValue::Integer(integer) = value else {
+            return false;
+        };
+
+        encode_block_values[encode_block_len] = *integer;
+        encode_block_len += 1;
+
+        if encode_block_len == 4 {
+            let layouts = classify_integer_block(encode_block_values, use_simd);
+            write_classified_integer_block(
+                &encode_block_values,
+                &layouts,
+                buf.as_mut_slice(),
+                &mut header_offset,
+                &mut body_offset,
+            );
+            encode_block_len = 0;
+        }
+    }
+
+    if encode_block_len > 0 {
+        let mut layouts = [IntegerEncoding::default(); 4];
+        for idx in 0..encode_block_len {
+            layouts[idx] = scalar_integer_encoding(encode_block_values[idx]);
+        }
+        write_classified_integer_block(
+            &encode_block_values[..encode_block_len],
+            &layouts[..encode_block_len],
+            buf.as_mut_slice(),
+            &mut header_offset,
+            &mut body_offset,
+        );
+    }
+
+    debug_assert_eq!(header_offset, header_size);
+    debug_assert_eq!(body_offset, total_size);
+    true
 }
 
 /// Serialize a list of `SqliteValue` into the SQLite record format.
@@ -1991,6 +2220,82 @@ mod tests {
         }
     }
 
+    fn arb_integer_record_values() -> BoxedStrategy<Vec<SqliteValue>> {
+        prop::collection::vec(
+            prop_oneof![
+                10 => any::<i64>(),
+                1 => Just(0_i64),
+                1 => Just(1_i64),
+                1 => Just(-1_i64),
+                1 => Just(127_i64),
+                1 => Just(-128_i64),
+                1 => Just(128_i64),
+                1 => Just(-129_i64),
+                1 => Just(32_767_i64),
+                1 => Just(-32_768_i64),
+                1 => Just(32_768_i64),
+                1 => Just(-32_769_i64),
+                1 => Just(8_388_607_i64),
+                1 => Just(-8_388_608_i64),
+                1 => Just(8_388_608_i64),
+                1 => Just(-8_388_609_i64),
+                1 => Just(2_147_483_647_i64),
+                1 => Just(-2_147_483_648_i64),
+                1 => Just(2_147_483_648_i64),
+                1 => Just(-2_147_483_649_i64),
+                1 => Just(140_737_488_355_327_i64),
+                1 => Just(-140_737_488_355_328_i64),
+                1 => Just(140_737_488_355_328_i64),
+                1 => Just(-140_737_488_355_329_i64),
+                1 => Just(i64::MAX),
+                1 => Just(i64::MIN),
+            ]
+            .prop_map(SqliteValue::Integer),
+            0..160,
+        )
+        .boxed()
+    }
+
+    #[test]
+    fn simd_integer_record_matches_scalar_record_bytes() {
+        let row = vec![
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-128),
+            SqliteValue::Integer(32_767),
+            SqliteValue::Integer(32_768),
+            SqliteValue::Integer(8_388_607),
+            SqliteValue::Integer(8_388_608),
+            SqliteValue::Integer(i64::MIN),
+        ];
+
+        let mut fast = Vec::new();
+        assert!(simd_serialize_integer_record(row.iter(), &mut fast));
+        assert_eq!(fast, serialize_record(&row));
+    }
+
+    #[test]
+    fn simd_integer_record_rejects_non_integer_rows_without_mutating_buffer() {
+        let row = vec![
+            SqliteValue::Integer(7),
+            SqliteValue::Text("not-an-integer".into()),
+            SqliteValue::Integer(9),
+        ];
+
+        let mut fast = Vec::from([0xAA, 0xBB]);
+        assert!(!simd_serialize_integer_record(row.iter(), &mut fast));
+        assert_eq!(fast, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn simd_integer_record_handles_large_headers() {
+        let row = (0_i64..140).map(SqliteValue::Integer).collect::<Vec<_>>();
+
+        let mut fast = Vec::new();
+        assert!(simd_serialize_integer_record(row.iter(), &mut fast));
+        assert_eq!(fast, serialize_record(&row));
+    }
+
     #[test]
     fn record_profile_scope_breakdown_tracks_and_restores_nested_scopes() {
         reset_record_profile();
@@ -2137,6 +2442,26 @@ mod tests {
                     lazy_val,
                 );
             }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(10_000))]
+
+        #[test]
+        fn prop_simd_integer_record_matches_scalar(
+            values in arb_integer_record_values()
+        ) {
+            let mut fast = Vec::new();
+            prop_assert!(
+                simd_serialize_integer_record(values.iter(), &mut fast),
+                "integer-only rows must be accepted by the SIMD record serializer",
+            );
+            prop_assert_eq!(
+                fast,
+                serialize_record(&values),
+                "SIMD/scalar record serialization diverged for values={values:?}",
+            );
         }
     }
 
