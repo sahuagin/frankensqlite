@@ -2472,6 +2472,10 @@ pub fn try_cleanup_orphaned_slot(
                 .store(now_epoch_secs, Ordering::Release);
             tracing::info!(
                 orphan_txn_id,
+                slot_pid = reclaim_pid,
+                slot_pid_birth = slot.pid_birth.load(Ordering::Acquire),
+                slot_lease_expiry = slot.lease_expiry.load(Ordering::Acquire),
+                cleanup_started_at = now_epoch_secs,
                 "transitioned stale CLAIMING slot to CLEANING"
             );
         }
@@ -2487,6 +2491,10 @@ pub fn try_cleanup_orphaned_slot(
         tracing::info!(
             orphan_txn_id,
             was_claiming,
+            slot_pid = reclaim_pid,
+            slot_pid_birth = slot.pid_birth.load(Ordering::Acquire),
+            slot_lease_expiry = slot.lease_expiry.load(Ordering::Acquire),
+            cleanup_started_at = now_epoch_secs,
             "reclaiming stale sentinel slot"
         );
 
@@ -2559,7 +2567,14 @@ pub fn try_cleanup_orphaned_slot(
     // Release page locks (idempotent).
     release_locks(orphan_txn_id);
 
-    tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
+    tracing::info!(
+        orphan_txn_id,
+        slot_pid = pid,
+        slot_pid_birth = birth,
+        slot_lease_expiry = lease,
+        cleanup_started_at = now_epoch_secs,
+        "reclaiming orphaned real TxnId slot"
+    );
 
     if slot
         .txn_id
@@ -2609,11 +2624,15 @@ pub fn cleanup_orphaned_slots(
 
     tracing::info!(
         scanned = slots.len(),
+        now_epoch_secs,
         "starting cleanup_orphaned_slots pass"
     );
 
     for (idx, slot) in slots.iter().enumerate() {
+        let slot_owner_txn_id = decode_payload(slot.txn_id.load(Ordering::Acquire));
         let slot_pid = slot.pid.load(Ordering::Acquire);
+        let slot_pid_birth = slot.pid_birth.load(Ordering::Acquire);
+        let slot_lease_expiry = slot.lease_expiry.load(Ordering::Acquire);
         let result =
             try_cleanup_orphaned_slot(slot, now_epoch_secs, &process_alive, &release_locks);
         if let SlotCleanupResult::Reclaimed {
@@ -2626,8 +2645,12 @@ pub fn cleanup_orphaned_slots(
             GLOBAL_TXN_SLOT_METRICS.record_crash_detected(Some(idx), slot_pid, orphan_txn_id);
             tracing::debug!(
                 slot_idx = idx,
+                slot_owner_txn_id,
                 orphan_txn_id,
                 was_claiming,
+                slot_pid,
+                slot_pid_birth,
+                slot_lease_expiry,
                 "reclaimed orphaned slot"
             );
         }
@@ -2657,6 +2680,49 @@ mod tests {
     use fsqlite_types::{PageData, PageSize, SchemaEpoch, VersionPointer};
     use proptest::prelude::*;
     use serde_json::json;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.0.lock().expect("core_types log buffer lock");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    where
+        F: FnOnce() -> R,
+    {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().expect("core_types log buffer lock").clone();
+        (result, String::from_utf8_lossy(&bytes).to_string())
+    }
 
     fn make_page_version(pgno: u32, commit: u64) -> PageVersion {
         let pgno = PageNumber::new(pgno).unwrap();
@@ -2687,6 +2753,29 @@ mod tests {
             "(1<<62) must be rejected"
         );
         assert!(TxnId::new(u64::MAX).is_none(), "u64::MAX must be rejected");
+    }
+
+    #[test]
+    fn test_cleanup_orphaned_slots_logs_slot_identity_and_lease_fields() {
+        let slot = SharedTxnSlot::new();
+        slot.txn_id.store(42, Ordering::Release);
+        slot.lease_expiry.store(90, Ordering::Release);
+        slot.pid.store(12_345, Ordering::Release);
+        slot.pid_birth.store(9_999, Ordering::Release);
+        slot.begin_seq.store(50, Ordering::Release);
+
+        let (_, logs) = with_tracing_capture(|| {
+            let stats =
+                cleanup_orphaned_slots(std::slice::from_ref(&slot), 100, |_, _| false, |_| {});
+            assert_eq!(stats.orphans_found, 1);
+        });
+
+        assert!(logs.contains("slot_idx=0"));
+        assert!(logs.contains("slot_owner_txn_id=42"));
+        assert!(logs.contains("slot_pid=12345"));
+        assert!(logs.contains("slot_pid_birth=9999"));
+        assert!(logs.contains("slot_lease_expiry=90"));
+        assert!(logs.contains("orphan_txn_id=42"));
     }
 
     #[test]

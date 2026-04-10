@@ -445,9 +445,25 @@ impl SharedPageLockTable {
             let draining = &self.tables[draining_idx as usize];
             match self.probe_for_existing(draining, page_number) {
                 ProbeResult::FoundOwnedBy(owner) if owner == txn_id => {
+                    debug!(
+                        page_number,
+                        requester_txn_id = txn_id,
+                        holder_txn_id = owner,
+                        table = "draining",
+                        lock_intent = "exclusive",
+                        "page lock already held by requester in draining table"
+                    );
                     return AcquireResult::AlreadyHeld;
                 }
                 ProbeResult::FoundOwnedBy(holder) => {
+                    debug!(
+                        page_number,
+                        requester_txn_id = txn_id,
+                        holder_txn_id = holder,
+                        table = "draining",
+                        lock_intent = "exclusive",
+                        "page lock acquisition blocked by draining-table holder"
+                    );
                     return AcquireResult::Busy { holder };
                 }
                 ProbeResult::FoundUnlocked | ProbeResult::NotFound => {
@@ -476,6 +492,18 @@ impl SharedPageLockTable {
             at_capacity = f64::from(occupied) / f64::from(self.capacity) > MAX_LOAD_FACTOR;
         }
 
+        debug!(
+            page_number,
+            requester_txn_id = txn_id,
+            lock_intent = "exclusive",
+            rebuild_epoch = start_epoch,
+            active_table = active_idx,
+            draining_table = ?(draining_idx != DRAINING_NONE).then_some(draining_idx),
+            occupied,
+            capacity = self.capacity,
+            "page lock acquisition requested"
+        );
+
         let mut idx = self.hash_index(page_number);
         let mut probes = 0_u32;
         let first_empty;
@@ -483,7 +511,13 @@ impl SharedPageLockTable {
         loop {
             if probes >= self.capacity {
                 // Full table wrap — should not happen if load factor is enforced.
-                warn!(page_number, "SharedPageLockTable: full table probe wrap");
+                warn!(
+                    page_number,
+                    requester_txn_id = txn_id,
+                    lock_intent = "exclusive",
+                    capacity = self.capacity,
+                    "SharedPageLockTable: full table probe wrap"
+                );
                 return AcquireResult::CapacityExhausted;
             }
 
@@ -513,10 +547,41 @@ impl SharedPageLockTable {
                             );
                             return self.try_acquire(page_number, txn_id);
                         }
+                        debug!(
+                            page_number,
+                            requester_txn_id = txn_id,
+                            table = "active",
+                            slot_idx = idx,
+                            reused_slot_key = true,
+                            lock_intent = "exclusive",
+                            "page lock acquired"
+                        );
                         AcquireResult::Acquired
                     }
-                    Err(holder) if holder == txn_id => AcquireResult::AlreadyHeld,
-                    Err(holder) => AcquireResult::Busy { holder },
+                    Err(holder) if holder == txn_id => {
+                        debug!(
+                            page_number,
+                            requester_txn_id = txn_id,
+                            holder_txn_id = holder,
+                            table = "active",
+                            slot_idx = idx,
+                            lock_intent = "exclusive",
+                            "page lock already held by requester"
+                        );
+                        AcquireResult::AlreadyHeld
+                    }
+                    Err(holder) => {
+                        debug!(
+                            page_number,
+                            requester_txn_id = txn_id,
+                            holder_txn_id = holder,
+                            table = "active",
+                            slot_idx = idx,
+                            lock_intent = "exclusive",
+                            "page lock acquisition conflicted with active holder"
+                        );
+                        AcquireResult::Busy { holder }
+                    }
                 };
             }
 
@@ -533,6 +598,8 @@ impl SharedPageLockTable {
         if at_capacity {
             warn!(
                 page_number,
+                requester_txn_id = txn_id,
+                lock_intent = "exclusive",
                 occupied,
                 capacity = self.capacity,
                 "SharedPageLockTable: capacity exhausted (load factor > 0.70)"
@@ -574,14 +641,31 @@ impl SharedPageLockTable {
                     );
                     return self.try_acquire(page_number, txn_id);
                 }
+                debug!(
+                    page_number,
+                    requester_txn_id = txn_id,
+                    table = "active",
+                    slot_idx = idx,
+                    reused_slot_key = false,
+                    lock_intent = "exclusive",
+                    "page lock acquired"
+                );
                 AcquireResult::Acquired
             }
             Err(_) => {
                 // Another process raced and acquired the lock.
                 // MUST NOT continue probing for a second copy.
-                AcquireResult::Busy {
-                    holder: entry.owner_txn.load(Ordering::Acquire),
-                }
+                let holder = entry.owner_txn.load(Ordering::Acquire);
+                debug!(
+                    page_number,
+                    requester_txn_id = txn_id,
+                    holder_txn_id = holder,
+                    table = "active",
+                    slot_idx = idx,
+                    lock_intent = "exclusive",
+                    "page lock acquisition conflicted after slot claim race"
+                );
+                AcquireResult::Busy { holder }
             }
         }
     }
@@ -793,6 +877,7 @@ impl SharedPageLockTable {
         pid_birth: u64,
         now_secs: u64,
     ) -> Result<(), RebuildLeaseError> {
+        let lease_expires_at = now_secs + DEFAULT_LEASE_SECS;
         // Try CAS from 0 → pid.
         match self
             .rebuild_pid
@@ -801,9 +886,12 @@ impl SharedPageLockTable {
             Ok(_) => {
                 self.rebuild_pid_birth.store(pid_birth, Ordering::Release);
                 self.rebuild_lease_expiry
-                    .store(now_secs + DEFAULT_LEASE_SECS, Ordering::Release);
+                    .store(lease_expires_at, Ordering::Release);
                 info!(
                     pid,
+                    pid_birth,
+                    request_now_secs = now_secs,
+                    lease_expires_at,
                     epoch = self.rebuild_epoch.load(Ordering::Relaxed),
                     "rebuild lease acquired"
                 );
@@ -830,10 +918,15 @@ impl SharedPageLockTable {
                         Ok(_) => {
                             self.rebuild_pid_birth.store(pid_birth, Ordering::Release);
                             self.rebuild_lease_expiry
-                                .store(now_secs + DEFAULT_LEASE_SECS, Ordering::Release);
+                                .store(lease_expires_at, Ordering::Release);
                             warn!(
                                 old_pid = current_pid,
+                                old_pid_birth = current_pid_birth,
+                                old_lease_expiry = expiry,
                                 new_pid = pid,
+                                new_pid_birth = pid_birth,
+                                request_now_secs = now_secs,
+                                lease_expires_at,
                                 lease_expired,
                                 process_dead,
                                 "rebuild lease stolen from stale holder"
@@ -852,8 +945,15 @@ impl SharedPageLockTable {
     /// Renew the rebuild lease (extend expiry).
     pub fn renew_rebuild_lease(&self, pid: u32, now_secs: u64) -> bool {
         if self.rebuild_pid.load(Ordering::Acquire) == pid {
+            let lease_expires_at = now_secs + DEFAULT_LEASE_SECS;
             self.rebuild_lease_expiry
-                .store(now_secs + DEFAULT_LEASE_SECS, Ordering::Release);
+                .store(lease_expires_at, Ordering::Release);
+            debug!(
+                pid,
+                request_now_secs = now_secs,
+                lease_expires_at,
+                "rebuild lease renewed"
+            );
             true
         } else {
             false
@@ -941,6 +1041,7 @@ impl SharedPageLockTable {
         if cleaned > 0 {
             debug!(
                 cleaned,
+                draining_table = draining_idx,
                 "SharedPageLockTable: orphaned locks cleaned during drain"
             );
         }
@@ -985,7 +1086,10 @@ impl SharedPageLockTable {
 
         info!(
             epoch = new_epoch,
-            cleared, pid, "SharedPageLockTable: rebuild finalized"
+            cleared,
+            pid,
+            draining_table = draining_idx,
+            "SharedPageLockTable: rebuild finalized"
         );
 
         Ok(cleared)
@@ -1183,10 +1287,55 @@ pub struct RebuildResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     /// Small capacity for tests to exercise the hash table mechanics.
     const TEST_CAP: u32 = 64;
+
+    #[derive(Clone)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.0.lock().expect("shared_lock_table log buffer lock");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    where
+        F: FnOnce() -> R,
+    {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf
+            .lock()
+            .expect("shared_lock_table log buffer lock")
+            .clone();
+        (result, String::from_utf8_lossy(&bytes).to_string())
+    }
 
     // -- bd-11x0 test 1: Rotate swaps active table --
 
@@ -1246,6 +1395,35 @@ mod tests {
         let status = table.drain_progress().unwrap();
         assert_eq!(status.remaining, 0);
         assert!(status.quiescent);
+    }
+
+    #[test]
+    fn test_try_acquire_conflict_logs_lock_intent_and_holder() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+        assert_eq!(table.try_acquire(7, 11), AcquireResult::Acquired);
+
+        let (result, logs) = with_tracing_capture(|| table.try_acquire(7, 22));
+        assert_eq!(result, AcquireResult::Busy { holder: 11 });
+        assert!(logs.contains("lock_intent=\"exclusive\""));
+        assert!(logs.contains("requester_txn_id=22"));
+        assert!(logs.contains("holder_txn_id=11"));
+        assert!(logs.contains("page_number=7"));
+    }
+
+    #[test]
+    fn test_rebuild_lease_logs_pid_birth_and_expiry() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        let (_, logs) = with_tracing_capture(|| {
+            table
+                .acquire_rebuild_lease(1234, 5678, 100)
+                .expect("lease acquisition must succeed");
+        });
+
+        assert!(logs.contains("pid=1234"));
+        assert!(logs.contains("pid_birth=5678"));
+        assert!(logs.contains("request_now_secs=100"));
+        assert!(logs.contains("lease_expires_at=105"));
     }
 
     // -- bd-11x0 test 3: Rebuild does NOT require abort --

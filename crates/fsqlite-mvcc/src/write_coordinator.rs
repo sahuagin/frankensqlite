@@ -344,25 +344,39 @@ impl WriteCoordinator {
                 info!(
                     bead_id = "bd-389e",
                     old_pid = existing.holder_pid,
+                    old_acquired_at = existing.acquired_at,
+                    old_expires_at = existing.expires_at,
                     new_pid = pid,
+                    requested_at = timestamp,
                     "coordinator lease expired, allowing takeover"
                 );
             } else {
                 debug!(
                     bead_id = "bd-389e",
                     holder = existing.holder_pid,
+                    acquired_at = existing.acquired_at,
+                    expires_at = existing.expires_at,
+                    requester_pid = pid,
+                    requested_at = timestamp,
                     "coordinator lease already held"
                 );
                 return false;
             }
         }
-        *lease = Some(CoordinatorLease {
+        let new_lease = CoordinatorLease {
             holder_pid: pid,
             acquired_at: timestamp,
             expires_at: 0, // No expiry by default.
-        });
+        };
+        *lease = Some(new_lease);
         drop(lease);
-        info!(bead_id = "bd-389e", pid, "coordinator lease acquired");
+        info!(
+            bead_id = "bd-389e",
+            pid,
+            acquired_at = new_lease.acquired_at,
+            expires_at = new_lease.expires_at,
+            "coordinator lease acquired"
+        );
         true
     }
 
@@ -371,9 +385,16 @@ impl WriteCoordinator {
         let mut lease = self.lease.write();
         if let Some(existing) = &*lease {
             if existing.holder_pid == pid {
+                let released_lease = *existing;
                 *lease = None;
                 drop(lease);
-                info!(bead_id = "bd-389e", pid, "coordinator lease released");
+                info!(
+                    bead_id = "bd-389e",
+                    pid,
+                    acquired_at = released_lease.acquired_at,
+                    expires_at = released_lease.expires_at,
+                    "coordinator lease released"
+                );
                 return true;
             }
         }
@@ -387,6 +408,8 @@ impl WriteCoordinator {
             warn!(
                 bead_id = "bd-389e",
                 pid = existing.holder_pid,
+                acquired_at = existing.acquired_at,
+                expires_at = existing.expires_at,
                 "coordinator lease force-released (crash recovery)"
             );
         }
@@ -419,7 +442,9 @@ impl WriteCoordinator {
         debug!(
             bead_id = "bd-389e",
             txn = ?req.txn,
-            pages = req.write_set_summary.len(),
+            begin_seq = req.begin_seq.get(),
+            write_set_pages = req.write_set_summary.len(),
+            lock_intent = "commit_validate",
             "native_publish: starting validation"
         );
 
@@ -446,7 +471,10 @@ impl WriteCoordinator {
                 info!(
                     bead_id = "bd-389e",
                     txn = ?req.txn,
+                    begin_seq = req.begin_seq.get(),
                     conflicts = conflict_pages.len(),
+                    conflicting_commit_seq = conflict_seq.get(),
+                    conflicting_pages = ?Self::page_numbers_for_log(&conflict_pages),
                     "native_publish: FCW conflict detected"
                 );
                 return NativePublishResponse::Conflict {
@@ -471,6 +499,7 @@ impl WriteCoordinator {
             bead_id = "bd-389e",
             txn = ?req.txn,
             commit_seq = commit_seq.get(),
+            write_set_pages = req.write_set_summary.len(),
             "native_publish: commit approved (marker only, no page bytes)"
         );
 
@@ -512,8 +541,11 @@ impl WriteCoordinator {
             bead_id = "bd-389e",
             txn = ?req.txn,
             mode = ?req.mode,
-            pages = page_numbers.len(),
+            snapshot_high = req.snapshot.high.get(),
+            page_count = page_numbers.len(),
+            page_lock_count = req.page_locks.len(),
             spilled = req.write_set.is_spilled(),
+            lock_intent = "commit_validate",
             "compat_commit: starting validation"
         );
 
@@ -540,7 +572,12 @@ impl WriteCoordinator {
                 info!(
                     bead_id = "bd-389e",
                     txn = ?req.txn,
+                    snapshot_high = req.snapshot.high.get(),
                     conflicts = conflict_pages.len(),
+                    conflicting_commit_seq = conflict_seq.get(),
+                    conflicting_pages = ?Self::page_numbers_for_log(&conflict_pages),
+                    page_lock_count = req.page_locks.len(),
+                    spilled = req.write_set.is_spilled(),
                     "compat_commit: FCW conflict detected"
                 );
                 return CompatCommitResponse::Conflict {
@@ -582,6 +619,10 @@ impl WriteCoordinator {
             bead_id = "bd-389e",
             txn = ?req.txn,
             commit_seq = commit_seq.get(),
+            wal_offset,
+            page_count = page_numbers.len(),
+            page_lock_count = req.page_locks.len(),
+            spilled = req.write_set.is_spilled(),
             "compat_commit: commit approved (WAL path)"
         );
 
@@ -653,6 +694,17 @@ impl WriteCoordinator {
             }
 
             if !conflict_pages.is_empty() {
+                info!(
+                    bead_id = "bd-389e",
+                    txn = ?req.txn,
+                    snapshot_high = req.snapshot.high.get(),
+                    conflicts = conflict_pages.len(),
+                    conflicting_commit_seq = conflict_seq.get(),
+                    conflicting_pages = ?Self::page_numbers_for_log(&conflict_pages),
+                    page_lock_count = req.page_locks.len(),
+                    spilled = req.write_set.is_spilled(),
+                    "compat_commit_batch: FCW conflict detected"
+                );
                 responses.push(CompatCommitResponse::Conflict {
                     conflicting_pages: conflict_pages,
                     conflicting_commit_seq: conflict_seq,
@@ -717,6 +769,10 @@ impl WriteCoordinator {
         self.lease.read().is_some()
     }
 
+    fn page_numbers_for_log(pages: &[PageNumber]) -> Vec<u32> {
+        pages.iter().map(|page| page.get()).collect()
+    }
+
     /// Infer page size from the write set, falling back to the authoritative
     /// page size stored in the coordinator (set at construction from the
     /// database header). Never falls back to a hardcoded 4096.
@@ -752,6 +808,52 @@ impl WriteCoordinator {
 mod tests {
     use super::*;
     use fsqlite_types::{SchemaEpoch, TxnEpoch, TxnId};
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.0.lock().expect("write_coordinator log buffer lock");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    where
+        F: FnOnce() -> R,
+    {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf
+            .lock()
+            .expect("write_coordinator log buffer lock")
+            .clone();
+        (result, String::from_utf8_lossy(&bytes).to_string())
+    }
 
     fn test_token(id: u64) -> TxnToken {
         TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(0))
@@ -978,6 +1080,19 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinator_lease_logging_includes_timestamps() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Native);
+        let (_, logs) = with_tracing_capture(|| {
+            assert!(coord.acquire_lease(100, 55));
+            assert!(coord.release_lease(100));
+        });
+
+        assert!(logs.contains("acquired_at=55"));
+        assert!(logs.contains("expires_at=0"));
+        assert!(logs.contains("pid=100"));
+    }
+
+    #[test]
     fn test_native_publish_requires_active_lease() {
         let coord = WriteCoordinator::new(CoordinatorMode::Native);
         let req = native_request(1, 0, &[5, 10, 15]);
@@ -1007,6 +1122,33 @@ mod tests {
             }
             other => panic!("expected IoError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_compat_commit_conflict_logs_conflict_diagnostics() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Compatibility);
+        assert!(coord.acquire_lease(1, 0));
+
+        let first = compat_request(1, &[42]);
+        let first_resp = coord.compat_commit(&first);
+        let first_commit_seq = match first_resp {
+            CompatCommitResponse::Ok { commit_seq, .. } => commit_seq,
+            other => panic!("expected first compat commit ok, got {other:?}"),
+        };
+
+        let second = compat_request(2, &[42]);
+        let (resp, logs) = with_tracing_capture(|| coord.compat_commit(&second));
+        assert_eq!(
+            resp,
+            CompatCommitResponse::Conflict {
+                conflicting_pages: vec![PageNumber::new(42).unwrap()],
+                conflicting_commit_seq: first_commit_seq,
+            }
+        );
+        assert!(logs.contains("conflicting_pages=[42]"));
+        assert!(logs.contains("conflicting_commit_seq=1"));
+        assert!(logs.contains("page_lock_count=1"));
+        assert!(logs.contains("snapshot_high=0"));
     }
 
     #[test]
