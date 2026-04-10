@@ -9318,6 +9318,27 @@ impl VdbeEngine {
                         continue;
                     }
 
+                    let index_root_page = self.cursor_root_pages.get(&cursor_id).copied();
+                    let index_desc_flags = index_root_page
+                        .map(|root_page| self.index_desc_flags_for_root(root_page))
+                        .unwrap_or_default();
+                    let index_collations = index_root_page
+                        .map(|root_page| self.index_collations_for_root(root_page))
+                        .unwrap_or_default();
+                    let uses_collated_unique_probe = is_unique
+                        && n_idx_cols > 0
+                        && index_collations.iter().take(n_idx_cols).any(|collation| {
+                            collation
+                                .as_deref()
+                                .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+                        });
+                    let collated_unique_registry = uses_collated_unique_probe.then(|| {
+                        self.collation_registry
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .clone()
+                    });
+
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let key_bytes = key_blob.as_slice();
@@ -9327,12 +9348,43 @@ impl VdbeEngine {
                                     P4::Table(s) => s.as_str(),
                                     _ => "",
                                 };
-                                match sc.cursor.index_insert_unique(
-                                    &sc.cx,
-                                    key_bytes,
-                                    n_idx_cols,
-                                    columns_label,
-                                ) {
+                                let unique_insert_result = if uses_collated_unique_probe {
+                                    let conflict_rowid = find_conflicting_rowid_in_index_collated(
+                                        sc,
+                                        key_bytes,
+                                        n_idx_cols,
+                                        &index_desc_flags,
+                                        &index_collations,
+                                        collated_unique_registry
+                                            .as_ref()
+                                            .expect("collated probe requires registry"),
+                                    )?;
+                                    if let Some(conflict_rowid) = conflict_rowid {
+                                        Err((
+                                            FrankenError::UniqueViolation {
+                                                columns: columns_label.to_owned(),
+                                            },
+                                            Some(conflict_rowid),
+                                        ))
+                                    } else {
+                                        sc.cursor.index_insert(&sc.cx, key_bytes)?;
+                                        Ok(())
+                                    }
+                                } else {
+                                    match sc.cursor.index_insert_unique(
+                                        &sc.cx,
+                                        key_bytes,
+                                        n_idx_cols,
+                                        columns_label,
+                                    ) {
+                                        Ok(()) => Ok(()),
+                                        Err(FrankenError::UniqueViolation { columns }) => {
+                                            Err((FrankenError::UniqueViolation { columns }, None))
+                                        }
+                                        Err(err) => return Err(err),
+                                    }
+                                };
+                                match unique_insert_result {
                                     Ok(()) => {
                                         invalidate_storage_cursor_row_cache_with_reason(
                                             sc,
@@ -9341,7 +9393,7 @@ impl VdbeEngine {
                                         );
                                         self.push_pending_idx_entry(cursor_id, key_bytes.to_vec());
                                     }
-                                    Err(FrankenError::UniqueViolation { .. }) => {
+                                    Err((FrankenError::UniqueViolation { .. }, conflict_rowid)) => {
                                         match oe_flag {
                                             // OE_IGNORE (4): Undo the table
                                             // insert, roll back any already-inserted
@@ -9360,10 +9412,13 @@ impl VdbeEngine {
                                             5 | 8 => {
                                                 // Find the rowid of the
                                                 // conflicting row from the index.
-                                                let conflict_rowid =
+                                                let conflict_rowid = if uses_collated_unique_probe {
+                                                    conflict_rowid
+                                                } else {
                                                     find_conflicting_rowid_in_index(
                                                         sc, key_bytes, n_idx_cols,
-                                                    )?;
+                                                    )?
+                                                };
 
                                                 if let Some(old_rowid) = conflict_rowid {
                                                     if let Some(tbl_cid) =
@@ -9407,7 +9462,7 @@ impl VdbeEngine {
                                             }
                                         }
                                     }
-                                    Err(e) => return Err(e),
+                                    Err((error, _)) => return Err(error),
                                 }
                             } else {
                                 sc.cursor.index_insert(&sc.cx, key_bytes)?;
@@ -13886,6 +13941,69 @@ fn find_conflicting_rowid_in_index(
 
         if attempt == 0 {
             sc.cursor.prev(&sc.cx)?;
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_conflicting_rowid_in_index_collated(
+    sc: &mut StorageCursor,
+    key_bytes: &[u8],
+    n_idx_cols: usize,
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+    collation_registry: &CollationRegistry,
+) -> Result<Option<i64>> {
+    let target_values = parse_record(key_bytes).ok_or_else(|| {
+        FrankenError::internal("find_conflicting_rowid_in_index_collated: malformed new index key")
+    })?;
+    if target_values.len() < n_idx_cols
+        || target_values
+            .iter()
+            .take(n_idx_cols)
+            .any(SqliteValue::is_null)
+    {
+        return Ok(None);
+    }
+
+    if !sc.cursor.first(&sc.cx)? {
+        return Ok(None);
+    }
+
+    loop {
+        let existing_key = sc.cursor.payload(&sc.cx)?;
+        let existing_values = parse_record(&existing_key).ok_or_else(|| {
+            FrankenError::internal(
+                "find_conflicting_rowid_in_index_collated: malformed index entry record",
+            )
+        })?;
+        if existing_values.len() >= n_idx_cols
+            && existing_values
+                .iter()
+                .take(n_idx_cols)
+                .all(|value| !value.is_null())
+            && compare_index_prefix_keys(
+                &existing_values,
+                &target_values,
+                n_idx_cols,
+                desc_flags,
+                collations,
+                collation_registry,
+            ) == Ordering::Equal
+        {
+            let rowid = existing_values
+                .last()
+                .and_then(|value| match value {
+                    SqliteValue::Integer(rowid) => Some(*rowid),
+                    _ => None,
+                })
+                .unwrap_or_else(|| sc.cursor.rowid(&sc.cx).unwrap_or(0));
+            return Ok(Some(rowid));
+        }
+
+        if !sc.cursor.next(&sc.cx)? {
+            break;
         }
     }
 
