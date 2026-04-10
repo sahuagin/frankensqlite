@@ -1488,7 +1488,7 @@ impl fmt::Display for CreateIndexStatement {
         }
         write!(f, "{} ON ", self.name)?;
         write_ident(f, &self.table)?;
-        f.write_str(" (")?;
+        f.write_str("(")?;
         comma_list(f, &self.columns)?;
         f.write_str(")")?;
         if let Some(ref w) = self.where_clause {
