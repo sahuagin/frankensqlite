@@ -15,6 +15,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
 use fsqlite_types::cx::Cx;
@@ -1653,13 +1654,6 @@ const PUBLISHED_READ_FAST_RETRY_LIMIT: usize = 64;
 /// for masking. Matches typical server core counts (up to 64 cores).
 const PUBLISHED_COUNTER_STRIPE_COUNT: usize = 64;
 
-// D1-CRITICAL Change 3: Sharded published pages to eliminate publish-side serialization.
-/// Number of shards for the published pages map. Must be power of 2.
-/// 64 shards balance contention reduction with memory overhead.
-const PUBLISHED_PAGES_SHARD_COUNT: usize = 64;
-const PUBLISHED_PAGES_SHARD_MASK: usize = PUBLISHED_PAGES_SHARD_COUNT - 1;
-const PUBLISHED_PAGES_GOLDEN_RATIO: u32 = 2_654_435_769;
-
 static NEXT_PUBLISHED_COUNTER_STRIPE: AtomicUsize = AtomicUsize::new(0);
 
 std::thread_local! {
@@ -1866,126 +1860,69 @@ impl AtomicPublishedPages {
     }
 }
 
-/// Overflow publication plane for pages outside the direct-index atomic range.
+/// Concurrent overflow publication plane for pages outside the direct-index atomic range.
 #[derive(Debug)]
-struct ShardedPublishedPages {
-    shards: Box<
-        [RwLock<HashMap<PageNumber, PageData, foldhash::fast::FixedState>>;
-            PUBLISHED_PAGES_SHARD_COUNT],
-    >,
+struct ConcurrentPublishedPages {
+    pages: DashMap<PageNumber, PageData, foldhash::fast::FixedState>,
     page_count: AtomicUsize,
 }
 
-impl ShardedPublishedPages {
+impl ConcurrentPublishedPages {
     fn new() -> Self {
         Self {
-            shards: Box::new(std::array::from_fn(|_| {
-                RwLock::new(HashMap::with_hasher(foldhash::fast::FixedState::default()))
-            })),
+            pages: DashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_count: AtomicUsize::new(0),
         }
     }
 
-    /// Select the shard index for a given page number using multiplicative hashing.
-    #[inline]
-    fn shard_index(page_no: PageNumber) -> usize {
-        let hash = page_no.get().wrapping_mul(PUBLISHED_PAGES_GOLDEN_RATIO);
-        (hash as usize) & PUBLISHED_PAGES_SHARD_MASK
-    }
-
-    /// Get a page from the appropriate shard.
+    /// Get a page from the concurrent overflow plane.
     fn get(&self, page_no: PageNumber) -> Option<PageData> {
-        let shard_idx = Self::shard_index(page_no);
-        self.shards[shard_idx]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&page_no)
-            .cloned()
+        self.pages.get(&page_no).map(|page| page.value().clone())
     }
 
-    /// Insert a page into the appropriate shard.
+    /// Insert a page into the concurrent overflow plane.
     fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
-        let shard_idx = Self::shard_index(page_no);
-        let inserted = self.shards[shard_idx]
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(page_no, page)
-            .is_none();
+        let inserted = self.pages.insert(page_no, page).is_none();
         if inserted {
             self.page_count.fetch_add(1, AtomicOrdering::Relaxed);
         }
         inserted
     }
 
-    /// Remove a page from the appropriate shard.
+    /// Remove a page from the concurrent overflow plane.
     fn remove(&self, page_no: PageNumber) -> bool {
-        let shard_idx = Self::shard_index(page_no);
-        let removed = self.shards[shard_idx]
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&page_no)
-            .is_some();
+        let removed = self.pages.remove(&page_no).is_some();
         if removed {
             self.page_count.fetch_sub(1, AtomicOrdering::Relaxed);
         }
         removed
     }
 
-    /// Clear all shards.
+    /// Clear the concurrent overflow plane.
     fn clear(&self) {
-        for shard in self.shards.iter() {
-            shard
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clear();
-        }
+        self.pages.clear();
         self.page_count.store(0, AtomicOrdering::Release);
     }
 
-    /// Retain pages matching the predicate across all shards.
+    /// Retain pages matching the predicate across the overflow plane.
     fn retain<F>(&self, f: F)
     where
         F: Fn(&PageNumber) -> bool,
     {
-        let mut retained_total = 0_usize;
-        for shard in self.shards.iter() {
-            let mut shard = shard
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            shard.retain(|page_no, _| f(page_no));
-            retained_total = retained_total.saturating_add(shard.len());
-        }
+        self.pages.retain(|page_no, _| f(page_no));
         self.page_count
-            .store(retained_total, AtomicOrdering::Release);
+            .store(self.pages.len(), AtomicOrdering::Release);
     }
 
-    /// Insert multiple pages, batching by shard to minimize lock acquisitions.
+    /// Insert multiple pages into the overflow plane.
     fn insert_batch<I>(&self, pages: I)
     where
         I: IntoIterator<Item = (PageNumber, PageData)>,
     {
-        // Group pages by shard index
-        let mut shard_batches: [Vec<(PageNumber, PageData)>; PUBLISHED_PAGES_SHARD_COUNT] =
-            std::array::from_fn(|_| Vec::new());
-
-        for (page_no, page) in pages {
-            let shard_idx = Self::shard_index(page_no);
-            shard_batches[shard_idx].push((page_no, page));
-        }
-
-        // Insert each batch into its shard
         let mut total_added = 0_usize;
-        for (shard_idx, batch) in shard_batches.into_iter().enumerate() {
-            if !batch.is_empty() {
-                let mut shard = self.shards[shard_idx]
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                shard.reserve(batch.len());
-                for (page_no, page) in batch {
-                    if shard.insert(page_no, page).is_none() {
-                        total_added = total_added.saturating_add(1);
-                    }
-                }
+        for (page_no, page) in pages {
+            if self.pages.insert(page_no, page).is_none() {
+                total_added = total_added.saturating_add(1);
             }
         }
         if total_added > 0 {
@@ -1994,37 +1931,33 @@ impl ShardedPublishedPages {
         }
     }
 
-    /// Total number of pages across all shards.
+    /// Total number of pages in the overflow plane.
     fn len(&self) -> usize {
         self.page_count.load(AtomicOrdering::Acquire)
     }
 
     fn prefetch_hint(&self, page_no: PageNumber) {
-        let shard_idx = Self::shard_index(page_no);
-        let shard = &self.shards[shard_idx];
-        prefetch_l1_read(std::ptr::from_ref(shard));
-        if let Ok(guard) = shard.try_read()
-            && let Some(page) = guard.get(&page_no)
-        {
-            prefetch_l1_read(page.as_bytes().as_ptr());
+        prefetch_l1_read(std::ptr::from_ref(&self.pages));
+        if let Some(page) = self.pages.get(&page_no) {
+            prefetch_l1_read(page.value().as_bytes().as_ptr());
         }
     }
 }
 
 /// Hybrid published-page store: direct-index atomic slots for the hot
-/// `< 64K` page range, plus the legacy sharded overflow map for larger page
+/// `< 64K` page range, plus a concurrent overflow map for larger page
 /// numbers.
 #[derive(Debug)]
 struct PublishedPages {
     atomic: AtomicPublishedPages,
-    overflow: ShardedPublishedPages,
+    overflow: ConcurrentPublishedPages,
 }
 
 impl PublishedPages {
     fn new() -> Self {
         Self {
             atomic: AtomicPublishedPages::new(),
-            overflow: ShardedPublishedPages::new(),
+            overflow: ConcurrentPublishedPages::new(),
         }
     }
 
@@ -5169,6 +5102,36 @@ where
 
         Ok(())
     }
+
+    fn flush_write_set_to_db_file_batch(
+        cx: &Cx,
+        inner: &mut PagerInner<V::File>,
+        write_set: &HashMap<PageNumber, StagedPage>,
+        write_pages_sorted: &[PageNumber],
+    ) -> Result<()> {
+        if write_pages_sorted.is_empty() {
+            return Ok(());
+        }
+
+        let page_size_bytes = u64::from(inner.page_size.get());
+        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+            SmallVec::with_capacity(write_pages_sorted.len());
+        for &page_no in write_pages_sorted {
+            let staged = write_set.get(&page_no).ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "write_set missing staged page {} referenced by write_pages_sorted",
+                    page_no.get()
+                ))
+            })?;
+            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+            batched_writes.push((offset, staged.as_page_bytes()));
+        }
+
+        inner
+            .db_file
+            .write_page_batch(cx, batched_writes.as_slice())
+    }
+
     /// Commit using the WAL protocol with group commit batching.
     ///
     /// This method implements the group commit pattern (D1: bd-3wop3.1) which
@@ -6379,6 +6342,16 @@ where
             };
 
             result
+        } else if self.memory_db_bump_alloc {
+            // Private `:memory:` commits do not need rollback-journal
+            // creation/sync. Page 1 has already been staged above, so flush
+            // the final committed image directly once at the release boundary.
+            Self::flush_write_set_to_db_file_batch(
+                cx,
+                &mut inner,
+                &self.write_set,
+                &self.write_pages_sorted,
+            )
         } else {
             // Journal mode: Direct commit (no group commit)
             // Journal mode keeps inner locked throughout - no parallelization.
@@ -6688,31 +6661,15 @@ where
                     // commit. Keep the staged pages in the write set for the later
                     // publish step so the flush path avoids an eager drain/move of
                     // the whole staging map on every autocommit write.
-                    let page_size_bytes = u64::from(inner.page_size.get());
-                    let mut flushed_db_size = inner.db_size;
-                    let write_result = {
-                        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
-                            SmallVec::with_capacity(self.write_pages_sorted.len());
-                        for &page_no in &self.write_pages_sorted {
-                            let staged = self.write_set.get(&page_no).ok_or_else(|| {
-                                FrankenError::internal(format!(
-                                    "write_set missing staged page {} referenced by write_pages_sorted",
-                                    page_no.get()
-                                ))
-                            })?;
-                            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
-                            batched_writes.push((offset, staged.as_page_bytes()));
-                            flushed_db_size = flushed_db_size.max(page_no.get());
-                        }
-                        inner
-                            .db_file
-                            .write_page_batch(cx, batched_writes.as_slice())
-                    };
-                    if let Err(e) = write_result {
+                    if let Err(e) = Self::flush_write_set_to_db_file_batch(
+                        cx,
+                        &mut inner,
+                        &self.write_set,
+                        &self.write_pages_sorted,
+                    ) {
                         self.freed_pages.extend(pending_freed);
                         return Err(e);
                     }
-                    inner.db_size = flushed_db_size;
                 }
                 Ok(())
             } else {
@@ -9294,6 +9251,42 @@ mod tests {
         assert!(
             !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
             "bead_id={BEAD_ID} case=journal_deleted_after_commit"
+        );
+    }
+
+    #[test]
+    fn test_private_memory_commit_skips_journal_creation() {
+        let pager = private_memory_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&pager.db_path);
+
+        assert!(
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_commit_starts_without_journal"
+        );
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0xA5; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert!(
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_commit_avoids_journal_creation"
+        );
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page).unwrap().as_ref()[0],
+            0xA5,
+            "bead_id={BEAD_ID} case=private_memory_commit_persists_visible_page_image"
         );
     }
 
@@ -16730,6 +16723,89 @@ mod tests {
     }
 
     #[test]
+    fn test_private_memory_commit_and_retain_batches_multiple_logical_commits_without_journal() {
+        init_publication_test_tracing();
+        let pager = private_memory_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let journal_path = SimplePager::<MemoryVfs>::journal_path(&pager.db_path);
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_one = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page_one, &vec![0x11; ps]).unwrap();
+        assert!(
+            txn.commit_and_retain(&cx).unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_first_logical_commit_retained"
+        );
+        assert!(
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_first_logical_commit_skips_journal"
+        );
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.active_transactions, 1,
+                "bead_id={BEAD_ID} case=private_memory_retained_writer_keeps_single_active_txn"
+            );
+            assert!(
+                inner.writer_active,
+                "bead_id={BEAD_ID} case=private_memory_retained_writer_keeps_writer_slot"
+            );
+        }
+
+        txn.write_page(&cx, page_one, &vec![0x22; ps]).unwrap();
+        let page_two = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x33; ps]).unwrap();
+        assert!(
+            txn.commit_and_retain(&cx).unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_second_logical_commit_retained"
+        );
+        assert!(
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_second_logical_commit_skips_journal"
+        );
+
+        txn.commit(&cx).unwrap();
+        assert!(
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=private_memory_release_commit_skips_journal"
+        );
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.active_transactions, 0,
+                "bead_id={BEAD_ID} case=private_memory_release_commit_drops_active_txn_count"
+            );
+            assert!(
+                !inner.writer_active,
+                "bead_id={BEAD_ID} case=private_memory_release_commit_releases_writer_slot"
+            );
+        }
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_one).unwrap().as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=private_memory_batched_commits_keep_latest_page_one"
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().as_ref()[0],
+            0x33,
+            "bead_id={BEAD_ID} case=private_memory_batched_commits_keep_latest_page_two"
+        );
+    }
+
+    #[test]
     fn test_dirty_bitmap_set_check() {
         let pager = private_memory_pager();
         pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
@@ -17141,6 +17217,45 @@ mod tests {
     }
 
     #[test]
+    fn test_published_pages_overflow_insert_remove_clear_tracks_count() {
+        let published_pages = PublishedPages::new();
+        let overflow_page = PageNumber::new(70_000).unwrap();
+
+        assert_eq!(published_pages.len(), 0);
+        assert!(published_pages.insert(overflow_page, PageData::from_vec(sample_page(0x70))));
+        assert_eq!(
+            published_pages.get(overflow_page),
+            Some(PageData::from_vec(sample_page(0x70))),
+            "bead_id=bd-uvdnk case=overflow_insert_makes_page_visible"
+        );
+        assert_eq!(published_pages.len(), 1);
+
+        assert!(!published_pages.insert(overflow_page, PageData::from_vec(sample_page(0x71))));
+        assert_eq!(
+            published_pages.get(overflow_page),
+            Some(PageData::from_vec(sample_page(0x71))),
+            "bead_id=bd-uvdnk case=overflow_replace_keeps_latest_page"
+        );
+        assert_eq!(
+            published_pages.len(),
+            1,
+            "bead_id=bd-uvdnk case=overflow_replace_does_not_increment_count"
+        );
+
+        assert!(published_pages.remove(overflow_page));
+        assert!(published_pages.get(overflow_page).is_none());
+        assert_eq!(published_pages.len(), 0);
+
+        assert!(published_pages.insert(overflow_page, PageData::from_vec(sample_page(0x72))));
+        published_pages.clear();
+        assert!(
+            published_pages.get(overflow_page).is_none(),
+            "bead_id=bd-uvdnk case=overflow_clear_removes_page"
+        );
+        assert_eq!(published_pages.len(), 0);
+    }
+
+    #[test]
     fn test_published_pages_insert_batch_and_retain_track_page_count() {
         let published_pages = PublishedPages::new();
         let page_two = PageNumber::new(2).unwrap();
@@ -17177,7 +17292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_published_snapshot_page_set_size_tracks_sharded_page_count() {
+    fn test_published_snapshot_page_set_size_tracks_concurrent_page_count() {
         init_publication_test_tracing();
         let published = PublishedPagerState::new(4, CommitSeq::new(7), JournalMode::Wal, 0);
         let cx = Cx::new();

@@ -10,8 +10,8 @@
 //!
 //! # Sharded Page Cache (bd-3wop3.2)
 //!
-//! [`ShardedPageCache`] partitions the page-number space across 128 shards,
-//! each protected by its own mutex. This eliminates the global lock contention
+//! [`ShardedPageCache`] partitions the page-number space across a power-of-two
+//! shard array, each protected by its own mutex. This eliminates the global lock contention
 //! that limited concurrent writer throughput to 8-16 threads.
 //!
 //! Shard selection uses a multiplicative hash of the page number to ensure
@@ -19,7 +19,8 @@
 //! B-tree scans). Each shard is cache-line aligned (64 bytes) to prevent
 //! false sharing between adjacent shards.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -34,6 +35,7 @@ use fsqlite_types::{PageData, PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
+use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -161,6 +163,295 @@ impl PageCacheMetricsSnapshot {
     }
 }
 
+/// Eviction policy used by [`PageCache`] and [`ShardedPageCache`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PageCacheEvictionPolicy {
+    /// Keep the existing best-effort arbitrary victim selection.
+    #[default]
+    Arbitrary,
+    /// Reconstruct an S3-FIFO queue state from recent accesses and use it to
+    /// choose the next victim.
+    S3Fifo(S3FifoConfig),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct S3FifoQueueSnapshot {
+    small_len: usize,
+    main_len: usize,
+    ghost_len: usize,
+    small_capacity: usize,
+}
+
+#[derive(Debug, Clone)]
+struct S3FifoEvictionTracker {
+    config: S3FifoConfig,
+    adaptation_interval: usize,
+    adaptive_bounds: (usize, usize),
+    access_trace: VecDeque<PageNumber>,
+    max_trace_entries: usize,
+}
+
+impl S3FifoEvictionTracker {
+    fn new(config: S3FifoConfig) -> Self {
+        let probe = S3Fifo::with_config(config);
+        let max_trace_entries = config.capacity().saturating_mul(8).max(64);
+        Self {
+            config,
+            adaptation_interval: probe.adaptation_interval(),
+            adaptive_bounds: probe.adaptive_bounds(),
+            access_trace: VecDeque::with_capacity(max_trace_entries),
+            max_trace_entries,
+        }
+    }
+
+    fn record_access(&mut self, page_no: PageNumber) {
+        if self.access_trace.len() >= self.max_trace_entries {
+            let _ = self.access_trace.pop_front();
+        }
+        self.access_trace.push_back(page_no);
+    }
+
+    fn record_admit(&mut self, page_no: PageNumber) {
+        self.record_access(page_no);
+    }
+
+    fn forget(&mut self, page_no: PageNumber) {
+        self.access_trace.retain(|candidate| *candidate != page_no);
+    }
+
+    fn clear_history(&mut self) {
+        self.access_trace.clear();
+    }
+
+    fn choose_victim<I>(&self, resident_pages: I) -> Option<PageNumber>
+    where
+        I: IntoIterator<Item = PageNumber>,
+    {
+        let resident_pages: Vec<PageNumber> = resident_pages.into_iter().collect();
+        let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
+        let mut model = self.build_model(&resident_pages)?;
+        let synthetic_miss = choose_synthetic_miss_page(&resident_set)?;
+        let events = model.insert(synthetic_miss);
+        events.iter().find_map(|event| match event {
+            S3FifoEvent::EvictedFromSmallToGhost(page_no)
+            | S3FifoEvent::EvictedFromMain(page_no)
+                if resident_set.contains(page_no) =>
+            {
+                Some(*page_no)
+            }
+            _ => None,
+        })
+    }
+
+    fn queue_snapshot<I>(&self, resident_pages: I) -> Option<S3FifoQueueSnapshot>
+    where
+        I: IntoIterator<Item = PageNumber>,
+    {
+        let resident_pages: Vec<PageNumber> = resident_pages.into_iter().collect();
+        let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
+        let model = self.build_model(&resident_pages)?;
+        Some(S3FifoQueueSnapshot {
+            small_len: model
+                .small_pages()
+                .into_iter()
+                .filter(|page_no| resident_set.contains(page_no))
+                .count(),
+            main_len: model
+                .main_pages()
+                .into_iter()
+                .filter(|page_no| resident_set.contains(page_no))
+                .count(),
+            ghost_len: model
+                .ghost_pages()
+                .into_iter()
+                .filter(|page_no| !resident_set.contains(page_no))
+                .count(),
+            small_capacity: model.config().small_capacity(),
+        })
+    }
+
+    fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
+        if resident_pages.is_empty() {
+            return None;
+        }
+
+        let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
+        let mut resident_order = resident_pages.to_vec();
+        resident_order.sort_unstable_by_key(|page_no| page_no.get());
+
+        let mut model = S3Fifo::with_config(self.scaled_config(resident_pages.len()));
+        model.set_adaptation_interval(self.adaptation_interval);
+        let (min_bound, max_bound) = self.scaled_bounds(resident_pages.len());
+        model.set_adaptive_bounds(min_bound, max_bound);
+
+        for &page_no in &self.access_trace {
+            if !resident_set.contains(&page_no) {
+                continue;
+            }
+            if !model.access(page_no) {
+                let _ = model.insert(page_no);
+            }
+        }
+
+        let mut remaining_rounds = resident_order.len().saturating_mul(2).max(1);
+        while remaining_rounds > 0 {
+            let missing: Vec<PageNumber> = resident_order
+                .iter()
+                .copied()
+                .filter(|page_no| {
+                    !matches!(
+                        model.lookup(*page_no),
+                        Some(location) if location.kind != QueueKind::Ghost
+                    )
+                })
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            for page_no in missing {
+                let _ = model.insert(page_no);
+            }
+            remaining_rounds = remaining_rounds.saturating_sub(1);
+        }
+
+        Some(model)
+    }
+
+    fn scaled_config(&self, resident_pages: usize) -> S3FifoConfig {
+        let capacity = resident_pages.max(1);
+        let prototype_capacity = self.config.capacity().max(1);
+        let small_capacity = scale_nonzero_for_eviction_policy(
+            self.config.small_capacity(),
+            prototype_capacity,
+            capacity,
+        )
+        .clamp(1, capacity);
+        let ghost_capacity = scale_nonzero_for_eviction_policy(
+            self.config.ghost_capacity(),
+            prototype_capacity,
+            capacity,
+        )
+        .max(1);
+        S3FifoConfig::with_limits(
+            capacity,
+            small_capacity,
+            ghost_capacity,
+            self.config.max_reinsert(),
+        )
+    }
+
+    fn scaled_bounds(&self, resident_pages: usize) -> (usize, usize) {
+        let capacity = resident_pages.max(1);
+        let prototype_capacity = self.config.capacity().max(1);
+        let min_bound =
+            scale_nonzero_for_eviction_policy(self.adaptive_bounds.0, prototype_capacity, capacity)
+                .clamp(1, capacity);
+        let max_bound =
+            scale_nonzero_for_eviction_policy(self.adaptive_bounds.1, prototype_capacity, capacity)
+                .clamp(min_bound, capacity);
+        (min_bound, max_bound)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+enum PageCacheEvictionTracker {
+    #[default]
+    Arbitrary,
+    S3Fifo(S3FifoEvictionTracker),
+}
+
+impl PageCacheEvictionTracker {
+    fn from_policy(policy: PageCacheEvictionPolicy) -> Self {
+        match policy {
+            PageCacheEvictionPolicy::Arbitrary => Self::Arbitrary,
+            PageCacheEvictionPolicy::S3Fifo(config) => {
+                Self::S3Fifo(S3FifoEvictionTracker::new(config))
+            }
+        }
+    }
+
+    fn policy(&self) -> PageCacheEvictionPolicy {
+        match self {
+            Self::Arbitrary => PageCacheEvictionPolicy::Arbitrary,
+            Self::S3Fifo(tracker) => PageCacheEvictionPolicy::S3Fifo(tracker.config),
+        }
+    }
+
+    fn set_policy(&mut self, policy: PageCacheEvictionPolicy) {
+        *self = Self::from_policy(policy);
+    }
+
+    fn record_access(&mut self, page_no: PageNumber) {
+        if let Self::S3Fifo(tracker) = self {
+            tracker.record_access(page_no);
+        }
+    }
+
+    fn record_admit(&mut self, page_no: PageNumber) {
+        if let Self::S3Fifo(tracker) = self {
+            tracker.record_admit(page_no);
+        }
+    }
+
+    fn forget(&mut self, page_no: PageNumber) {
+        if let Self::S3Fifo(tracker) = self {
+            tracker.forget(page_no);
+        }
+    }
+
+    fn clear_history(&mut self) {
+        if let Self::S3Fifo(tracker) = self {
+            tracker.clear_history();
+        }
+    }
+
+    fn choose_victim<I>(&self, resident_pages: I) -> Option<PageNumber>
+    where
+        I: IntoIterator<Item = PageNumber>,
+    {
+        match self {
+            Self::Arbitrary => None,
+            Self::S3Fifo(tracker) => tracker.choose_victim(resident_pages),
+        }
+    }
+
+    fn queue_snapshot<I>(&self, resident_pages: I) -> Option<S3FifoQueueSnapshot>
+    where
+        I: IntoIterator<Item = PageNumber>,
+    {
+        match self {
+            Self::Arbitrary => None,
+            Self::S3Fifo(tracker) => tracker.queue_snapshot(resident_pages),
+        }
+    }
+}
+
+fn scale_nonzero_for_eviction_policy(
+    value: usize,
+    from_capacity: usize,
+    to_capacity: usize,
+) -> usize {
+    if value == 0 || to_capacity == 0 {
+        return 0;
+    }
+    let numerator = value.saturating_mul(to_capacity);
+    numerator.saturating_add(from_capacity.saturating_sub(1)) / from_capacity.max(1)
+}
+
+fn choose_synthetic_miss_page(resident_pages: &HashSet<PageNumber>) -> Option<PageNumber> {
+    let mut candidate = u32::MAX;
+    loop {
+        let page_no = PageNumber::new(candidate)?;
+        if !resident_pages.contains(&page_no) {
+            return Some(page_no);
+        }
+        if candidate == 1 {
+            return None;
+        }
+        candidate = candidate.saturating_sub(1);
+    }
+}
+
 /// Simple page cache: `PageNumber → PageBuf`.
 ///
 /// All buffers are drawn from a shared [`PageBufPool`].  On eviction the
@@ -178,6 +469,7 @@ pub struct PageCache {
     misses: Cell<u64>,
     admits: Cell<u64>,
     evictions: Cell<u64>,
+    eviction_policy: RefCell<PageCacheEvictionTracker>,
 }
 
 impl PageCache {
@@ -210,12 +502,24 @@ impl PageCache {
             misses: Cell::new(0),
             admits: Cell::new(0),
             evictions: Cell::new(0),
+            eviction_policy: RefCell::new(PageCacheEvictionTracker::default()),
         }
     }
 
     /// Access the underlying page pool.
     pub fn pool(&self) -> &PageBufPool {
         &self.pool
+    }
+
+    /// Set the eviction policy used by [`Self::evict_any`].
+    pub fn set_eviction_policy(&self, policy: PageCacheEvictionPolicy) {
+        self.eviction_policy.borrow_mut().set_policy(policy);
+    }
+
+    /// Return the current eviction policy.
+    #[must_use]
+    pub fn eviction_policy(&self) -> PageCacheEvictionPolicy {
+        self.eviction_policy.borrow().policy()
     }
 
     /// Number of pages currently in the cache.
@@ -232,6 +536,7 @@ impl PageCache {
     pub fn get(&self, page_no: PageNumber) -> Option<&[u8]> {
         if let Some(page) = self.pages.get(&page_no) {
             self.hits.set(self.hits.get().saturating_add(1));
+            self.eviction_policy.borrow_mut().record_access(page_no);
             Some(page.as_slice())
         } else {
             self.misses.set(self.misses.get().saturating_add(1));
@@ -246,9 +551,10 @@ impl PageCache {
     /// layer.
     #[inline]
     pub fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
-        if let Some(page) = self.pages.get_mut(&page_no) {
+        if self.pages.contains_key(&page_no) {
             self.hits.set(self.hits.get().saturating_add(1));
-            Some(page.as_mut_slice())
+            self.eviction_policy.borrow_mut().record_access(page_no);
+            self.pages.get_mut(&page_no).map(PageBuf::as_mut_slice)
         } else {
             self.misses.set(self.misses.get().saturating_add(1));
             None
@@ -279,7 +585,9 @@ impl PageCache {
         file: &mut impl VfsFile,
         page_no: PageNumber,
     ) -> Result<&[u8]> {
-        if !self.contains(page_no) {
+        if self.contains(page_no) {
+            self.eviction_policy.borrow_mut().record_access(page_no);
+        } else {
             let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
             let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
@@ -294,6 +602,7 @@ impl PageCache {
             }
             self.pages.insert(page_no, buf);
             self.admits.set(self.admits.get().saturating_add(1));
+            self.eviction_policy.borrow_mut().record_admit(page_no);
         }
         // SAFETY (logical): we just ensured the key exists above.
         Ok(self.pages.get(&page_no).expect("just inserted").as_slice())
@@ -314,6 +623,7 @@ impl PageCache {
             )));
         };
         self.hits.set(self.hits.get().saturating_add(1));
+        self.eviction_policy.borrow_mut().record_access(page_no);
         let offset = page_offset(page_no, self.page_size);
         file.write(cx, buf.as_slice(), offset)?;
         Ok(())
@@ -327,15 +637,19 @@ impl PageCache {
         // Zero the buffer to match the "new page" semantics.
         let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
+        let admitted_new = !self.pages.contains_key(&page_no);
+        if admitted_new {
+            self.eviction_policy.borrow_mut().record_admit(page_no);
+        } else {
+            self.eviction_policy.borrow_mut().record_access(page_no);
+        }
 
-        let (out, admitted_new) = match self.pages.entry(page_no) {
+        let out = match self.pages.entry(page_no) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(buf);
-                (entry.into_mut().as_mut_slice(), false)
+                entry.into_mut().as_mut_slice()
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                (entry.insert(buf).as_mut_slice(), true)
-            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(buf).as_mut_slice(),
         };
         if admitted_new {
             self.admits.set(self.admits.get().saturating_add(1));
@@ -345,6 +659,12 @@ impl PageCache {
 
     /// Directly insert an existing `PageBuf` into the cache.
     pub fn insert_buffer(&mut self, page_no: PageNumber, buf: PageBuf) {
+        let admitted_new = !self.pages.contains_key(&page_no);
+        if admitted_new {
+            self.eviction_policy.borrow_mut().record_admit(page_no);
+        } else {
+            self.eviction_policy.borrow_mut().record_access(page_no);
+        }
         let admitted_new = match self.pages.entry(page_no) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(buf);
@@ -370,6 +690,7 @@ impl PageCache {
         let removed = self.pages.remove(&page_no).is_some();
         if removed {
             self.evictions.set(self.evictions.get().saturating_add(1));
+            self.eviction_policy.borrow_mut().forget(page_no);
         }
         removed
     }
@@ -378,10 +699,16 @@ impl PageCache {
     ///
     /// Returns `true` if a page was evicted, `false` if the cache was empty.
     pub fn evict_any(&mut self) -> bool {
-        let key = self.pages.keys().next().copied();
+        let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
+        let key = self
+            .eviction_policy
+            .borrow()
+            .choose_victim(residents.iter().copied())
+            .or_else(|| residents.first().copied());
         if let Some(key) = key {
             self.pages.remove(&key);
             self.evictions.set(self.evictions.get().saturating_add(1));
+            self.eviction_policy.borrow_mut().forget(key);
             true
         } else {
             false
@@ -395,12 +722,28 @@ impl PageCache {
         self.evictions
             .set(self.evictions.get().saturating_add(removed_u64));
         self.pages.clear();
+        self.eviction_policy.borrow_mut().clear_history();
     }
 
     /// Capture current cache metrics.
     #[must_use]
     pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
         let cached_pages = self.pages.len();
+        let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
+        let queue_snapshot = self
+            .eviction_policy
+            .borrow()
+            .queue_snapshot(residents.iter().copied());
+        let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
+            (
+                snapshot.small_len,
+                snapshot.main_len,
+                snapshot.ghost_len,
+                snapshot.small_capacity,
+            )
+        } else {
+            (cached_pages, 0, 0, cached_pages)
+        };
         PageCacheMetricsSnapshot {
             hits: self.hits.get(),
             misses: self.misses.get(),
@@ -409,11 +752,11 @@ impl PageCache {
             cached_pages,
             pool_capacity: self.pool.capacity(),
             dirty_ratio_pct: 0,
-            t1_size: cached_pages,
-            t2_size: 0,
-            b1_size: 0,
+            t1_size,
+            t2_size,
+            b1_size,
             b2_size: 0,
-            p_target: cached_pages,
+            p_target,
             mvcc_multi_version_pages: 0,
         }
     }
@@ -446,18 +789,17 @@ impl std::fmt::Debug for PageCache {
 // ShardedPageCache (bd-3wop3.2)
 // ---------------------------------------------------------------------------
 
-/// Number of shards in [`ShardedPageCache`].
+/// Default number of shards in [`ShardedPageCache`].
 ///
-/// Must be a power of 2 for efficient masking. 128 shards provides good
-/// scalability up to ~64 concurrent writers while keeping memory overhead
-/// reasonable (~8KB for shard metadata on 64-byte cache lines).
+/// Must be a power of 2 for efficient masking. The default 128 shards provide
+/// good scalability up to ~64 concurrent writers while keeping memory
+/// overhead reasonable (~8KB for shard metadata on 64-byte cache lines).
 ///
 /// Future: consider scaling with `std::thread::available_parallelism()` for
 /// small embedded targets (fewer shards) or large servers (more shards).
-const SHARD_COUNT: usize = 128;
-
-/// Mask for shard index calculation (`SHARD_COUNT - 1`).
-const SHARD_MASK: usize = SHARD_COUNT - 1;
+pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 128;
+const MIN_PAGE_CACHE_SHARDS: usize = 2;
+const MAX_PAGE_CACHE_SHARDS: usize = 1024;
 
 /// Golden ratio constant for multiplicative hashing.
 ///
@@ -496,6 +838,14 @@ const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
 /// configured maximum buffer count while overflow shards still absorb the cold
 /// tail.
 const FLAT_SLOTS_TARGET_CAPACITY: usize = 16_384;
+
+fn normalize_page_cache_shard_count(requested: usize) -> usize {
+    requested
+        .clamp(MIN_PAGE_CACHE_SHARDS, MAX_PAGE_CACHE_SHARDS)
+        .checked_next_power_of_two()
+        .unwrap_or(MAX_PAGE_CACHE_SHARDS)
+        .clamp(MIN_PAGE_CACHE_SHARDS, MAX_PAGE_CACHE_SHARDS)
+}
 
 #[derive(Debug)]
 struct CachedPageEntry {
@@ -703,6 +1053,18 @@ impl FastPageArray {
     #[inline]
     fn len(&self) -> usize {
         self.count
+    }
+
+    fn resident_pages(&self) -> Vec<PageNumber> {
+        self.pages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                slot.as_ref()?;
+                let pgno = u32::try_from(idx.saturating_add(1)).ok()?;
+                PageNumber::new(pgno)
+            })
+            .collect()
     }
 
     /// Reset metrics counters.
@@ -945,8 +1307,8 @@ impl FlatPageSlots {
         }
     }
 
-    /// Remove an arbitrary page (for eviction). Returns `true` if evicted.
-    fn remove_any(&self) -> bool {
+    /// Remove an arbitrary page (for eviction) and return its page number.
+    fn remove_any_page(&self) -> Option<PageNumber> {
         // Pseudo-random start to spread eviction pressure.
         let start = self.count.load(Ordering::Relaxed) & self.mask;
         for i in 0..self.slots.len() {
@@ -967,10 +1329,10 @@ impl FlatPageSlots {
                 let _ = self.slots[idx].data.lock().take();
                 self.count.fetch_sub(1, Ordering::Relaxed);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
-                return true;
+                return PageNumber::new(slot_pgno);
             }
         }
-        false
+        None
     }
 
     /// Clear all pages. Returns the number of pages evicted.
@@ -993,6 +1355,19 @@ impl FlatPageSlots {
     #[inline]
     fn len(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    fn resident_pages(&self) -> Vec<PageNumber> {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                let pgno = slot.pgno.load(Ordering::Acquire);
+                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
+                    return None;
+                }
+                PageNumber::new(pgno)
+            })
+            .collect()
     }
 
     /// Reset metrics counters.
@@ -1053,6 +1428,10 @@ impl PageCacheShard {
     #[inline]
     fn len(&self) -> usize {
         self.pages.len()
+    }
+
+    fn resident_pages(&self) -> Vec<PageNumber> {
+        self.pages.keys().copied().collect()
     }
 
     /// Check if a page is present in this shard.
@@ -1164,15 +1543,16 @@ impl std::fmt::Debug for PageCacheShard {
 
 /// Sharded page cache for high-concurrency workloads (bd-3wop3.2).
 ///
-/// This cache partitions the page-number space across 128 mutex-protected
-/// shards. Concurrent writers operating on different pages (or even the same
-/// page with different page numbers) acquire different shard locks, enabling
-/// near-linear scaling up to ~64 threads.
+/// This cache partitions the page-number space across a configurable
+/// power-of-two number of mutex-protected shards. Concurrent writers
+/// operating on different pages acquire different shard locks, enabling
+/// near-linear scaling up to ~64 threads with the default configuration.
 ///
 /// # Design Rationale
 ///
-/// - **128 shards**: Balance between lock granularity and memory overhead.
-///   Each shard adds ~64 bytes of cache-line-padded mutex overhead.
+/// - **Partitioned overflow map**: The default 128 shards balance lock
+///   granularity and memory overhead. Each shard adds ~64 bytes of
+///   cache-line-padded mutex overhead.
 /// - **Multiplicative hash**: Ensures good distribution even for sequential
 ///   page access patterns (B-tree scans, bulk inserts).
 /// - **Shared pool**: The underlying `PageBufPool` remains global because
@@ -1195,9 +1575,11 @@ pub struct ShardedPageCache {
     /// CAS-based flat hash page cache (bd-eorms, pcache1 pattern).
     /// Tried first for all lookups; cache misses are lock-free.
     flat_slots: FlatPageSlots,
-    /// Overflow: 128 cache shards, each cache-line aligned.
+    /// Overflow: one cache-line aligned shard per configured partition.
     /// Used when the flat table is full or for CAS-failure fallback.
-    shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]>,
+    shards: Box<[Mutex<PageCacheShard>]>,
+    shard_mask: usize,
+    shard_shift: u32,
     /// Shared page buffer pool (lock-free allocation).
     pool: PageBufPool,
     /// Configured page size.
@@ -1208,6 +1590,10 @@ pub struct ShardedPageCache {
     /// Whether to use the fast path. Checked first on every operation.
     /// `Relaxed` ordering is sufficient since we're just reading a hint.
     use_fast_path: AtomicBool,
+    /// Fast gate for eviction-policy bookkeeping on the read path.
+    eviction_policy_enabled: AtomicBool,
+    /// Shared eviction-policy tracker used by [`Self::evict_any`].
+    eviction_policy: Mutex<PageCacheEvictionTracker>,
 }
 
 impl ShardedPageCache {
@@ -1221,7 +1607,11 @@ impl ShardedPageCache {
     /// For single-connection `:memory:` workloads, prefer [`new_single_connection`]
     /// which enables the fast-path flat array (bd-fzr07).
     pub fn new(page_size: PageSize) -> Self {
-        Self::with_max_buffers(page_size, resolve_page_buffer_max(None))
+        Self::with_max_buffers_and_shards(
+            page_size,
+            resolve_page_buffer_max(None),
+            DEFAULT_PAGE_CACHE_SHARDS,
+        )
     }
 
     /// Create a new sharded page cache with an explicit buffer-pool ceiling.
@@ -1230,7 +1620,23 @@ impl ShardedPageCache {
     /// the underlying [`PageBufPool`] will allow.  Once the bound is reached,
     /// further buffer acquisitions fail with [`FrankenError::OutOfMemory`].
     pub fn with_max_buffers(page_size: PageSize, max_buffers: usize) -> Self {
-        Self::with_pool(PageBufPool::new(page_size, max_buffers), page_size)
+        Self::with_max_buffers_and_shards(page_size, max_buffers, DEFAULT_PAGE_CACHE_SHARDS)
+    }
+
+    /// Create a sharded cache with an explicit partition count.
+    ///
+    /// `shard_count` is normalized to a power of two within a bounded range so
+    /// shard selection can stay on the fast multiplicative-hash path.
+    pub fn with_max_buffers_and_shards(
+        page_size: PageSize,
+        max_buffers: usize,
+        shard_count: usize,
+    ) -> Self {
+        Self::with_pool_and_shards(
+            PageBufPool::new(page_size, max_buffers),
+            page_size,
+            shard_count,
+        )
     }
 
     /// Create a new sharded page cache optimized for single-connection mode (bd-fzr07).
@@ -1250,9 +1656,17 @@ impl ShardedPageCache {
 
     /// Create a new sharded page cache using an existing `PageBufPool`.
     pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
-        // Initialize all shards
-        let shards: Box<[Mutex<PageCacheShard>; SHARD_COUNT]> =
-            Box::new(std::array::from_fn(|_| Mutex::new(PageCacheShard::new())));
+        Self::with_pool_and_shards(pool, page_size, DEFAULT_PAGE_CACHE_SHARDS)
+    }
+
+    fn with_pool_and_shards(pool: PageBufPool, page_size: PageSize, shard_count: usize) -> Self {
+        let shard_count = normalize_page_cache_shard_count(shard_count);
+        let shard_shift = 32 - shard_count.trailing_zeros();
+        let shard_mask = shard_count - 1;
+        let shards = (0..shard_count)
+            .map(|_| Mutex::new(PageCacheShard::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
 
         // Bound the lock-free front-cache to a reasonable hot set. The pool
         // ceiling is a lazy upper bound; eagerly allocating one flat slot per
@@ -1266,10 +1680,14 @@ impl ShardedPageCache {
         Self {
             flat_slots: FlatPageSlots::new(flat_capacity),
             shards,
+            shard_mask,
+            shard_shift,
             pool,
             page_size,
             fast_array: None,
             use_fast_path: AtomicBool::new(false),
+            eviction_policy_enabled: AtomicBool::new(false),
+            eviction_policy: Mutex::new(PageCacheEvictionTracker::default()),
         }
     }
 
@@ -1301,16 +1719,87 @@ impl ShardedPageCache {
         self.use_fast_path.load(Ordering::Relaxed)
     }
 
+    /// Set the eviction policy used by [`Self::evict_any`].
+    pub fn set_eviction_policy(&self, policy: PageCacheEvictionPolicy) {
+        *self.eviction_policy.lock() = PageCacheEvictionTracker::from_policy(policy);
+        self.eviction_policy_enabled.store(
+            !matches!(policy, PageCacheEvictionPolicy::Arbitrary),
+            Ordering::Release,
+        );
+    }
+
+    /// Return the current eviction policy.
+    #[must_use]
+    pub fn eviction_policy(&self) -> PageCacheEvictionPolicy {
+        self.eviction_policy.lock().policy()
+    }
+
+    #[inline]
+    fn eviction_tracking_enabled(&self) -> bool {
+        self.eviction_policy_enabled.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn record_eviction_access(&self, page_no: PageNumber) {
+        if self.eviction_tracking_enabled() {
+            self.eviction_policy.lock().record_access(page_no);
+        }
+    }
+
+    #[inline]
+    fn record_eviction_admit(&self, page_no: PageNumber) {
+        if self.eviction_tracking_enabled() {
+            self.eviction_policy.lock().record_admit(page_no);
+        }
+    }
+
+    #[inline]
+    fn forget_eviction_page(&self, page_no: PageNumber) {
+        if self.eviction_tracking_enabled() {
+            self.eviction_policy.lock().forget(page_no);
+        }
+    }
+
+    #[inline]
+    fn clear_eviction_history(&self) {
+        if self.eviction_tracking_enabled() {
+            self.eviction_policy.lock().clear_history();
+        }
+    }
+
     /// Select the shard index for a given page number.
     ///
     /// Uses multiplicative hashing with the golden ratio constant for good
     /// distribution of sequential page numbers.
     #[inline]
-    fn shard_index(page_no: PageNumber) -> usize {
+    fn shard_index(&self, page_no: PageNumber) -> usize {
+        Self::shard_index_for(page_no, self.shard_shift, self.shard_mask)
+    }
+
+    #[inline]
+    fn shard_index_for(page_no: PageNumber, shard_shift: u32, shard_mask: usize) -> usize {
         let hash = page_no.get().wrapping_mul(GOLDEN_RATIO_32);
-        // Multiplicative hashing requires extracting the highest bits.
-        // SHARD_COUNT is 128 (2^7), so we shift right by (32 - 7) = 25.
-        (hash >> 25) as usize
+        (hash >> shard_shift) as usize & shard_mask
+    }
+
+    /// Number of configured partitions in the overflow shard map.
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn resident_pages(&self) -> Vec<PageNumber> {
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                return fast.lock().resident_pages();
+            }
+        }
+
+        let mut residents = self.flat_slots.resident_pages();
+        for shard in self.shards.iter() {
+            residents.extend(shard.lock().resident_pages());
+        }
+        residents
     }
 
     /// Access the underlying page pool.
@@ -1357,7 +1846,7 @@ impl ShardedPageCache {
         if self.flat_slots.contains(page_no) {
             return true;
         }
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         self.shards[idx].lock().contains(page_no)
     }
 
@@ -1373,17 +1862,27 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get(page_no).map(|s| s.to_vec());
+                let result = fast.lock().get(page_no).map(|s| s.to_vec());
+                if result.is_some() {
+                    self.record_eviction_access(page_no);
+                }
+                return result;
             }
         }
         // Flat slots (bd-eorms) — lock-free probe, per-slot Mutex on hit
         if let Some(data) = self.flat_slots.get_copy(page_no) {
+            self.record_eviction_access(page_no);
             return Some(data);
         }
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get(page_no).map(|slice| slice.to_vec())
+        let result = shard.get(page_no).map(|slice| slice.to_vec());
+        drop(shard);
+        if result.is_some() {
+            self.record_eviction_access(page_no);
+        }
+        result
     }
 
     /// Access a cached page via a callback (zero-copy pattern).
@@ -1395,7 +1894,11 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get(page_no).map(f);
+                let result = fast.lock().get(page_no).map(f);
+                if result.is_some() {
+                    self.record_eviction_access(page_no);
+                }
+                return result;
             }
         }
         // Flat slots (bd-eorms) — find_slot is lock-free; data Mutex on hit only
@@ -1403,14 +1906,22 @@ impl ShardedPageCache {
             self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let guard = self.flat_slots.slots[slot_idx].data.lock();
             if let Some(ref buf) = *guard {
-                return Some(f(buf.as_slice()));
+                let result = f(buf.as_slice());
+                drop(guard);
+                self.record_eviction_access(page_no);
+                return Some(result);
             }
             // Data cleared between probe and lock (rare race). Fall through.
         }
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get(page_no).map(f)
+        let result = shard.get(page_no).map(f);
+        drop(shard);
+        if result.is_some() {
+            self.record_eviction_access(page_no);
+        }
+        result
     }
 
     /// Access a cached page mutably via a callback.
@@ -1423,7 +1934,11 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get_mut(page_no).map(f);
+                let result = fast.lock().get_mut(page_no).map(f);
+                if result.is_some() {
+                    self.record_eviction_access(page_no);
+                }
+                return result;
             }
         }
         // Flat slots (bd-eorms)
@@ -1431,13 +1946,21 @@ impl ShardedPageCache {
             self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let mut guard = self.flat_slots.slots[slot_idx].data.lock();
             if let Some(ref mut buf) = *guard {
-                return Some(f(buf.as_mut_slice()));
+                let result = f(buf.as_mut_slice());
+                drop(guard);
+                self.record_eviction_access(page_no);
+                return Some(result);
             }
         }
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get_mut(page_no).map(f)
+        let result = shard.get_mut(page_no).map(f);
+        drop(shard);
+        if result.is_some() {
+            self.record_eviction_access(page_no);
+        }
+        result
     }
 
     /// Read a page from a VFS file into the cache.
@@ -1458,7 +1981,10 @@ impl ShardedPageCache {
                 let mut arr = fast.lock();
                 // Check for cache hit first
                 if let Some(data) = arr.get(page_no) {
-                    return Ok(f(data));
+                    let result = f(data);
+                    drop(arr);
+                    self.record_eviction_access(page_no);
+                    return Ok(result);
                 }
                 // Cache miss — read from VFS
                 let mut buf = self.pool.acquire()?;
@@ -1475,6 +2001,8 @@ impl ShardedPageCache {
                 }
                 let result = f(buf.as_slice());
                 arr.insert(page_no, buf);
+                drop(arr);
+                self.record_eviction_admit(page_no);
                 return Ok(result);
             }
         }
@@ -1484,19 +2012,25 @@ impl ShardedPageCache {
             self.flat_slots.hits.fetch_add(1, Ordering::Relaxed);
             let guard = self.flat_slots.slots[slot_idx].data.lock();
             if let Some(ref buf) = *guard {
-                return Ok(f(buf.as_slice()));
+                let result = f(buf.as_slice());
+                drop(guard);
+                self.record_eviction_access(page_no);
+                return Ok(result);
             }
             // Data cleared between probe and lock (rare). Fall through.
         }
 
         // Overflow shard hit check
-        let shard_idx = Self::shard_index(page_no);
+        let shard_idx = self.shard_index(page_no);
         {
             let mut shard = self.shards[shard_idx].lock();
             if shard.pages.contains_key(&page_no) {
                 shard.hits = shard.hits.saturating_add(1);
                 let data = shard.pages.get(&page_no).expect("just checked");
-                return Ok(f(data.as_slice()));
+                let result = f(data.as_slice());
+                drop(shard);
+                self.record_eviction_access(page_no);
+                return Ok(result);
             }
             shard.misses = shard.misses.saturating_add(1);
         }
@@ -1523,6 +2057,7 @@ impl ShardedPageCache {
         if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
             self.shards[shard_idx].lock().insert(page_no, buf);
         }
+        self.record_eviction_admit(page_no);
         Ok(result)
     }
 
@@ -1535,6 +2070,8 @@ impl ShardedPageCache {
                 if let Some(data) = arr.get(page_no) {
                     let offset = page_offset(page_no, self.page_size);
                     file.write(cx, data, offset)?;
+                    drop(arr);
+                    self.record_eviction_access(page_no);
                     return Ok(());
                 }
                 return Err(FrankenError::internal(format!(
@@ -1551,12 +2088,14 @@ impl ShardedPageCache {
             if let Some(ref buf) = *guard {
                 let offset = page_offset(page_no, self.page_size);
                 file.write(cx, buf.as_slice(), offset)?;
+                drop(guard);
+                self.record_eviction_access(page_no);
                 return Ok(());
             }
         }
 
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
 
         if !shard.pages.contains_key(&page_no) {
@@ -1571,6 +2110,8 @@ impl ShardedPageCache {
         let buf = shard.pages.get(&page_no).expect("just checked");
         let offset = page_offset(page_no, self.page_size);
         file.write(cx, buf.as_slice(), offset)?;
+        drop(shard);
+        self.record_eviction_access(page_no);
         Ok(())
     }
 
@@ -1589,7 +2130,13 @@ impl ShardedPageCache {
                 let mut buf = self.pool.acquire()?;
                 buf.as_mut_slice().fill(0);
                 let result = f(buf.as_mut_slice());
-                arr.insert(page_no, buf);
+                let admitted_new = arr.insert(page_no, buf);
+                drop(arr);
+                if admitted_new {
+                    self.record_eviction_admit(page_no);
+                } else {
+                    self.record_eviction_access(page_no);
+                }
                 return Ok(result);
             }
         }
@@ -1598,9 +2145,17 @@ impl ShardedPageCache {
         let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
         let result = f(buf.as_mut_slice());
-        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
-            let idx = Self::shard_index(page_no);
-            self.shards[idx].lock().insert(page_no, buf);
+        let admitted_new = match self.flat_slots.try_insert(page_no, buf) {
+            Ok(is_new) => is_new,
+            Err(buf) => {
+                let idx = self.shard_index(page_no);
+                self.shards[idx].lock().insert(page_no, buf)
+            }
+        };
+        if admitted_new {
+            self.record_eviction_admit(page_no);
+        } else {
+            self.record_eviction_access(page_no);
         }
         Ok(result)
     }
@@ -1610,14 +2165,27 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                fast.lock().insert(page_no, buf);
+                let admitted_new = fast.lock().insert(page_no, buf);
+                if admitted_new {
+                    self.record_eviction_admit(page_no);
+                } else {
+                    self.record_eviction_access(page_no);
+                }
                 return;
             }
         }
         // Flat slots first; overflow to shard.
-        if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
-            let idx = Self::shard_index(page_no);
-            self.shards[idx].lock().insert(page_no, buf);
+        let admitted_new = match self.flat_slots.try_insert(page_no, buf) {
+            Ok(is_new) => is_new,
+            Err(buf) => {
+                let idx = self.shard_index(page_no);
+                self.shards[idx].lock().insert(page_no, buf)
+            }
+        };
+        if admitted_new {
+            self.record_eviction_admit(page_no);
+        } else {
+            self.record_eviction_access(page_no);
         }
     }
 
@@ -1626,15 +2194,24 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().remove(page_no);
+                let removed = fast.lock().remove(page_no);
+                if removed {
+                    self.forget_eviction_page(page_no);
+                }
+                return removed;
             }
         }
         // Try flat slots first, then overflow shard.
         if self.flat_slots.remove(page_no) {
+            self.forget_eviction_page(page_no);
             return true;
         }
-        let idx = Self::shard_index(page_no);
-        self.shards[idx].lock().remove(page_no)
+        let idx = self.shard_index(page_no);
+        let removed = self.shards[idx].lock().remove(page_no);
+        if removed {
+            self.forget_eviction_page(page_no);
+        }
+        removed
     }
 
     /// Evict an arbitrary page from the cache.
@@ -1642,22 +2219,41 @@ impl ShardedPageCache {
     /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
+        let residents = self.resident_pages();
+        let preferred_victim = self
+            .eviction_policy
+            .lock()
+            .choose_victim(residents.iter().copied());
+        if let Some(page_no) = preferred_victim
+            && self.evict(page_no)
+        {
+            return true;
+        }
+
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().remove_any().is_some();
+                let removed = fast.lock().remove_any();
+                if let Some(page_no) = removed {
+                    self.forget_eviction_page(page_no);
+                    return true;
+                }
+                return false;
             }
         }
         // Flat slots first (bd-eorms)
-        if self.flat_slots.remove_any() {
+        if let Some(page_no) = self.flat_slots.remove_any_page() {
+            self.forget_eviction_page(page_no);
             return true;
         }
         // Overflow shards
-        let start = (std::time::Instant::now().elapsed().as_nanos() as usize) & SHARD_MASK;
-        for i in 0..SHARD_COUNT {
-            let idx = (start + i) & SHARD_MASK;
+        let start = (std::time::Instant::now().elapsed().as_nanos() as usize) & self.shard_mask;
+        for i in 0..self.shards.len() {
+            let idx = (start + i) & self.shard_mask;
             let mut shard = self.shards[idx].lock();
-            if shard.remove_any().is_some() {
+            if let Some(page_no) = shard.remove_any() {
+                drop(shard);
+                self.forget_eviction_page(page_no);
                 return true;
             }
         }
@@ -1670,6 +2266,7 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 fast.lock().clear();
+                self.clear_eviction_history();
                 return;
             }
         }
@@ -1677,6 +2274,7 @@ impl ShardedPageCache {
         for shard in self.shards.iter() {
             shard.lock().clear();
         }
+        self.clear_eviction_history();
     }
 
     /// Capture current cache metrics aggregated across all shards.
@@ -1686,6 +2284,21 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 let arr = fast.lock();
+                let residents = arr.resident_pages();
+                let queue_snapshot = self
+                    .eviction_policy
+                    .lock()
+                    .queue_snapshot(residents.iter().copied());
+                let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
+                    (
+                        snapshot.small_len,
+                        snapshot.main_len,
+                        snapshot.ghost_len,
+                        snapshot.small_capacity,
+                    )
+                } else {
+                    (arr.len(), 0, 0, arr.len())
+                };
                 return PageCacheMetricsSnapshot {
                     hits: arr.hits,
                     misses: arr.misses,
@@ -1694,11 +2307,11 @@ impl ShardedPageCache {
                     cached_pages: arr.len(),
                     pool_capacity: self.pool.capacity(),
                     dirty_ratio_pct: 0,
-                    t1_size: arr.len(),
-                    t2_size: 0,
-                    b1_size: 0,
+                    t1_size,
+                    t2_size,
+                    b1_size,
                     b2_size: 0,
-                    p_target: arr.len(),
+                    p_target,
                     mvcc_multi_version_pages: 0,
                 };
             }
@@ -1721,6 +2334,22 @@ impl ShardedPageCache {
             total_pages += s.len();
         }
 
+        let residents = self.resident_pages();
+        let queue_snapshot = self
+            .eviction_policy
+            .lock()
+            .queue_snapshot(residents.iter().copied());
+        let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
+            (
+                snapshot.small_len,
+                snapshot.main_len,
+                snapshot.ghost_len,
+                snapshot.small_capacity,
+            )
+        } else {
+            (total_pages, 0, 0, total_pages)
+        };
+
         PageCacheMetricsSnapshot {
             hits: total_hits,
             misses: total_misses,
@@ -1729,11 +2358,11 @@ impl ShardedPageCache {
             cached_pages: total_pages,
             pool_capacity: self.pool.capacity(),
             dirty_ratio_pct: 0,
-            t1_size: total_pages,
-            t2_size: 0,
-            b1_size: 0,
+            t1_size,
+            t2_size,
+            b1_size,
             b2_size: 0,
-            p_target: total_pages,
+            p_target,
             mvcc_multi_version_pages: 0,
         }
     }
@@ -1786,17 +2415,27 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get(page_no).map(|data| data.to_vec());
+                let result = fast.lock().get(page_no).map(|data| data.to_vec());
+                if result.is_some() {
+                    self.record_eviction_access(page_no);
+                }
+                return result;
             }
         }
         // Flat slots (bd-eorms)
         if let Some(data) = self.flat_slots.get_copy(page_no) {
+            self.record_eviction_access(page_no);
             return Some(data);
         }
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get(page_no).map(|data| data.to_vec())
+        let result = shard.get(page_no).map(|data| data.to_vec());
+        drop(shard);
+        if result.is_some() {
+            self.record_eviction_access(page_no);
+        }
+        result
     }
 
     /// bd-perf (V1.2): Return a shared `PageData` (Arc) instead of copying
@@ -1807,17 +2446,27 @@ impl ShardedPageCache {
         // Fast path (bd-fzr07)
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                return fast.lock().get_shared(page_no);
+                let result = fast.lock().get_shared(page_no);
+                if result.is_some() {
+                    self.record_eviction_access(page_no);
+                }
+                return result;
             }
         }
         // Flat slots (bd-eorms)
         if let Some(data) = self.flat_slots.get_shared(page_no) {
+            self.record_eviction_access(page_no);
             return Some(data);
         }
         // Overflow shard
-        let idx = Self::shard_index(page_no);
+        let idx = self.shard_index(page_no);
         let mut shard = self.shards[idx].lock();
-        shard.get_shared(page_no)
+        let result = shard.get_shared(page_no);
+        drop(shard);
+        if result.is_some() {
+            self.record_eviction_access(page_no);
+        }
+        result
     }
 
     /// Best-effort software prefetch for an upcoming `page_no` lookup.
@@ -1838,7 +2487,7 @@ impl ShardedPageCache {
 
         self.flat_slots.prefetch_page_hint(page_no);
 
-        let shard_idx = Self::shard_index(page_no);
+        let shard_idx = self.shard_index(page_no);
         let shard = &self.shards[shard_idx];
         prefetch_l1_read(std::ptr::from_ref(shard));
         if let Some(guard) = shard.try_lock()
@@ -1854,7 +2503,7 @@ impl std::fmt::Debug for ShardedPageCache {
         let metrics = self.metrics_snapshot();
         let fast_path = self.use_fast_path.load(Ordering::Relaxed);
         f.debug_struct("ShardedPageCache")
-            .field("shard_count", &SHARD_COUNT)
+            .field("shard_count", &self.shards.len())
             .field("page_size", &self.page_size)
             .field("fast_path_enabled", &fast_path)
             .field("flat_slots", &self.flat_slots)
@@ -1939,6 +2588,7 @@ mod tests {
         sorted[rank]
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_track_f_log(
         test_name: &str,
         phase: &str,
@@ -1965,6 +2615,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_track_q_log(
         test_name: &str,
         phase: &str,
@@ -2786,6 +3437,122 @@ mod tests {
         assert_eq!(reset.evictions, 0, "bead_id={BEAD_ID} case=reset_evictions");
     }
 
+    #[test]
+    fn test_page_cache_s3_fifo_evict_any_keeps_hot_pages() {
+        let mut cache = PageCache::new(PageSize::DEFAULT);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::with_limits(
+            4, 1, 1, 1,
+        )));
+
+        let hot_a = PageNumber::ONE;
+        let hot_b = PageNumber::new(2).unwrap();
+        let cold_a = PageNumber::new(3).unwrap();
+        let cold_b = PageNumber::new(4).unwrap();
+
+        for page_no in [hot_a, hot_b, cold_a, cold_b] {
+            let page = cache.insert_fresh(page_no).unwrap();
+            page[0] = u8::try_from(page_no.get()).unwrap();
+        }
+
+        for _ in 0..8 {
+            assert!(
+                cache.get(hot_a).is_some(),
+                "hot page A must remain readable"
+            );
+            assert!(
+                cache.get(hot_b).is_some(),
+                "hot page B must remain readable"
+            );
+        }
+
+        assert!(
+            cache.evict_any(),
+            "S3-FIFO cache should evict one cold page"
+        );
+        assert!(
+            cache.contains(hot_a),
+            "hot page A should survive S3-FIFO eviction"
+        );
+        assert!(
+            cache.contains(hot_b),
+            "hot page B should survive S3-FIFO eviction"
+        );
+        assert_eq!(
+            [cold_a, cold_b]
+                .into_iter()
+                .filter(|page_no| cache.contains(*page_no))
+                .count(),
+            1,
+            "exactly one cold page should remain resident after one eviction"
+        );
+
+        let snapshot = cache.metrics_snapshot();
+        assert_eq!(snapshot.cached_pages, 3, "one page should be evicted");
+        assert!(
+            snapshot.t2_size >= 1,
+            "S3-FIFO metrics should expose a non-empty main queue after hot re-access"
+        );
+    }
+
+    #[test]
+    fn test_sharded_page_cache_s3_fifo_evict_any_keeps_hot_pages() {
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::with_limits(
+            4, 1, 1, 1,
+        )));
+
+        let hot_a = PageNumber::ONE;
+        let hot_b = PageNumber::new(2).unwrap();
+        let cold_a = PageNumber::new(3).unwrap();
+        let cold_b = PageNumber::new(4).unwrap();
+
+        for page_no in [hot_a, hot_b, cold_a, cold_b] {
+            cache.insert_buffer(page_no, track_q_page_buf(page_no));
+        }
+
+        for _ in 0..8 {
+            assert!(
+                cache.get_copy(hot_a).is_some(),
+                "hot shard page A must remain readable"
+            );
+            assert!(
+                cache.get_copy(hot_b).is_some(),
+                "hot shard page B must remain readable"
+            );
+        }
+
+        assert!(
+            cache.evict_any(),
+            "sharded S3-FIFO cache should evict one cold page"
+        );
+        assert!(
+            cache.contains(hot_a),
+            "hot shard page A should survive S3-FIFO eviction"
+        );
+        assert!(
+            cache.contains(hot_b),
+            "hot shard page B should survive S3-FIFO eviction"
+        );
+        assert_eq!(
+            [cold_a, cold_b]
+                .into_iter()
+                .filter(|page_no| cache.contains(*page_no))
+                .count(),
+            1,
+            "exactly one cold shard page should remain resident after one eviction"
+        );
+
+        let snapshot = cache.metrics_snapshot();
+        assert_eq!(
+            snapshot.cached_pages, 3,
+            "one sharded page should be evicted"
+        );
+        assert!(
+            snapshot.t2_size >= 1,
+            "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum BenchEvictionPolicy {
         Arbitrary,
@@ -3311,12 +4078,12 @@ mod tests {
         }
 
         let dist = cache.shard_distribution();
-        assert_eq!(dist.len(), 128);
+        assert_eq!(dist.len(), cache.shard_count());
 
         // Count non-empty shards
         let non_empty = dist.iter().filter(|&&n| n > 0).count();
 
-        // With 256 pages and 128 shards, we expect good distribution.
+        // With 256 pages and the default shard count, we expect good distribution.
         // Multiplicative hashing should spread sequential keys well.
         assert!(
             non_empty >= 64,
@@ -3677,13 +4444,13 @@ mod tests {
         // All threads use page numbers that hash to the same shard
         // We find pages with the same shard index
         let base_page = PageNumber::ONE;
-        let base_shard = ShardedPageCache::shard_index(base_page);
+        let base_shard = cache.shard_index(base_page);
 
         // Find other pages in the same shard
         let mut same_shard_pages = vec![1u32];
         for i in 2..10000u32 {
             let pn = PageNumber::new(i).unwrap();
-            if ShardedPageCache::shard_index(pn) == base_shard {
+            if cache.shard_index(pn) == base_shard {
                 same_shard_pages.push(i);
                 if same_shard_pages.len() >= (num_threads * ops_per_thread) {
                     break;
@@ -3724,6 +4491,31 @@ mod tests {
         assert!(
             dist[base_shard] > 0,
             "bead_id={BEAD_3WOP3_2} case=same_shard_populated"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_normalizes_configured_partition_count() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 64, 37);
+        assert_eq!(
+            cache.shard_count(),
+            64,
+            "bead_id={BEAD_3WOP3_2} case=normalize_to_next_power_of_two"
+        );
+        assert_eq!(cache.shard_distribution().len(), 64);
+
+        let min_cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 64, 1);
+        assert_eq!(
+            min_cache.shard_count(),
+            2,
+            "bead_id={BEAD_3WOP3_2} case=clamp_minimum_partitions"
+        );
+
+        let max_cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 64, 8_192);
+        assert_eq!(
+            max_cache.shard_count(),
+            1024,
+            "bead_id={BEAD_3WOP3_2} case=clamp_maximum_partitions"
         );
     }
 
@@ -4606,7 +5398,7 @@ mod tests {
         let miss_delta = after.misses.saturating_sub(before.misses);
         let mutation_ops =
             u64::try_from(THREADS * SHARED_PAGES * ITERATIONS_PER_THREAD).expect("ops fit");
-        let read_ops = u64::try_from(THREADS * ((SHARED_PAGES + 1) / 2) * ITERATIONS_PER_THREAD)
+        let read_ops = u64::try_from(THREADS * SHARED_PAGES.div_ceil(2) * ITERATIONS_PER_THREAD)
             .expect("ops fit");
 
         assert_eq!(
