@@ -1,3 +1,7 @@
 [submodule "legacy_sqlite_code/sqlite"]
 	path = legacy_sqlite_code/sqlite
 	url = https://github.com/sqlite/sqlite
+	# Suppress "-dirty" status from uncommitted changes inside the vendored sqlite
+	# tree so our `git status` stays focused on our own code. The submodule commit
+	# itself is still tracked normally; only the inner working-tree drift is hidden.
+	ignore = dirty
