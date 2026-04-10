@@ -65,6 +65,24 @@ if [[ $MISSING_SCRIPTS -gt 0 ]]; then
     ERRORS=$((ERRORS + 1))
 fi
 
+# Verify the matrix catalogs every current e2e entrypoint in e2e/ and
+# crates/fsqlite-e2e/tests/.
+UNCATALOGED_E2E_LIST="$(
+    comm -23 \
+        <(find "$WORKSPACE_ROOT/e2e" -maxdepth 1 -type f | sed "s#^$WORKSPACE_ROOT/##" | sort) \
+        <(printf '%s\n' "$SCRIPT_PATHS" | sort -u)
+)"
+UNCATALOGED_RUST_E2E_LIST="$(
+    comm -23 \
+        <(find "$WORKSPACE_ROOT/crates/fsqlite-e2e/tests" -maxdepth 1 -type f | sed "s#^$WORKSPACE_ROOT/##" | sort) \
+        <(printf '%s\n' "$SCRIPT_PATHS" | sort -u)
+)"
+UNCATALOGED_E2E_COUNT=$(printf '%s\n' "$UNCATALOGED_E2E_LIST" | grep -c . || true)
+UNCATALOGED_RUST_E2E_COUNT=$(printf '%s\n' "$UNCATALOGED_RUST_E2E_LIST" | grep -c . || true)
+if [[ $UNCATALOGED_E2E_COUNT -gt 0 || $UNCATALOGED_RUST_E2E_COUNT -gt 0 ]]; then
+    ERRORS=$((ERRORS + 1))
+fi
+
 # Count scenario and gap coverage from source
 SCENARIO_COUNT=$(grep -oP '"[A-Z]+-\d+"' "$MODULE_FILE" | sort -u | wc -l)
 GAP_COUNT=$(grep -c 'GapAnnotation {' "$MODULE_FILE" || echo 0)
@@ -84,7 +102,9 @@ if $JSON_OUTPUT; then
   },
   "script_verification": {
     "verified": $VERIFIED_SCRIPTS,
-    "missing": $MISSING_SCRIPTS
+    "missing": $MISSING_SCRIPTS,
+    "uncataloged_e2e": $UNCATALOGED_E2E_COUNT,
+    "uncataloged_rust_e2e": $UNCATALOGED_RUST_E2E_COUNT
   },
   "coverage": {
     "unique_scenarios": $SCENARIO_COUNT,
@@ -106,9 +126,23 @@ else
     echo "--- Script Verification ---"
     echo "Verified:         $VERIFIED_SCRIPTS"
     echo "Missing:          $MISSING_SCRIPTS"
+    echo "Uncataloged e2e:  $UNCATALOGED_E2E_COUNT"
+    echo "Uncataloged Rust: $UNCATALOGED_RUST_E2E_COUNT"
     if [[ $MISSING_SCRIPTS -gt 0 ]]; then
         echo "Missing scripts:"
         echo -e "$MISSING_LIST" | while read -r line; do
+            [[ -n "$line" ]] && echo "  - $line"
+        done
+    fi
+    if [[ $UNCATALOGED_E2E_COUNT -gt 0 ]]; then
+        echo "Uncataloged e2e files:"
+        echo -e "$UNCATALOGED_E2E_LIST" | while read -r line; do
+            [[ -n "$line" ]] && echo "  - $line"
+        done
+    fi
+    if [[ $UNCATALOGED_RUST_E2E_COUNT -gt 0 ]]; then
+        echo "Uncataloged Rust e2e files:"
+        echo -e "$UNCATALOGED_RUST_E2E_LIST" | while read -r line; do
             [[ -n "$line" ]] && echo "  - $line"
         done
     fi

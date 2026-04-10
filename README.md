@@ -1300,7 +1300,7 @@ Checkpointing materializes a canonical `.db` for compatibility export, but the c
 
 ## Time Travel Queries
 
-FrankenSQLite supports temporal queries using SQL:2011-inspired `FOR SYSTEM_TIME AS OF` syntax. This works end-to-end for `:memory:` databases and any connection using the compatibility runtime.
+FrankenSQLite supports temporal queries using SQL:2011-inspired `FOR SYSTEM_TIME AS OF` syntax. Today the externally verified surface is the `:memory:` / compatibility-runtime snapshot-ring path.
 
 **How it works:**
 
@@ -1318,17 +1318,17 @@ SELECT * FROM orders FOR SYSTEM_TIME AS OF '2024-06-15 09:30:00';
 
 **What works:**
 
-- **COMMITSEQ-based time travel** returns verified historical results. Each commit increments the sequence counter, and queries resolve to the exact snapshot at that commit.
-- **Timestamp-based time travel** resolves to the latest snapshot at or before the requested time. Accepts Unix epoch seconds, ISO-8601, and SQLite `datetime()` format strings.
-- **DML rejection:** `INSERT`, `UPDATE`, `DELETE` with temporal clauses fail with an explicit error.
-- **No silent fallback:** Queries against non-existent commit sequences or timestamps return explicit errors rather than silently returning current data.
-- **10 end-to-end tests** cover: historical state retrieval across multiple commits, DELETE visibility (deleted rows visible in history), UPDATE old-value visibility, live-state non-corruption, empty-table snapshots, error on missing commits, and DML rejection.
+- **COMMITSEQ-based time travel** returns verified historical results. The conformance corpus now compares `FOR SYSTEM_TIME AS OF COMMITSEQ ...` reads against shadow `rusqlite` databases stopped at the same commit boundary.
+- **Timestamp-based time travel** resolves against the in-memory compatibility snapshot ring. External conformance currently pins the "latest retained snapshot" case with a far-future timestamp and explicit failure when no retained snapshot matches.
+- **Live-state preservation:** after a historical SELECT completes, the compatibility-runtime connection restores the live source state instead of leaving the historical snapshot swapped in.
+- **No silent fallback:** queries against non-existent commit sequences or timestamps return explicit errors rather than silently returning current data.
+- **Coverage split:** the public conformance suite now covers COMMITSEQ historical parity, delete/update historical visibility, latest-snapshot timestamp resolution, missing-snapshot errors, and live-state preservation after historical reads; internal engine tests additionally cover empty-table snapshots.
 
 **Limitations:**
 
 - Snapshots are stored in memory (ring buffer, max 256). Oldest snapshots are evicted when the buffer is full.
 - JOINs and subqueries in time-travel SELECT use the interpreted `execute_join_select` path.
-- The VDBE/pager `SetSnapshot` + `VersionStore` path (for file-backed databases with page-level MVCC) is wired but not yet populated during normal operation. This is a future Native-mode enhancement.
+- The VDBE/pager `SetSnapshot` + `VersionStore` path (for file-backed databases with page-level MVCC) is wired but not yet populated during normal operation. That remains the Native-mode enhancement needed for file-backed historical reads.
 
 ---
 

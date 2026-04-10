@@ -3,8 +3,8 @@
 #
 # Track H matched-pack collector for SQLite vs FrankenSQLite MVCC vs forced
 # single-writer mode. The script runs one canonical benchmark cell per selected
-# row/fixture/placement triple, writes mode-specific benchmark artifacts, and
-# produces a matched-pack manifest/report with shared provenance fields.
+# row/fixture/placement/storage tuple, writes mode-specific benchmark artifacts,
+# and produces a matched-pack manifest/report with shared provenance fields.
 #
 # Heavy work is always routed through `rch exec`.
 
@@ -26,6 +26,7 @@ SUMMARY_MD="${OUTPUT_DIR}/summary.md"
 ROW_IDS="${ROW_IDS:-mixed_read_write_c4}"
 FIXTURE_IDS="${FIXTURE_IDS:-}"
 PLACEMENT_PROFILE_IDS="${PLACEMENT_PROFILE_IDS:-baseline_unpinned}"
+STORAGE_PROFILE_IDS="${STORAGE_PROFILE_IDS:-file_backed,memory}"
 REPEAT="${REPEAT:-1}"
 WARMUP="${WARMUP:-0}"
 CARGO_PROFILE="${CARGO_PROFILE:-release-perf}"
@@ -159,6 +160,27 @@ placement_execution_status() {
     fi
 }
 
+validate_storage_profile() {
+    case "$1" in
+        file_backed|memory) ;;
+        *) fail "inputs" "unsupported storage profile: $1" ;;
+    esac
+}
+
+storage_profile_note() {
+    case "$1" in
+        file_backed)
+            printf '%s\n' "file_backed runs replay each iteration against a copied on-disk working database"
+            ;;
+        memory)
+            printf '%s\n' "memory runs replay the same OpLog against :memory: connections for zero-file-placement comparison"
+            ;;
+        *)
+            fail "inputs" "unsupported storage profile: $1"
+            ;;
+    esac
+}
+
 mode_engine_label() {
     case "$1" in
         sqlite_reference) printf 'sqlite3\n' ;;
@@ -177,6 +199,50 @@ mode_cli_args() {
     esac
 }
 
+recover_benchmark_outputs_from_logs() {
+    local results_jsonl="$1"
+    local summary_md="$2"
+    local stdout_log="$3"
+    local stderr_log="$4"
+
+    local benchmark_json=""
+    local log_path
+    for log_path in "${stdout_log}" "${stderr_log}"; do
+        [[ -f "${log_path}" ]] || continue
+        benchmark_json="$(grep -E '^{"benchmark_id":' "${log_path}" | tail -n 1 || true)"
+        if [[ -n "${benchmark_json}" ]]; then
+            printf '%s\n' "${benchmark_json}" > "${results_jsonl}"
+            break
+        fi
+    done
+
+    if [[ ! -s "${results_jsonl}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -s "${summary_md}" ]]; then
+        jq -r '
+            [
+                "# Benchmark Summary",
+                "",
+                "_Recovered locally from rch-captured bench logs because the remote explicit output files were not synchronized back into the workspace._",
+                "",
+                "- benchmark_id: `\(.benchmark_id)`",
+                "- engine: `\(.engine)`",
+                "- workload: `\(.workload)`",
+                "- fixture_id: `\(.fixture_id)`",
+                "- concurrency: `\(.concurrency)`",
+                "- measurement_count: `\(.measurement_count)`",
+                "- latency.median_ms: `\(.latency.median_ms)`",
+                "- latency.p95_ms: `\(.latency.p95_ms)`",
+                "- throughput.median_ops_per_sec: `\(.throughput.median_ops_per_sec)`"
+            ] | join("\n")
+        ' < "${results_jsonl}" > "${summary_md}"
+    fi
+
+    return 0
+}
+
 run_mode_benchmark() {
     local row_id="$1"
     local fixture_id="$2"
@@ -184,8 +250,9 @@ run_mode_benchmark() {
     local concurrency="$4"
     local placement_profile_id="$5"
     local hardware_class_id="$6"
-    local pack_dir="$7"
-    local mode_id="$8"
+    local storage_profile_id="$7"
+    local pack_dir="$8"
+    local mode_id="$9"
 
     local mode_dir="${pack_dir}/${mode_id}"
     local results_jsonl="${mode_dir}/results.jsonl"
@@ -215,16 +282,27 @@ run_mode_benchmark() {
         --db "${fixture_id}"
         --preset "${workload}"
         --concurrency "${concurrency}"
+        --placement-profile "${placement_profile_id}"
+        --storage-profile "${storage_profile_id}"
         --warmup "${WARMUP}"
         --repeat "${REPEAT}"
         --output-jsonl "${results_jsonl}"
         --output-md "${summary_md}"
     )
 
-    log_event "INFO" "run" "starting ${row_id} fixture=${fixture_id} placement=${placement_profile_id} mode=${mode_id}"
+    log_event "INFO" "run" "starting ${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id} mode=${mode_id}"
 
-    if ! rch exec -- "${cmd[@]}" >"${stdout_log}" 2>"${stderr_log}"; then
-        fail "run" "benchmark failed for row=${row_id} fixture=${fixture_id} placement=${placement_profile_id} mode=${mode_id}; see ${stderr_log}"
+    if ! rch exec -- "${cmd[@]}" </dev/null >"${stdout_log}" 2>"${stderr_log}"; then
+        fail "run" "benchmark failed for row=${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id} mode=${mode_id}; see ${stderr_log}"
+    fi
+
+    if [[ ! -s "${results_jsonl}" ]] || [[ ! -s "${summary_md}" ]]; then
+        recover_benchmark_outputs_from_logs \
+            "${results_jsonl}" \
+            "${summary_md}" \
+            "${stdout_log}" \
+            "${stderr_log}" \
+            || fail "run" "benchmark completed but outputs were not available locally for row=${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id} mode=${mode_id}; see ${stderr_log}"
     fi
 
     require_nonempty_file "${results_jsonl}"
@@ -236,13 +314,14 @@ run_mode_benchmark() {
         --arg workload "${workload}" \
         --arg placement_profile_id "${placement_profile_id}" \
         --arg hardware_class_id "${hardware_class_id}" \
+        --arg storage_profile_id "${storage_profile_id}" \
         --arg mode_id "${mode_id}" \
         --arg engine_label "$(mode_engine_label "${mode_id}")" \
         --arg results_jsonl_rel "$(realpath --relative-to="${pack_dir}" "${results_jsonl}")" \
         --arg summary_md_rel "$(realpath --relative-to="${pack_dir}" "${summary_md}")" \
         --arg stdout_log_rel "$(realpath --relative-to="${pack_dir}" "${stdout_log}")" \
         --arg stderr_log_rel "$(realpath --relative-to="${pack_dir}" "${stderr_log}")" \
-        --arg rerun_command "cd ${WORKSPACE_ROOT} && BEAD_ID=${BEAD_ID} OUTPUT_DIR=${OUTPUT_DIR} ROW_IDS=${row_id} FIXTURE_IDS=${fixture_id} PLACEMENT_PROFILE_IDS=${placement_profile_id} CARGO_PROFILE=${CARGO_PROFILE} WARMUP=${WARMUP} REPEAT=${REPEAT} bash ${SCRIPT_ENTRYPOINT}" \
+        --arg rerun_command "cd ${WORKSPACE_ROOT} && BEAD_ID=${BEAD_ID} OUTPUT_DIR=${OUTPUT_DIR} ROW_IDS=${row_id} FIXTURE_IDS=${fixture_id} PLACEMENT_PROFILE_IDS=${placement_profile_id} STORAGE_PROFILE_IDS=${storage_profile_id} CARGO_PROFILE=${CARGO_PROFILE} WARMUP=${WARMUP} REPEAT=${REPEAT} bash ${SCRIPT_ENTRYPOINT}" \
         '
         . as $bench
         | {
@@ -254,6 +333,7 @@ run_mode_benchmark() {
             concurrency: $bench.concurrency,
             placement_profile_id: $placement_profile_id,
             hardware_class_id: $hardware_class_id,
+            storage_profile_id: $storage_profile_id,
             benchmark_id: $bench.benchmark_id,
             measurement_count: $bench.measurement_count,
             latency: {
@@ -295,7 +375,7 @@ run_mode_benchmark() {
         }
         ' < "${results_jsonl}" > "${summary_json}"
 
-    log_event "INFO" "run" "completed ${row_id} fixture=${fixture_id} placement=${placement_profile_id} mode=${mode_id}"
+    log_event "INFO" "run" "completed ${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id} mode=${mode_id}"
 }
 
 build_pack_manifest() {
@@ -305,7 +385,8 @@ build_pack_manifest() {
     local concurrency="$4"
     local placement_profile_id="$5"
     local hardware_class_id="$6"
-    local pack_dir="$7"
+    local storage_profile_id="$7"
+    local pack_dir="$8"
 
     local placement_profile
     placement_profile="$(placement_profile_json "${placement_profile_id}")"
@@ -315,8 +396,11 @@ build_pack_manifest() {
     hardware_class="$(hardware_class_json "${hardware_class_id}")"
     [[ -n "${hardware_class}" ]] || fail "inputs" "hardware class `${hardware_class_id}` not found"
 
+    local storage_note
+    storage_note="$(storage_profile_note "${storage_profile_id}")"
+
     jq -n \
-        --arg schema_version "fsqlite-e2e.db300.matched_mode_pack.v1" \
+        --arg schema_version "fsqlite-e2e.db300.matched_mode_pack.v2" \
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
@@ -327,7 +411,9 @@ build_pack_manifest() {
         --argjson concurrency "${concurrency}" \
         --arg placement_profile_id "${placement_profile_id}" \
         --arg hardware_class_id "${hardware_class_id}" \
+        --arg storage_profile_id "${storage_profile_id}" \
         --arg comparability_status "$(placement_execution_status "${placement_profile_id}")" \
+        --arg storage_note "${storage_note}" \
         --arg source_revision "${SOURCE_REVISION}" \
         --arg beads_hash "${BEADS_HASH}" \
         --arg cargo_profile "${CARGO_PROFILE}" \
@@ -356,6 +442,7 @@ build_pack_manifest() {
             concurrency: $concurrency,
             placement_profile_id: $placement_profile_id,
             hardware_class_id: $hardware_class_id,
+            storage_profile_id: $storage_profile_id,
             comparability_status: $comparability_status,
             source_revision: $source_revision,
             beads_data_hash: $beads_hash,
@@ -394,6 +481,7 @@ build_pack_manifest() {
                     "packs produced without that enforcement should be treated as declared_only rather than clean topology claims"
                 ]
                 end
+                + [$storage_note]
             )
         }
         ' > "${pack_dir}/manifest.json"
@@ -408,6 +496,7 @@ build_pack_summary() {
             "- row_id: `\(.row_id)`",
             "- fixture_id: `\(.fixture_id)`",
             "- placement_profile_id: `\(.placement_profile_id)`",
+            "- storage_profile_id: `\(.storage_profile_id)`",
             "- hardware_class_id: `\(.hardware_class_id)`",
             "- comparability_status: `\(.comparability_status)`",
             "- source_revision: `\(.source_revision)`",
@@ -439,6 +528,7 @@ collect_pack() {
     local row_id="$1"
     local fixture_id="$2"
     local placement_profile_id="$3"
+    local storage_profile_id="$4"
 
     local workload
     workload="$(row_workload "${row_id}")"
@@ -450,10 +540,10 @@ collect_pack() {
     [[ -n "${hardware_class_id}" ]] \
         || fail "inputs" "row `${row_id}` does not define placement `${placement_profile_id}`"
 
-    local pack_dir="${PACKS_DIR}/${row_id}__${fixture_id}__${placement_profile_id}__run_${RUN_ID_SAFE}__rev_$(short_hash "${SOURCE_REVISION}")__beads_$(short_hash "${BEADS_HASH}")"
+    local pack_dir="${PACKS_DIR}/${row_id}__${fixture_id}__${placement_profile_id}__${storage_profile_id}__run_${RUN_ID_SAFE}__rev_$(short_hash "${SOURCE_REVISION}")__beads_$(short_hash "${BEADS_HASH}")"
     mkdir -p "${pack_dir}"
 
-    log_event "INFO" "pack" "collecting matched pack row=${row_id} fixture=${fixture_id} placement=${placement_profile_id}"
+    log_event "INFO" "pack" "collecting matched pack row=${row_id} fixture=${fixture_id} placement=${placement_profile_id} storage=${storage_profile_id}"
 
     local mode_id
     for mode_id in "${MODES[@]}"; do
@@ -464,6 +554,7 @@ collect_pack() {
             "${concurrency}" \
             "${placement_profile_id}" \
             "${hardware_class_id}" \
+            "${storage_profile_id}" \
             "${pack_dir}" \
             "${mode_id}"
     done
@@ -475,6 +566,7 @@ collect_pack() {
         "${concurrency}" \
         "${placement_profile_id}" \
         "${hardware_class_id}" \
+        "${storage_profile_id}" \
         "${pack_dir}"
     build_pack_summary "${pack_dir}"
 }
@@ -488,7 +580,7 @@ build_report() {
     ((${#manifests[@]} > 0)) || fail "report" "no pack manifests were generated"
 
     jq -s \
-        --arg schema_version "fsqlite-e2e.db300.matched_mode_pack_report.v1" \
+        --arg schema_version "fsqlite-e2e.db300.matched_mode_pack_report.v2" \
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
@@ -517,11 +609,11 @@ build_report() {
             "- campaign_manifest: `\(.campaign_manifest)`",
             "- pack_count: `\(.pack_count)`",
             "",
-            "| row_id | fixture_id | placement_profile_id | comparability | sqlite ops/s | mvcc ops/s | single-writer ops/s | single-writer vs mvcc ops ratio | single-writer minus mvcc retries |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| row_id | fixture_id | placement_profile_id | storage_profile_id | comparability | sqlite ops/s | mvcc ops/s | single-writer ops/s | single-writer vs mvcc ops ratio | single-writer minus mvcc retries |",
+            "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
             (
                 .packs[]
-                | "| \(.row_id) | \(.fixture_id) | \(.placement_profile_id) | \(.comparability_status) | \(.mode_results.sqlite_reference.throughput.median_ops_per_sec) | \(.mode_results.fsqlite_mvcc.throughput.median_ops_per_sec) | \(.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec) | \(.deltas.single_writer_vs_mvcc_median_ops_ratio) | \(.deltas.single_writer_minus_mvcc_mean_retries) |"
+                | "| \(.row_id) | \(.fixture_id) | \(.placement_profile_id) | \(.storage_profile_id) | \(.comparability_status) | \(.mode_results.sqlite_reference.throughput.median_ops_per_sec) | \(.mode_results.fsqlite_mvcc.throughput.median_ops_per_sec) | \(.mode_results.fsqlite_single_writer.throughput.median_ops_per_sec) | \(.deltas.single_writer_vs_mvcc_median_ops_ratio) | \(.deltas.single_writer_minus_mvcc_mean_retries) |"
             )
         ] | join("\n")
     ' "${REPORT_JSON}" > "${SUMMARY_MD}"
@@ -532,7 +624,7 @@ main() {
     require_nonempty_file "${BEADS_DATA_PATH}"
     log_event "INFO" "start" "starting matched artifact pack collection"
 
-    local row_id fixture_id placement_profile_id
+    local row_id fixture_id placement_profile_id storage_profile_id
     while IFS= read -r row_id; do
         [[ -n "${row_id}" ]] || continue
         ensure_row_exists "${row_id}"
@@ -540,7 +632,11 @@ main() {
             [[ -n "${fixture_id}" ]] || continue
             while IFS= read -r placement_profile_id; do
                 [[ -n "${placement_profile_id}" ]] || continue
-                collect_pack "${row_id}" "${fixture_id}" "${placement_profile_id}"
+                while IFS= read -r storage_profile_id; do
+                    [[ -n "${storage_profile_id}" ]] || continue
+                    validate_storage_profile "${storage_profile_id}"
+                    collect_pack "${row_id}" "${fixture_id}" "${placement_profile_id}" "${storage_profile_id}"
+                done < <(csv_to_lines "${STORAGE_PROFILE_IDS}")
             done < <(row_placement_profiles "${row_id}")
         done < <(row_fixture_ids "${row_id}")
     done < <(csv_to_lines "${ROW_IDS}")

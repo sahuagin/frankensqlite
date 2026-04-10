@@ -29,8 +29,13 @@ on:
       - "crates/fsqlite-harness/src/validation_manifest.rs"
       - "crates/fsqlite-harness/tests/bd_2yqp6_2_5_oracle_preflight_doctor.rs"
       - "crates/fsqlite-harness/tests/bd_mblr_7_4_durability_matrix.rs"
+      - "crates/fsqlite-e2e/src/benchmark.rs"
+      - "crates/fsqlite-e2e/src/bin/realdb_e2e.rs"
+      - "crates/fsqlite-e2e/src/perf_runner.rs"
+      - "crates/fsqlite-e2e/src/report_render.rs"
       - "crates/fsqlite-mvcc/**"
       - "crates/fsqlite-vdbe/**"
+      - "scripts/hot-profile.sh"
       - "scripts/verify_backlog_quality_gate.sh"
       - "scripts/verify_bd_2yqp6_2_5_oracle_preflight_doctor.sh"
       - "scripts/verify_ci_artifact_gates.sh"
@@ -694,7 +699,9 @@ jobs:
       - name: "Perf regression tracking (optional, non-blocking)"
         continue-on-error: true
         run: |
+          set -euo pipefail
           echo "=== Perf regression: concurrency workload ==="
+          mkdir -p artifacts/hot-profile/verification-gates
           # Create a tiny seed database for the perf workload.
           mkdir -p /tmp/perf-seed
           sqlite3 /tmp/perf-seed/seed.db "CREATE TABLE seed (id INTEGER PRIMARY KEY);"
@@ -702,7 +709,35 @@ jobs:
             --engine sqlite3 --db /tmp/perf-seed/seed.db --workload commutative_inserts \
             --concurrency 1,2,4 --repeat 3 --output-jsonl artifacts/perf_regression.jsonl \
             2>&1 | tee artifacts/perf_regression.log || true
+          echo "=== Hot-path profile wrapper ==="
+          bash ./scripts/hot-profile.sh \
+            --db frankensqlite \
+            --workload commutative_inserts \
+            --concurrency 2 \
+            --seed 7 \
+            --scale 20 \
+            --output-dir artifacts/hot-profile/verification-gates \
+            2>&1 | tee artifacts/hot_profile_verification_gates.log || true
           echo "=== Perf data captured (non-blocking) ==="
+
+      - name: Publish hot-path perf summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary_path="artifacts/hot-profile/verification-gates/summary.md"
+          manifest_path="artifacts/hot-profile/verification-gates/manifest.json"
+          echo "### Hot-Path Perf Summary" >> "${GITHUB_STEP_SUMMARY}"
+          if [[ -f "${summary_path}" ]]; then
+            echo "- summary: \`${summary_path}\`" >> "${GITHUB_STEP_SUMMARY}"
+            if [[ -f "${manifest_path}" ]]; then
+              echo "- manifest: \`${manifest_path}\`" >> "${GITHUB_STEP_SUMMARY}"
+            fi
+            echo >> "${GITHUB_STEP_SUMMARY}"
+            cat "${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Hot-path summary missing at ${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
 
       - name: Upload verification gate artifacts
         if: always()

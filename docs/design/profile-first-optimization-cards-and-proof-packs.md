@@ -212,6 +212,51 @@ artifacts/{bead_id}/proof_pack/
 }
 ```
 
+### 3.3 Benchmark Catastrophe Recovery Packs
+
+Some benchmark-recovery slices are measurement-only work in `fsqlite-e2e`
+rather than direct code changes in the engine. Those slices still need a typed
+proof artifact instead of ad hoc stderr lines.
+
+Current operational example: `bd-wwqen` IN-subquery catastrophe recovery.
+
+- 10k residual probe:
+  `manual_perf_probe.read_guard_shapes.in_subquery`
+  Contract: pass if `p50 < 500us` and `p95 < 800us`
+  Legacy anchor: `p50=3760us p95=4429us throughput=266 ops/sec`
+- 100k catastrophe probe:
+  `manual_hot_path_profile.in_subquery_100k`
+  Contract: pass if `wall < 200ms`
+  Hard fail if `wall > 5s`
+  Legacy anchor: `~20s wall time`
+
+The canonical artifact for these slices is:
+
+```json
+{
+  "schema_version": "fsqlite-e2e.benchmark_recovery_report.v1",
+  "bead_id": "bd-wwqen",
+  "slice_id": "in_subquery_catastrophe_recovery",
+  "thresholds": [
+    {
+      "probe_id": "in_subquery_10k_latency",
+      "target_summary": "PASS if p50 < 500us and p95 < 800us"
+    },
+    {
+      "probe_id": "in_subquery_100k_wall_time",
+      "target_summary": "PASS if wall < 200ms; HARD FAIL if wall > 5s"
+    }
+  ]
+}
+```
+
+Packaging rule:
+
+- keep the legacy human-readable log lines because bead history may cite them
+- also emit the structured recovery report JSON
+- emit a markdown summary derived from the same typed report so pass/fail
+  decisions are reproducible and reviewable without reinterpreting the raw logs
+
 ---
 
 ## 4. Controller/Policy-Bearing Optimization Cards
