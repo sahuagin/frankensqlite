@@ -257,25 +257,28 @@ fn validate_benchmark_metadata_records(records: Vec<BenchmarkMetaRecord>) -> Vec
             continue;
         }
 
+        // Explicit arms (no `_ => {}` catch-all) preserve exhaustiveness
+        // so future additions to BenchmarkComparisonMode force updates here.
+        #[allow(clippy::collapsible_match)]
         match csqlite.comparisons.first() {
-            Some(BenchmarkComparisonMode::Parity)
-                if csqlite.dimensions != frankensqlite.dimensions =>
-            {
-                violations.push(format!(
-                    "{file_relpath}:{benchmark_group}: lifecycle/storage/concurrency parity mismatch: csqlite={} frankensqlite={}",
-                    describe_dimension_set(&csqlite.dimensions),
-                    describe_dimension_set(&frankensqlite.dimensions),
-                ));
+            Some(BenchmarkComparisonMode::Parity) => {
+                if csqlite.dimensions != frankensqlite.dimensions {
+                    violations.push(format!(
+                        "{file_relpath}:{benchmark_group}: lifecycle/storage/concurrency parity mismatch: csqlite={} frankensqlite={}",
+                        describe_dimension_set(&csqlite.dimensions),
+                        describe_dimension_set(&frankensqlite.dimensions),
+                    ));
+                }
             }
-            Some(BenchmarkComparisonMode::Control)
-                if csqlite.dimensions == frankensqlite.dimensions =>
-            {
-                violations.push(format!(
-                    "{file_relpath}:{benchmark_group}: comparison=control is unnecessary because lifecycle/storage/concurrency already match ({})",
-                    describe_dimension_set(&csqlite.dimensions),
-                ));
+            Some(BenchmarkComparisonMode::Control) => {
+                if csqlite.dimensions == frankensqlite.dimensions {
+                    violations.push(format!(
+                        "{file_relpath}:{benchmark_group}: comparison=control is unnecessary because lifecycle/storage/concurrency already match ({})",
+                        describe_dimension_set(&csqlite.dimensions),
+                    ));
+                }
             }
-            _ => {}
+            None => {}
         }
     }
 
