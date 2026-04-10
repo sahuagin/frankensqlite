@@ -6592,10 +6592,9 @@ fn resolve_join_output_count(
             ResultColumn::TableStar(name) => tables
                 .iter()
                 .find(|(t, alias)| {
-                    alias.map_or_else(
-                        || t.name.eq_ignore_ascii_case(name),
-                        |a| a.eq_ignore_ascii_case(name),
-                    )
+                    (name.schema.is_none()
+                        && alias.is_some_and(|a| a.eq_ignore_ascii_case(&name.name)))
+                        || t.name.eq_ignore_ascii_case(&name.name)
                 })
                 .map_or(0, |(t, _)| t.columns.len()),
             ResultColumn::Expr { .. } => 1,
@@ -6796,10 +6795,10 @@ fn emit_join_result_columns(
                 }
             }
             ResultColumn::TableStar(table_name) => {
-                let name_lower = table_name.to_ascii_lowercase();
                 for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
-                    let matches = alias.is_some_and(|a| a.eq_ignore_ascii_case(&name_lower))
-                        || table.name.eq_ignore_ascii_case(&name_lower);
+                    let matches = (table_name.schema.is_none()
+                        && alias.is_some_and(|a| a.eq_ignore_ascii_case(&table_name.name)))
+                        || table.name.eq_ignore_ascii_case(&table_name.name);
                     if matches {
                         for col_idx in 0..table.columns.len() {
                             let dst = out_regs + reg_offset;
@@ -11949,8 +11948,8 @@ fn emit_column_reads(
                 }
             }
             ResultColumn::TableStar(qualifier) => {
-                if !matches_table_or_alias(qualifier, table, table_alias) {
-                    return Err(CodegenError::TableNotFound(qualifier.clone()));
+                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                    return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
                 for (i, ci) in table.columns.iter().enumerate() {
                     if ci.is_ipk {
@@ -13006,8 +13005,8 @@ fn resolve_result_column_indices(
                 indices.extend(0..table.columns.len());
             }
             ResultColumn::TableStar(qualifier) => {
-                if !qualifier.eq_ignore_ascii_case(&table.name) {
-                    return Err(CodegenError::TableNotFound(qualifier.clone()));
+                if !qualifier.name.eq_ignore_ascii_case(&table.name) {
+                    return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
                 indices.extend(0..table.columns.len());
             }
@@ -20034,7 +20033,7 @@ mod tests {
             body: SelectBody {
                 select: SelectCore::Select {
                     distinct: Distinctness::All,
-                    columns: vec![ResultColumn::TableStar("u".to_owned())],
+                    columns: vec![ResultColumn::TableStar(QualifiedName::bare("u"))],
                     from: Some(from_table("t")),
                     where_clause: None,
                     group_by: vec![],

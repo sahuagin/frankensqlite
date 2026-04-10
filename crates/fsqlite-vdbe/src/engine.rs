@@ -12721,6 +12721,7 @@ impl VdbeEngine {
                 existing.root_page = root_page;
                 existing.rowid_mode = rowid_mode;
                 existing.autoincrement_high_water = autoincrement_high_water;
+                self.cursor_root_pages.insert(cursor_id, root_page);
                 tracing::trace!(
                     cursor_id,
                     page_id = root_page,
@@ -12870,6 +12871,7 @@ impl VdbeEngine {
                             payload_includes_rowid_alias: None,
                         },
                     );
+                    self.cursor_root_pages.insert(cursor_id, root_page);
                     tracing::debug!(
                         cursor_id,
                         page_id = root_page,
@@ -12975,6 +12977,7 @@ impl VdbeEngine {
                             payload_includes_rowid_alias: None,
                         },
                     );
+                    self.cursor_root_pages.insert(cursor_id, root_page);
                     tracing::debug!(
                         cursor_id,
                         page_id = root_page,
@@ -13102,6 +13105,7 @@ impl VdbeEngine {
                 payload_includes_rowid_alias: None,
             },
         );
+        self.cursor_root_pages.insert(cursor_id, root_page);
         tracing::debug!(
             cursor_id,
             page_id = root_page,
@@ -22816,6 +22820,35 @@ mod tests {
         let _txn = engine
             .take_transaction()
             .expect("take_transaction should succeed");
+    }
+
+    #[test]
+    fn test_open_storage_cursor_records_root_page_for_manual_open() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let root_page = db.allocate_root_page();
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(7, root_page, true),
+            "manual storage cursor open should succeed"
+        );
+        assert_eq!(
+            engine.cursor_root_pages.get(&7),
+            Some(&root_page),
+            "manual open must publish root-page metadata for later index collation lookups"
+        );
+        assert_eq!(
+            engine
+                .storage_cursors
+                .get(&7)
+                .expect("storage cursor should exist")
+                .root_page,
+            root_page,
+            "cursor metadata and published root-page map must stay in sync"
+        );
     }
 
     #[test]
