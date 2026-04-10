@@ -2500,7 +2500,8 @@ mod tests {
             prop_assert_eq!(
                 fast,
                 serialize_record(&values),
-                "SIMD/scalar record serialization diverged for values={values:?}",
+                "SIMD/scalar record serialization diverged for values={:?}",
+                values,
             );
         }
     }
