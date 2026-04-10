@@ -1178,9 +1178,9 @@ impl<'a> Resolver<'a> {
                 }
             }
             ResultColumn::TableStar(table_name) => {
-                if !scope.has_alias(table_name) {
+                if !scope.has_alias(&table_name.name) {
                     self.push_error(SemanticErrorKind::UnresolvedTable {
-                        name: table_name.clone(),
+                        name: table_name.to_string(),
                     });
                 }
             }
@@ -2041,6 +2041,39 @@ mod tests {
     fn test_resolve_star_select() {
         let schema = make_schema();
         let stmt = parse_one("SELECT * FROM users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(resolver.tables_resolved, 1);
+    }
+
+    #[test]
+    fn test_resolve_schema_qualified_table_star() {
+        let mut schema = make_schema();
+        schema.add_table_in_schema(
+            "aux",
+            TableDef {
+                name: "users".to_owned(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_owned(),
+                        affinity: TypeAffinity::Integer,
+                        is_ipk: true,
+                        not_null: true,
+                    },
+                    ColumnDef {
+                        name: "nickname".to_owned(),
+                        affinity: TypeAffinity::Text,
+                        is_ipk: false,
+                        not_null: false,
+                    },
+                ],
+                without_rowid: false,
+                strict: false,
+            },
+        );
+
+        let stmt = parse_one("SELECT aux.users.* FROM aux.users");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
