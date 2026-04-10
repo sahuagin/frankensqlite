@@ -16974,6 +16974,7 @@ mod tests {
         let before = vdbe_test_sideband_materialization_count_snapshot();
         let (rows, _) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let done = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(2), 0);
             b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
@@ -16981,7 +16982,7 @@ mod tests {
             b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("alpha".to_owned()), 0);
             b.emit_op(Opcode::MakeRecord, 2, 2, 4, P4::None, 0);
             b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
 
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
@@ -16991,6 +16992,7 @@ mod tests {
             let next_target =
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
