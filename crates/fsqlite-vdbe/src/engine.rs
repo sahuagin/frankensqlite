@@ -22436,6 +22436,102 @@ mod tests {
     }
 
     #[test]
+    fn test_lazy_dirty_clean_table_scan_then_dirty_table_fallback() {
+        let mut db = MemDatabase::new();
+        let dirty_root = db.create_table(1);
+        let clean_root = db.create_table(1);
+        db.get_table_mut(clean_root)
+            .expect("clean table should exist")
+            .insert(1, vec![SqliteValue::Integer(7)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let clean_done = b.emit_label();
+        let dirty_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, dirty_root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::OpenRead, 1, clean_root, 0, P4::Int(1), 0);
+
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 41, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        b.emit_jump_to_label(Opcode::Rewind, 1, 0, clean_done, P4::None, 0);
+        let clean_body = b.current_addr();
+        b.emit_op(Opcode::Column, 1, 0, 4, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+        let clean_next =
+            i32::try_from(clean_body).expect("program counter should fit into i32 for tests");
+        b.emit_op(Opcode::Next, 1, clean_next, 0, P4::None, 0);
+        b.resolve_label(clean_done);
+
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, dirty_done, P4::None, 0);
+        let dirty_body = b.current_addr();
+        b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 5, 1, 0, P4::None, 0);
+        let dirty_next =
+            i32::try_from(dirty_body).expect("program counter should fit into i32 for tests");
+        b.emit_op(Opcode::Next, 0, dirty_next, 0, P4::None, 0);
+        b.resolve_label(dirty_done);
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_storage_cursor_memdb_count_shortcuts_safe(true);
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|row| row.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(7)],
+                vec![SqliteValue::Integer(41)],
+            ],
+            "same-statement reads should preserve clean-table visibility while still sourcing dirty-table rows from the storage-backed B-tree"
+        );
+        assert!(engine.has_dirty_root_pages());
+        assert!(engine.dirty_root_pages().contains(&dirty_root));
+        assert!(
+            !engine.dirty_root_pages().contains(&clean_root),
+            "reading a clean table must not mark it dirty"
+        );
+        assert_eq!(
+            engine.dirty_root_pages().len(),
+            1,
+            "only the written table should remain dirty"
+        );
+
+        let db = engine.take_database().expect("database should exist");
+        assert_eq!(
+            db.get_table(dirty_root)
+                .expect("dirty table should exist")
+                .rows
+                .len(),
+            0,
+            "lazy dirty tracking must keep the written table stale in the MemDatabase mirror"
+        );
+        assert_eq!(
+            db.get_table(clean_root)
+                .expect("clean table should exist")
+                .rows
+                .len(),
+            1,
+            "clean-table reads must leave the untouched MemDatabase mirror intact"
+        );
+    }
+
+    #[test]
     fn test_lazy_dirty_multiple_tables() {
         let mut db = MemDatabase::new();
         let root_a = db.create_table(1);

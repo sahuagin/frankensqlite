@@ -638,6 +638,171 @@ fn test_lazy_memdb_cross_statement_visibility() {
     assert_eq!(f_rows, expected, "unexpected fsqlite final rows");
 }
 
+#[test]
+fn test_lazy_memdb_multi_table_clean_read_then_dirty_visibility() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let steps = [
+        (
+            "CREATE TABLE lazy_memdb_dirty_a (id INTEGER PRIMARY KEY, val TEXT)",
+            false,
+        ),
+        (
+            "CREATE TABLE lazy_memdb_clean_b (id INTEGER PRIMARY KEY, val TEXT)",
+            false,
+        ),
+        ("INSERT INTO lazy_memdb_clean_b VALUES (1, 'seed')", false),
+        ("BEGIN", false),
+        ("INSERT INTO lazy_memdb_dirty_a VALUES (1, 'alpha')", false),
+        ("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id", true),
+        ("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id", true),
+        (
+            "UPDATE lazy_memdb_dirty_a SET val = 'alpha2' WHERE id = 1",
+            false,
+        ),
+        ("SELECT val FROM lazy_memdb_dirty_a WHERE id = 1", true),
+        ("COMMIT", false),
+        ("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id", true),
+        ("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id", true),
+    ];
+
+    let is_txn_control = |sql: &str| {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("BEGIN")
+            || upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("SAVEPOINT")
+            || upper.starts_with("RELEASE")
+            || upper.starts_with("END")
+    };
+
+    for (sql, is_query) in steps {
+        if is_query {
+            let c_rows = runner.csqlite().query(sql).expect("csqlite query");
+            let f_rows = runner.frank().query(sql).expect("fsqlite query");
+            assert_eq!(
+                c_rows, f_rows,
+                "multi-table lazy dirty visibility mismatch for query `{sql}`:\n  csqlite={c_rows:?}\n  fsqlite={f_rows:?}"
+            );
+            continue;
+        }
+
+        let c_res = runner.csqlite().execute(sql);
+        let f_res = runner.frank().execute(sql);
+        if is_txn_control(sql) {
+            assert!(
+                c_res.is_ok() == f_res.is_ok(),
+                "transaction-control outcome diverged for `{sql}`:\n  csqlite={c_res:?}\n  fsqlite={f_res:?}"
+            );
+        } else {
+            let c_changes = c_res.unwrap_or_else(|err| panic!("csqlite failed on `{sql}`: {err}"));
+            let f_changes = f_res.unwrap_or_else(|err| panic!("fsqlite failed on `{sql}`: {err}"));
+            assert_eq!(
+                c_changes, f_changes,
+                "affected-row count mismatch for `{sql}`: csqlite={c_changes} fsqlite={f_changes}"
+            );
+        }
+    }
+
+    let expected_dirty = vec![vec![
+        SqlValue::Integer(1),
+        SqlValue::Text("alpha2".to_owned()),
+    ]];
+    let expected_clean = vec![vec![
+        SqlValue::Integer(1),
+        SqlValue::Text("seed".to_owned()),
+    ]];
+    let c_dirty = runner
+        .csqlite()
+        .query("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id")
+        .expect("csqlite final dirty query");
+    let f_dirty = runner
+        .frank()
+        .query("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id")
+        .expect("fsqlite final dirty query");
+    let c_clean = runner
+        .csqlite()
+        .query("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id")
+        .expect("csqlite final clean query");
+    let f_clean = runner
+        .frank()
+        .query("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id")
+        .expect("fsqlite final clean query");
+    assert_eq!(c_dirty, expected_dirty, "unexpected csqlite dirty rows");
+    assert_eq!(f_dirty, expected_dirty, "unexpected fsqlite dirty rows");
+    assert_eq!(c_clean, expected_clean, "unexpected csqlite clean rows");
+    assert_eq!(f_clean, expected_clean, "unexpected fsqlite clean rows");
+}
+
+#[test]
+#[ignore = "known regression: after a clean-table read boundary inside an explicit transaction, a later insert into the dirty table is not yet visible to COUNT(*) through the lazy MemDB compatibility path"]
+fn test_lazy_memdb_multi_table_post_read_insert_count_regression() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let steps = [
+        (
+            "CREATE TABLE lazy_memdb_dirty_a (id INTEGER PRIMARY KEY, val TEXT)",
+            false,
+        ),
+        (
+            "CREATE TABLE lazy_memdb_clean_b (id INTEGER PRIMARY KEY, val TEXT)",
+            false,
+        ),
+        ("INSERT INTO lazy_memdb_clean_b VALUES (1, 'seed')", false),
+        ("BEGIN", false),
+        ("INSERT INTO lazy_memdb_dirty_a VALUES (1, 'alpha')", false),
+        ("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id", true),
+        ("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id", true),
+        (
+            "UPDATE lazy_memdb_dirty_a SET val = 'alpha2' WHERE id = 1",
+            false,
+        ),
+        ("SELECT val FROM lazy_memdb_dirty_a WHERE id = 1", true),
+        ("INSERT INTO lazy_memdb_dirty_a VALUES (2, 'beta')", false),
+        ("SELECT COUNT(*) FROM lazy_memdb_dirty_a", true),
+        ("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id", true),
+        ("COMMIT", false),
+        ("SELECT id, val FROM lazy_memdb_dirty_a ORDER BY id", true),
+        ("SELECT id, val FROM lazy_memdb_clean_b ORDER BY id", true),
+    ];
+
+    let is_txn_control = |sql: &str| {
+        let upper = sql.trim().to_uppercase();
+        upper.starts_with("BEGIN")
+            || upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("SAVEPOINT")
+            || upper.starts_with("RELEASE")
+            || upper.starts_with("END")
+    };
+
+    for (sql, is_query) in steps {
+        if is_query {
+            let c_rows = runner.csqlite().query(sql).expect("csqlite query");
+            let f_rows = runner.frank().query(sql).expect("fsqlite query");
+            assert_eq!(
+                c_rows, f_rows,
+                "post-read insert lazy dirty visibility mismatch for query `{sql}`:\n  csqlite={c_rows:?}\n  fsqlite={f_rows:?}"
+            );
+            continue;
+        }
+
+        let c_res = runner.csqlite().execute(sql);
+        let f_res = runner.frank().execute(sql);
+        if is_txn_control(sql) {
+            assert!(
+                c_res.is_ok() == f_res.is_ok(),
+                "transaction-control outcome diverged for `{sql}`:\n  csqlite={c_res:?}\n  fsqlite={f_res:?}"
+            );
+        } else {
+            let c_changes = c_res.unwrap_or_else(|err| panic!("csqlite failed on `{sql}`: {err}"));
+            let f_changes = f_res.unwrap_or_else(|err| panic!("fsqlite failed on `{sql}`: {err}"));
+            assert_eq!(
+                c_changes, f_changes,
+                "affected-row count mismatch for `{sql}`: csqlite={c_changes} fsqlite={f_changes}"
+            );
+        }
+    }
+}
+
 // ─── Scenario K: WAL/checkpoint/journal-mode parity transitions ───────
 
 #[test]
