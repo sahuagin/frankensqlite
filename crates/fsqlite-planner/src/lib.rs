@@ -2451,6 +2451,7 @@ fn analyze_skip_scan_candidate(
     };
 
     let leading_col = &index.columns[0];
+    let second_col = &index.columns[1];
     let leading_constrained = terms.iter().any(|term| {
         term.column.as_ref().is_some_and(|wc| {
             col_matches(wc, leading_col)
@@ -2473,30 +2474,32 @@ fn analyze_skip_scan_candidate(
         return None;
     }
 
-    for idx_col in index.columns.iter().skip(1) {
-        for term in terms {
-            let Some(wc) = term.column.as_ref() else {
-                continue;
-            };
-            if !col_matches(wc, idx_col) {
-                continue;
-            }
-
-            let (trailing_probe_count, per_probe_selectivity) = match term.kind {
-                WhereTermKind::Equality => (1, SKIP_SCAN_EQ_SELECTIVITY),
-                WhereTermKind::InList { count } if count > 0 => (count, SKIP_SCAN_EQ_SELECTIVITY),
-                WhereTermKind::Range
-                | WhereTermKind::Between
-                | WhereTermKind::LikePrefix { .. } => (1, SKIP_SCAN_RANGE_SELECTIVITY),
-                _ => continue,
-            };
-
-            return Some(SkipScanCandidate {
-                leading_probes: leading_distinct as usize,
-                trailing_probe_count,
-                per_probe_selectivity,
-            });
+    // The current heuristic only prices skip-scan over one skipped leading
+    // column. If the first usable constraint is deeper in the key, the planner
+    // would also need the distinct cardinality of every skipped prefix, not
+    // just the leftmost column, to avoid underestimating cost.
+    for term in terms {
+        let Some(wc) = term.column.as_ref() else {
+            continue;
+        };
+        if !col_matches(wc, second_col) {
+            continue;
         }
+
+        let (trailing_probe_count, per_probe_selectivity) = match term.kind {
+            WhereTermKind::Equality => (1, SKIP_SCAN_EQ_SELECTIVITY),
+            WhereTermKind::InList { count } if count > 0 => (count, SKIP_SCAN_EQ_SELECTIVITY),
+            WhereTermKind::Range | WhereTermKind::Between | WhereTermKind::LikePrefix { .. } => {
+                (1, SKIP_SCAN_RANGE_SELECTIVITY)
+            }
+            _ => continue,
+        };
+
+        return Some(SkipScanCandidate {
+            leading_probes: leading_distinct as usize,
+            trailing_probe_count,
+            per_probe_selectivity,
+        });
     }
 
     None
@@ -7027,6 +7030,68 @@ mod tests {
             ap.kind,
             AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
         ));
+    }
+
+    #[test]
+    fn test_best_access_path_skip_scan_allows_immediate_second_column_on_three_column_index() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_region_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec![
+                "tenant_id".to_owned(),
+                "region_code".to_owned(),
+                "email".to_owned(),
+            ],
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let ap = best_access_path(&table, &[idx], &[eq_term("region_code")], None);
+        assert_eq!(ap.index.as_deref(), Some("idx_tenant_region_email"));
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_skip_scan_rejects_gapped_trailing_column() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_region_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec![
+                "tenant_id".to_owned(),
+                "region_code".to_owned(),
+                "email".to_owned(),
+            ],
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
+        assert!(
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "gapped skip-scan should fall back to full scan until multi-prefix cardinality is modeled, got {:?}",
+            ap.kind
+        );
     }
 
     #[test]

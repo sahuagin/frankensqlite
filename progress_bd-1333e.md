@@ -90,3 +90,30 @@
 - `rch exec -- cargo check --workspace --all-targets`: blocked by unrelated dirty-tree failure in `crates/fsqlite-pager/src/page_cache.rs` (`stable_snapshot_impl(None)` no longer matches the method signature, plus an unused `attempt` warning)
 - `rch exec -- cargo check -p fsqlite-planner --all-targets`: passed
 - `rch exec -- cargo clippy -p fsqlite-planner --all-targets -- -D warnings`: passed
+
+- Selected sub-task: reject under-modeled multi-gap skip-scan candidates in `crates/fsqlite-planner/src/lib.rs`.
+- Why this slice: the existing skip-scan heuristic only prices one skipped leading column, but it still treated a constraint on the third column of `(a, b, c)` as planner-usable. That underestimates cost for multi-gap skip-scan shapes and can make the planner choose an index it cannot price correctly.
+- Scope:
+  - limit skip-scan candidate detection to constraints on the immediate second index column
+  - keep existing one-leading-column skip-scan behavior for `(a, b)` and `(a, b, c)` shapes where `b` is constrained
+  - add regressions covering both the accepted three-column second-column case and the rejected third-column gap case
+- Planned verification:
+  - `rustfmt --edition 2024 crates/fsqlite-planner/src/lib.rs`
+  - `cargo fmt --check`
+  - `rch exec -- cargo test -p fsqlite-planner test_best_access_path_skip_scan_allows_immediate_second_column_on_three_column_index -- --nocapture`
+  - `rch exec -- cargo test -p fsqlite-planner test_best_access_path_skip_scan_rejects_gapped_trailing_column -- --nocapture`
+  - `rch exec -- cargo check -p fsqlite-planner --all-targets`
+  - `rch exec -- cargo clippy -p fsqlite-planner --all-targets -- -D warnings`
+  - `rch exec -- cargo check --workspace --all-targets`
+  - `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
+  - `ubs crates/fsqlite-planner/src/lib.rs`
+
+- `rustfmt --edition 2024 crates/fsqlite-planner/src/lib.rs`: passed
+- `cargo fmt --check`: blocked by unrelated formatting drift in `crates/fsqlite-observability/src/connection_pool.rs` around the `recommended_point["throughput_score"]` assertion chain
+- `rch exec -- cargo test -p fsqlite-planner test_best_access_path_skip_scan_allows_immediate_second_column_on_three_column_index -- --nocapture`: passed
+- `rch exec -- cargo test -p fsqlite-planner test_best_access_path_skip_scan_rejects_gapped_trailing_column -- --nocapture`: passed
+- `rch exec -- cargo check -p fsqlite-planner --all-targets`: passed
+- `rch exec -- cargo clippy -p fsqlite-planner --all-targets -- -D warnings`: passed
+- `rch exec -- cargo check --workspace --all-targets`: passed
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `ubs crates/fsqlite-planner/src/lib.rs`: exits non-zero on broad pre-existing whole-file findings in `fsqlite-planner`, but still reports formatting/clippy/build health clean for the changed file
