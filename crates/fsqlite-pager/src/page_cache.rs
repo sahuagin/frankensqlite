@@ -2910,7 +2910,7 @@ mod tests {
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::{MemoryVfs, Vfs};
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::hint::black_box;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -2918,6 +2918,7 @@ mod tests {
     const BEAD_ID: &str = "bd-22n.2";
     const BEAD_TRACK_F: &str = "bd-pm1zd";
     const BEAD_TRACK_Q: &str = "bd-aztlm";
+    const BEAD_CACHE_MONITOR: &str = "bd-t6sv2.8";
 
     fn elapsed_ns(duration: Duration) -> u64 {
         u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
@@ -2996,6 +2997,39 @@ mod tests {
         );
     }
 
+    fn emit_cache_monitor_log(
+        test_name: &str,
+        workload_type: &str,
+        elapsed: Duration,
+        snapshot: PageCacheMetricsSnapshot,
+        extra: serde_json::Value,
+    ) {
+        eprintln!(
+            "CACHE_MONITOR:{}",
+            json!({
+                "bead_id": BEAD_CACHE_MONITOR,
+                "test_name": test_name,
+                "workload_type": workload_type,
+                "elapsed_ns": elapsed_ns(elapsed),
+                "hits": snapshot.hits,
+                "misses": snapshot.misses,
+                "total_accesses": snapshot.total_accesses(),
+                "hit_rate_pct": snapshot.hit_rate_percent(),
+                "eviction_count": snapshot.evictions,
+                "dirty_ratio_pct": snapshot.dirty_ratio_pct,
+                "t1_size": snapshot.t1_size,
+                "t2_size": snapshot.t2_size,
+                "b1_size": snapshot.b1_size,
+                "b2_size": snapshot.b2_size,
+                "p_target": snapshot.p_target,
+                "cached_pages": snapshot.cached_pages,
+                "pool_capacity": snapshot.pool_capacity,
+                "mvcc_multi_version_pages": snapshot.mvcc_multi_version_pages,
+                "extra": extra
+            })
+        );
+    }
+
     fn track_q_page_buf(page_no: PageNumber) -> PageBuf {
         let pattern = page_pattern(page_no);
         let mut buf = PageBuf::new(PageSize::DEFAULT);
@@ -3052,6 +3086,37 @@ mod tests {
         }
         f64::from(u32::try_from(hits.min(u64::from(u32::MAX))).expect("hit count fits u32"))
             / f64::from(u32::try_from(total.min(u64::from(u32::MAX))).expect("total fits u32"))
+    }
+
+    fn populate_monitored_page(page_no: PageNumber, data: &mut [u8]) {
+        data[..4].copy_from_slice(&page_no.get().to_le_bytes());
+        data[4] = page_pattern(page_no);
+        let last = data
+            .len()
+            .checked_sub(1)
+            .expect("page buffer should never be empty");
+        data[last] = page_pattern(page_no);
+    }
+
+    fn touch_monitored_page(cache: &ShardedPageCache, page_no: PageNumber) {
+        if cache.get_copy(page_no).is_some() {
+            return;
+        }
+
+        loop {
+            match cache.insert_fresh(page_no, |data| populate_monitored_page(page_no, data)) {
+                Ok(()) => return,
+                Err(FrankenError::OutOfMemory) => {
+                    assert!(
+                        cache.evict_any(),
+                        "cache monitor workload admission must free one victim"
+                    );
+                }
+                Err(err) => {
+                    panic!("cache monitor workload insert failed for page {page_no}: {err}")
+                }
+            }
+        }
     }
 
     fn lane_counter(data: &[u8], lane: usize) -> u32 {
@@ -3902,6 +3967,202 @@ mod tests {
         assert!(
             snapshot.t2_size >= 1,
             "S3-FIFO metrics should expose a non-empty main queue for sharded cache"
+        );
+    }
+
+    #[test]
+    fn test_cache_monitor_sequential_scan_reports_recency_queue_bias() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 8, 1);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(8)));
+        cache.reset_metrics();
+
+        let started = Instant::now();
+        for raw_pgno in 1..=32_u32 {
+            touch_monitored_page(&cache, PageNumber::new(raw_pgno).unwrap());
+        }
+        let elapsed = started.elapsed();
+
+        let snapshot = cache.metrics_snapshot();
+        emit_cache_monitor_log(
+            "test_cache_monitor_sequential_scan_reports_recency_queue_bias",
+            "sequential",
+            elapsed,
+            snapshot,
+            json!({
+                "unique_pages": 32,
+                "expected_capacity": 8,
+                "replay_hint": "cargo test -p fsqlite-pager test_cache_monitor_sequential_scan_reports_recency_queue_bias -- --nocapture"
+            }),
+        );
+
+        assert_eq!(
+            snapshot.total_accesses(),
+            32,
+            "cache monitor sequential scenario should account for every page touch"
+        );
+        assert!(
+            snapshot.hit_rate_percent() <= 10.0,
+            "sequential scan should remain miss-heavy, got {:.2}%",
+            snapshot.hit_rate_percent()
+        );
+        assert!(
+            snapshot.evictions > 0,
+            "sequential scan should force evictions once the working set exceeds capacity"
+        );
+        assert!(
+            snapshot.t1_size >= snapshot.t2_size,
+            "recency queue should dominate after a pure scan: t1={} t2={}",
+            snapshot.t1_size,
+            snapshot.t2_size
+        );
+        assert!(
+            snapshot.cached_pages <= 8,
+            "resident cache must stay bounded by configured capacity"
+        );
+    }
+
+    #[test]
+    fn test_cache_monitor_hotset_reports_frequency_queue_bias() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 16, 1);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(16)));
+        cache.reset_metrics();
+
+        let hot_pages = [
+            PageNumber::ONE,
+            PageNumber::new(2).unwrap(),
+            PageNumber::new(3).unwrap(),
+            PageNumber::new(4).unwrap(),
+        ];
+
+        let started = Instant::now();
+        for round in 0..160_u32 {
+            for page_no in hot_pages {
+                touch_monitored_page(&cache, page_no);
+            }
+            let cold_page = PageNumber::new(100 + (round % 24)).unwrap();
+            touch_monitored_page(&cache, cold_page);
+        }
+        let elapsed = started.elapsed();
+
+        let snapshot = cache.metrics_snapshot();
+        let page_snapshots = cache.page_snapshots();
+        let queue_by_page: HashMap<PageNumber, Option<PageCacheQueueKind>> = page_snapshots
+            .iter()
+            .map(|entry| (entry.page_no, entry.queue))
+            .collect();
+        let hot_pages_in_t2 = hot_pages
+            .iter()
+            .filter(|page_no| queue_by_page.get(page_no) == Some(&Some(PageCacheQueueKind::T2)))
+            .count();
+
+        emit_cache_monitor_log(
+            "test_cache_monitor_hotset_reports_frequency_queue_bias",
+            "zipfian",
+            elapsed,
+            snapshot,
+            json!({
+                "hot_pages": hot_pages.iter().map(|page_no| page_no.get()).collect::<Vec<_>>(),
+                "resident_pages": page_snapshots.len(),
+                "hot_pages_in_t2": hot_pages_in_t2,
+                "replay_hint": "cargo test -p fsqlite-pager test_cache_monitor_hotset_reports_frequency_queue_bias -- --nocapture"
+            }),
+        );
+
+        assert_eq!(
+            snapshot.total_accesses(),
+            800,
+            "hot-set workload should account for four hot reads plus one cold read per round"
+        );
+        assert!(
+            snapshot.hit_rate_percent() >= 80.0,
+            "hot-set workload should be hit-heavy, got {:.2}%",
+            snapshot.hit_rate_percent()
+        );
+        assert!(
+            snapshot.t2_size >= snapshot.t1_size,
+            "frequency queue should dominate for the hot-set workload: t1={} t2={}",
+            snapshot.t1_size,
+            snapshot.t2_size
+        );
+        assert!(
+            hot_pages_in_t2 >= 3,
+            "most hot pages should graduate into the frequency queue, got {hot_pages_in_t2}"
+        );
+    }
+
+    #[test]
+    fn test_cache_monitor_page_snapshots_rank_hot_pages_by_access_frequency() {
+        let cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 32, 1);
+        cache.set_eviction_policy(PageCacheEvictionPolicy::S3Fifo(S3FifoConfig::new(32)));
+        cache.reset_metrics();
+
+        let hot_pages = [
+            PageNumber::ONE,
+            PageNumber::new(2).unwrap(),
+            PageNumber::new(3).unwrap(),
+        ];
+        let cold_pages = [
+            PageNumber::new(21).unwrap(),
+            PageNumber::new(22).unwrap(),
+            PageNumber::new(23).unwrap(),
+            PageNumber::new(24).unwrap(),
+            PageNumber::new(25).unwrap(),
+            PageNumber::new(26).unwrap(),
+        ];
+
+        let started = Instant::now();
+        for page_no in cold_pages {
+            touch_monitored_page(&cache, page_no);
+        }
+        for _ in 0..48 {
+            for page_no in hot_pages {
+                touch_monitored_page(&cache, page_no);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        let snapshot = cache.metrics_snapshot();
+        let access_counts: HashMap<PageNumber, u64> = cache
+            .page_snapshots()
+            .into_iter()
+            .map(|entry| (entry.page_no, entry.access_count))
+            .collect();
+        let hot_min = hot_pages
+            .iter()
+            .map(|page_no| {
+                *access_counts
+                    .get(page_no)
+                    .expect("hot page must appear in page snapshots")
+            })
+            .min()
+            .expect("hot pages should not be empty");
+        let cold_max = cold_pages
+            .iter()
+            .map(|page_no| {
+                *access_counts
+                    .get(page_no)
+                    .expect("cold page must appear in page snapshots")
+            })
+            .max()
+            .expect("cold pages should not be empty");
+
+        emit_cache_monitor_log(
+            "test_cache_monitor_page_snapshots_rank_hot_pages_by_access_frequency",
+            "working_set",
+            elapsed,
+            snapshot,
+            json!({
+                "hot_pages": hot_pages.iter().map(|page_no| page_no.get()).collect::<Vec<_>>(),
+                "cold_pages": cold_pages.iter().map(|page_no| page_no.get()).collect::<Vec<_>>(),
+                "hot_min_access_count": hot_min,
+                "cold_max_access_count": cold_max,
+                "replay_hint": "cargo test -p fsqlite-pager test_cache_monitor_page_snapshots_rank_hot_pages_by_access_frequency -- --nocapture"
+            }),
+        );
+
+        assert!(
+            hot_min > cold_max,
+            "page snapshots should preserve access-frequency separation for working-set analysis: hot_min={hot_min} cold_max={cold_max}"
         );
     }
 
