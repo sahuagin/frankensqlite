@@ -2,22 +2,22 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{
-    Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
+    Mutex, OnceLock,
 };
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::DatabaseHeader;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::DatabaseHeader;
 use fsqlite_vdbe::codegen::TableSchema;
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_vfs::host_fs;
 
-use crate::compat_persist::SqliteMasterEntry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::compat_persist::persist_to_sqlite_with_header_and_master_entries;
+use crate::compat_persist::SqliteMasterEntry;
 
 pub(crate) const ATTACHED_SCHEMA_UNSUPPORTED: &str = "VACUUM on attached schemas";
 pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
@@ -176,10 +176,23 @@ pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn replace_database_file(target_path: &Path, rebuilt_path: &Path) -> Result<()> {
-    let bytes = host_fs::read(rebuilt_path)?;
-    host_fs::write(target_path, bytes)?;
-    drop(host_fs::remove_file(rebuilt_path));
-    Ok(())
+    let bytes = match host_fs::read(rebuilt_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            drop(host_fs::remove_file(rebuilt_path));
+            return Err(err);
+        }
+    };
+    match host_fs::write(target_path, bytes) {
+        Ok(()) => {
+            host_fs::remove_file(rebuilt_path)?;
+            Ok(())
+        }
+        Err(err) => {
+            drop(host_fs::remove_file(rebuilt_path));
+            Err(err)
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -197,7 +210,7 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        NON_TEXT_FILENAME, resolve_vacuum_into_target, take_temp_vacuum_into_discard_target,
+        resolve_vacuum_into_target, take_temp_vacuum_into_discard_target, NON_TEXT_FILENAME,
     };
 
     #[test]
@@ -445,6 +458,27 @@ mod tests {
         assert!(
             temp_files.is_empty(),
             "VACUUM should not leave rebuild temp files behind: {temp_files:?}"
+        );
+    }
+
+    #[test]
+    fn test_replace_database_file_cleans_up_temp_file_on_write_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("vacuum-target-dir");
+        let rebuilt_path = dir.path().join("vacuum-target.db.fsqlite-vacuum-1.tmp");
+
+        fsqlite_vfs::host_fs::create_dir_all(&target_dir).unwrap();
+        fsqlite_vfs::host_fs::write(&rebuilt_path, b"rebuilt database bytes").unwrap();
+
+        let err = super::replace_database_file(&target_dir, &rebuilt_path)
+            .expect_err("directory targets must fail replacement");
+        assert!(
+            !rebuilt_path.exists(),
+            "failed replacements must still remove the rebuild temp file"
+        );
+        assert!(
+            err.to_string().contains("Is a directory") || err.to_string().contains("directory"),
+            "unexpected replacement failure: {err}"
         );
     }
 
