@@ -2256,11 +2256,28 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
                     }
                 }
                 WhereTermKind::InList { count } => {
-                    summary.first_in_probe_count.get_or_insert(*count);
-                    if column_index == 0 && leftmost_first_constraint.is_none() {
-                        leftmost_first_constraint = Some(IndexUsability::InExpansion {
-                            probe_count: *count,
-                        });
+                    if summary
+                        .first_in_probe_count
+                        .is_none_or(|existing| *count < existing)
+                    {
+                        summary.first_in_probe_count = Some(*count);
+                    }
+                    if column_index == 0 {
+                        match leftmost_first_constraint {
+                            Some(IndexUsability::InExpansion { probe_count })
+                                if *count < probe_count =>
+                            {
+                                leftmost_first_constraint = Some(IndexUsability::InExpansion {
+                                    probe_count: *count,
+                                });
+                            }
+                            None => {
+                                leftmost_first_constraint = Some(IndexUsability::InExpansion {
+                                    probe_count: *count,
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 WhereTermKind::LikePrefix {
@@ -2495,9 +2512,12 @@ fn analyze_skip_scan_candidate(
         match &term.kind {
             WhereTermKind::Equality => second_column_summary.has_equality = true,
             WhereTermKind::InList { count } if *count > 0 => {
-                second_column_summary
+                if second_column_summary
                     .first_in_probe_count
-                    .get_or_insert(*count);
+                    .is_none_or(|existing| *count < existing)
+                {
+                    second_column_summary.first_in_probe_count = Some(*count);
+                }
             }
             WhereTermKind::Range | WhereTermKind::Between | WhereTermKind::LikePrefix { .. } => {
                 second_column_summary.has_range = true;
@@ -5087,6 +5107,29 @@ mod tests {
     }
 
     #[test]
+    fn test_best_access_path_multicolumn_trailing_in_prefers_tighter_probe_count()
+    -> Result<(), String> {
+        let table = table_stats("t1", 1_000, 1_000_000);
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        let ap = best_access_path(
+            &table,
+            &[idx],
+            &[eq_term("a"), in_term("b", 5), in_term("b", 2)],
+            None,
+        );
+
+        if ap.index.as_deref() == Some("idx_ab") {
+            if ap.kind == AccessPathKind::IndexScanEquality {
+                if (ap.estimated_rows - 20_000.0).abs() < f64::EPSILON {
+                    return Ok(());
+                }
+                return Err("expected tighter IN-list row estimate".to_owned());
+            }
+            return Err("expected equality access path".to_owned());
+        }
+        Err("expected idx_ab access path".to_owned())
+    }
+    #[test]
     fn test_best_access_path_multicolumn_or_disjunction_reuses_composite_in_expansion() {
         let table = table_stats("t1", 1_000, 1_000_000);
         let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
@@ -7168,6 +7211,41 @@ mod tests {
         assert_eq!(candidate.per_probe_selectivity, SKIP_SCAN_EQ_SELECTIVITY);
     }
 
+    #[test]
+    fn test_skip_scan_candidate_second_column_prefers_tighter_in_probe_count() -> Result<(), String>
+    {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_email".to_owned(),
+            table: "users".to_owned(),
+            columns: ["tenant_id".to_owned(), "email".to_owned()]
+                .into_iter()
+                .collect(),
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: Vec::new(),
+        };
+
+        let candidate =
+            analyze_skip_scan_candidate(&table, &idx, &[in_term("email", 5), in_term("email", 2)])
+                .ok_or_else(|| "expected skip-scan candidate".to_owned())?;
+
+        if candidate.leading_probes == 8
+            && candidate.trailing_probe_count == 2
+            && candidate.per_probe_selectivity == SKIP_SCAN_EQ_SELECTIVITY
+        {
+            return Ok(());
+        }
+
+        Err("expected tighter second-column IN probe count".to_owned())
+    }
     #[test]
     fn test_best_access_path_skip_scan_rejects_high_cardinality_leading_column() {
         let table = TableStats {
