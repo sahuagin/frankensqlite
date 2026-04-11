@@ -8034,15 +8034,6 @@ where
             _ => mode,
         };
 
-        if sole_connection && effective_mode != mode {
-            // This branch is unreachable but guards against future refactors.
-            tracing::warn!(
-                requested_mode = ?mode,
-                effective_mode = ?effective_mode,
-                "unexpected downgrade despite sole-connection fast path"
-            );
-        }
-
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
         let mut result = guard
