@@ -379,6 +379,21 @@ impl TableSchema {
         })
     }
 
+    /// Find a direct-lookup UNIQUE index that guarantees at most one row for
+    /// an equality probe on `col_name`.
+    #[must_use]
+    pub fn unique_single_column_index_for_column(&self, col_name: &str) -> Option<&IndexSchema> {
+        self.indexes.iter().find(|idx| {
+            idx.is_unique
+                && idx.columns.len() == 1
+                && idx.supports_direct_column_lookup()
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+        })
+    }
+
     /// STRICT type-check pattern for `Opcode::TypeCheck` (`I`,`R`,`T`,`L`,`A`).
     #[must_use]
     pub fn strict_type_pattern(&self) -> Option<String> {
@@ -6368,23 +6383,13 @@ fn resolve_multi_join_lookup_plan<'a>(
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
             SortKeySource::Column(col_idx) => {
                 let column_name = &right_table.columns.get(col_idx)?.name;
-                let index = right_table.index_for_column(column_name)?;
-                // Only accept single-column UNIQUE indexes for the
-                // multi-join fast path. The codegen below takes only the
-                // *first* matching row per outer row (no duplicate-run
-                // walk), so it is only correct when probing the join key
-                // can produce at most one row. UNIQUE(a, b) does not make
-                // `a = ?` unique; multiple rows may still share the same
-                // leftmost prefix with different trailing key terms.
-                //
-                // The single-join codegen handles multi-row probes via a
-                // SeekGE + Next loop, but generalising that to N-way chains
-                // adds substantial complexity. Rejecting everything except
-                // true single-column unique lookups here keeps the fast path
-                // correct and lets the scan fallback handle broader shapes.
-                if !index.is_unique || index.columns.len() != 1 {
-                    return None;
-                }
+                // The multi-join fast path is only correct when the probe key
+                // yields at most one row. Pick any direct-lookup single-column
+                // UNIQUE index on the join key instead of blindly taking the
+                // first leftmost-column index; otherwise a preceding non-unique
+                // sibling index would disable the fast path even when a safe
+                // unique lookup exists.
+                let index = right_table.unique_single_column_index_for_column(column_name)?;
                 SingleJoinLookupTarget::Index(index)
             }
             SortKeySource::Expression(_) => return None,
@@ -24769,6 +24774,190 @@ mod tests {
             rewind_count >= 2,
             "joining on the leftmost column of UNIQUE(tenant_id, slug) is not a \
              single-row lookup; the multi-join fast path must be rejected"
+        );
+    }
+
+    fn test_schema_multi_join_prefers_unique_single_column_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "messages".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("conversation_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "conversations".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "agents".to_owned(),
+                root_page: 4,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "agents_tenant_idx".to_owned(),
+                        root_page: 5,
+                        columns: vec!["tenant_id".to_owned()],
+                        key_expressions: vec!["tenant_id".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "agents_tenant_unique".to_owned(),
+                        root_page: 6,
+                        columns: vec!["tenant_id".to_owned()],
+                        key_expressions: vec!["tenant_id".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![],
+                    },
+                ],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn unique_single_column_lookup_multi_join_stmt() -> SelectStatement {
+        let on_m_c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("m", "conversation_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::qualified("c", "id"), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let on_c_a = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef::qualified("c", "tenant_id"),
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(
+                ColumnRef::qualified("a", "tenant_id"),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        };
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("m", "id"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("a", "label"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("messages"),
+                            alias: Some("m".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("conversations"),
+                                    alias: Some("c".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_m_c)),
+                            },
+                            fsqlite_ast::JoinClause {
+                                join_type: fsqlite_ast::JoinType {
+                                    kind: fsqlite_ast::JoinKind::Inner,
+                                    natural: false,
+                                },
+                                table: TableOrSubquery::Table {
+                                    name: QualifiedName::bare("agents"),
+                                    alias: Some("a".to_owned()),
+                                    index_hint: None,
+                                    time_travel: None,
+                                },
+                                constraint: Some(fsqlite_ast::JoinConstraint::On(on_c_a)),
+                            },
+                        ],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_uses_unique_lookup_even_if_nonunique_sibling_comes_first() {
+        let stmt = unique_single_column_lookup_multi_join_stmt();
+        let schema = test_schema_multi_join_prefers_unique_single_column_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert_eq!(
+            rewind_count, 1,
+            "a qualifying single-column UNIQUE lookup should keep the multi-join fast path enabled \
+             even if a non-unique sibling index appears first"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "the multi-join fast path should still seek into the qualifying unique index"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
+            "the multi-join fast path should fetch rowids from the qualifying unique index"
         );
     }
 
