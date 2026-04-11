@@ -1230,6 +1230,59 @@ struct PageSlot {
     data: Mutex<Option<CachedPageEntry>>,
 }
 
+impl PageSlot {
+    /// Observe a stable `(pgno, entry)` pair for diagnostics. Writers publish a
+    /// new page number before swapping the slot payload, so readers need to
+    /// validate the page number again after taking the payload lock.
+    fn stable_snapshot(&self) -> Option<PageCachePageSnapshot> {
+        self.stable_snapshot_impl(
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn stable_snapshot_impl(
+        &self,
+        #[cfg(test)] prelock_barrier: Option<&std::sync::Barrier>,
+    ) -> Option<PageCachePageSnapshot> {
+        const MAX_ATTEMPTS: usize = 3;
+
+        for _attempt in 0..MAX_ATTEMPTS {
+            let pgno_before = self.pgno.load(Ordering::Acquire);
+            if pgno_before == SLOT_EMPTY || pgno_before == SLOT_TOMBSTONE {
+                return None;
+            }
+
+            #[cfg(test)]
+            if _attempt == 0
+                && let Some(barrier) = prelock_barrier
+            {
+                barrier.wait();
+            }
+
+            let guard = self.data.lock();
+            let pgno_after = self.pgno.load(Ordering::Acquire);
+            if pgno_before != pgno_after {
+                continue;
+            }
+
+            let entry = guard.as_ref()?;
+            let page_no = PageNumber::new(pgno_after)?;
+            return Some(snapshot_cached_page(page_no, entry));
+        }
+
+        None
+    }
+
+    #[cfg(test)]
+    fn stable_snapshot_with_barrier(
+        &self,
+        prelock_barrier: &std::sync::Barrier,
+    ) -> Option<PageCachePageSnapshot> {
+        self.stable_snapshot_impl(Some(prelock_barrier))
+    }
+}
+
 /// Flat hash page cache with CAS-based slot pinning (bd-eorms).
 ///
 /// Models C SQLite's `pcache1`: pages stored in a power-of-2 flat array
@@ -1485,13 +1538,8 @@ impl FlatPageSlots {
     fn resident_pages(&self) -> Vec<PageNumber> {
         self.slots
             .iter()
-            .filter_map(|slot| {
-                let pgno = slot.pgno.load(Ordering::Acquire);
-                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
-                    return None;
-                }
-                PageNumber::new(pgno)
-            })
+            .filter_map(PageSlot::stable_snapshot)
+            .map(|snapshot| snapshot.page_no)
             .collect()
     }
 
@@ -2545,18 +2593,15 @@ impl ShardedPageCache {
         let mut total_admits = self.flat_slots.admits.load(Ordering::Relaxed);
         let mut total_evictions = self.flat_slots.evictions.load(Ordering::Relaxed);
         let mut total_pages = self.flat_slots.len();
-        let mut dirty_pages = self
+        let flat_snapshots: Vec<PageCachePageSnapshot> = self
             .flat_slots
             .slots
             .iter()
-            .filter(|slot| {
-                let pgno = slot.pgno.load(Ordering::Acquire);
-                pgno != SLOT_EMPTY && pgno != SLOT_TOMBSTONE
-            })
-            .filter(|slot| {
-                let guard = slot.data.lock();
-                guard.as_ref().is_some_and(CachedPageEntry::is_dirty)
-            })
+            .filter_map(PageSlot::stable_snapshot)
+            .collect();
+        let mut dirty_pages = flat_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.dirty)
             .count();
 
         // Add overflow shard metrics
@@ -2570,7 +2615,13 @@ impl ShardedPageCache {
             dirty_pages += s.pages.values().filter(|entry| entry.is_dirty()).count();
         }
 
-        let residents = self.resident_pages();
+        let mut residents: Vec<PageNumber> = flat_snapshots
+            .iter()
+            .map(|snapshot| snapshot.page_no)
+            .collect();
+        for shard in self.shards.iter() {
+            residents.extend(shard.lock().resident_pages());
+        }
         let queue_snapshot = self
             .eviction_policy
             .lock()
@@ -2625,19 +2676,12 @@ impl ShardedPageCache {
                 }
             }
         } else {
-            for slot in self.flat_slots.slots.iter() {
-                let pgno = slot.pgno.load(Ordering::Acquire);
-                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
-                    continue;
-                }
-                let Some(page_no) = PageNumber::new(pgno) else {
-                    continue;
-                };
-                let guard = slot.data.lock();
-                if let Some(entry) = guard.as_ref() {
-                    snapshots.push(snapshot_cached_page(page_no, entry));
-                }
-            }
+            snapshots.extend(
+                self.flat_slots
+                    .slots
+                    .iter()
+                    .filter_map(PageSlot::stable_snapshot),
+            );
 
             for shard in self.shards.iter() {
                 let shard = shard.lock();
@@ -4435,6 +4479,44 @@ mod tests {
             "bead_id={BEAD_3WOP3_2} case=cross_shard_eviction_count"
         );
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_flat_slot_snapshot_retries_after_pgno_flip_before_lock() {
+        let slots = std::sync::Arc::new(FlatPageSlots::new(8));
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        let old_page = PageNumber::ONE;
+        let new_page = PageNumber::new(2).unwrap();
+
+        let old_buf = pool.acquire().unwrap();
+        assert!(slots.try_insert(old_page, old_buf).unwrap());
+
+        let slot_idx = slots.find_slot(old_page).unwrap();
+        let slot = &slots.slots[slot_idx];
+        let mut guard = slot.data.lock();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let slots_for_thread = std::sync::Arc::clone(&slots);
+        let barrier_for_thread = std::sync::Arc::clone(&barrier);
+
+        let handle = std::thread::spawn(move || {
+            slots_for_thread.slots[slot_idx].stable_snapshot_with_barrier(&barrier_for_thread)
+        });
+
+        barrier.wait();
+        slot.pgno.store(new_page.get(), Ordering::Release);
+
+        let new_buf = pool.acquire().unwrap();
+        *guard = Some(CachedPageEntry::new(new_buf));
+        drop(guard);
+
+        let snapshot = handle
+            .join()
+            .unwrap()
+            .expect("snapshot should retry and observe the replacement page");
+        assert_eq!(
+            snapshot.page_no, new_page,
+            "snapshot must not pair a stale page number with a newer slot entry"
+        );
     }
 
     #[test]
