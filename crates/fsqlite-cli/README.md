@@ -11,13 +11,18 @@ execution mode.
 - **Interactive REPL** -- Multi-line SQL input with TTY-aware prompts. The
   shell keeps classic `fsqlite> ` / `...> ` prompts for `:memory:` sessions and
   shows the current database name after `.open` or when launched against a file.
+- **TTY syntax highlighting** -- Continuation prompts render a highlighted
+  preview of the pending SQL statement so interactive sessions surface keywords,
+  literals, and comments more clearly.
 - **Single-command mode** (`-c` / `--command`) -- Execute one SQL string and
   exit. SQL and supported dot-commands both work here, which makes the CLI
   easier to script.
-- **sqlite3-style dot commands** -- `.read`, `.open`, `.schema`, and `.dump`
-  are built in for common shell workflows.
+- **sqlite3-style dot commands** -- `.read`, `.open`, `.tables`, `.schema`,
+  `.dump`, `.mode`, and `.headers` / `.header` are built in for common shell
+  workflows.
 - **Batch mode for piped stdin** -- When stdin/stdout are not attached to a TTY,
-  prompts are suppressed automatically so pipelines stay clean.
+  prompts are suppressed automatically so pipelines stay clean, and `-batch` /
+  `--batch` can force the same behavior on a TTY.
 - **Decode proof verification** (`--verify-proof`) -- Verify ECS decode proofs
   from a JSON file, with configurable policy ID and slack parameters.
 - **In-memory or file-backed** -- Defaults to `:memory:` if no database path is
@@ -76,7 +81,9 @@ fsqlite --help
 | Flag | Description |
 |------|-------------|
 | `<db_path>` | Database file path (default: `:memory:`) |
-| `-c`, `--command <SQL>` | Execute SQL and exit |
+| `-c`, `--command <SQL>` | Execute SQL or a dot-command and exit |
+| `-batch`, `--batch` | Force batch-mode execution with prompts disabled |
+| `-init`, `--init <FILE>` | Run a startup script before command mode or the REPL |
 | `--verify-proof <path>` | Verify ECS decode proof from JSON file |
 | `--verify-policy-id <N>` | Policy ID for proof verification |
 | `--verify-slack <N>` | Slack parameter for proof verification |
@@ -88,8 +95,11 @@ fsqlite --help
 |---------|-------------|
 | `.help` | Show shell help |
 | `.open <path>` | Re-open the shell against another database |
+| `.tables [pattern]` | List tables and views, optionally filtered by `LIKE` pattern |
 | `.schema [pattern]` | Print schema SQL, optionally filtered by `LIKE` pattern |
 | `.dump [pattern]` | Emit schema and table contents as SQL text |
+| `.mode <mode>` | Set output mode: `list`, `column`, `csv`, `tabs`, `line` |
+| `.headers <on\|off>` | Toggle column headers (`.header` alias also works) |
 | `.read <path>` | Execute commands from a file |
 | `.quit`, `.exit` | Leave the shell |
 

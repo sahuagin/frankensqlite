@@ -1177,7 +1177,7 @@ title = "Dot-commands (.open, .tables, .schema, .dump, .import, etc.)"
 weight = 6
 status = "partial"
 observability = ["test_cli_dot_commands"]
-notes = "Core dot-commands implemented; full set in progress"
+notes = "Implemented: .read, .open, .tables, .schema, .dump, .mode, and .header/.headers; broader sqlite3 dot-command parity (for example .import) remains in progress"
 
 [[features]]
 id = "F-CLI.04"
@@ -1220,9 +1220,9 @@ id = "F-CLI.08"
 family = "CLI"
 title = "Batch mode (stdin/file input)"
 weight = 3
-status = "partial"
+status = "pass"
 observability = ["test_batch_mode"]
-notes = "Pipe SQL from file or stdin"
+notes = "Piped stdin suppresses prompts automatically; `-batch/--batch`, `-init/--init`, and `.read` cover explicit batch/scripted execution paths"
 
 [[features]]
 id = "F-CLI.09"
@@ -1231,7 +1231,7 @@ title = "SQL syntax highlighting and tab completion"
 weight = 3
 status = "partial"
 observability = ["test_syntax_highlight"]
-notes = "Interactive shell UX features"
+notes = "TTY continuation prompts render ANSI SQL highlighting; tab completion is still pending"
 
 # ============================================================================
 # EXCLUSIONS — Features deliberately NOT in scope

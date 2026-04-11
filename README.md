@@ -1008,14 +1008,17 @@ The `fsqlite-cli` binary currently provides a small interactive SQL shell plus o
 
 ### Features
 
-- Multi-line statement detection (continues until `;`)
-- Simple row rendering with ` | ` separators
-- REPL dot commands: `.help`, `.quit`, `.exit`, `.read FILE`
+- Multi-line statement detection with TTY-aware continuation prompts
+- Syntax-highlighted SQL previews in interactive continuation prompts
+- Output modes: `list`, `column`, `csv`, `tabs`, `line`, with optional headers
+- REPL and command-mode dot commands: `.help`, `.quit`, `.exit`, `.read FILE`, `.open FILE`, `.tables`, `.schema`, `.dump`, `.mode`, `.headers` / `.header`
 - Single-command mode: `-c` / `--command`
+- Batch mode for piped stdin plus explicit `-batch` / `--batch`
+- Startup script support via `-init` / `--init`
 - Decode-proof verification mode: `--verify-proof`
 - Ctrl-C clears the current pending statement; EOF exits the shell
 
-Features such as persistent history, completion, syntax highlighting, rich output modes, and broad sqlite3-style dot-command coverage are still future work.
+Persistent history, full tab completion, and broader sqlite3 dot-command parity are still future work.
 
 ---
 

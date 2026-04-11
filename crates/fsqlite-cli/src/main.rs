@@ -1592,14 +1592,19 @@ where
         return DotCommandResult::Continue;
     }
 
-    if let Some(arg) = dot_command_arg(trimmed, ".header") {
+    if let Some(arg) =
+        dot_command_arg(trimmed, ".headers").or_else(|| dot_command_arg(trimmed, ".header"))
+    {
         let Some(value) = parse_optional_quoted_arg(arg) else {
-            let _ = writeln!(err, "error: .header requires `on` or `off`");
+            let _ = writeln!(err, "error: .header/.headers requires `on` or `off`");
             *had_error = true;
             return DotCommandResult::Continue;
         };
         let Some(headers) = parse_on_off(&value) else {
-            let _ = writeln!(err, "error: .header expects `on` or `off`, got `{value}`");
+            let _ = writeln!(
+                err,
+                "error: .header/.headers expects `on` or `off`, got `{value}`"
+            );
             *had_error = true;
             return DotCommandResult::Continue;
         };
@@ -2048,7 +2053,7 @@ where
          .schema ?PAT  Show schema SQL, optionally filtered by pattern\n\
          .dump ?PAT    Emit SQL text for schema + table contents\n\
          .mode MODE    Set output mode: list, column, csv, tabs, line\n\
-         .header on|off Toggle column headers for row output\n\
+         .headers on|off Toggle column headers for row output (`.header` alias also works)\n\
          .quit         Exit the shell\n\
          .exit         Exit the shell\n\
          .read FILE    Execute SQL from file\n\
@@ -2596,6 +2601,30 @@ SELECT 1 AS one, 'two,three' AS two;\n\
     }
 
     #[test]
+    fn test_headers_alias_toggles_header_output() {
+        let mut input = Cursor::new(
+            b".mode column\n\
+.headers on\n\
+SELECT 1 AS one, 'x' AS two;\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+        let stdout = String::from_utf8(out).expect("stdout should be utf-8");
+        assert!(
+            stdout.contains("one") && stdout.contains("two"),
+            "expected .headers alias to enable column headers, got: {stdout}",
+        );
+    }
+
+    #[test]
     fn test_command_mode_dot_schema_supports_filtering() {
         let path = unique_temp_path("fsqlite_cli_schema", "db");
         let path_text = path.to_string_lossy().into_owned();
@@ -2715,6 +2744,31 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
         assert!(
             prompt.contains("SELECT 1 FROM widgets"),
             "expected continuation prompt preview, got: {prompt}",
+        );
+    }
+
+    #[test]
+    fn test_render_prompt_colorizes_pending_sql_preview() {
+        let prompt = render_prompt(
+            "demo.db",
+            "SELECT 7, 'x'",
+            ShellOptions {
+                show_prompts: true,
+                colorize_prompts: true,
+                fail_on_error: false,
+            },
+        );
+        assert!(
+            prompt.contains(&format!("{ANSI_BOLD_BLUE}SELECT{ANSI_RESET}")),
+            "expected SQL keyword highlighting in prompt preview, got: {prompt}",
+        );
+        assert!(
+            prompt.contains(&format!("{ANSI_MAGENTA}7{ANSI_RESET}")),
+            "expected numeric literal highlighting in prompt preview, got: {prompt}",
+        );
+        assert!(
+            prompt.contains(&format!("{ANSI_GREEN}'x'{ANSI_RESET}")),
+            "expected string literal highlighting in prompt preview, got: {prompt}",
         );
     }
 
