@@ -26,9 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use connection_pool::{
     ConnectionLifecycleSnapshot, ConnectionPoolBestPractice, ConnectionPoolFinding,
     ConnectionPoolHealth, ConnectionPoolPattern, ConnectionPoolRecommendation,
-    ConnectionPoolSeverity, ConnectionPoolSummary, ConnectionPoolTelemetrySample,
-    ConnectionPoolValidationReport, ConnectionPoolValidator, ConnectionPoolValidatorConfig,
-    ConnectionPoolWorkloadProfile, best_practices as connection_pool_best_practices,
+    ConnectionPoolSeverity, ConnectionPoolSimulationPoint, ConnectionPoolSimulationReport,
+    ConnectionPoolSummary, ConnectionPoolTelemetrySample, ConnectionPoolValidationReport,
+    ConnectionPoolValidator, ConnectionPoolValidatorConfig, ConnectionPoolWorkloadProfile,
+    best_practices as connection_pool_best_practices, simulate_connection_pool,
     validate_connection_pool,
 };
 pub use page_cache::PageCacheEfficiencySnapshot;

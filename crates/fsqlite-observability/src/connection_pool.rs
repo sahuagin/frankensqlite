@@ -188,6 +188,34 @@ impl ConnectionPoolValidationReport {
     }
 }
 
+/// Simulated outcome for one candidate pool size.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConnectionPoolSimulationPoint {
+    pub pool_size: usize,
+    pub predicted_active_connections: usize,
+    pub throughput_score: f64,
+    pub efficiency_score: f64,
+    pub rationale: Vec<String>,
+    pub validation: ConnectionPoolValidationReport,
+}
+
+/// Deterministic sweep across candidate pool sizes for one workload sample.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConnectionPoolSimulationReport {
+    pub recommended_pool_size: usize,
+    pub points: Vec<ConnectionPoolSimulationPoint>,
+}
+
+impl ConnectionPoolSimulationReport {
+    /// Lookup a simulation point by candidate pool size.
+    #[must_use]
+    pub fn point_for_pool_size(&self, pool_size: usize) -> Option<&ConnectionPoolSimulationPoint> {
+        self.points
+            .iter()
+            .find(|point| point.pool_size == pool_size)
+    }
+}
+
 /// Tunable thresholds for the validator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConnectionPoolValidatorConfig {
@@ -555,6 +583,238 @@ pub fn validate_connection_pool(
     ConnectionPoolValidator::default().validate(sample)
 }
 
+/// Simulate a deterministic sweep across candidate pool sizes.
+///
+/// This is a heuristic aid, not a benchmark substitute. It projects how the
+/// validator would assess nearby pool sizes for the same observed workload.
+#[must_use]
+pub fn simulate_connection_pool(
+    sample: &ConnectionPoolTelemetrySample,
+    candidate_pool_sizes: &[usize],
+) -> ConnectionPoolSimulationReport {
+    let validator = ConnectionPoolValidator::default();
+    let recommended_by_validator = ConnectionPoolValidator::recommended_pool_size(sample);
+    let candidate_pool_sizes = sanitized_candidate_pool_sizes(
+        candidate_pool_sizes,
+        sample.configured_pool_size,
+        recommended_by_validator,
+    );
+    let points = candidate_pool_sizes
+        .into_iter()
+        .map(|pool_size| {
+            let projected = projected_sample_for_pool_size(sample, pool_size);
+            let validation = validator.validate(&projected);
+            let throughput_score =
+                projected_throughput_score(sample, pool_size, &validation);
+            let efficiency_score = projected_efficiency_score(
+                throughput_score,
+                projected.observed_active_connections,
+                pool_size,
+            );
+            let mut rationale = vec![format!(
+                "Projected active connections: {} / {} for this workload.",
+                projected.observed_active_connections, pool_size
+            )];
+            rationale.push(format!(
+                "Validator recommendation for the observed workload is pool_size={recommended_by_validator}."
+            ));
+            if validation.findings.is_empty() {
+                rationale.push(
+                    "No pool anti-patterns are predicted for this candidate size.".to_owned(),
+                );
+            } else {
+                rationale.extend(
+                    validation
+                        .findings
+                        .iter()
+                        .map(|finding| finding.summary.clone()),
+                );
+            }
+            ConnectionPoolSimulationPoint {
+                pool_size,
+                predicted_active_connections: projected.observed_active_connections,
+                throughput_score,
+                efficiency_score,
+                rationale,
+                validation,
+            }
+        })
+        .collect::<Vec<_>>();
+    let recommended_pool_size = recommended_simulated_pool_size(&points, recommended_by_validator);
+
+    ConnectionPoolSimulationReport {
+        recommended_pool_size,
+        points,
+    }
+}
+
+fn sanitized_candidate_pool_sizes(
+    candidate_pool_sizes: &[usize],
+    configured_pool_size: usize,
+    recommended_pool_size: usize,
+) -> Vec<usize> {
+    let mut candidates = Vec::new();
+    for pool_size in candidate_pool_sizes
+        .iter()
+        .copied()
+        .chain([configured_pool_size, recommended_pool_size])
+    {
+        let normalized = pool_size.max(1);
+        if !candidates.contains(&normalized) {
+            candidates.push(normalized);
+        }
+    }
+    candidates
+}
+
+fn projected_sample_for_pool_size(
+    sample: &ConnectionPoolTelemetrySample,
+    pool_size: usize,
+) -> ConnectionPoolTelemetrySample {
+    let predicted_active_connections = projected_active_connections(sample, pool_size);
+    let mut projected = sample.clone();
+    projected.configured_pool_size = pool_size;
+    projected.observed_active_connections = predicted_active_connections;
+    projected.connections = projected_connections(sample, pool_size, predicted_active_connections);
+    projected
+}
+
+fn projected_active_connections(sample: &ConnectionPoolTelemetrySample, pool_size: usize) -> usize {
+    let observed_need = sample
+        .concurrent_writers
+        .max(sample.observed_active_connections)
+        .max(sample.peak_concurrent_checkout_requests);
+    let bounded_need = match sample.workload_profile {
+        ConnectionPoolWorkloadProfile::ReadHeavy => observed_need.clamp(1, 2),
+        ConnectionPoolWorkloadProfile::Mixed | ConnectionPoolWorkloadProfile::WriteHeavy => {
+            observed_need.max(1)
+        }
+    };
+    pool_size.min(bounded_need)
+}
+
+fn projected_connections(
+    sample: &ConnectionPoolTelemetrySample,
+    pool_size: usize,
+    predicted_active_connections: usize,
+) -> Vec<ConnectionLifecycleSnapshot> {
+    const IDLE_EXTRA_CONNECTION_MS: u64 = 45_000;
+
+    let mut projected = Vec::with_capacity(pool_size);
+    for idx in 0..pool_size {
+        let mut connection =
+            sample
+                .connections
+                .get(idx)
+                .cloned()
+                .unwrap_or(ConnectionLifecycleSnapshot {
+                    connection_id: 0,
+                    age_ms: 0,
+                    idle_ms: 0,
+                    open_transactions: 0,
+                    active_snapshot_age_ms: None,
+                    queries_executed: 0,
+                    prepare_calls: 0,
+                });
+        connection.connection_id = u64::try_from(idx.saturating_add(1)).unwrap_or(u64::MAX);
+        if idx < predicted_active_connections {
+            connection.idle_ms = connection.idle_ms.min(500);
+            if connection.open_transactions == 0 {
+                connection.active_snapshot_age_ms =
+                    connection.active_snapshot_age_ms.map(|age| age.min(1_000));
+            }
+        } else {
+            connection.idle_ms = connection.idle_ms.max(IDLE_EXTRA_CONNECTION_MS);
+            if connection.open_transactions == 0 {
+                connection.active_snapshot_age_ms = None;
+                connection.queries_executed = 0;
+                connection.prepare_calls = 0;
+            }
+        }
+        projected.push(connection);
+    }
+    projected
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn projected_throughput_score(
+    sample: &ConnectionPoolTelemetrySample,
+    pool_size: usize,
+    validation: &ConnectionPoolValidationReport,
+) -> f64 {
+    let recommended_pool_size = ConnectionPoolValidator::recommended_pool_size(sample);
+    let recommended_pool_size_f64 = recommended_pool_size.max(1) as f64;
+    let useful_parallelism =
+        pool_size.min(recommended_pool_size) as f64 / recommended_pool_size_f64;
+    let overshoot_ratio =
+        pool_size.saturating_sub(recommended_pool_size) as f64 / recommended_pool_size_f64;
+
+    let mut score = 45.0 + (useful_parallelism * 55.0) - (overshoot_ratio * 10.0);
+    score -= validation
+        .findings
+        .iter()
+        .map(projected_finding_penalty)
+        .sum::<f64>();
+    score.clamp(1.0, 100.0)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn projected_efficiency_score(
+    throughput_score: f64,
+    predicted_active_connections: usize,
+    pool_size: usize,
+) -> f64 {
+    if pool_size == 0 {
+        return 0.0;
+    }
+    throughput_score * (predicted_active_connections as f64 / pool_size as f64)
+}
+
+fn projected_finding_penalty(finding: &ConnectionPoolFinding) -> f64 {
+    match finding.pattern {
+        ConnectionPoolPattern::SingleConnectionSerializedWriters => 35.0,
+        ConnectionPoolPattern::OverPooling => 8.0,
+        ConnectionPoolPattern::StaleIdleSnapshot => 12.0,
+        ConnectionPoolPattern::ConnectionThrashing => 10.0,
+        ConnectionPoolPattern::UnpreparedHotLoop => 6.0,
+    }
+}
+
+fn recommended_simulated_pool_size(
+    points: &[ConnectionPoolSimulationPoint],
+    validator_recommendation: usize,
+) -> usize {
+    let mut best_point = &points[0];
+    for point in &points[1..] {
+        let throughput_cmp = point
+            .throughput_score
+            .total_cmp(&best_point.throughput_score);
+        if throughput_cmp.is_gt() {
+            best_point = point;
+            continue;
+        }
+        if throughput_cmp.is_eq() {
+            let efficiency_cmp = point
+                .efficiency_score
+                .total_cmp(&best_point.efficiency_score);
+            if efficiency_cmp.is_gt() {
+                best_point = point;
+                continue;
+            }
+            if efficiency_cmp.is_eq() {
+                let point_distance = point.pool_size.abs_diff(validator_recommendation);
+                let best_distance = best_point.pool_size.abs_diff(validator_recommendation);
+                if point_distance < best_distance
+                    || (point_distance == best_distance && point.pool_size < best_point.pool_size)
+                {
+                    best_point = point;
+                }
+            }
+        }
+    }
+    best_point.pool_size
+}
+
 /// MVCC-specific guidance for consumers building pools around FrankenSQLite.
 #[must_use]
 pub fn best_practices(
@@ -595,7 +855,8 @@ mod tests {
     use super::{
         ConnectionLifecycleSnapshot, ConnectionPoolHealth, ConnectionPoolPattern,
         ConnectionPoolTelemetrySample, ConnectionPoolValidator, ConnectionPoolValidatorConfig,
-        ConnectionPoolWorkloadProfile, best_practices, validate_connection_pool,
+        ConnectionPoolWorkloadProfile, best_practices, simulate_connection_pool,
+        validate_connection_pool,
     };
 
     fn sample(workload_profile: ConnectionPoolWorkloadProfile) -> ConnectionPoolTelemetrySample {
@@ -787,6 +1048,143 @@ mod tests {
                 .findings
                 .iter()
                 .any(|finding| { finding.pattern == ConnectionPoolPattern::StaleIdleSnapshot })
+        );
+    }
+
+    #[test]
+    fn test_simulator_prefers_pool_size_matching_writer_parallelism() {
+        let mut sample = sample(ConnectionPoolWorkloadProfile::WriteHeavy);
+        sample.configured_pool_size = 1;
+        sample.observed_active_connections = 1;
+        sample.peak_concurrent_checkout_requests = 4;
+        sample.concurrent_writers = 4;
+
+        let simulation = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
+
+        assert_eq!(simulation.recommended_pool_size, 4);
+        assert!(
+            simulation.point_for_pool_size(4).unwrap().throughput_score
+                > simulation.point_for_pool_size(1).unwrap().throughput_score
+        );
+    }
+
+    #[test]
+    fn test_simulator_caps_read_heavy_workloads_aggressively() {
+        let mut sample = sample(ConnectionPoolWorkloadProfile::ReadHeavy);
+        sample.cpu_cores = 8;
+        sample.observed_active_connections = 2;
+        sample.peak_concurrent_checkout_requests = 6;
+        sample.concurrent_writers = 1;
+
+        let simulation = simulate_connection_pool(&sample, &[1, 2, 4]);
+
+        assert_eq!(simulation.recommended_pool_size, 2);
+        assert_eq!(
+            simulation
+                .point_for_pool_size(4)
+                .unwrap()
+                .predicted_active_connections,
+            2
+        );
+    }
+
+    #[test]
+    fn test_simulator_is_stable_across_runs() {
+        let sample = sample(ConnectionPoolWorkloadProfile::Mixed);
+
+        let left = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
+        let right = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn test_docs_validator_example_matches_exported_api() {
+        let sample = ConnectionPoolTelemetrySample {
+            workload_profile: ConnectionPoolWorkloadProfile::WriteHeavy,
+            cpu_cores: 4,
+            configured_pool_size: 4,
+            observed_active_connections: 4,
+            peak_concurrent_checkout_requests: 4,
+            concurrent_writers: 4,
+            connect_events: 4,
+            disconnect_events: 4,
+            measurement_window_ms: 60_000,
+            connections: vec![
+                ConnectionLifecycleSnapshot {
+                    connection_id: 1,
+                    age_ms: 20_000,
+                    idle_ms: 200,
+                    open_transactions: 0,
+                    active_snapshot_age_ms: None,
+                    queries_executed: 240,
+                    prepare_calls: 8,
+                },
+                ConnectionLifecycleSnapshot {
+                    connection_id: 2,
+                    age_ms: 20_000,
+                    idle_ms: 250,
+                    open_transactions: 0,
+                    active_snapshot_age_ms: None,
+                    queries_executed: 230,
+                    prepare_calls: 8,
+                },
+                ConnectionLifecycleSnapshot {
+                    connection_id: 3,
+                    age_ms: 20_000,
+                    idle_ms: 175,
+                    open_transactions: 0,
+                    active_snapshot_age_ms: None,
+                    queries_executed: 225,
+                    prepare_calls: 8,
+                },
+                ConnectionLifecycleSnapshot {
+                    connection_id: 4,
+                    age_ms: 20_000,
+                    idle_ms: 225,
+                    open_transactions: 0,
+                    active_snapshot_age_ms: None,
+                    queries_executed: 235,
+                    prepare_calls: 8,
+                },
+            ],
+        };
+
+        let report = validate_connection_pool(&sample);
+
+        assert_eq!(report.recommendation.recommended_pool_size, 4);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn test_docs_simulator_example_matches_exported_api() {
+        let sample = ConnectionPoolTelemetrySample {
+            workload_profile: ConnectionPoolWorkloadProfile::WriteHeavy,
+            cpu_cores: 4,
+            configured_pool_size: 1,
+            observed_active_connections: 1,
+            peak_concurrent_checkout_requests: 4,
+            concurrent_writers: 4,
+            connect_events: 4,
+            disconnect_events: 4,
+            measurement_window_ms: 60_000,
+            connections: vec![ConnectionLifecycleSnapshot {
+                connection_id: 1,
+                age_ms: 10_000,
+                idle_ms: 100,
+                open_transactions: 0,
+                active_snapshot_age_ms: None,
+                queries_executed: 400,
+                prepare_calls: 8,
+            }],
+        };
+
+        let simulation = simulate_connection_pool(&sample, &[1, 2, 4, 8]);
+
+        assert_eq!(simulation.recommended_pool_size, 4);
+        assert!(
+            simulation.point_for_pool_size(4).unwrap().throughput_score
+                > simulation.point_for_pool_size(1).unwrap().throughput_score
         );
     }
 }
