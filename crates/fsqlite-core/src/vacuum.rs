@@ -1,6 +1,10 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::DatabaseHeader;
@@ -20,6 +24,52 @@ pub(crate) const NON_TEXT_FILENAME: &str = "non-text filename";
 
 #[cfg(not(target_arch = "wasm32"))]
 static NEXT_TEMP_REBUILD_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(target_arch = "wasm32"))]
+static NEXT_TEMP_VACUUM_INTO_DISCARD_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(not(target_arch = "wasm32"))]
+static TEMP_VACUUM_INTO_DISCARD_TARGETS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn temp_vacuum_into_discard_targets() -> &'static Mutex<HashSet<PathBuf>> {
+    TEMP_VACUUM_INTO_DISCARD_TARGETS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn register_temp_vacuum_into_discard_target(path: &Path) {
+    let mut targets = temp_vacuum_into_discard_targets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    targets.insert(path.to_path_buf());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn take_temp_vacuum_into_discard_target(path: &Path) -> bool {
+    let mut targets = temp_vacuum_into_discard_targets()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    targets.remove(path)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_empty_vacuum_into_target(source_path: &str) -> PathBuf {
+    let seq = NEXT_TEMP_VACUUM_INTO_DISCARD_ID.fetch_add(1, Ordering::Relaxed);
+    let source = Path::new(source_path);
+    let file_name = format!(
+        "{}.fsqlite-vacuum-into-discard-{seq}.tmp",
+        source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && *name != ":memory:")
+            .unwrap_or("memory")
+    );
+    let path = if source == Path::new(":memory:") {
+        std::env::temp_dir().join(file_name)
+    } else {
+        source.with_file_name(file_name)
+    };
+    register_temp_vacuum_into_discard_target(&path);
+    path
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn persist_compacted_database(
@@ -30,14 +80,18 @@ pub(crate) fn persist_compacted_database(
     header: &DatabaseHeader,
     extra_master_entries: &[SqliteMasterEntry],
 ) -> Result<()> {
-    persist_to_sqlite_with_header_and_master_entries(
+    let result = persist_to_sqlite_with_header_and_master_entries(
         cx,
         target_path,
         schema,
         db,
         header,
         extra_master_entries,
-    )
+    );
+    if take_temp_vacuum_into_discard_target(target_path) {
+        drop(host_fs::remove_file(target_path));
+    }
+    result
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -75,6 +129,9 @@ pub(crate) fn resolve_vacuum_into_target(
 ) -> Result<PathBuf> {
     let target_path = match target_value {
         SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(&**path),
+        #[cfg(not(target_arch = "wasm32"))]
+        SqliteValue::Text(_) => resolve_empty_vacuum_into_target(source_path),
+        #[cfg(target_arch = "wasm32")]
         SqliteValue::Text(_) => {
             return Err(FrankenError::CannotOpen {
                 path: PathBuf::new(),
@@ -82,7 +139,11 @@ pub(crate) fn resolve_vacuum_into_target(
         }
         _ => return Err(FrankenError::FunctionError(NON_TEXT_FILENAME.to_owned())),
     };
-    validate_vacuum_into_target(source_path, &target_path)?;
+    if let Err(err) = validate_vacuum_into_target(source_path, &target_path) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = take_temp_vacuum_into_discard_target(&target_path);
+        return Err(err);
+    }
     Ok(target_path)
 }
 
@@ -135,7 +196,9 @@ mod tests {
     use crate::connection::Connection;
     use fsqlite_types::value::SqliteValue;
 
-    use super::{NON_TEXT_FILENAME, resolve_vacuum_into_target};
+    use super::{
+        NON_TEXT_FILENAME, resolve_vacuum_into_target, take_temp_vacuum_into_discard_target,
+    };
 
     #[test]
     fn test_vacuum_rebuilds_file_backed_database_and_preserves_header_metadata() {
@@ -287,6 +350,20 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_vacuum_into_target_empty_text_uses_discard_sink() {
+        let target_path =
+            resolve_vacuum_into_target("source.db", &SqliteValue::Text("".into())).unwrap();
+        assert!(
+            !target_path.as_os_str().is_empty(),
+            "empty VACUUM INTO targets should resolve to an internal discard sink"
+        );
+        assert!(
+            take_temp_vacuum_into_discard_target(&target_path),
+            "discard sink should be tracked for cleanup"
+        );
+    }
+
+    #[test]
     fn test_vacuum_into_null_parameter_reports_non_text_filename() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("vacuum-into-null-source.db");
@@ -300,6 +377,42 @@ mod tests {
             .execute_with_params("VACUUM INTO ?1;", &[SqliteValue::Null])
             .unwrap_err();
         assert_eq!(err.to_string(), NON_TEXT_FILENAME);
+    }
+
+    #[test]
+    fn test_vacuum_into_empty_text_succeeds_without_leaving_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-into-empty-source.db");
+        let source = source_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+
+        conn.execute("VACUUM INTO '';").unwrap();
+
+        let discard_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy())
+                    .is_some_and(|name| name.contains(".fsqlite-vacuum-into-discard-"))
+            })
+            .collect();
+        assert!(
+            discard_files.is_empty(),
+            "VACUUM INTO '' should clean up its temporary discard sink: {discard_files:?}"
+        );
+
+        let rows = conn
+            .query("SELECT id, payload FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
