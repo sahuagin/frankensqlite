@@ -21510,6 +21510,67 @@ mod tests {
                 .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
             "escaped pure-prefix LIKE range should not fall back to a table rewind"
         );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "LIKE")
+            }),
+            "escaped pure-prefix LIKE range should not keep the generic LIKE runtime filter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_like_escaped_underscore_prefix_uses_range_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("123\\_%".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: Some(Box::new(Expr::Literal(
+                    Literal::String("\\".to_owned()),
+                    Span::ZERO,
+                ))),
+                op: fsqlite_ast::LikeOp::Like,
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "escaped underscore-prefix LIKE patterns should lower to indexed range seeks"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Ge),
+            "escaped underscore-prefix LIKE patterns should still stop at the derived upper bound"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "escaped underscore-prefix LIKE range should open the matching index"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "escaped underscore-prefix LIKE range should not fall back to a table rewind"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::PureFunc
+                    && matches!(&op.p4, P4::FuncName(name) if name == "LIKE")
+            }),
+            "escaped underscore-prefix LIKE range should not keep the generic LIKE runtime filter"
+        );
     }
 
     #[test]
