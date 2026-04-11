@@ -390,6 +390,7 @@ impl TableSchema {
         self.indexes.iter().find(|idx| {
             idx.supports_direct_column_lookup()
                 && idx.columns.len() == 1
+                && !idx.key_term_descending(0)
                 && idx
                     .columns
                     .first()
@@ -411,6 +412,7 @@ impl TableSchema {
             idx.is_unique
                 && idx.columns.len() == 1
                 && idx.supports_direct_column_lookup()
+                && !idx.key_term_descending(0)
                 && idx
                     .columns
                     .first()
@@ -24918,6 +24920,75 @@ mod tests {
         ]
     }
 
+    fn test_schema_multi_join_prefers_ascending_unique_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "messages".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("conversation_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "conversations".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "agents".to_owned(),
+                root_page: 4,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("tenant_id", 'D', false),
+                    ColumnInfo::basic("label", 'B', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "agents_tenant_unique_desc".to_owned(),
+                        root_page: 5,
+                        columns: vec!["tenant_id".to_owned()],
+                        key_expressions: vec!["tenant_id".to_owned()],
+                        key_sort_directions: vec![SortDirection::Desc],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "agents_tenant_unique_asc".to_owned(),
+                        root_page: 6,
+                        columns: vec!["tenant_id".to_owned()],
+                        key_expressions: vec!["tenant_id".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: true,
+                        key_collations: vec![],
+                    },
+                ],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
     fn unique_single_column_lookup_multi_join_stmt() -> SelectStatement {
         let on_m_c = Expr::BinaryOp {
             left: Box::new(Expr::Column(
@@ -25030,6 +25101,30 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
             "the multi-join fast path should fetch rowids from the qualifying unique index"
+        );
+    }
+
+    #[test]
+    fn test_codegen_multi_join_skips_descending_unique_lookup_sibling() {
+        let stmt = unique_single_column_lookup_multi_join_stmt();
+        let schema = test_schema_multi_join_prefers_ascending_unique_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "agents_tenant_unique_asc")),
+            "multi-join lookup should skip descending unique siblings and open an ascending direct-lookup index"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "agents_tenant_unique_desc")),
+            "multi-join lookup must not drive the fast path with a descending unique index"
         );
     }
 
@@ -25199,6 +25294,62 @@ mod tests {
                     is_unique: false,
                     key_collations: vec![],
                 }],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn test_schema_single_join_prefers_ascending_lookup_index() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "customers".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("name", 'B', false),
+                    ColumnInfo::basic("region", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "orders".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("region", 'B', false),
+                    ColumnInfo::basic("amount", 'E', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "idx_orders_region_desc".to_owned(),
+                        root_page: 4,
+                        columns: vec!["region".to_owned()],
+                        key_expressions: vec!["region".to_owned()],
+                        key_sort_directions: vec![SortDirection::Desc],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "idx_orders_region_asc".to_owned(),
+                        root_page: 5,
+                        columns: vec!["region".to_owned()],
+                        key_expressions: vec!["region".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![],
+                    },
+                ],
                 strict: false,
                 without_rowid: false,
                 primary_key_constraints: Vec::new(),
@@ -25796,6 +25947,30 @@ mod tests {
                 .iter()
                 .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_amount")),
             "falling back to the generic nested-loop join must avoid opening the composite sibling index as a direct lookup cursor"
+        );
+    }
+
+    #[test]
+    fn test_codegen_single_join_skips_descending_lookup_sibling() {
+        let stmt = collation_matching_single_join_lookup_stmt();
+        let schema = test_schema_single_join_prefers_ascending_lookup_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_asc")),
+            "single-join lookup should skip descending siblings and open an ascending direct-lookup index"
+        );
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_desc")),
+            "single-join lookup must not drive the fast path with a descending index"
         );
     }
 
