@@ -1,3 +1,32 @@
+## Latest follow-up
+
+This section supersedes older verification notes below when they differ.
+
+Current status:
+- `HEAD` already contains the main `bd-3wop3.1.2` production changes, including the lane-staging e2e hardening in `6b363823` and the named verifier updates in `3bf3b5d4`.
+- This follow-up commit only stabilizes the WAL lane-stager unit slice after the named verifier exposed global slot-counter leakage between tests.
+
+This focused follow-up adds:
+- a bead-local `clippy` cleanup in `crates/fsqlite-wal/src/parallel_wal.rs` by replacing `map_or(false, ...)` with `is_some_and(...)`
+- deterministic test isolation for `test_lane_stager_reuses_lanes_after_worker_churn()` by serializing the test with a static lock and resetting the per-core slot counter before the assertion
+
+Constraints held:
+- `concurrent_mode_default` remains `true`
+- no `unsafe_code`
+- no Tokio ecosystem
+- manual edits only
+
+Verification:
+- `bash -n scripts/verify_d1_parallel_wal_staging.sh` passed.
+- `cargo test -p fsqlite-wal lane_stager -- --nocapture` passed.
+- `scripts/verify_d1_parallel_wal_staging.sh` passed and wrote artifacts under `artifacts/bd-3wop3.1.2/bd-3wop3.1.2-20260411T001142Z/`.
+- `rustfmt --edition 2024 crates/fsqlite-wal/src/parallel_wal.rs` passed.
+
+Known blockers outside this focused change:
+- `cargo fmt --check` fails on an unrelated local formatting delta in `crates/fsqlite-core/src/connection.rs:88914`.
+- `cargo check --workspace --all-targets` fails in `crates/fsqlite-e2e/src/perf_runner.rs:4715` because `HotPathProfileSnapshot` is initialized without the new `window_func_partitions_total` field; the same run also emitted an unrelated `dead_code` warning for `crates/fsqlite-core/src/connection.rs:75084`.
+- `cargo clippy --workspace --all-targets -- -D warnings` fails on unrelated existing `dead_code` in `crates/fsqlite-core/src/connection.rs:75084`.
+
 ## bd-3wop3.1.2 progress
 
 Current status:

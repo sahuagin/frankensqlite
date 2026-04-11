@@ -360,7 +360,7 @@ pub fn parallel_wal_should_shadow_compare(
         ParallelWalOperatingMode::Auto => {
             control
                 .shadow_compare_sampling_per_mille
-                .map_or(false, |rate| {
+                .is_some_and(|rate| {
                     let rate = u64::from(rate.min(1_000));
                     rate > 0 && batch_id.saturating_sub(1) % 1_000 < rate
                 })
@@ -1473,6 +1473,11 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    use crate::per_core_buffer::reset_slot_counter;
+
+    static PARALLEL_WAL_LANE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn test_runtime() -> asupersync::runtime::Runtime {
         RuntimeBuilder::current_thread()
@@ -1573,6 +1578,12 @@ mod tests {
 
     #[test]
     fn test_lane_stager_reuses_lanes_after_worker_churn() {
+        let _guard = match PARALLEL_WAL_LANE_TEST_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        reset_slot_counter();
+
         let stager = Arc::new(ParallelWalLaneStager::<u32>::new(
             ParallelWalControlSurface {
                 mode: ParallelWalOperatingMode::Auto,
