@@ -1241,8 +1241,11 @@ fn best_access_path_internal(
                 #[allow(clippy::cast_precision_loss)]
                 let per_probe_rows = if idx.unique
                     && equality_width == idx.columns.len()
-                    && !matches!(trailing_constraint, MultiColumnTrailingConstraint::Range)
-                {
+                    && !matches!(
+                        trailing_constraint,
+                        MultiColumnTrailingConstraint::Range
+                            | MultiColumnTrailingConstraint::LikePrefix
+                    ) {
                     1.0
                 } else {
                     let divisor = 10.0_f64.powi(i32::try_from(equality_width).unwrap_or(i32::MAX));
@@ -1251,6 +1254,14 @@ fn best_access_path_internal(
                 let (rows, sel) = match trailing_constraint {
                     MultiColumnTrailingConstraint::Range => {
                         let range_factor = DEFAULT_RANGE_SELECTIVITY;
+                        let r = (per_probe_rows * range_factor).max(1.0);
+                        (
+                            r,
+                            range_factor * per_probe_rows / table.n_rows.max(1) as f64,
+                        )
+                    }
+                    MultiColumnTrailingConstraint::LikePrefix => {
+                        let range_factor = LIKE_PREFIX_SELECTIVITY;
                         let r = (per_probe_rows * range_factor).max(1.0);
                         (
                             r,
@@ -1269,7 +1280,11 @@ fn best_access_path_internal(
                 };
                 if is_covering {
                     (AccessPathKind::CoveringIndexScan { selectivity: sel }, rows)
-                } else if matches!(trailing_constraint, MultiColumnTrailingConstraint::Range) {
+                } else if matches!(
+                    trailing_constraint,
+                    MultiColumnTrailingConstraint::Range
+                        | MultiColumnTrailingConstraint::LikePrefix
+                ) {
                     (AccessPathKind::IndexScanRange { selectivity: sel }, rows)
                 } else {
                     (AccessPathKind::IndexScanEquality, rows)
@@ -1296,7 +1311,7 @@ fn best_access_path_internal(
                 (AccessPathKind::IndexScanEquality, rows)
             }
             IndexUsability::LikePrefix { .. } => {
-                let selectivity = 0.1; // Heuristic: 10% for prefix LIKE.
+                let selectivity = LIKE_PREFIX_SELECTIVITY;
                 let rows = (selectivity * table.n_rows as f64).max(1.0);
                 if is_covering {
                     (AccessPathKind::CoveringIndexScan { selectivity }, rows)
@@ -1672,6 +1687,7 @@ pub enum MultiColumnTrailingConstraint {
     None,
     Range,
     InExpansion { probe_count: usize },
+    LikePrefix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2150,8 +2166,8 @@ fn like_prefix_upper_bound(prefix: &str) -> Option<String> {
 /// - Walk the index columns left-to-right; for each column, check if the WHERE
 ///   has an equality constraint. The equality prefix can be extended as long as
 ///   consecutive leading columns have equality terms.
-/// - After the equality prefix, check for a range/BETWEEN or IN-list probe on
-///   the next column.
+/// - After the equality prefix, check for a range/BETWEEN, `IN (...)`, or
+///   `LIKE`/`GLOB` prefix probe on the next column.
 /// - For single-column leftmost matches, also check IN and LIKE prefix.
 /// - For expression indexes, match query expressions structurally against the
 ///   index's expression columns.
@@ -2250,6 +2266,8 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
             let summary = &column_summaries[eq_columns];
             if let Some(probe_count) = summary.first_in_probe_count {
                 MultiColumnTrailingConstraint::InExpansion { probe_count }
+            } else if summary.first_like_prefix.is_some() {
+                MultiColumnTrailingConstraint::LikePrefix
             } else if summary.has_range {
                 MultiColumnTrailingConstraint::Range
             } else {
@@ -2366,6 +2384,8 @@ fn analyze_expression_index_usability(
 /// `sqlite_stat1` data. When ANALYZE has been run, the planner uses the
 /// actual statistics from sqlite_stat1 instead.
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
+/// Selectivity heuristic for a constant LIKE/GLOB prefix range.
+const LIKE_PREFIX_SELECTIVITY: f64 = 0.10;
 /// Equality selectivity for skip-scan leading columns (1% = 100 distinct values).
 const SKIP_SCAN_EQ_SELECTIVITY: f64 = 0.01;
 /// Range selectivity for skip-scan trailing columns.
@@ -4923,6 +4943,20 @@ mod tests {
     }
 
     #[test]
+    fn test_index_usability_multicolumn_trailing_like_prefix() {
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 50);
+        let terms = [eq_term("a"), like_term("b", "123%")];
+        let result = analyze_index_usability(&idx, &terms);
+        assert!(matches!(
+            result,
+            IndexUsability::MultiColumnEquality {
+                eq_columns: 1,
+                trailing_constraint: MultiColumnTrailingConstraint::LikePrefix
+            }
+        ));
+    }
+
+    #[test]
     fn test_in_expansion_cost_scales_by_probe_count() {
         // Regression: IN (v1, v2, v3) should cost ~3x a single equality
         // probe, not the same as a single probe.
@@ -4996,6 +5030,51 @@ mod tests {
         assert!(
             (ap.estimated_rows - 40_000.0).abs() < f64::EPSILON,
             "expected 1e6 / 10^2 * 4 = 40000 rows, got {}",
+            ap.estimated_rows
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_multicolumn_trailing_like_prefix_refines_row_estimate() {
+        let table = table_stats("t1", 1_000, 1_000_000);
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        let equality_only = [eq_term("a")];
+        let trailing_like = [eq_term("a"), like_term("b", "123%")];
+
+        let ap_eq = best_access_path(&table, std::slice::from_ref(&idx), &equality_only, None);
+        let ap_like = best_access_path(&table, &[idx], &trailing_like, None);
+
+        assert_eq!(ap_like.index.as_deref(), Some("idx_ab"));
+        assert!(matches!(
+            ap_like.kind,
+            AccessPathKind::IndexScanRange { .. }
+        ));
+        assert!(
+            ap_like.estimated_rows < ap_eq.estimated_rows,
+            "composite LIKE prefix should narrow row estimates: eq_only={} trailing_like={}",
+            ap_eq.estimated_rows,
+            ap_like.estimated_rows
+        );
+        assert!(
+            (ap_like.estimated_rows - 10_000.0).abs() < f64::EPSILON,
+            "expected 1e6 / 10 * 0.1 = 10000 rows, got {}",
+            ap_like.estimated_rows
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_multicolumn_trailing_glob_prefix_refines_row_estimate() {
+        let table = table_stats("t1", 1_000, 1_000_000);
+        let idx = index_info("idx_ab", "t1", &["a", "b"], false, 80);
+        let trailing_glob = [eq_term("a"), glob_term("b", "abc*")];
+
+        let ap = best_access_path(&table, &[idx], &trailing_glob, None);
+
+        assert_eq!(ap.index.as_deref(), Some("idx_ab"));
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanRange { .. }));
+        assert!(
+            (ap.estimated_rows - 10_000.0).abs() < f64::EPSILON,
+            "expected 1e6 / 10 * 0.1 = 10000 rows, got {}",
             ap.estimated_rows
         );
     }
