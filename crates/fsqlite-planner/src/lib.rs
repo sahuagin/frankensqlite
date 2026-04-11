@@ -5146,6 +5146,70 @@ mod tests {
         );
     }
 
+    /// SQL function names are case-insensitive, so `lower(name)` in the
+    /// index key must match `LOWER(name)` in the WHERE clause.  Before the
+    /// `eq_ignore_ascii_case` fix in `impl PartialEq for Expr`, this would
+    /// silently fall back to a full scan.
+    #[test]
+    fn test_index_usability_expression_index_case_insensitive_function_name() {
+        // Index key uses lowercase function name.
+        let key_expr = Expr::FunctionCall {
+            name: "lower".to_owned(),
+            args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                ColumnRef::bare("name"),
+                Span::ZERO,
+            )]),
+            distinct: false,
+            order_by: vec![],
+            filter: None,
+            over: None,
+            span: Span::ZERO,
+        };
+
+        // WHERE clause uses UPPERCASE function name.
+        let where_expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::FunctionCall {
+                name: "LOWER".to_owned(),
+                args: fsqlite_ast::FunctionArgs::List(vec![Expr::Column(
+                    ColumnRef::bare("name"),
+                    Span::ZERO,
+                )]),
+                distinct: false,
+                order_by: vec![],
+                filter: None,
+                over: None,
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(
+                Literal::String("alice".to_owned()),
+                Span::ZERO,
+            )),
+            span: Span::ZERO,
+        }));
+
+        let idx = IndexInfo {
+            name: "idx_lower_name".to_owned(),
+            table: "users".to_owned(),
+            columns: vec![],
+            unique: false,
+            n_pages: 50,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![key_expr],
+        };
+
+        let terms = [classify_where_term(where_expr)];
+        assert!(
+            matches!(
+                analyze_index_usability(&idx, &terms),
+                IndexUsability::Equality
+            ),
+            "case-insensitive function name match must reach Equality \
+             (lower vs LOWER)"
+        );
+    }
+
     /// Expression-index regression companion: a non-matching WHERE term must
     /// still return NotUsable (i.e. the reordered guard does not accidentally
     /// widen acceptance).
