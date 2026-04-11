@@ -379,6 +379,24 @@ impl TableSchema {
         })
     }
 
+    /// Find a direct-lookup index for `col_name` whose comparison collation
+    /// matches the join predicate.
+    #[must_use]
+    pub fn index_for_column_with_collation(
+        &self,
+        col_name: &str,
+        comparison_collation: Option<&str>,
+    ) -> Option<&IndexSchema> {
+        self.indexes.iter().find(|idx| {
+            idx.supports_direct_column_lookup()
+                && idx
+                    .columns
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                && direct_lookup_index_collation_matches_join(idx, comparison_collation)
+        })
+    }
+
     /// Find a direct-lookup UNIQUE index that guarantees at most one row for
     /// an equality probe on `col_name` and whose comparison collation matches
     /// the join predicate.
@@ -5879,10 +5897,8 @@ fn resolve_single_join_lookup_plan<'a>(
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
             let comparison_collation =
                 join_lookup_effective_collation(left, right, &comparison_tables);
-            let index = right_table.index_for_column(column_name)?;
-            if !direct_lookup_index_collation_matches_join(index, comparison_collation) {
-                return None;
-            }
+            let index =
+                right_table.index_for_column_with_collation(column_name, comparison_collation)?;
             SingleJoinLookupTarget::Index(index)
         }
         SortKeySource::Expression(_) => return None,
@@ -25085,6 +25101,208 @@ mod tests {
         ]
     }
 
+    fn test_schema_single_join_prefers_collation_matching_lookup() -> Vec<TableSchema> {
+        vec![
+            TableSchema {
+                name: "customers".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo::basic("name", 'B', false),
+                    ColumnInfo::basic("region", 'B', false),
+                ],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+            TableSchema {
+                name: "orders".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("id", 'D', true),
+                    ColumnInfo {
+                        collation: Some("NOCASE".to_owned()),
+                        ..ColumnInfo::basic("region", 'B', false)
+                    },
+                    ColumnInfo::basic("amount", 'E', false),
+                ],
+                indexes: vec![
+                    IndexSchema {
+                        name: "idx_orders_region_binary".to_owned(),
+                        root_page: 4,
+                        columns: vec!["region".to_owned()],
+                        key_expressions: vec!["region".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![],
+                    },
+                    IndexSchema {
+                        name: "idx_orders_region_nocase".to_owned(),
+                        root_page: 5,
+                        columns: vec!["region".to_owned()],
+                        key_expressions: vec!["region".to_owned()],
+                        key_sort_directions: vec![],
+                        where_clause: None,
+                        is_unique: false,
+                        key_collations: vec![Some("NOCASE".to_owned())],
+                    },
+                ],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            },
+        ]
+    }
+
+    fn collation_matching_single_join_lookup_stmt() -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("c", "name"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("o", "amount"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("customers"),
+                            alias: Some("c".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![fsqlite_ast::JoinClause {
+                            join_type: fsqlite_ast::JoinType {
+                                kind: fsqlite_ast::JoinKind::Inner,
+                                natural: false,
+                            },
+                            table: TableOrSubquery::Table {
+                                name: QualifiedName::bare("orders"),
+                                alias: Some("o".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            constraint: Some(fsqlite_ast::JoinConstraint::On(Expr::BinaryOp {
+                                left: Box::new(Expr::Column(
+                                    ColumnRef::qualified("c", "region"),
+                                    Span::ZERO,
+                                )),
+                                op: AstBinaryOp::Eq,
+                                right: Box::new(Expr::Column(
+                                    ColumnRef::qualified("o", "region"),
+                                    Span::ZERO,
+                                )),
+                                span: Span::ZERO,
+                            })),
+                        }],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    fn collation_matching_grouped_join_lookup_stmt() -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::qualified("c", "name"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "count".to_owned(),
+                                args: FunctionArgs::Star,
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "sum".to_owned(),
+                                args: FunctionArgs::List(vec![Expr::Column(
+                                    ColumnRef::qualified("o", "amount"),
+                                    Span::ZERO,
+                                )]),
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("customers"),
+                            alias: Some("c".to_owned()),
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![fsqlite_ast::JoinClause {
+                            join_type: fsqlite_ast::JoinType {
+                                kind: fsqlite_ast::JoinKind::Inner,
+                                natural: false,
+                            },
+                            table: TableOrSubquery::Table {
+                                name: QualifiedName::bare("orders"),
+                                alias: Some("o".to_owned()),
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            constraint: Some(fsqlite_ast::JoinConstraint::On(Expr::BinaryOp {
+                                left: Box::new(Expr::Column(
+                                    ColumnRef::qualified("c", "region"),
+                                    Span::ZERO,
+                                )),
+                                op: AstBinaryOp::Eq,
+                                right: Box::new(Expr::Column(
+                                    ColumnRef::qualified("o", "region"),
+                                    Span::ZERO,
+                                )),
+                                span: Span::ZERO,
+                            })),
+                        }],
+                    }),
+                    where_clause: None,
+                    group_by: vec![Expr::Column(ColumnRef::qualified("c", "name"), Span::ZERO)],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
     fn collation_matching_unique_single_column_lookup_multi_join_stmt() -> SelectStatement {
         let on_m_c = Expr::BinaryOp {
             left: Box::new(Expr::Column(
@@ -25469,6 +25687,72 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == Opcode::SorterInsert),
             "grouped lookup join should still materialize rows for grouped aggregation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_single_join_prefers_collation_matching_lookup_index() {
+        let stmt = collation_matching_single_join_lookup_stmt();
+        let schema = test_schema_single_join_prefers_collation_matching_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert_eq!(
+            rewind_count, 1,
+            "single-join lookup should keep its fast path when a later sibling index matches the join collation"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_nocase")),
+            "single-join lookup should open the collation-matching sibling index"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Ne && op.p4 == P4::Collation("NOCASE".to_owned())),
+            "single-join lookup should recheck landed keys with the join collation"
+        );
+    }
+
+    #[test]
+    fn test_codegen_grouped_join_prefers_collation_matching_lookup_index() {
+        let stmt = collation_matching_grouped_join_lookup_stmt();
+        let schema = test_schema_single_join_prefers_collation_matching_lookup();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let rewind_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Rewind)
+            .count();
+
+        assert_eq!(
+            rewind_count, 1,
+            "grouped lookup join should keep its fast path when a later sibling index matches the join collation"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_nocase")),
+            "grouped lookup join should open the collation-matching sibling index"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Ne && op.p4 == P4::Collation("NOCASE".to_owned())),
+            "grouped lookup join should recheck landed keys with the join collation"
         );
     }
 
