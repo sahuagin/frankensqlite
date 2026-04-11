@@ -1964,10 +1964,10 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
         //   (a) PRAGMA case_sensitive_like = ON, OR
         //   (b) The column has BINARY collation
         //
-        // bd-wwqen.6: LIKE prefix optimization is now supported when the
-        // `like_prefix_optimization` feature is enabled AND collation is
-        // known to be case-sensitive. Until collation tracking is wired,
-        // LIKE falls through to the generic handler below.
+        // Until collation/pragma state is wired through the planner, we still
+        // have one sound subset we can lower today: prefixes with no ASCII
+        // letters. SQLite's default LIKE only case-folds ASCII, so those
+        // prefixes are already case-stable.
         Expr::Like {
             expr: inner,
             pattern,
@@ -1980,14 +1980,9 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             let (prefix, operator) = match op {
                 LikeOp::Glob => (extract_glob_prefix(pattern), "GLOB"),
                 LikeOp::Like => {
-                    // bd-wwqen.6: LIKE prefix optimization infrastructure.
-                    // Currently disabled: only enable when collation is BINARY
-                    // or case_sensitive_like pragma is ON.
-                    // TODO(bd-wwqen.6): Pass case_sensitive_like pragma or
-                    // column collation through planner context, then call
-                    // `extract_like_prefix(pattern, escape.as_deref())`.
-                    let _ = escape; // suppress unused warning
-                    (None, "LIKE")
+                    let prefix = extract_like_prefix(pattern, escape.as_deref())
+                        .filter(|prefix| is_like_prefix_safe_for_column(column.as_ref(), prefix));
+                    (prefix, "LIKE")
                 }
                 // Match and Regexp are not optimizable via prefix-to-range.
                 LikeOp::Match | LikeOp::Regexp => (None, "MATCH/REGEXP"),
@@ -2084,7 +2079,6 @@ fn extract_glob_prefix(pattern: &Expr) -> Option<String> {
 ///
 /// bd-wwqen.6: This enables the LIKE prefix-to-range optimization when
 /// collation makes it safe (BINARY collation or case_sensitive_like = ON).
-#[allow(dead_code)] // bd-wwqen.6: Infrastructure for future LIKE prefix optimization
 fn extract_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> {
     // Escape characters complicate prefix extraction; bail out for now.
     // Future: handle escaped `%` and `_` in the prefix portion.
@@ -2110,23 +2104,23 @@ fn extract_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> 
     }
 }
 
-/// Check if LIKE prefix optimization is safe for the given column.
+/// Check if a LIKE prefix is guaranteed to be case-stable under SQLite's
+/// default ASCII-only case folding.
 ///
-/// bd-wwqen.6: LIKE prefix-to-range optimization is only safe when:
-///   (a) The column has BINARY collation (case-sensitive), OR
-///   (b) `PRAGMA case_sensitive_like = ON` is set
+/// The conservative fallback we can enable today, even without collation or
+/// pragma plumbing, is: if the extracted prefix contains no ASCII letters, the
+/// default LIKE case folding cannot expand the match set beyond the byte range
+/// defined by `prefix .. upper_bound(prefix)`.
 ///
-/// Currently always returns `false` because collation tracking is not yet
-/// wired through the planner context. This stub exists to enable the
-/// optimization incrementally when collation information becomes available.
+/// Examples that are safe under default SQLite semantics:
+/// - `"2024-%"` (digits and punctuation only)
+/// - `"é%"` (non-ASCII characters are not case-folded by built-in LIKE)
 ///
-/// TODO(bd-wwqen.6): Accept `PlannerContext` or similar to access pragma state
-/// and schema collation metadata.
-#[allow(dead_code)]
-fn is_like_prefix_safe_for_column(_column: Option<&WhereColumn>) -> bool {
-    // Placeholder: will check column collation or pragma state when available.
-    // For now, conservatively return false to preserve correctness.
-    false
+/// Future planner context can widen this by checking:
+/// - `PRAGMA case_sensitive_like`
+/// - BINARY/case-sensitive column or index collations
+fn is_like_prefix_safe_for_column(_column: Option<&WhereColumn>, prefix: &str) -> bool {
+    prefix.chars().all(|ch| !ch.is_ascii_alphabetic())
 }
 
 /// Compute the exclusive upper bound for a LIKE prefix range.
@@ -5009,8 +5003,8 @@ mod tests {
     #[test]
     fn test_index_usability_like_not_usable() {
         let idx = index_info("idx_name", "t1", &["name"], false, 50);
-        // LIKE is case-insensitive by default — prefix optimisation disabled,
-        // so the index is not usable for LIKE terms.
+        // ASCII LIKE prefixes remain unsafe under default SQLite semantics
+        // because LIKE folds ASCII case.
         let terms = [like_term("name", "Jo%")];
         assert!(matches!(
             analyze_index_usability(&idx, &terms),
@@ -5021,6 +5015,20 @@ mod tests {
         assert!(matches!(
             analyze_index_usability(&idx, &terms),
             IndexUsability::NotUsable
+        ));
+    }
+
+    #[test]
+    fn test_index_usability_like_case_stable_prefix() {
+        let idx = index_info("idx_name", "t1", &["name"], false, 50);
+        let terms = [like_term("name", "123%")];
+        let result = analyze_index_usability(&idx, &terms);
+        assert!(matches!(
+            result,
+            IndexUsability::LikePrefix {
+                ref low,
+                high: Some(ref high)
+            } if low == "123" && high == "124"
         ));
     }
 
@@ -6348,14 +6356,26 @@ mod tests {
 
     #[test]
     fn test_classify_where_term_like_is_other() {
-        // LIKE is case-insensitive by default, so prefix optimisation is
-        // intentionally disabled — it must classify as Other regardless of
-        // whether a constant prefix exists.
+        // ASCII LIKE prefixes remain unsafe because default SQLite LIKE folds
+        // ASCII case, so range lowering would miss rows like 'ABC...'.
         let term = like_term("name", "abc%");
         assert!(matches!(term.kind, WhereTermKind::Other));
 
         let term = like_term("name", "%wildcard");
         assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
+    fn test_classify_where_term_like_case_stable_prefix() {
+        let term = like_term("name", "123%");
+        assert!(matches!(
+            term.kind,
+            WhereTermKind::LikePrefix {
+                ref prefix,
+                upper_bound: Some(ref upper_bound),
+            } if prefix == "123" && upper_bound == "124"
+        ));
+        assert_eq!(term.column.as_ref().unwrap().column, "name");
     }
 
     #[test]
@@ -6704,11 +6724,24 @@ mod tests {
         let idx = index_info("idx_name", "t1", &["name"], false, 20);
         let terms = [like_term("name", "Jo%")];
         let ap = best_access_path(&table, &[idx], &terms, None);
-        // LIKE is case-insensitive by default — prefix optimisation disabled,
-        // so a full table scan is expected.
+        // ASCII LIKE prefixes remain unsafe under default SQLite semantics, so
+        // a full table scan is expected.
         assert!(
             matches!(ap.kind, AccessPathKind::FullTableScan),
             "LIKE should fall back to full scan, got {:?}",
+            ap.kind
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_like_case_stable_prefix_uses_index_scan() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_name", "t1", &["name"], false, 20);
+        let terms = [like_term("name", "123%")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(
+            matches!(ap.kind, AccessPathKind::IndexScanRange { .. }),
+            "case-stable LIKE prefix should use index scan, got {:?}",
             ap.kind
         );
     }
