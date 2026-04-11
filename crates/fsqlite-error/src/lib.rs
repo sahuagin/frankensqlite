@@ -130,6 +130,10 @@ pub enum FrankenError {
     #[error("cannot commit - no transaction is active")]
     NoActiveTransaction,
 
+    /// VACUUM cannot run while a transaction/savepoint is active.
+    #[error("cannot VACUUM from within a transaction")]
+    VacuumWithinTransaction,
+
     /// Transaction was rolled back due to constraint violation.
     #[error("transaction rolled back: {reason}")]
     TransactionRolledBack { reason: String },
@@ -367,6 +371,7 @@ impl FrankenError {
             | Self::IndexExists { .. }
             | Self::AmbiguousColumn { .. }
             | Self::NestedTransaction
+            | Self::VacuumWithinTransaction
             | Self::NoActiveTransaction
             | Self::TransactionRolledBack { .. }
             | Self::TooManyColumns { .. }
@@ -852,6 +857,10 @@ mod tests {
             "cannot commit - no transaction is active"
         );
         assert_eq!(
+            FrankenError::VacuumWithinTransaction.to_string(),
+            "cannot VACUUM from within a transaction"
+        );
+        assert_eq!(
             FrankenError::TransactionRolledBack {
                 reason: "constraint".to_owned()
             }
@@ -1100,6 +1109,10 @@ mod tests {
         // Transaction errors
         assert_eq!(
             FrankenError::NestedTransaction.error_code(),
+            ErrorCode::Error
+        );
+        assert_eq!(
+            FrankenError::VacuumWithinTransaction.error_code(),
             ErrorCode::Error
         );
         assert_eq!(
