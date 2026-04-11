@@ -1258,33 +1258,43 @@ mod tests {
         prop::string::string_regex("[a-z][a-z0-9]{0,4}")
             .expect("valid identifier regex")
             .prop_filter("identifiers must avoid SQL keywords", |identifier| {
+                // Every SQL keyword recognised by the fsqlite tokenizer
+                // that is NOT in `is_nonreserved_kw` (i.e. truly reserved)
+                // must appear here, plus any nonreserved keyword that the
+                // differential generators use in a clause-starting position
+                // where the parser would confuse it with a keyword.
+                //
+                // Nonreserved keywords (asc, desc, do, each, fail, first,
+                // if, key, last, no, over, plan, query, range, row, rows,
+                // table, temp, view, etc.) are safe as identifiers and do
+                // NOT need to be listed here.
                 !matches!(
                     identifier.as_str(),
-                    // Reserved words that appear in the productions we
-                    // generate (SELECT / FROM / JOIN / WHERE / GROUP BY
-                    // / ORDER BY / LIMIT / DISTINCT / aggregate names).
-                    "and"
+                    // ── truly reserved (not in is_nonreserved_kw) ──
+                    "add"
+                        | "all"
+                        | "alter"
+                        | "and"
                         | "as"
+                        | "begin"
                         | "between"
                         | "by"
                         | "case"
                         | "cast"
-                        | "count"
+                        | "check"
                         | "cross"
-                        | "distinct"
+                        | "drop"
                         | "else"
-                        | "end"
                         | "except"
                         | "exists"
                         | "false"
+                        | "for"
                         | "from"
-                        | "full"
                         | "glob"
                         | "group"
                         | "having"
                         | "in"
                         | "inner"
-                        | "intersect"
                         | "into"
                         | "is"
                         | "isnull"
@@ -1292,22 +1302,17 @@ mod tests {
                         | "left"
                         | "like"
                         | "limit"
-                        | "match"
-                        | "natural"
                         | "not"
                         | "notnull"
                         | "null"
-                        | "of"
-                        | "offset"
                         | "on"
                         | "or"
                         | "order"
                         | "outer"
-                        | "regexp"
+                        | "raise"
                         | "right"
                         | "select"
                         | "set"
-                        | "sum"
                         | "then"
                         | "to"
                         | "true"
@@ -1317,6 +1322,22 @@ mod tests {
                         | "when"
                         | "where"
                         | "with"
+                        // ── nonreserved but used in generated SQL ──
+                        // These are safe as identifiers generally, but
+                        // confuse the parser when they appear as table/column
+                        // names in the specific SQL shapes the generators
+                        // produce (e.g. `count` as a column name in a
+                        // `COUNT(*)` projection, or `distinct` after SELECT).
+                        | "count"
+                        | "sum"
+                        | "distinct"
+                        | "end"
+                        | "full"
+                        | "match"
+                        | "natural"
+                        | "offset"
+                        | "regexp"
+                        | "intersect"
                 )
             })
             .boxed()
