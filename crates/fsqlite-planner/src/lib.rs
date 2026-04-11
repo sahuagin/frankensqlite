@@ -1560,7 +1560,9 @@ fn expr_guarantees_non_null(expr: &Expr, predicate_column: &WhereColumn) -> bool
     }
 
     match expr {
-        Expr::Between { expr: inner, .. } => extract_where_column(inner)
+        Expr::Between { expr: inner, .. }
+        | Expr::In { expr: inner, .. }
+        | Expr::Like { expr: inner, .. } => extract_where_column(inner)
             .is_some_and(|column| where_columns_compatible(&column, predicate_column)),
         Expr::IsNull {
             expr: inner,
@@ -7159,6 +7161,59 @@ mod tests {
         assert!(matches!(
             ap.kind,
             AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_is_not_null_from_in_list() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+
+        let ap = best_access_path(&table, &[partial_idx], &[in_term("a", 3)], None);
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanEquality
+                | AccessPathKind::IndexScanRange { .. }
+                | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_is_not_null_from_like_prefix() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+
+        let ap = best_access_path(&table, &[partial_idx], &[like_term("a", "123%")], None);
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_is_not_null_from_glob_prefix() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+
+        let ap = best_access_path(&table, &[partial_idx], &[glob_term("a", "abc*")], None);
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
         ));
     }
 
