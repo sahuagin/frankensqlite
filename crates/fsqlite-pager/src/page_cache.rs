@@ -20,7 +20,7 @@
 //! false sharing between adjacent shards.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -122,6 +122,41 @@ pub struct PageCacheMetricsSnapshot {
     pub p_target: usize,
     /// Number of pages that currently have multiple visible MVCC versions.
     pub mvcc_multi_version_pages: usize,
+}
+
+/// Observer-only queue classification for a resident cache page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageCacheQueueKind {
+    T1,
+    T2,
+    B1,
+    B2,
+}
+
+impl PageCacheQueueKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::T1 => "t1",
+            Self::T2 => "t2",
+            Self::B1 => "b1",
+            Self::B2 => "b2",
+        }
+    }
+}
+
+/// Point-in-time diagnostics for one resident cache page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCachePageSnapshot {
+    pub page_no: PageNumber,
+    /// Present when the cache implementation exposes multiple resident MVCC
+    /// versions of the same logical page. The active page cache keeps only the
+    /// published image, so this is currently `None`.
+    pub version_txn_id: Option<u64>,
+    pub queue: Option<PageCacheQueueKind>,
+    pub dirty: bool,
+    pub ref_count: u32,
+    pub access_count: u64,
 }
 
 impl PageCacheMetricsSnapshot {
@@ -268,6 +303,30 @@ impl S3FifoEvictionTracker {
                 .count(),
             small_capacity: model.config().small_capacity(),
         })
+    }
+
+    fn queue_assignments(
+        &self,
+        resident_pages: &[PageNumber],
+    ) -> HashMap<PageNumber, PageCacheQueueKind> {
+        let Some(model) = self.build_model(resident_pages) else {
+            return HashMap::new();
+        };
+
+        resident_pages
+            .iter()
+            .filter_map(|page_no| {
+                let queue = match model.lookup(*page_no) {
+                    Some(location) => match location.kind {
+                        QueueKind::Small => Some(PageCacheQueueKind::T1),
+                        QueueKind::Main => Some(PageCacheQueueKind::T2),
+                        QueueKind::Ghost => Some(PageCacheQueueKind::B1),
+                    },
+                    None => None,
+                }?;
+                Some((*page_no, queue))
+            })
+            .collect()
     }
 
     fn build_model(&self, resident_pages: &[PageNumber]) -> Option<S3Fifo> {
@@ -751,6 +810,8 @@ impl PageCache {
             evictions: self.evictions.get(),
             cached_pages,
             pool_capacity: self.pool.capacity(),
+            // The legacy non-sharded cache still stores raw `PageBuf`s, so it
+            // does not expose per-page dirty state yet.
             dirty_ratio_pct: 0,
             t1_size,
             t2_size,
@@ -851,27 +912,38 @@ fn normalize_page_cache_shard_count(requested: usize) -> usize {
 struct CachedPageEntry {
     buf: PageBuf,
     shared: Option<Arc<[u8]>>,
+    access_count: AtomicU64,
+    dirty: AtomicBool,
 }
 
 impl CachedPageEntry {
     #[inline]
     fn new(buf: PageBuf) -> Self {
-        Self { buf, shared: None }
+        Self {
+            buf,
+            shared: None,
+            access_count: AtomicU64::new(0),
+            dirty: AtomicBool::new(false),
+        }
     }
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
+        self.record_access();
         self.buf.as_slice()
     }
 
     #[inline]
     fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.record_access();
+        self.mark_dirty();
         self.shared = None;
         self.buf.as_mut_slice()
     }
 
     #[inline]
     fn shared_page(&mut self) -> PageData {
+        self.record_access();
         let shared = if let Some(shared) = self.shared.as_ref() {
             Arc::clone(shared)
         } else {
@@ -885,6 +957,49 @@ impl CachedPageEntry {
     #[inline]
     fn prefetch_hint(&self) {
         prefetch_l1_read(self.buf.as_slice().as_ptr());
+    }
+
+    #[inline]
+    fn record_access(&self) {
+        self.access_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn access_count(&self) -> u64 {
+        self.access_count.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn mark_clean(&self) {
+        self.dirty.store(false, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn shared_ref_count(&self) -> u32 {
+        self.shared.as_ref().map_or(0, |shared| {
+            u32::try_from(Arc::strong_count(shared).saturating_sub(1)).unwrap_or(u32::MAX)
+        })
+    }
+}
+
+fn snapshot_cached_page(page_no: PageNumber, entry: &CachedPageEntry) -> PageCachePageSnapshot {
+    PageCachePageSnapshot {
+        page_no,
+        version_txn_id: None,
+        queue: None,
+        dirty: entry.is_dirty(),
+        ref_count: entry.shared_ref_count(),
+        access_count: entry.access_count(),
     }
 }
 
@@ -1767,6 +1882,81 @@ impl ShardedPageCache {
         }
     }
 
+    fn note_page_access_without_metrics(&self, page_no: PageNumber) {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
+                entry.record_access();
+            }
+            return;
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref entry) = *guard {
+                entry.record_access();
+                return;
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
+            entry.record_access();
+        }
+    }
+
+    fn mark_page_dirty(&self, page_no: PageNumber) {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
+                entry.mark_dirty();
+            }
+            return;
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref entry) = *guard {
+                entry.mark_dirty();
+                return;
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
+            entry.mark_dirty();
+        }
+    }
+
+    fn mark_page_clean(&self, page_no: PageNumber) {
+        if self.use_fast_path.load(Ordering::Relaxed)
+            && let Some(ref fast) = self.fast_array
+        {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
+                entry.mark_clean();
+            }
+            return;
+        }
+
+        if let Some(slot_idx) = self.flat_slots.find_slot(page_no) {
+            let guard = self.flat_slots.slots[slot_idx].data.lock();
+            if let Some(ref entry) = *guard {
+                entry.mark_clean();
+                return;
+            }
+        }
+
+        let idx = self.shard_index(page_no);
+        if let Some(entry) = self.shards[idx].lock().pages.get(&page_no) {
+            entry.mark_clean();
+        }
+    }
+
     /// Select the shard index for a given page number.
     ///
     /// Uses multiplicative hashing with the golden ratio constant for good
@@ -2001,6 +2191,9 @@ impl ShardedPageCache {
                 }
                 let result = f(buf.as_slice());
                 arr.insert(page_no, buf);
+                if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
+                    entry.record_access();
+                }
                 drop(arr);
                 self.record_eviction_admit(page_no);
                 return Ok(result);
@@ -2057,6 +2250,7 @@ impl ShardedPageCache {
         if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
             self.shards[shard_idx].lock().insert(page_no, buf);
         }
+        self.note_page_access_without_metrics(page_no);
         self.record_eviction_admit(page_no);
         Ok(result)
     }
@@ -2070,6 +2264,9 @@ impl ShardedPageCache {
                 if let Some(data) = arr.get(page_no) {
                     let offset = page_offset(page_no, self.page_size);
                     file.write(cx, data, offset)?;
+                    if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
+                        entry.mark_clean();
+                    }
                     drop(arr);
                     self.record_eviction_access(page_no);
                     return Ok(());
@@ -2088,6 +2285,7 @@ impl ShardedPageCache {
             if let Some(ref buf) = *guard {
                 let offset = page_offset(page_no, self.page_size);
                 file.write(cx, buf.as_slice(), offset)?;
+                buf.mark_clean();
                 drop(guard);
                 self.record_eviction_access(page_no);
                 return Ok(());
@@ -2110,6 +2308,7 @@ impl ShardedPageCache {
         let buf = shard.pages.get(&page_no).expect("just checked");
         let offset = page_offset(page_no, self.page_size);
         file.write(cx, buf.as_slice(), offset)?;
+        buf.mark_clean();
         drop(shard);
         self.record_eviction_access(page_no);
         Ok(())
@@ -2131,6 +2330,10 @@ impl ShardedPageCache {
                 buf.as_mut_slice().fill(0);
                 let result = f(buf.as_mut_slice());
                 let admitted_new = arr.insert(page_no, buf);
+                if let Some(Some(entry)) = arr.pages.get(FastPageArray::pgno_to_idx(page_no)) {
+                    entry.mark_dirty();
+                    entry.record_access();
+                }
                 drop(arr);
                 if admitted_new {
                     self.record_eviction_admit(page_no);
@@ -2152,6 +2355,8 @@ impl ShardedPageCache {
                 self.shards[idx].lock().insert(page_no, buf)
             }
         };
+        self.mark_page_dirty(page_no);
+        self.note_page_access_without_metrics(page_no);
         if admitted_new {
             self.record_eviction_admit(page_no);
         } else {
@@ -2166,6 +2371,7 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 let admitted_new = fast.lock().insert(page_no, buf);
+                self.mark_page_clean(page_no);
                 if admitted_new {
                     self.record_eviction_admit(page_no);
                 } else {
@@ -2182,6 +2388,7 @@ impl ShardedPageCache {
                 self.shards[idx].lock().insert(page_no, buf)
             }
         };
+        self.mark_page_clean(page_no);
         if admitted_new {
             self.record_eviction_admit(page_no);
         } else {
@@ -2285,6 +2492,11 @@ impl ShardedPageCache {
             if let Some(ref fast) = self.fast_array {
                 let arr = fast.lock();
                 let residents = arr.resident_pages();
+                let dirty_pages = arr
+                    .pages
+                    .iter()
+                    .filter(|slot| slot.as_ref().is_some_and(CachedPageEntry::is_dirty))
+                    .count();
                 let queue_snapshot = self
                     .eviction_policy
                     .lock()
@@ -2306,7 +2518,7 @@ impl ShardedPageCache {
                     evictions: arr.evictions,
                     cached_pages: arr.len(),
                     pool_capacity: self.pool.capacity(),
-                    dirty_ratio_pct: 0,
+                    dirty_ratio_pct: percent_ratio_u64(dirty_pages, arr.len()),
                     t1_size,
                     t2_size,
                     b1_size,
@@ -2323,6 +2535,22 @@ impl ShardedPageCache {
         let mut total_admits = self.flat_slots.admits.load(Ordering::Relaxed);
         let mut total_evictions = self.flat_slots.evictions.load(Ordering::Relaxed);
         let mut total_pages = self.flat_slots.len();
+        let mut dirty_pages = self
+            .flat_slots
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                let pgno = slot.pgno.load(Ordering::Acquire);
+                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
+                    return None;
+                }
+                Some(slot)
+            })
+            .filter(|slot| {
+                let guard = slot.data.lock();
+                guard.as_ref().is_some_and(CachedPageEntry::is_dirty)
+            })
+            .count();
 
         // Add overflow shard metrics
         for shard in self.shards.iter() {
@@ -2332,6 +2560,7 @@ impl ShardedPageCache {
             total_admits = total_admits.saturating_add(s.admits);
             total_evictions = total_evictions.saturating_add(s.evictions);
             total_pages += s.len();
+            dirty_pages += s.pages.values().filter(|entry| entry.is_dirty()).count();
         }
 
         let residents = self.resident_pages();
@@ -2357,7 +2586,7 @@ impl ShardedPageCache {
             evictions: total_evictions,
             cached_pages: total_pages,
             pool_capacity: self.pool.capacity(),
-            dirty_ratio_pct: 0,
+            dirty_ratio_pct: percent_ratio_u64(dirty_pages, total_pages),
             t1_size,
             t2_size,
             b1_size,
@@ -2365,6 +2594,60 @@ impl ShardedPageCache {
             p_target,
             mvcc_multi_version_pages: 0,
         }
+    }
+
+    /// Capture a read-only snapshot of the resident cache pages.
+    #[must_use]
+    pub fn page_snapshots(&self) -> Vec<PageCachePageSnapshot> {
+        let mut snapshots = Vec::new();
+
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let arr = fast.lock();
+                for (idx, slot) in arr.pages.iter().enumerate() {
+                    let Some(entry) = slot.as_ref() else {
+                        continue;
+                    };
+                    let Some(pgno) = u32::try_from(idx.saturating_add(1))
+                        .ok()
+                        .and_then(PageNumber::new)
+                    else {
+                        continue;
+                    };
+                    snapshots.push(snapshot_cached_page(pgno, entry));
+                }
+            }
+        } else {
+            for slot in self.flat_slots.slots.iter() {
+                let pgno = slot.pgno.load(Ordering::Acquire);
+                if pgno == SLOT_EMPTY || pgno == SLOT_TOMBSTONE {
+                    continue;
+                }
+                let Some(page_no) = PageNumber::new(pgno) else {
+                    continue;
+                };
+                let guard = slot.data.lock();
+                if let Some(entry) = guard.as_ref() {
+                    snapshots.push(snapshot_cached_page(page_no, entry));
+                }
+            }
+
+            for shard in self.shards.iter() {
+                let shard = shard.lock();
+                for (&page_no, entry) in &shard.pages {
+                    snapshots.push(snapshot_cached_page(page_no, entry));
+                }
+            }
+        }
+
+        let resident_pages: Vec<PageNumber> = snapshots.iter().map(|snapshot| snapshot.page_no).collect();
+        let queue_assignments = self.eviction_policy.lock().queue_assignments(&resident_pages);
+        for snapshot in &mut snapshots {
+            snapshot.queue = queue_assignments.get(&snapshot.page_no).copied();
+        }
+
+        snapshots.sort_unstable_by_key(|snapshot| snapshot.page_no.get());
+        snapshots
     }
 
     /// Reset cache counters while preserving resident pages.

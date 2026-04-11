@@ -1862,6 +1862,11 @@ impl Fts5Table {
         rows
     }
 
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.documents.len()
+    }
+
     /// Get document content for a rowid.
     #[must_use]
     pub fn get_document(&self, rowid: i64) -> Option<&[String]> {
