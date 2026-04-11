@@ -14313,9 +14313,18 @@ fn extract_pure_glob_prefix(pattern: &Expr) -> Option<String> {
 }
 
 fn extract_pure_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<String> {
-    if escape.is_some() {
-        return None;
-    }
+    let escape_char = match escape {
+        None => None,
+        Some(Expr::Literal(Literal::String(s), _)) => {
+            let mut chars = s.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(ch)
+        }
+        Some(_) => return None,
+    };
 
     let Expr::Literal(Literal::String(pattern), _) = pattern else {
         return None;
@@ -14323,7 +14332,15 @@ fn extract_pure_like_prefix(pattern: &Expr, escape: Option<&Expr>) -> Option<Str
 
     let mut prefix = String::new();
     let mut saw_trailing_percent = false;
-    for ch in pattern.chars() {
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if escape_char.is_some_and(|esc| esc == ch) {
+            if saw_trailing_percent {
+                return None;
+            }
+            prefix.push(chars.next()?);
+            continue;
+        }
         match ch {
             '%' => saw_trailing_percent = true,
             '_' => return None,
@@ -21445,6 +21462,53 @@ mod tests {
         assert!(
             !ops.iter().any(|op| op.opcode == Opcode::LikeConstFast),
             "pure prefix LIKE lowered as an index range should not keep the full-scan LIKE filter path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_like_escaped_prefix_uses_range_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                pattern: Box::new(Expr::Literal(
+                    Literal::String("123\\%%".to_owned()),
+                    Span::ZERO,
+                )),
+                escape: Some(Box::new(Expr::Literal(
+                    Literal::String("\\".to_owned()),
+                    Span::ZERO,
+                ))),
+                op: fsqlite_ast::LikeOp::Like,
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "escaped pure-prefix LIKE patterns should lower to indexed range seeks"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Ge),
+            "escaped pure-prefix LIKE patterns should still stop at the derived upper bound"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "escaped pure-prefix LIKE range should open the matching index"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "escaped pure-prefix LIKE range should not fall back to a table rewind"
         );
     }
 
