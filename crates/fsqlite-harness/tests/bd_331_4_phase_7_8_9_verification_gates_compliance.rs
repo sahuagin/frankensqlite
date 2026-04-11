@@ -12,7 +12,7 @@ const UNIT_TEST_IDS: [&str; 2] = [
     "test_bd_331_4_unit_compliance_gate",
     "prop_bd_331_4_structure_compliance",
 ];
-const PHASE_GATE_TEST_IDS: [&str; 10] = [
+const PHASE_GATE_TEST_IDS: [&str; 11] = [
     "test_phase7_gate_index_usage",
     "test_phase7_gate_window_functions",
     "test_phase7_gate_recursive_cte_limit",
@@ -20,12 +20,13 @@ const PHASE_GATE_TEST_IDS: [&str; 10] = [
     "test_phase8_gate_fts5",
     "test_phase8_gate_rtree",
     "test_phase9_gate_conformance_golden",
+    "test_phase9_gate_time_travel_mvcc",
     "test_phase9_gate_benchmark_3x",
     "test_phase9_gate_no_regression",
     "test_phase9_gate_replication_loss",
 ];
 const E2E_TEST_IDS: [&str; 2] = ["test_e2e_bd_331_4", "test_e2e_bd_331_4_compliance"];
-const PHASE_GATE_MARKERS: [&str; 13] = [
+const PHASE_GATE_MARKERS: [&str; 14] = [
     "Phase 7 Gates",
     "Phase 8 Gates",
     "Phase 9 Gates",
@@ -36,6 +37,7 @@ const PHASE_GATE_MARKERS: [&str; 13] = [
     "FTS5 Full-Text Search (100 Test Queries)",
     "R*-Tree Spatial Queries (50 Bounding Box Tests)",
     "100% Conformance Parity (1,000+ Golden Files)",
+    "Time-Travel MVCC Snapshot Verification",
     "Single-Writer Benchmark Within 3x of C SQLite",
     "No Performance Regression (Conformal Calibration)",
     "Replication Under Packet Loss",
@@ -52,6 +54,7 @@ const REQUIRED_TOKENS: &[&str] = &[
     "test_phase8_gate_fts5",
     "test_phase8_gate_rtree",
     "test_phase9_gate_conformance_golden",
+    "test_phase9_gate_time_travel_mvcc",
     "test_phase9_gate_benchmark_3x",
     "test_phase9_gate_no_regression",
     "test_phase9_gate_replication_loss",
@@ -383,6 +386,16 @@ fn test_phase9_gate_conformance_golden() -> Result<(), String> {
         &description,
         "test_phase9_gate_conformance_golden",
         "100% Conformance Parity (1,000+ Golden Files)",
+    )
+}
+
+#[test]
+fn test_phase9_gate_time_travel_mvcc() -> Result<(), String> {
+    let description = load_issue_description(BEAD_ID)?;
+    assert_phase_gate_token(
+        &description,
+        "test_phase9_gate_time_travel_mvcc",
+        "Time-Travel MVCC Snapshot Verification",
     )
 }
 

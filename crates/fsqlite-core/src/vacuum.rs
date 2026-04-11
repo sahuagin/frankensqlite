@@ -97,7 +97,9 @@ pub(crate) fn temp_rebuild_path(source_path: &Path) -> PathBuf {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn replace_database_file(target_path: &Path, rebuilt_path: &Path) -> Result<()> {
     let bytes = host_fs::read(rebuilt_path)?;
-    host_fs::write(target_path, bytes)
+    host_fs::write(target_path, bytes)?;
+    drop(host_fs::remove_file(rebuilt_path));
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -244,6 +246,39 @@ mod tests {
         assert_eq!(
             values,
             vec![(1, "alpha".to_owned()), (3, "gamma".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_vacuum_in_place_removes_rebuild_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vacuum-temp-cleanup.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+
+        conn.execute("VACUUM;").unwrap();
+
+        let temp_prefix = format!(
+            "{}.fsqlite-vacuum-",
+            db_path.file_name().unwrap().to_string_lossy()
+        );
+        let temp_files: Vec<_> = fsqlite_vfs::host_fs::read_dir_paths(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy())
+                    .is_some_and(|name| name.starts_with(&temp_prefix) && name.ends_with(".tmp"))
+            })
+            .collect();
+        assert!(
+            temp_files.is_empty(),
+            "VACUUM should not leave rebuild temp files behind: {temp_files:?}"
         );
     }
 
