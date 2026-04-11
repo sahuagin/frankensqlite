@@ -39,6 +39,34 @@ For FrankenSQLite pools:
 For stock SQLite you might often centralize writes onto one connection. Do not
 carry that pattern over unchanged here.
 
+## Runtime Snapshot
+
+Use `PRAGMA fsqlite.connection_stats;` from any connection attached to the same
+database path to inspect the live shared pool state that FrankenSQLite can see
+inside this process:
+
+```sql
+PRAGMA fsqlite.connection_stats;
+PRAGMA fsqlite_connection_stats;
+```
+
+The PRAGMA reports:
+
+- `pool_size_estimate` and `open_connections` for the currently tracked pool
+- `idle_connections` and `active_transactions` so you can spot stuck snapshot
+  holders quickly
+- `connection_age_max_ms` and `idle_ms_max` to distinguish healthy reuse from
+  long-idle leak patterns
+- `queries_executed_total`, `prepare_calls_total`, and
+  `transactions_started_total` for the shared workload
+- `current_connection_*` fields for the connection issuing the PRAGMA, which
+  makes it easier to correlate a local handle with the shared aggregate view
+
+This is intentionally a lightweight live diagnostic surface, not a replacement
+for `validate_connection_pool()` or `simulate_connection_pool()`. Use the
+PRAGMA to capture raw pool behavior, then feed representative samples into the
+observability helpers when you want recommendations.
+
 ## Validator Example
 
 This example matches the compile-checked API shape used by the observability
@@ -163,5 +191,5 @@ scripts/verify_pool_advisor.sh --json
 ```
 
 It runs the connection-pool validator tests, simulator tests, doc tests, and a
-content check that this guide still covers the required MVCC guidance and the
-common Rust pool wrappers.
+content check that this guide still covers the required MVCC guidance, the
+`PRAGMA fsqlite.connection_stats` workflow, and the common Rust pool wrappers.

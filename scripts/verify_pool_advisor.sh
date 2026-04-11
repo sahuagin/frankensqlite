@@ -3,7 +3,7 @@
 set -euo pipefail
 
 BEAD_ID="bd-t6sv2.10"
-SCHEMA_VERSION="1"
+SCHEMA_VERSION="2"
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 REPORT_DIR="test-results"
 REPORT_FILE="${REPORT_DIR}/${BEAD_ID}-pool-advisor-verify.json"
@@ -99,11 +99,16 @@ run_case \
   run_build cargo clippy -p fsqlite-observability --all-targets --no-deps -- -D warnings
 
 run_case \
+  "core_pragma_suite" \
+  run_build cargo test -p fsqlite-core connection_stats -- --nocapture
+
+run_case \
   "docs_contract" \
   bash -lc \
   "rg -q 'multiple writer connections' docs/connection-pooling.md \
     && rg -q 'simulate_connection_pool' docs/connection-pooling.md \
     && rg -q 'validate_connection_pool' docs/connection-pooling.md \
+    && rg -q 'PRAGMA fsqlite\\.connection_stats' docs/connection-pooling.md \
     && rg -q 'sqlx::Pool|sqlx' docs/connection-pooling.md \
     && rg -q 'r2d2' docs/connection-pooling.md \
     && rg -q 'deadpool' docs/connection-pooling.md \
@@ -160,6 +165,14 @@ REPORT_CONTENT=$(cat <<ENDJSON
       "passed": ${CASE_PASSED["clippy_observability"]},
       "failed": ${CASE_FAILED["clippy_observability"]}
     },
+    "core_pragma_suite": {
+      "status": "${CASE_STATUS["core_pragma_suite"]}",
+      "command": "${CASE_COMMAND["core_pragma_suite"]}",
+      "exit_code": ${CASE_EXIT["core_pragma_suite"]},
+      "duration_ms": ${CASE_DURATION_MS["core_pragma_suite"]},
+      "passed": ${CASE_PASSED["core_pragma_suite"]},
+      "failed": ${CASE_FAILED["core_pragma_suite"]}
+    },
     "docs_contract": {
       "status": "${CASE_STATUS["docs_contract"]}",
       "command": "${CASE_COMMAND["docs_contract"]}",
@@ -189,6 +202,7 @@ else
   echo "  validator_suite: ${CASE_STATUS["validator_suite"]}"
   echo "  doctest_suite: ${CASE_STATUS["doctest_suite"]}"
   echo "  clippy_observability: ${CASE_STATUS["clippy_observability"]}"
+  echo "  core_pragma_suite: ${CASE_STATUS["core_pragma_suite"]}"
   echo "  docs_contract: ${CASE_STATUS["docs_contract"]}"
   echo "  recommendation_accuracy_pct=${RECOMMENDATION_ACCURACY_PCT}"
   echo "  report_path=${REPORT_FILE}"

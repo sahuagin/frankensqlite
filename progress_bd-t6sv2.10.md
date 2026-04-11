@@ -1,18 +1,16 @@
 # bd-t6sv2.10 progress
 
 Summary:
-- Re-read `bd-t6sv2.10` and narrowed this commit to the pool validator / simulator / guidance slice that is already centered in `fsqlite-observability`.
-- Added the missing deterministic `simulate_connection_pool()` API plus serializable simulation report types so the documented simulator surface now exists in the crate instead of only in `docs/connection-pooling.md`.
-- Added focused tests for:
-  - single-connection underprovisioning vs. multi-writer sizing
-  - read-heavy pool capping
-  - simulator determinism across repeated runs
-  - docs-example API shapes for both validator and simulator flows
-- Kept the docs aligned with the exported API and retained MVCC-specific guidance that multiple writer connections are the default recommendation for FrankenSQLite.
+- Finished the remaining core-side slice that the earlier observability-only work left open:
+  - added shared connection lifecycle telemetry in `crates/fsqlite-core/src/connection.rs`
+  - exposed `PRAGMA fsqlite.connection_stats` / `PRAGMA fsqlite_connection_stats`
+  - kept the tracker lightweight by using per-connection atomics for hot-path updates instead of a global statement-time mutex
+- Retained the existing validator / simulator / docs surface in `fsqlite-observability` and connected the docs to the new runtime PRAGMA workflow.
+- Extended the bead verifier so it now checks the core PRAGMA tests in addition to the observability validator/simulator coverage.
 
 Scope decisions:
-- I intentionally did not touch the currently dirty `crates/fsqlite-core/src/connection.rs` in this commit.
-- The bead's core-side `PRAGMA fsqlite_connection_stats` / shared lifecycle tracking follow-up remains open work; this commit focuses on the best-practices and validator/simulator surface without mixing in unrelated pre-existing `connection.rs` changes.
+- I left unrelated dirty worktree files alone (`crates/fsqlite-ext-fts5/src/lib.rs`, planner artifacts, heaptrack archives, other progress notes).
+- I did not change MVCC defaults or introduce connection-level write serialization. `BEGIN` promotion remains driven by `concurrent_mode_default = true`.
 
 Constraints held:
 - `concurrent_mode_default` remains `true`
@@ -21,31 +19,23 @@ Constraints held:
 - manual edits only
 
 Verification:
-- `cargo test -p fsqlite-observability connection_pool::tests:: -- --nocapture`
-  - Passed: 14 tests, including the new simulator and docs-shape tests.
-- `cargo test -p fsqlite-observability test_simulator -- --nocapture`
-  - Passed: 3 simulator-focused tests.
-- `cargo test -p fsqlite-observability test_docs_ -- --nocapture`
-  - Passed: 2 docs-shape tests.
-- `cargo test -p fsqlite-observability --doc -- --nocapture`
-  - Passed: crate doc-test harness completed cleanly (0 doc tests in this crate).
-- `cargo clippy -p fsqlite-observability --all-targets --no-deps -- -D warnings`
-  - Passed after fixing one local `clippy::unnecessary_lazy_evaluations` finding in the simulator projection helper.
-- `rustfmt --edition 2024 --check crates/fsqlite-observability/src/connection_pool.rs crates/fsqlite-observability/src/lib.rs`
+- `cargo test -p fsqlite-core connection_stats -- --nocapture`
+  - Passed: 2 new core PRAGMA tests covering shared pool lifecycle and disconnect handling.
+- `rch exec -- cargo clippy -p fsqlite-core --all-targets -- -D warnings`
   - Passed.
-- `bash scripts/verify_pool_advisor.sh --json --no-rch`
+- `cargo test -p fsqlite-observability connection_pool::tests:: -- --nocapture`
+  - Passed: 14 tests.
+- `cargo test -p fsqlite-observability --doc -- --nocapture`
+  - Passed.
+- `cargo clippy -p fsqlite-observability --all-targets --no-deps -- -D warnings`
+  - Passed.
+- `bash scripts/verify_pool_advisor.sh --json`
   - Passed with `verdict=pass` and `recommendation_accuracy_pct=100`.
   - Report written to `test-results/bd-t6sv2.10-pool-advisor-verify.json`.
 - `rch exec -- cargo check --workspace --all-targets`
-  - Blocked by unrelated existing `fsqlite-pager` errors in `crates/fsqlite-pager/src/page_cache.rs`:
-    - missing `record_access` on `PageBuf` at line 594
-    - missing `mark_dirty` on `PageBuf` at line 601
-    - missing `mark_clean` on `PageBuf` at line 608
+  - Passed.
 - `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
-  - Blocked by the same unrelated existing `fsqlite-pager` errors in `crates/fsqlite-pager/src/page_cache.rs`.
+  - Blocked by an unrelated pre-existing workspace lint in `crates/fsqlite-vdbe/src/codegen.rs:25214`:
+    - `clippy::replace_box` on an existing `Box::new(Expr::Collate { ... })`
 - `cargo fmt --check`
-  - Blocked by unrelated formatting drift in:
-    - `crates/fsqlite-harness/tests/bd_1sf8n_phase9_time_travel_gate.rs`
-    - `crates/fsqlite-pager/src/page_cache.rs`
-- `ubs crates/fsqlite-observability/src/connection_pool.rs crates/fsqlite-observability/src/lib.rs`
-  - UBS exited non-zero on broad pre-existing findings in `crates/fsqlite-observability/src/lib.rs` (existing unwrap/panic/unsafe-pattern inventory and similar whole-file heuristics), not on the new `bd-t6sv2.10` simulator code.
+  - Passed.
