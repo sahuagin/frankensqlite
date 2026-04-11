@@ -30,7 +30,7 @@ use smallvec::SmallVec;
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
-use crate::page_cache::{PageCacheMetricsSnapshot, ShardedPageCache};
+use crate::page_cache::{PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache};
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 use fsqlite_wal::{
@@ -3948,6 +3948,11 @@ where
     /// Capture point-in-time page-cache counters.
     pub fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         Ok(self.cache.metrics_snapshot())
+    }
+
+    /// Capture a read-only snapshot of the resident page-cache entries.
+    pub fn cache_page_snapshots(&self) -> Result<Vec<PageCachePageSnapshot>> {
+        Ok(self.cache.page_snapshots())
     }
 
     /// Capture page-cache efficiency metrics via the shared observability API.
