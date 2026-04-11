@@ -2474,6 +2474,8 @@ fn analyze_skip_scan_candidate(
         return None;
     }
 
+    let mut second_column_summary = IndexColumnTermSummary::default();
+
     // The current heuristic only prices skip-scan over one skipped leading
     // column. If the first usable constraint is deeper in the key, the planner
     // would also need the distinct cardinality of every skipped prefix, not
@@ -2486,23 +2488,35 @@ fn analyze_skip_scan_candidate(
             continue;
         }
 
-        let (trailing_probe_count, per_probe_selectivity) = match term.kind {
-            WhereTermKind::Equality => (1, SKIP_SCAN_EQ_SELECTIVITY),
-            WhereTermKind::InList { count } if count > 0 => (count, SKIP_SCAN_EQ_SELECTIVITY),
-            WhereTermKind::Range | WhereTermKind::Between | WhereTermKind::LikePrefix { .. } => {
-                (1, SKIP_SCAN_RANGE_SELECTIVITY)
+        match &term.kind {
+            WhereTermKind::Equality => second_column_summary.has_equality = true,
+            WhereTermKind::InList { count } if *count > 0 => {
+                second_column_summary
+                    .first_in_probe_count
+                    .get_or_insert(*count);
             }
-            _ => continue,
-        };
-
-        return Some(SkipScanCandidate {
-            leading_probes: leading_distinct as usize,
-            trailing_probe_count,
-            per_probe_selectivity,
-        });
+            WhereTermKind::Range | WhereTermKind::Between | WhereTermKind::LikePrefix { .. } => {
+                second_column_summary.has_range = true;
+            }
+            _ => {}
+        }
     }
 
-    None
+    let (trailing_probe_count, per_probe_selectivity) = if second_column_summary.has_equality {
+        (1, SKIP_SCAN_EQ_SELECTIVITY)
+    } else if let Some(probe_count) = second_column_summary.first_in_probe_count {
+        (probe_count, SKIP_SCAN_EQ_SELECTIVITY)
+    } else if second_column_summary.has_range {
+        (1, SKIP_SCAN_RANGE_SELECTIVITY)
+    } else {
+        return None;
+    };
+
+    Some(SkipScanCandidate {
+        leading_probes: leading_distinct as usize,
+        trailing_probe_count,
+        per_probe_selectivity,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -7092,6 +7106,62 @@ mod tests {
             "gapped skip-scan should fall back to full scan until multi-prefix cardinality is modeled, got {:?}",
             ap.kind
         );
+    }
+
+    #[test]
+    fn test_skip_scan_candidate_second_column_equality_beats_range_ordering() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec!["tenant_id".to_owned(), "email".to_owned()],
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let candidate =
+            analyze_skip_scan_candidate(&table, &idx, &[range_term("email"), eq_term("email")])
+                .expect("second-column equality should remain a skip-scan candidate");
+
+        assert_eq!(candidate.leading_probes, 8);
+        assert_eq!(candidate.trailing_probe_count, 1);
+        assert_eq!(candidate.per_probe_selectivity, SKIP_SCAN_EQ_SELECTIVITY);
+    }
+
+    #[test]
+    fn test_skip_scan_candidate_second_column_in_beats_range_ordering() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec!["tenant_id".to_owned(), "email".to_owned()],
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let candidate =
+            analyze_skip_scan_candidate(&table, &idx, &[range_term("email"), in_term("email", 3)])
+                .expect("second-column IN-list should remain a skip-scan candidate");
+
+        assert_eq!(candidate.leading_probes, 8);
+        assert_eq!(candidate.trailing_probe_count, 3);
+        assert_eq!(candidate.per_probe_selectivity, SKIP_SCAN_EQ_SELECTIVITY);
     }
 
     #[test]
