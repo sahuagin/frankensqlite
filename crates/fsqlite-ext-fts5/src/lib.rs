@@ -1005,7 +1005,7 @@ pub struct Posting {
 #[derive(Debug, Default, Clone)]
 pub struct InvertedIndex {
     /// term -> list of postings
-    index: HashMap<String, PostingList>,
+    index: HashMap<SmallText, PostingList>,
     /// Total number of documents
     doc_count: u64,
     /// Total token count per document (for BM25 avgdl)
@@ -1032,7 +1032,7 @@ impl InvertedIndex {
 
         for (term, positions) in term_positions {
             self.index
-                .entry(term.to_owned())
+                .entry(SmallText::from(term))
                 .or_default()
                 .push(Posting {
                     docid,
@@ -1073,7 +1073,7 @@ impl InvertedIndex {
                 let mut positions = Positions::new();
                 positions.push(position);
                 self.index.insert(
-                    term.to_owned(),
+                    SmallText::from(term),
                     SmallVec::from_buf([Posting {
                         docid,
                         column,
