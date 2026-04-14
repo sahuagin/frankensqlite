@@ -309,6 +309,10 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             // so a non-NULL sql here would be an invalid schema entry.
             let idx_sql = if index.name.starts_with("sqlite_autoindex_") {
                 None
+            } else if let Some(orig) = original_ddl.get(&index.name) {
+                // Prefer original DDL for the same reasons as tables: preserves
+                // exact WHERE clause formatting, collation names, etc.
+                Some(orig.clone())
             } else {
                 let terms: Vec<CreateIndexSqlTerm<'_>> = index
                     .columns
@@ -325,10 +329,8 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
                     &table_name,
                     index.is_unique,
                     &terms,
-                    None, // WHERE clause from string is already in index.where_clause
+                    None,
                 );
-                // Append WHERE clause text if present (the build function takes an
-                // Expr, but we have a String — append directly).
                 Some(if let Some(ref wc) = index.where_clause {
                     format!("{sql} WHERE {wc}")
                 } else {
