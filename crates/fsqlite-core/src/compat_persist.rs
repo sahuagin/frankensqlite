@@ -34,6 +34,9 @@ use fsqlite_types::record::{
     RecordProfileScope, enter_record_profile_scope, parse_record, serialize_record,
 };
 use fsqlite_types::value::SqliteValue;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::connection::{eval_join_expr, is_sqlite_truthy};
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema};
@@ -272,6 +275,24 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             let idx_root = txn.allocate_page(cx)?;
             init_leaf_index_page(cx, &mut txn, idx_root, page_size_usize, usable_size)?;
 
+            // Parse the partial index WHERE clause (if any) so we can skip
+            // rows that don't satisfy the predicate.
+            let partial_predicate = index
+                .where_clause
+                .as_deref()
+                .map(fsqlite_parser::expr::parse_expr)
+                .transpose()
+                .ok()
+                .flatten();
+
+            // Build column map for evaluating the WHERE predicate:
+            // [(table_name, column_name, is_rowid_alias), ...]
+            let col_map: Vec<(String, String, bool)> = table
+                .columns
+                .iter()
+                .map(|c| (table.name.clone(), c.name.clone(), false))
+                .collect();
+
             // Populate the index B-tree from table rows.
             {
                 let mut idx_cursor = fsqlite_btree::BtCursor::new(
@@ -283,6 +304,18 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
                 configure_btree_cursor_page_size(&mut idx_cursor, usable_size, full_page_size);
                 if let Some(mem_table) = db.get_table(table.root_page) {
                     for (rowid, values) in mem_table.iter_rows() {
+                        // For partial indexes, skip rows that don't match
+                        // the WHERE predicate.
+                        if let Some(ref predicate) = partial_predicate {
+                            let eval_row: Vec<SqliteValue> = values.to_vec();
+                            if let Ok(result) = eval_join_expr(predicate, &eval_row, &col_map) {
+                                if !is_sqlite_truthy(&result) {
+                                    continue;
+                                }
+                            }
+                            // If evaluation fails, include the row (safe default).
+                        }
+
                         // Build index key: (indexed_column_values..., rowid).
                         let mut key_values: Vec<SqliteValue> = Vec::new();
                         for col_name in &index.columns {
