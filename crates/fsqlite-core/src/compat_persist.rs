@@ -244,8 +244,9 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
         // Prefer the original DDL when available — it preserves column-level
         // CHECK constraints, exact DEFAULT formatting, and constraint ordering
         // that build_create_table_sql might not reconstruct perfectly.
+        // Keys in original_ddl are lowercased (per reload_memdb_from_txn_with_mode).
         let create_sql = original_ddl
-            .get(&table.name)
+            .get(&table.name.to_ascii_lowercase())
             .cloned()
             .unwrap_or_else(|| build_create_table_sql(table));
         let table_name = table.name.clone();
@@ -309,7 +310,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             // so a non-NULL sql here would be an invalid schema entry.
             let idx_sql = if index.name.starts_with("sqlite_autoindex_") {
                 None
-            } else if let Some(orig) = original_ddl.get(&index.name) {
+            } else if let Some(orig) = original_ddl.get(&index.name.to_ascii_lowercase()) {
                 // Prefer original DDL for the same reasons as tables: preserves
                 // exact WHERE clause formatting, collation names, etc.
                 Some(orig.clone())
