@@ -941,8 +941,39 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
             }
         }
     }
+    // Emit PRIMARY KEY constraints BEFORE UNIQUE constraints.  Stock SQLite
+    // assigns autoindex ordinals (sqlite_autoindex_T_N) in the order they
+    // appear: first column-level PK, then table-level PK, then column-level
+    // UNIQUE, then table-level UNIQUE.  If we emit UNIQUE before PRIMARY KEY,
+    // the ordinal-to-definition mapping in
+    // `infer_implicit_index_definition_from_master_entries` will assign the
+    // wrong columns to autoindexes, corrupting the schema on reload (#239).
+    for pk in &table.primary_key_constraints {
+        if pk.len() == 1
+            && table
+                .columns
+                .iter()
+                .any(|column| column.is_ipk && column.name.eq_ignore_ascii_case(&pk[0]))
+        {
+            continue;
+        }
+        let cols = pk
+            .iter()
+            .map(|name| quote_identifier(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, ", PRIMARY KEY ({cols})");
+    }
     for index in &table.indexes {
         if !index.is_unique || index.columns.is_empty() || primary_key_matches_index(index) {
+            continue;
+        }
+        // Only emit table-level UNIQUE for autoindexes.  Explicitly-named
+        // indexes (e.g. `idx_issues_external_ref_unique`) are written as
+        // separate CREATE INDEX entries in sqlite_master; emitting them
+        // here as well would create a phantom sqlite_autoindex that stock
+        // SQLite tries to populate, causing "wrong # of entries" errors.
+        if !index.name.starts_with("sqlite_autoindex_") {
             continue;
         }
         if index.columns.len() == 1
@@ -961,22 +992,6 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         let _ = write!(sql, ", UNIQUE ({cols})");
-    }
-    for pk in &table.primary_key_constraints {
-        if pk.len() == 1
-            && table
-                .columns
-                .iter()
-                .any(|column| column.is_ipk && column.name.eq_ignore_ascii_case(&pk[0]))
-        {
-            continue;
-        }
-        let cols = pk
-            .iter()
-            .map(|name| quote_identifier(name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = write!(sql, ", PRIMARY KEY ({cols})");
     }
     for fk in &table.foreign_keys {
         let child_columns = fk
