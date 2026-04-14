@@ -10,7 +10,7 @@
 //! On **load**, a real `.db` file is read via B-tree cursors and its
 //! contents are replayed into a fresh `MemDatabase` + schema vector.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
@@ -168,7 +168,15 @@ pub fn persist_to_sqlite_with_header(
     db: &MemDatabase,
     header_template: &DatabaseHeader,
 ) -> Result<()> {
-    persist_to_sqlite_with_header_and_master_entries(cx, path, schema, db, header_template, &[])
+    persist_to_sqlite_with_header_and_master_entries(
+        cx,
+        path,
+        schema,
+        db,
+        header_template,
+        &[],
+        &HashMap::new(),
+    )
 }
 
 /// Persist `schema` + `db` plus additional sqlite_master rows using the
@@ -182,6 +190,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
     db: &MemDatabase,
     header_template: &DatabaseHeader,
     extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &HashMap<String, String>,
 ) -> Result<()> {
     // Remove existing file so the pager creates a fresh one.
     if path.exists() {
@@ -232,8 +241,13 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             }
         }
 
-        // Build CREATE TABLE SQL for sqlite_master.
-        let create_sql = build_create_table_sql(table);
+        // Prefer the original DDL when available — it preserves column-level
+        // CHECK constraints, exact DEFAULT formatting, and constraint ordering
+        // that build_create_table_sql might not reconstruct perfectly.
+        let create_sql = original_ddl
+            .get(&table.name)
+            .cloned()
+            .unwrap_or_else(|| build_create_table_sql(table));
         let table_name = table.name.clone();
         master_entries.push((
             "table".to_owned(),

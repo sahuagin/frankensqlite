@@ -79,6 +79,7 @@ pub(crate) fn persist_compacted_database(
     db: &MemDatabase,
     header: &DatabaseHeader,
     extra_master_entries: &[SqliteMasterEntry],
+    original_ddl: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let result = persist_to_sqlite_with_header_and_master_entries(
         cx,
@@ -87,6 +88,7 @@ pub(crate) fn persist_compacted_database(
         db,
         header,
         extra_master_entries,
+        original_ddl,
     );
     if take_temp_vacuum_into_discard_target(target_path) {
         drop(host_fs::remove_file(target_path));
@@ -102,6 +104,7 @@ pub(crate) fn persist_compacted_database(
     _db: &MemDatabase,
     _header: &DatabaseHeader,
     _extra_master_entries: &[SqliteMasterEntry],
+    _original_ddl: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     Err(FrankenError::not_implemented(
         "VACUUM is not supported on wasm32",
