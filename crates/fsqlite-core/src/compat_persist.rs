@@ -261,6 +261,14 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
             Some(create_sql),
         ));
 
+        // Build column map once for evaluating partial index WHERE predicates.
+        // [(table_name, column_name, is_rowid_alias), ...]
+        let col_map: Vec<(String, String, bool)> = table
+            .columns
+            .iter()
+            .map(|c| (table.name.clone(), c.name.clone(), false))
+            .collect();
+
         // Write index B-trees for all indexes including autoindexes.
         // Autoindexes (sqlite_autoindex_*) are created for UNIQUE constraints
         // and non-IPK PRIMARY KEY columns. Their sqlite_master entries point to
@@ -285,14 +293,6 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
                 .ok()
                 .flatten();
 
-            // Build column map for evaluating the WHERE predicate:
-            // [(table_name, column_name, is_rowid_alias), ...]
-            let col_map: Vec<(String, String, bool)> = table
-                .columns
-                .iter()
-                .map(|c| (table.name.clone(), c.name.clone(), false))
-                .collect();
-
             // Populate the index B-tree from table rows.
             {
                 let mut idx_cursor = fsqlite_btree::BtCursor::new(
@@ -307,8 +307,7 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
                         // For partial indexes, skip rows that don't match
                         // the WHERE predicate.
                         if let Some(ref predicate) = partial_predicate {
-                            let eval_row: Vec<SqliteValue> = values.to_vec();
-                            if let Ok(result) = eval_join_expr(predicate, &eval_row, &col_map) {
+                            if let Ok(result) = eval_join_expr(predicate, values, &col_map) {
                                 if !is_sqlite_truthy(&result) {
                                     continue;
                                 }
