@@ -7869,6 +7869,7 @@ mod tests {
                 borrowed_exact_size_copies_total: 1,
                 owned_write_normalization_calls_total: 2,
                 owned_passthrough_total: 1,
+                owned_in_place_zero_extends_total: 1,
                 owned_resized_copies_total: 1,
                 normalized_payload_bytes_total: 96,
                 normalized_zero_fill_bytes_total: 32,

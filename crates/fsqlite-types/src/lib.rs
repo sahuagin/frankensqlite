@@ -333,6 +333,31 @@ impl PageDataRepr {
 }
 
 impl PageData {
+    fn invalidate_owned_snapshot_cache_if_needed(&mut self) {
+        let reset_owned_snapshot_cache = matches!(
+            &self.repr,
+            PageDataRepr::Owned { shared, .. } if shared.get().is_some()
+        );
+        if reset_owned_snapshot_cache {
+            let bytes = match std::mem::replace(
+                &mut self.repr,
+                PageDataRepr::Owned {
+                    bytes: Vec::new(),
+                    shared: OnceLock::new(),
+                },
+            ) {
+                PageDataRepr::Owned { bytes, .. } => bytes,
+                PageDataRepr::Shared(_) => {
+                    unreachable!("owned snapshot cache reset should only run for owned pages")
+                }
+            };
+            self.repr = PageDataRepr::Owned {
+                bytes,
+                shared: OnceLock::new(),
+            };
+        }
+    }
+
     /// Create a zero-filled page of the given size.
     pub fn zeroed(size: PageSize) -> Self {
         Self::from_vec(vec![0u8; size.as_usize()])
@@ -368,31 +393,30 @@ impl PageData {
     /// This performs a clone if the data is shared (Copy-On-Write).
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let reset_owned_snapshot_cache = matches!(
-            &self.repr,
-            PageDataRepr::Owned { shared, .. } if shared.get().is_some()
-        );
-        if reset_owned_snapshot_cache {
-            let bytes = match std::mem::replace(
-                &mut self.repr,
-                PageDataRepr::Owned {
-                    bytes: Vec::new(),
-                    shared: OnceLock::new(),
-                },
-            ) {
-                PageDataRepr::Owned { bytes, .. } => bytes,
-                PageDataRepr::Shared(_) => {
-                    unreachable!("owned snapshot cache reset should only run for owned pages")
-                }
-            };
-            self.repr = PageDataRepr::Owned {
-                bytes,
-                shared: OnceLock::new(),
-            };
-        }
+        self.invalidate_owned_snapshot_cache_if_needed();
         match &mut self.repr {
             PageDataRepr::Owned { bytes, .. } => bytes.as_mut_slice(),
             PageDataRepr::Shared(bytes) => Arc::make_mut(bytes),
+        }
+    }
+
+    /// Extend an owned page buffer with zero bytes in place.
+    ///
+    /// Returns `true` when the underlying representation stayed owned and was
+    /// extended without promoting/cloning through a shared snapshot.
+    pub fn try_zero_extend_owned_to(&mut self, new_len: usize) -> bool {
+        self.invalidate_owned_snapshot_cache_if_needed();
+        match &mut self.repr {
+            PageDataRepr::Owned { bytes, .. } => {
+                if bytes.len() > new_len {
+                    return false;
+                }
+                if bytes.len() < new_len {
+                    bytes.resize(new_len, 0);
+                }
+                true
+            }
+            PageDataRepr::Shared(_) => false,
         }
     }
 
@@ -1668,6 +1692,36 @@ mod tests {
         assert_eq!(first_snapshot.as_bytes(), &[9, 8, 7, 6]);
         assert_eq!(second_snapshot.as_bytes(), &[1, 8, 7, 6]);
         assert_eq!(page.as_bytes(), &[1, 8, 7, 6]);
+    }
+
+    #[test]
+    fn page_data_try_zero_extend_owned_to_preserves_owned_bytes_and_invalidates_stale_snapshot() {
+        let mut page = PageData::from_vec(vec![9, 8, 7, 6]);
+        let snapshot = page.clone();
+
+        assert!(page.try_zero_extend_owned_to(8));
+        assert_eq!(page.as_bytes(), &[9, 8, 7, 6, 0, 0, 0, 0]);
+        assert_eq!(snapshot.as_bytes(), &[9, 8, 7, 6]);
+        assert!(
+            matches!(page.repr, PageDataRepr::Owned { .. }),
+            "zero-extending an owned page should stay on the owned representation"
+        );
+        let PageDataRepr::Owned { shared, .. } = &page.repr else {
+            panic!("zero-extended page should remain owned");
+        };
+        assert!(
+            shared.get().is_none(),
+            "zero-extending must invalidate any stale shared snapshot cache"
+        );
+    }
+
+    #[test]
+    fn page_data_try_zero_extend_owned_to_returns_false_for_shared_pages() {
+        let original = PageData::from_vec(vec![1, 2, 3, 4]);
+        let mut shared = original.clone();
+
+        assert!(!shared.try_zero_extend_owned_to(8));
+        assert_eq!(shared.as_bytes(), &[1, 2, 3, 4]);
     }
 
     fn make_header_for_tests() -> DatabaseHeader {

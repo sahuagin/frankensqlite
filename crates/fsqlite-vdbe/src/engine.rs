@@ -176,11 +176,12 @@ use fsqlite_types::{
 
 use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
-    enter_vdbe_execute_profile_stage, opcode_register_spans,
+    enter_vdbe_execute_profile_stage,
     jit::{
         CompiledProgram, ConstantResultRowTemplate, InsertValueSource, SimpleInsertTemplate,
         try_compile_program,
     },
+    opcode_register_spans,
 };
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
@@ -2426,6 +2427,22 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
     }
 
     let payload_len = data.len();
+    let zero_fill_len = page_size.saturating_sub(payload_len);
+    let mut data = data;
+    if data.try_zero_extend_owned_to(page_size) {
+        add_vdbe_counter_if(
+            metrics_enabled,
+            &FSQLITE_VDBE_PAGE_DATA_OWNED_IN_PLACE_ZERO_EXTENDS_TOTAL,
+            1,
+        );
+        add_vdbe_counter_if(
+            metrics_enabled,
+            &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL,
+            u64::try_from(zero_fill_len).unwrap_or(u64::MAX),
+        );
+        return Ok(data);
+    }
+
     let mut page = vec![0_u8; page_size];
     page[..payload_len].copy_from_slice(data.as_bytes());
     add_vdbe_counter_if(
@@ -2441,7 +2458,7 @@ fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageD
     add_vdbe_counter_if(
         metrics_enabled,
         &FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL,
-        u64::try_from(page_size.saturating_sub(payload_len)).unwrap_or(u64::MAX),
+        u64::try_from(zero_fill_len).unwrap_or(u64::MAX),
     );
     Ok(PageData::from_vec(page))
 }
@@ -4268,6 +4285,8 @@ static FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL: AtomicU64 = Atom
 static FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total owned `PageData` writes that passed through without resizing/copying.
 static FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total owned short-page writes that zero-extended the existing buffer in place.
+static FSQLITE_VDBE_PAGE_DATA_OWNED_IN_PLACE_ZERO_EXTENDS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total owned `PageData` writes that required allocating a resized page image.
 static FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total payload bytes copied while normalizing page data before writes.
@@ -4345,7 +4364,9 @@ pub struct PageDataMotionMetricsSnapshot {
     pub owned_write_normalization_calls_total: u64,
     /// Total owned writes that passed through without resizing/copying.
     pub owned_passthrough_total: u64,
-    /// Total owned writes that required resizing/copying.
+    /// Total owned short-page writes that zero-extended the existing buffer.
+    pub owned_in_place_zero_extends_total: u64,
+    /// Total owned writes that required allocating and copying into a new page image.
     pub owned_resized_copies_total: u64,
     /// Total payload bytes copied into normalized page images.
     pub normalized_payload_bytes_total: u64,
@@ -4552,6 +4573,9 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
                 FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL.load(AtomicOrdering::Relaxed),
             owned_passthrough_total: FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL
                 .load(AtomicOrdering::Relaxed),
+            owned_in_place_zero_extends_total:
+                FSQLITE_VDBE_PAGE_DATA_OWNED_IN_PLACE_ZERO_EXTENDS_TOTAL
+                    .load(AtomicOrdering::Relaxed),
             owned_resized_copies_total: FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL
                 .load(AtomicOrdering::Relaxed),
             normalized_payload_bytes_total: FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL
@@ -4623,6 +4647,7 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_PAGE_DATA_BORROWED_EXACT_SIZE_COPIES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_OWNED_NORMALIZATION_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_OWNED_PASSTHROUGH_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_PAGE_DATA_OWNED_IN_PLACE_ZERO_EXTENDS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_OWNED_RESIZED_COPIES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_NORMALIZED_PAYLOAD_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_PAGE_DATA_NORMALIZED_ZERO_FILL_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
@@ -12016,7 +12041,8 @@ impl VdbeEngine {
                     "rowid overflow in compiled simple INSERT",
                 )?
             };
-            sc.cursor.table_append_after_last_position(&sc.cx, rowid, &payload)?;
+            sc.cursor
+                .table_append_after_last_position(&sc.cx, rowid, &payload)?;
             sc.last_successful_insert_rowid = Some(rowid);
             rowid
         };
@@ -12048,12 +12074,13 @@ impl VdbeEngine {
         row_handler: &mut Option<&mut ResultRowCallback<'_>>,
     ) -> Result<ExecOutcome> {
         match compiled_program {
-            CompiledProgram::ConstantResultRow(template) => {
-                self.execute_compiled_constant_result_row(template, collect_vdbe_metrics, row_handler)
-            }
-            CompiledProgram::SimpleInsert(template) => {
-                self.execute_compiled_simple_insert(template, borrowed_bindings, collect_vdbe_metrics)
-            }
+            CompiledProgram::ConstantResultRow(template) => self
+                .execute_compiled_constant_result_row(template, collect_vdbe_metrics, row_handler),
+            CompiledProgram::SimpleInsert(template) => self.execute_compiled_simple_insert(
+                template,
+                borrowed_bindings,
+                collect_vdbe_metrics,
+            ),
         }
     }
 
@@ -29046,6 +29073,70 @@ mod tests {
             bytes[expected.len()..].iter().all(|byte| *byte == 0),
             "concurrent owned writes should zero-fill any unwritten tail bytes"
         );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_short_owned_write_tracks_in_place_zero_extend_metrics() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(true);
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut page_io = SharedTxnPageIo::new(txn);
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let expected = vec![0x6B; 32];
+
+        let before = vdbe_metrics_snapshot();
+        page_io
+            .write_page_data(&cx, page_no, PageData::from_vec(expected.clone()))
+            .expect("short owned write should succeed");
+        let after = vdbe_metrics_snapshot();
+
+        let bytes = page_io
+            .read_page(&cx, page_no)
+            .expect("write should remain readable through the pager");
+        assert_eq!(bytes.len(), PageSize::DEFAULT.as_usize());
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert!(
+            bytes[expected.len()..].iter().all(|byte| *byte == 0),
+            "short owned writes should still zero-fill their unwritten tail"
+        );
+        assert_eq!(
+            after.page_data_motion.owned_write_normalization_calls_total
+                - before
+                    .page_data_motion
+                    .owned_write_normalization_calls_total,
+            1
+        );
+        assert_eq!(
+            after.page_data_motion.owned_in_place_zero_extends_total
+                - before.page_data_motion.owned_in_place_zero_extends_total,
+            1
+        );
+        assert_eq!(
+            after.page_data_motion.owned_resized_copies_total
+                - before.page_data_motion.owned_resized_copies_total,
+            0
+        );
+        assert_eq!(
+            after.page_data_motion.normalized_payload_bytes_total
+                - before.page_data_motion.normalized_payload_bytes_total,
+            0
+        );
+        assert_eq!(
+            after.page_data_motion.normalized_zero_fill_bytes_total
+                - before.page_data_motion.normalized_zero_fill_bytes_total,
+            u64::try_from(PageSize::DEFAULT.as_usize() - expected.len()).unwrap()
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 
     #[test]

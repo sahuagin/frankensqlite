@@ -337,6 +337,7 @@ pub struct HotPathPageDataMotionProfile {
     pub borrowed_exact_size_copies_total: u64,
     pub owned_write_normalization_calls_total: u64,
     pub owned_passthrough_total: u64,
+    pub owned_in_place_zero_extends_total: u64,
     pub owned_resized_copies_total: u64,
     pub normalized_payload_bytes_total: u64,
     pub normalized_zero_fill_bytes_total: u64,
@@ -1245,6 +1246,10 @@ fn build_hot_path_profile_report(
             .page_data_motion
             .owned_write_normalization_calls_total,
         owned_passthrough_total: snapshot.vdbe.page_data_motion.owned_passthrough_total,
+        owned_in_place_zero_extends_total: snapshot
+            .vdbe
+            .page_data_motion
+            .owned_in_place_zero_extends_total,
         owned_resized_copies_total: snapshot.vdbe.page_data_motion.owned_resized_copies_total,
         normalized_payload_bytes_total: snapshot
             .vdbe
@@ -1390,7 +1395,7 @@ fn build_hot_path_profile_report(
             metric_kind: "bytes".to_owned(),
             metric_value: page_data_normalization_bytes_total,
             rationale:
-                "payload + zero-fill bytes materialized while normalizing page images before writes"
+                "payload-copy + zero-fill bytes materialized while normalizing page images before writes"
                     .to_owned(),
         },
     ];
@@ -1879,11 +1884,12 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- Owned normalization calls: {} (passthrough={}, resized_copies={})",
+        "- Owned normalization calls: {} (passthrough={}, in_place_zero_extends={}, resized_copies={})",
         report
             .page_data_motion
             .owned_write_normalization_calls_total,
         report.page_data_motion.owned_passthrough_total,
+        report.page_data_motion.owned_in_place_zero_extends_total,
         report.page_data_motion.owned_resized_copies_total
     );
     let _ = writeln!(
@@ -2847,7 +2853,7 @@ fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'stati
             &["bd-db300.10.3"],
         ),
         "page_data_ownership_reuse" => (
-            "J6 target: PageData ownership reuse is now measured directly, so next cuts can use passthrough versus resized-copy evidence instead of treating ownership churn as a blind spot.",
+            "J6 target: PageData ownership reuse is now measured directly, so next cuts can use passthrough, in-place zero-extend, and resized-copy evidence instead of treating ownership churn as a blind spot.",
             &["bd-db300.10.6"],
         ),
         _ => (
@@ -3025,18 +3031,30 @@ fn build_hot_path_baseline_reuse_ledger(
             rank: 0,
             surface: "page_data_ownership_reuse".to_owned(),
             supported: true,
-            hits: report.page_data_motion.owned_passthrough_total,
+            hits: report
+                .page_data_motion
+                .owned_passthrough_total
+                .saturating_add(report.page_data_motion.owned_in_place_zero_extends_total),
             misses: report
                 .page_data_motion
                 .owned_write_normalization_calls_total
-                .saturating_sub(report.page_data_motion.owned_passthrough_total),
+                .saturating_sub(
+                    report
+                        .page_data_motion
+                        .owned_passthrough_total
+                        .saturating_add(report.page_data_motion.owned_in_place_zero_extends_total),
+                ),
             hit_rate_basis_points: Some(ratio_basis_points(
-                report.page_data_motion.owned_passthrough_total,
+                report
+                    .page_data_motion
+                    .owned_passthrough_total
+                    .saturating_add(report.page_data_motion.owned_in_place_zero_extends_total),
                 report.page_data_motion.owned_write_normalization_calls_total,
             )),
             rationale: format!(
-                "owned PageData writes now report passthrough versus resized-copy outcomes ({} passthrough, {} resized copies); borrowed writes remain a separate explicit copy lane",
+                "owned PageData writes now report passthrough, in-place zero-extend, and resized-copy outcomes ({} passthrough, {} in-place zero-extends, {} resized copies); borrowed writes remain a separate explicit copy lane",
                 report.page_data_motion.owned_passthrough_total,
+                report.page_data_motion.owned_in_place_zero_extends_total,
                 report.page_data_motion.owned_resized_copies_total
             ),
             implication: String::new(),
@@ -3342,7 +3360,7 @@ fn build_hot_path_baseline_waste_ledger(
                 .borrowed_write_normalization_calls_total
                 .saturating_add(report.page_data_motion.owned_write_normalization_calls_total),
             rationale:
-                "page writes now expose the full payload + zero-fill byte volume materialized while normalizing page images before pager entry"
+                "page writes now expose payload-copy + zero-fill byte volume that still materializes while normalizing page images before pager entry"
                     .to_owned(),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -3465,7 +3483,7 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
                 .borrowed_write_normalization_calls_total
                 .saturating_add(report.page_data_motion.owned_write_normalization_calls_total),
             rationale:
-                "write-path page normalization now surfaces full payload + zero-fill byte motion even when time attribution remains in the surrounding executor body"
+                "write-path page normalization now surfaces payload-copy + zero-fill byte motion even when time attribution remains in the surrounding executor body"
                     .to_owned(),
             implication: String::new(),
             mapped_beads: Vec::new(),
@@ -5028,6 +5046,7 @@ mod tests {
                     borrowed_exact_size_copies_total: 2,
                     owned_write_normalization_calls_total: 5,
                     owned_passthrough_total: 3,
+                    owned_in_place_zero_extends_total: 1,
                     owned_resized_copies_total: 2,
                     normalized_payload_bytes_total: 1_120,
                     normalized_zero_fill_bytes_total: 384,
@@ -5657,6 +5676,11 @@ mod tests {
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
+                .contains("in_place_zero_extends")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
                 .contains("## Baseline Waste Ledger")
         );
         assert!(
@@ -5898,7 +5922,7 @@ mod tests {
             .find(|entry| entry.surface == "page_data_ownership_reuse")
             .unwrap();
         assert!(page_data_reuse.supported);
-        assert_eq!(page_data_reuse.hit_rate_basis_points, Some(6_000));
+        assert_eq!(page_data_reuse.hit_rate_basis_points, Some(8_000));
         assert_eq!(
             page_data_reuse.mapped_beads,
             vec!["bd-db300.10.6".to_owned()]
