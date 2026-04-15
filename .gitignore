@@ -272,7 +272,8 @@ evidence/
 /test
 .bench-history/
 
-# Codex CLI config directory
+# Codex CLI ephemeral files and directories
+.codex
 .codex/
 
 # Heaptrack profiling dumps
