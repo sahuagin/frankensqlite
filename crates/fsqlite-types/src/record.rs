@@ -2582,4 +2582,184 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // bd-gieaf Track R: record encoding correctness, zero-alloc verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bd_gieaf_record_scratch_reuse_1000_records_no_realloc_after_warmup() {
+        let mut scratch = Vec::<u8>::new();
+
+        // Phase 1: Warmup — first 100 rows allow the buffer to grow to accommodate
+        // the largest record shape in the workload. The blob column varies 1-32 bytes
+        // based on row_id % 32, so we need ~32 rows minimum for full coverage.
+        const WARMUP_ROWS: i64 = 100;
+        const TOTAL_ROWS: i64 = 1000;
+
+        let generate_row = |row_id: i64| -> Vec<SqliteValue> {
+            vec![
+                SqliteValue::Integer(row_id),
+                SqliteValue::Integer(row_id.saturating_mul(17).saturating_sub(500)),
+                SqliteValue::Float((row_id as f64).mul_add(1.25, -100.5)),
+                SqliteValue::Text(SmallText::from_string(format!("row-{row_id:05}"))),
+                SqliteValue::Blob(Arc::from(
+                    (0_u8..((row_id as usize % 32) + 1) as u8).collect::<Vec<_>>(),
+                )),
+                if row_id % 5 == 0 {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::Integer(row_id % 97 - 48)
+                },
+            ]
+        };
+
+        // Warmup phase: allow reallocations
+        for row_id in 0_i64..WARMUP_ROWS {
+            let values = generate_row(row_id);
+            serialize_record_iter_into(values.iter(), &mut scratch);
+
+            let fresh = serialize_record(&values);
+            assert_eq!(
+                scratch, fresh,
+                "bead_id=bd-gieaf scenario=SCRATCH-REUSE row={row_id} scratch and fresh outputs must match"
+            );
+        }
+
+        let capacity_after_warmup = scratch.capacity();
+        let mut realloc_count_after_warmup = 0_usize;
+
+        // Steady-state phase: verify zero reallocations
+        for row_id in WARMUP_ROWS..TOTAL_ROWS {
+            let values = generate_row(row_id);
+            let capacity_before = scratch.capacity();
+
+            serialize_record_iter_into(values.iter(), &mut scratch);
+
+            if scratch.capacity() != capacity_before {
+                realloc_count_after_warmup += 1;
+            }
+
+            let fresh = serialize_record(&values);
+            assert_eq!(
+                scratch, fresh,
+                "bead_id=bd-gieaf scenario=SCRATCH-REUSE row={row_id} scratch and fresh outputs must match"
+            );
+        }
+
+        eprintln!(
+            "INFO bead_id=bd-gieaf scenario=SCRATCH-REUSE-1000 warmup_rows={} steady_rows={} capacity_after_warmup={} reallocs_after_warmup={} replay_command=\"cargo test -p fsqlite-types -- bd_gieaf --nocapture\"",
+            WARMUP_ROWS, TOTAL_ROWS - WARMUP_ROWS, capacity_after_warmup, realloc_count_after_warmup
+        );
+        assert_eq!(
+            realloc_count_after_warmup, 0,
+            "bead_id=bd-gieaf scratch buffer should not reallocate after warmup phase"
+        );
+    }
+
+    #[test]
+    fn bd_gieaf_record_max_columns_128_roundtrip() {
+        let values: Vec<SqliteValue> = (0_i64..128)
+            .map(|i| match i % 5 {
+                0 => SqliteValue::Null,
+                1 => SqliteValue::Integer(i * 1000 + 7),
+                2 => SqliteValue::Float((i as f64) * 3.14159),
+                3 => SqliteValue::Text(SmallText::from_string(format!("col-{i:03}"))),
+                _ => SqliteValue::Blob(Arc::from(vec![
+                    (i % 256) as u8,
+                    ((i + 1) % 256) as u8,
+                    ((i + 2) % 256) as u8,
+                ])),
+            })
+            .collect();
+
+        let encoded = serialize_record(&values);
+        let decoded = parse_record(&encoded).expect("128-column record must decode");
+
+        assert_eq!(
+            decoded.len(),
+            128,
+            "bead_id=bd-gieaf scenario=MAX-COLUMNS-128 column count mismatch"
+        );
+        for (i, (orig, parsed)) in values.iter().zip(decoded.iter()).enumerate() {
+            assert!(
+                values_bitwise_eq(orig, parsed),
+                "bead_id=bd-gieaf scenario=MAX-COLUMNS-128 col={i} mismatch: orig={orig:?} parsed={parsed:?}"
+            );
+        }
+        eprintln!(
+            "INFO bead_id=bd-gieaf scenario=MAX-COLUMNS-128 columns=128 encoded_bytes={} replay_command=\"cargo test -p fsqlite-types -- bd_gieaf --nocapture\"",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn bd_gieaf_record_all_types_comprehensive_coverage() {
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-1),
+            SqliteValue::Integer(127),
+            SqliteValue::Integer(-128),
+            SqliteValue::Integer(32767),
+            SqliteValue::Integer(-32768),
+            SqliteValue::Integer(8_388_607),
+            SqliteValue::Integer(-8_388_608),
+            SqliteValue::Integer(2_147_483_647),
+            SqliteValue::Integer(-2_147_483_648),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(0.0),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(3.14159265358979),
+            SqliteValue::Float(f64::MAX),
+            SqliteValue::Float(f64::MIN_POSITIVE),
+            SqliteValue::Text(SmallText::new("")),
+            SqliteValue::Text(SmallText::new("hello")),
+            SqliteValue::Text(SmallText::from_string("x".repeat(200))),
+            SqliteValue::Blob(Arc::from(&[] as &[u8])),
+            SqliteValue::Blob(Arc::from([0xDE_u8, 0xAD, 0xBE, 0xEF].as_slice())),
+            SqliteValue::Blob(Arc::from(vec![0xCA_u8; 100])),
+        ];
+
+        let encoded = serialize_record(&values);
+        let decoded = parse_record(&encoded).expect("all-types record must decode");
+
+        assert_eq!(
+            decoded.len(),
+            values.len(),
+            "bead_id=bd-gieaf scenario=ALL-TYPES column count mismatch"
+        );
+        for (i, (orig, parsed)) in values.iter().zip(decoded.iter()).enumerate() {
+            assert!(
+                values_bitwise_eq(orig, parsed),
+                "bead_id=bd-gieaf scenario=ALL-TYPES col={i} mismatch: orig={orig:?} parsed={parsed:?}"
+            );
+        }
+        eprintln!(
+            "INFO bead_id=bd-gieaf scenario=ALL-TYPES columns={} encoded_bytes={} replay_command=\"cargo test -p fsqlite-types -- bd_gieaf --nocapture\"",
+            values.len(),
+            encoded.len()
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(10_000))]
+
+        #[test]
+        fn bd_gieaf_prop_scratch_buffer_matches_fresh_allocation(
+            values in proptest::collection::vec(arb_sqlite_value(), 0..50)
+        ) {
+            let mut scratch = Vec::new();
+            serialize_record_iter_into(values.iter(), &mut scratch);
+            let fresh = serialize_record(&values);
+
+            prop_assert_eq!(
+                scratch,
+                fresh,
+                "bead_id=bd-gieaf scenario=SCRATCH-MATCHES-FRESH scratch and fresh allocation must produce identical bytes"
+            );
+        }
+    }
 }
