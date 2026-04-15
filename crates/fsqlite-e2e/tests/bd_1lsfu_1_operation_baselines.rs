@@ -548,6 +548,7 @@ struct DecodeCacheProbeRun {
     decode_cache_invalidations_position: u64,
     decode_cache_invalidations_write: u64,
     decode_cache_invalidations_pseudo: u64,
+    record_decodes_per_row: f64,
 }
 
 fn opcode_total(profile: &fsqlite_core::connection::HotPathProfileSnapshot, opcode: &str) -> u64 {
@@ -819,7 +820,12 @@ where
     }
 }
 
-fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCacheProbeRun {
+fn run_fsqlite_decode_cache_probe(
+    sql: &str,
+    iterations: usize,
+    bench_rows: i64,
+    expected_rows: usize,
+) -> DecodeCacheProbeRun {
     const CREATE_TABLE: &str = "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT);";
     const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ?2);";
 
@@ -838,20 +844,26 @@ fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCachePr
     let conn = fsqlite::Connection::open(":memory:").unwrap();
     apply_pragmas_fsqlite(&conn);
     conn.execute(CREATE_TABLE).unwrap();
-    conn.execute_with_params(
-        INSERT_SQL,
-        &[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("decode-cache-hot-row".into()),
-        ],
-    )
-    .unwrap();
+    for id in 1..=bench_rows {
+        conn.execute_with_params(
+            INSERT_SQL,
+            &[
+                SqliteValue::Integer(id),
+                SqliteValue::Text(format!("decode-cache-hot-row-{id}").into()),
+            ],
+        )
+        .unwrap();
+    }
 
     reset_hot_path_profile();
     let start = std::time::Instant::now();
     for _ in 0..iterations {
         let rows = conn.query(sql).unwrap();
-        assert_eq!(rows.len(), 1, "probe query should return exactly one row");
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "probe query should return the expected number of rows"
+        );
     }
     let elapsed = start.elapsed();
 
@@ -863,6 +875,11 @@ fn run_fsqlite_decode_cache_probe(sql: &str, iterations: usize) -> DecodeCachePr
         decode_cache_invalidations_position: profile.vdbe.decode_cache_invalidations_position_total,
         decode_cache_invalidations_write: profile.vdbe.decode_cache_invalidations_write_total,
         decode_cache_invalidations_pseudo: profile.vdbe.decode_cache_invalidations_pseudo_total,
+        record_decodes_per_row: if profile.vdbe.result_rows_total == 0 {
+            0.0
+        } else {
+            profile.vdbe.decode_cache_misses_total as f64 / profile.vdbe.result_rows_total as f64
+        },
     }
 }
 
@@ -1748,22 +1765,22 @@ fn manual_perf_probe_prepare_cache_reuse_vs_unique_sql_variants() {
 }
 
 #[test]
-#[ignore = "manual perf probe; run via rch when investigating record-decode cache reuse"]
-fn manual_perf_probe_record_decode_cache_repeated_column_reads() {
-    const ITERATIONS: usize = 10_000;
+fn record_decode_cache_repeated_column_reads_reduce_record_decodes_per_row() {
+    const ITERATIONS: usize = 2_000;
     const REPEATED_COLUMN_SQL: &str =
         "SELECT data, data, data, data, data FROM bench WHERE id = 1;";
 
-    let repeated = run_fsqlite_decode_cache_probe(REPEATED_COLUMN_SQL, ITERATIONS);
+    let repeated = run_fsqlite_decode_cache_probe(REPEATED_COLUMN_SQL, ITERATIONS, 1, 1);
 
     eprintln!(
-        "manual_perf_probe.record_decode_cache.repeated_column_reads rows_per_sec={:.1} decode_cache_hit={} decode_cache_miss={} invalidation_position={} invalidation_write={} invalidation_pseudo={}",
+        "record_decode_cache.repeated_column_reads rows_per_sec={:.1} decode_cache_hit={} decode_cache_miss={} invalidation_position={} invalidation_write={} invalidation_pseudo={} record_decodes_per_row={:.3}",
         repeated.rows_per_sec,
         repeated.decode_cache_hits,
         repeated.decode_cache_misses,
         repeated.decode_cache_invalidations_position,
         repeated.decode_cache_invalidations_write,
         repeated.decode_cache_invalidations_pseudo,
+        repeated.record_decodes_per_row,
     );
 
     assert!(repeated.rows_per_sec > 0.0);
@@ -1771,7 +1788,47 @@ fn manual_perf_probe_record_decode_cache_repeated_column_reads() {
         repeated.decode_cache_hits > repeated.decode_cache_misses,
         "repeated-column query should produce more decode-cache hits than misses: {repeated:?}"
     );
+    assert!(
+        repeated.record_decodes_per_row <= 1.5,
+        "repeated-column query should keep record decodes near one per returned row: {repeated:?}"
+    );
     assert_eq!(repeated.decode_cache_invalidations_position, 0);
+    assert_eq!(repeated.decode_cache_invalidations_write, 0);
+    assert_eq!(repeated.decode_cache_invalidations_pseudo, 0);
+}
+
+#[test]
+fn record_decode_cache_multi_row_repeated_columns_hold_one_decode_per_row() {
+    const ITERATIONS: usize = 250;
+    const MULTI_ROW_SQL: &str =
+        "SELECT id, data, data, data FROM bench WHERE id BETWEEN 1 AND 16 ORDER BY id;";
+
+    let repeated = run_fsqlite_decode_cache_probe(MULTI_ROW_SQL, ITERATIONS, 32, 16);
+
+    eprintln!(
+        "record_decode_cache.multi_row_repeated_columns rows_per_sec={:.1} decode_cache_hit={} decode_cache_miss={} invalidation_position={} invalidation_write={} invalidation_pseudo={} record_decodes_per_row={:.3}",
+        repeated.rows_per_sec,
+        repeated.decode_cache_hits,
+        repeated.decode_cache_misses,
+        repeated.decode_cache_invalidations_position,
+        repeated.decode_cache_invalidations_write,
+        repeated.decode_cache_invalidations_pseudo,
+        repeated.record_decodes_per_row,
+    );
+
+    assert!(repeated.rows_per_sec > 0.0);
+    assert!(
+        repeated.decode_cache_hits > repeated.decode_cache_misses,
+        "multi-row repeated-column query should produce more decode-cache hits than misses: {repeated:?}"
+    );
+    assert!(
+        repeated.record_decodes_per_row <= 1.1,
+        "multi-row repeated-column query should stay near one decode miss per returned row: {repeated:?}"
+    );
+    assert!(
+        repeated.decode_cache_invalidations_position > 0,
+        "multi-row cursor movement should invalidate the per-row decode cache between rows: {repeated:?}"
+    );
     assert_eq!(repeated.decode_cache_invalidations_write, 0);
     assert_eq!(repeated.decode_cache_invalidations_pseudo, 0);
 }

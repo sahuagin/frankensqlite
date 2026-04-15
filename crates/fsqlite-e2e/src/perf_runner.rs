@@ -261,6 +261,7 @@ pub struct HotPathRecordDecodeProfile {
     pub vdbe_decoded_value_heap_bytes_total: u64,
     pub decode_cache_hits_total: u64,
     pub decode_cache_misses_total: u64,
+    pub record_decodes_per_row_basis_points: Option<u32>,
     pub decode_cache_invalidations_position_total: u64,
     pub decode_cache_invalidations_write_total: u64,
     pub decode_cache_invalidations_pseudo_total: u64,
@@ -1041,6 +1042,12 @@ fn build_hot_path_profile_report(
         vdbe_decoded_value_heap_bytes_total: snapshot.vdbe.decoded_value_heap_bytes_total,
         decode_cache_hits_total: snapshot.vdbe.decode_cache_hits_total,
         decode_cache_misses_total: snapshot.vdbe.decode_cache_misses_total,
+        record_decodes_per_row_basis_points: (snapshot.vdbe.result_rows_total != 0).then(|| {
+            ratio_basis_points(
+                snapshot.vdbe.decode_cache_misses_total,
+                snapshot.vdbe.result_rows_total,
+            )
+        }),
         decode_cache_invalidations_position_total: snapshot
             .vdbe
             .decode_cache_invalidations_position_total,
@@ -1656,6 +1663,40 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     let _ = writeln!(
         out,
         "- `invalidation_reason`: emitted by `fsqlite.statement_reuse` telemetry for cache invalidations such as `schema_cookie_changed` and `explicit_invalidate`."
+    );
+    let _ = writeln!(out);
+
+    let record_decodes_per_row = report
+        .record_decode
+        .record_decodes_per_row_basis_points
+        .map_or_else(|| "n/a".to_owned(), format_basis_points_ratio);
+    let _ = writeln!(out, "## Record Decode\n");
+    let _ = writeln!(
+        out,
+        "- `decode_cache_hit` / `decode_cache_miss`: {}/{}",
+        report.record_decode.decode_cache_hits_total,
+        report.record_decode.decode_cache_misses_total
+    );
+    let _ = writeln!(
+        out,
+        "- `decode_invalidation_reason` counts: position={} write={} pseudo={}",
+        report
+            .record_decode
+            .decode_cache_invalidations_position_total,
+        report.record_decode.decode_cache_invalidations_write_total,
+        report.record_decode.decode_cache_invalidations_pseudo_total
+    );
+    let _ = writeln!(
+        out,
+        "- `record_decodes_per_row`: {}",
+        record_decodes_per_row
+    );
+    let _ = writeln!(
+        out,
+        "- Decode time / heap bytes / column reads: {}/{}/{}",
+        report.record_decode.decode_time_ns,
+        report.record_decode.vdbe_decoded_value_heap_bytes_total,
+        report.record_decode.vdbe_column_reads_total
     );
     let _ = writeln!(out);
 
@@ -2737,6 +2778,10 @@ fn ratio_basis_points(value: u64, total: u64) -> u32 {
     let denominator = u128::from(total);
     let rounded = numerator.saturating_add(denominator / 2) / denominator;
     u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
+fn format_basis_points_ratio(value: u32) -> String {
+    format!("{:.3}", f64::from(value) / 10_000.0)
 }
 
 fn hot_path_artifact_sha256(bytes: &[u8]) -> String {
@@ -5631,6 +5676,16 @@ mod tests {
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
+                .contains("## Record Decode")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("`record_decodes_per_row`")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
                 .contains("## Connection Ceremony")
         );
         assert!(
@@ -6087,9 +6142,13 @@ mod tests {
 
         let first_scope = HotPathProfileScope::enable().unwrap();
 
-        let error = match HotPathProfileScope::enable() {
-            Ok(_) => panic!("reentrant profiling scope should fail"),
-            Err(error) => error,
+        let second_scope = HotPathProfileScope::enable();
+        assert!(
+            second_scope.is_err(),
+            "reentrant profiling scope should fail"
+        );
+        let Err(error) = second_scope else {
+            return;
         };
 
         assert!(error.to_string().contains("already active in this process"));

@@ -7794,6 +7794,7 @@ mod tests {
                 vdbe_decoded_value_heap_bytes_total: 16,
                 decode_cache_hits_total: 0,
                 decode_cache_misses_total: 1,
+                record_decodes_per_row_basis_points: Some(10_000),
                 decode_cache_invalidations_position_total: 0,
                 decode_cache_invalidations_write_total: 0,
                 decode_cache_invalidations_pseudo_total: 0,
