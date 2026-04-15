@@ -1699,7 +1699,7 @@ impl ConcurrentContext {
 /// Optionally includes [`ConcurrentContext`] for MVCC page-level locking
 /// (bd-kivg / 5E.2).
 #[derive(Clone)]
-struct SharedTxnPageIo {
+pub struct SharedTxnPageIo {
     txn: Rc<RefCell<TransactionKind>>,
     /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
     /// page-level locking for write operations.
@@ -1730,14 +1730,13 @@ impl SharedTxnPageIo {
         }
     }
 
-    #[cfg(test)]
-    fn new(txn: impl Into<TransactionKind>) -> Self {
+    /// Create a shared page-I/O wrapper over a pager transaction.
+    pub fn new(txn: impl Into<TransactionKind>) -> Self {
         Self::from_parts(txn.into(), None)
     }
 
     /// Create with MVCC concurrent context (bd-kivg / 5E.2).
-    #[cfg(test)]
-    fn with_concurrent(
+    pub fn with_concurrent(
         txn: impl Into<TransactionKind>,
         session_id: u64,
         handle: SharedConcurrentHandle,
@@ -1759,7 +1758,7 @@ impl SharedTxnPageIo {
 
     /// Unwrap back to the owned transaction handle.
     /// Returns an error if other Rc clones still exist.
-    fn into_inner(self) -> Result<TransactionKind> {
+    pub fn into_inner(self) -> Result<TransactionKind> {
         match Rc::try_unwrap(self.txn) {
             Ok(cell) => Ok(cell.into_inner()),
             Err(rc) => Err(FrankenError::Internal(format!(
