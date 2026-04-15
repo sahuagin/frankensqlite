@@ -34,8 +34,8 @@ use crate::page_cache::{PageCacheMetricsSnapshot, PageCachePageSnapshot, Sharded
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 use fsqlite_wal::{
-    FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
-    PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
+    ConsolidationPhase, FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig,
+    GroupCommitConsolidator, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionFrameBatch,
@@ -98,6 +98,8 @@ const GROUP_COMMIT_WAIT_TIMEOUT_FALLBACK: Duration = Duration::from_millis(200);
 const LEGACY_GROUP_COMMIT_ARRIVAL_WAIT: Duration = Duration::from_micros(20);
 const GROUP_COMMIT_ARRIVAL_WAIT_POLICY: &str = "fill_age_tail_safe_v1";
 const PHYSICAL_WRITER_LANE_RUN_ID: &str = "physical-writer-batching-lane";
+const PHYSICAL_WRITER_CHECKPOINT_RUN_ID: &str = "physical-writer-checkpoint-decoupling";
+const PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID: &str = "parallel_wal_checkpoint_coordination";
 // Flush busy handoff: retry on-CPU with a bounded spin budget and yield only
 // every `FLUSH_BUSY_HANDOFF_YIELD_EVERY` attempts. The owner-handoff rule is
 // that a losing flusher yields rarely and otherwise stays hot so the current
@@ -270,6 +272,80 @@ fn physical_writer_ordering_phase(arrival_wait_reason: &'static str) -> &'static
     } else {
         "group_flush"
     }
+}
+
+fn group_commit_phase_name(phase: ConsolidationPhase) -> &'static str {
+    match phase {
+        ConsolidationPhase::Filling => "filling",
+        ConsolidationPhase::Flushing => "flushing",
+        ConsolidationPhase::Complete => "complete",
+    }
+}
+
+fn transaction_mode_name(mode: TransactionMode) -> &'static str {
+    match mode {
+        TransactionMode::ReadOnly => "read_only",
+        TransactionMode::Deferred => "deferred",
+        TransactionMode::Immediate => "immediate",
+        TransactionMode::Exclusive => "exclusive",
+        TransactionMode::Concurrent => "concurrent",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckpointCoordinationQueueSnapshot {
+    queue_phase: &'static str,
+    queue_epoch: u64,
+    pending_batch_count: usize,
+}
+
+fn checkpoint_coordination_queue_snapshot(
+    queue: &GroupCommitQueueRef,
+) -> CheckpointCoordinationQueueSnapshot {
+    let consolidator = queue
+        .consolidator
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    CheckpointCoordinationQueueSnapshot {
+        queue_phase: group_commit_phase_name(consolidator.phase()),
+        queue_epoch: consolidator.epoch(),
+        pending_batch_count: consolidator.pending_batch_count(),
+    }
+}
+
+fn log_checkpoint_coordination(
+    cx: &Cx,
+    queue: &GroupCommitQueueRef,
+    checkpoint_phase: &'static str,
+    foreground_phase: &'static str,
+    foreground_action: &'static str,
+    interaction_rule: &'static str,
+    stall_avoided: bool,
+    active_transactions: u32,
+    checkpoint_active: bool,
+) {
+    let queue_snapshot = checkpoint_coordination_queue_snapshot(queue);
+    tracing::debug!(
+        target: "fsqlite::wal::checkpoint_coordination",
+        trace_id = cx.trace_id(),
+        run_id = PHYSICAL_WRITER_CHECKPOINT_RUN_ID,
+        scenario_id = PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID,
+        checkpoint_phase,
+        foreground_phase,
+        foreground_action,
+        interaction_rule,
+        stall_avoided,
+        active_transactions,
+        checkpoint_active,
+        queue_phase = queue_snapshot.queue_phase,
+        queue_epoch = queue_snapshot.queue_epoch,
+        pending_batch_count = queue_snapshot.pending_batch_count,
+        "checkpoint/foreground coordination event"
+    );
+}
+
+fn pager_group_commit_queue<V: Vfs>(pager: &SimplePager<V>) -> GroupCommitQueueRef {
+    group_commit_queue_for_backend(pager.vfs.as_ref(), &pager.db_path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3431,6 +3507,20 @@ where
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
         if inner.checkpoint_active {
+            let active_transactions = inner.active_transactions;
+            let checkpoint_active = inner.checkpoint_active;
+            drop(inner);
+            log_checkpoint_coordination(
+                cx,
+                &pager_group_commit_queue(self),
+                "active_gate",
+                "begin",
+                transaction_mode_name(mode),
+                "checkpoint_excludes_new_transactions",
+                true,
+                active_transactions,
+                checkpoint_active,
+            );
             return Err(FrankenError::Busy);
         }
 
@@ -6343,6 +6433,20 @@ where
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 if inner.checkpoint_active {
+                    let active_transactions = inner.active_transactions;
+                    let checkpoint_active = inner.checkpoint_active;
+                    drop(inner);
+                    log_checkpoint_coordination(
+                        cx,
+                        &self.group_commit_queue,
+                        "active_gate",
+                        "ensure_writer",
+                        transaction_mode_name(self.mode),
+                        "checkpoint_excludes_foreground_writer_upgrade",
+                        true,
+                        active_transactions,
+                        checkpoint_active,
+                    );
                     return Err(FrankenError::Busy);
                 }
                 // Concurrent writers don't acquire the global writer_active lock.
@@ -6356,6 +6460,20 @@ where
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                 if inner.checkpoint_active {
+                    let active_transactions = inner.active_transactions;
+                    let checkpoint_active = inner.checkpoint_active;
+                    drop(inner);
+                    log_checkpoint_coordination(
+                        cx,
+                        &self.group_commit_queue,
+                        "active_gate",
+                        "ensure_writer",
+                        transaction_mode_name(self.mode),
+                        "checkpoint_excludes_foreground_writer_upgrade",
+                        true,
+                        active_transactions,
+                        checkpoint_active,
+                    );
                     return Err(FrankenError::Busy);
                 }
                 if inner.writer_active {
@@ -8068,6 +8186,7 @@ where
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
         let cleanup_cx = cleanup_child_cx(cx);
+        let checkpoint_gate_state;
         // Take the WAL backend out of the pager while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
@@ -8082,15 +8201,44 @@ where
                 return Err(FrankenError::Unsupported);
             }
             if inner.checkpoint_active {
+                let active_transactions = inner.active_transactions;
+                let checkpoint_active = inner.checkpoint_active;
+                drop(inner);
+                log_checkpoint_coordination(
+                    cx,
+                    &pager_group_commit_queue(self),
+                    "active_gate",
+                    "checkpoint_begin",
+                    "return_busy",
+                    "checkpoint_already_owns_serialized_backend",
+                    true,
+                    active_transactions,
+                    checkpoint_active,
+                );
                 return Err(FrankenError::Busy);
             }
             // Without reader tracking in pager, the safe policy is to refuse
             // checkpoint while any transaction is active.
             if inner.active_transactions > 0 {
+                let active_transactions = inner.active_transactions;
+                let checkpoint_active = inner.checkpoint_active;
+                drop(inner);
+                log_checkpoint_coordination(
+                    cx,
+                    &pager_group_commit_queue(self),
+                    "writer_gate",
+                    "checkpoint_begin",
+                    "return_busy",
+                    "checkpoint_waits_for_foreground_writers_to_quiesce",
+                    true,
+                    active_transactions,
+                    checkpoint_active,
+                );
                 return Err(FrankenError::Busy);
             }
 
             inner.checkpoint_active = true;
+            checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
             let mut wal_guard = self
                 .wal_backend
                 .write()
@@ -8115,6 +8263,17 @@ where
             wal
         };
         // Lock is released here.
+        log_checkpoint_coordination(
+            cx,
+            &pager_group_commit_queue(self),
+            "backend_owned",
+            "foreground_idle",
+            "checkpoint_runs",
+            "checkpoint_only_enters_after_group_commit_lane_quiesces",
+            true,
+            checkpoint_gate_state.0,
+            checkpoint_gate_state.1,
+        );
 
         struct CheckpointGuard<'a, F: VfsFile> {
             inner: &'a std::sync::Mutex<PagerInner<F>>,
@@ -8185,16 +8344,66 @@ where
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
-        let mut result = guard
+        let checkpoint_result = guard
             .wal
             .as_mut()
             .expect("wal was just inserted")
-            .checkpoint(cx, effective_mode, &mut writer, 0, None)?;
+            .checkpoint(cx, effective_mode, &mut writer, 0, None);
+        if let Err(error) = &checkpoint_result {
+            let queue_snapshot =
+                checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(self));
+            tracing::warn!(
+                target: "fsqlite::wal::checkpoint_coordination",
+                trace_id = cx.trace_id(),
+                run_id = PHYSICAL_WRITER_CHECKPOINT_RUN_ID,
+                scenario_id = PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID,
+                checkpoint_phase = "error",
+                foreground_phase = "foreground_idle",
+                foreground_action = "checkpoint_failed",
+                interaction_rule = "checkpoint_keeps_foreground_writer_lane_decoupled_even_on_error",
+                stall_avoided = true,
+                active_transactions = checkpoint_gate_state.0,
+                checkpoint_active = checkpoint_gate_state.1,
+                queue_phase = queue_snapshot.queue_phase,
+                queue_epoch = queue_snapshot.queue_epoch,
+                pending_batch_count = queue_snapshot.pending_batch_count,
+                requested_mode = ?mode,
+                effective_mode = ?effective_mode,
+                failure_context = %error,
+                "checkpoint failed after acquiring exclusive checkpoint ownership"
+            );
+        }
+        let mut result = checkpoint_result?;
 
         // Surface any pager-level downgrade in the result so callers can
         // detect that their requested mode was not honored (issue #66 fix 4).
         result.requested_mode = mode;
         result.effective_mode = effective_mode;
+        let queue_snapshot =
+            checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(self));
+        tracing::debug!(
+            target: "fsqlite::wal::checkpoint_coordination",
+            trace_id = cx.trace_id(),
+            run_id = PHYSICAL_WRITER_CHECKPOINT_RUN_ID,
+            scenario_id = PHYSICAL_WRITER_CHECKPOINT_SCENARIO_ID,
+            checkpoint_phase = "complete",
+            foreground_phase = "foreground_idle",
+            foreground_action = "checkpoint_complete",
+            interaction_rule = "checkpoint_keeps_foreground_writer_lane_idle_until_release",
+            stall_avoided = true,
+            active_transactions = checkpoint_gate_state.0,
+            checkpoint_active = checkpoint_gate_state.1,
+            queue_phase = queue_snapshot.queue_phase,
+            queue_epoch = queue_snapshot.queue_epoch,
+            pending_batch_count = queue_snapshot.pending_batch_count,
+            requested_mode = ?result.requested_mode,
+            effective_mode = ?result.effective_mode,
+            total_frames = result.total_frames,
+            frames_backfilled = result.frames_backfilled,
+            completed = result.completed,
+            wal_was_reset = result.wal_was_reset,
+            "checkpoint completed without re-entering the foreground physical writer lane"
+        );
         Ok(result)
     }
 }
@@ -8213,6 +8422,7 @@ mod tests {
 
     const BEAD_ID: &str = "bd-bca.1";
     const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
+    const CHECKPOINT_DECOUPLING_BEAD_ID: &str = "bd-1dp9.6.7.9.2";
     type ObservedLockLevel = Arc<Mutex<LockLevel>>;
     type ObservedUnlockTraceIds = Arc<Mutex<Vec<u64>>>;
     type ObservedCleanupUnlockHarness = (
@@ -11095,6 +11305,8 @@ mod tests {
         }
     }
 
+    struct FailingCheckpointWalBackend;
+
     struct PreparedBatchObservedWalBackend {
         frames: SharedFrames,
         append_frames_calls: SharedCounter,
@@ -11528,6 +11740,41 @@ mod tests {
                 requested_mode: _mode,
                 effective_mode: _mode,
             })
+        }
+    }
+
+    impl crate::traits::WalBackend for FailingCheckpointWalBackend {
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+            _page_data: &[u8],
+            _db_size_if_commit: u32,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            0
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> Result<crate::traits::CheckpointResult> {
+            Err(FrankenError::BusyRecovery)
         }
     }
 
@@ -12559,6 +12806,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_busy_with_active_reader() {
+        init_publication_test_tracing();
         let (pager, _frames) = wal_pager();
         let cx = Cx::new();
 
@@ -12578,6 +12826,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_busy_with_active_writer() {
+        init_publication_test_tracing();
         let (pager, _frames) = wal_pager();
         let cx = Cx::new();
 
@@ -12586,6 +12835,86 @@ mod tests {
             .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
             .expect_err("checkpoint should be blocked by active writer");
         assert!(matches!(err, FrankenError::Busy));
+    }
+
+    #[test]
+    fn test_checkpoint_coordination_blocks_new_writer_when_checkpoint_active() {
+        init_publication_test_tracing();
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        {
+            let mut inner = pager
+                .inner
+                .lock()
+                .expect("checkpoint coordination test lock poisoned");
+            inner.checkpoint_active = true;
+        }
+
+        let err = match pager.begin(&cx, TransactionMode::Concurrent) {
+            Ok(_) => panic!("checkpoint-active pager should reject foreground writer begin"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_active_blocks_writer_begin error={err}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_coordination_reports_idle_queue_on_success() {
+        init_publication_test_tracing();
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        let result = pager
+            .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
+            .expect("idle checkpoint should succeed");
+        let queue_snapshot =
+            checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(&pager));
+        assert_eq!(
+            queue_snapshot.queue_phase, "filling",
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_success_queue_phase"
+        );
+        assert_eq!(
+            queue_snapshot.pending_batch_count, 0,
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_success_queue_pending_count"
+        );
+        assert_eq!(
+            result.total_frames, 0,
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_success_total_frames"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_coordination_preserves_foreground_isolation_on_checkpoint_error() {
+        init_publication_test_tracing();
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        pager
+            .set_wal_backend(Box::new(FailingCheckpointWalBackend))
+            .expect("install failing checkpoint wal backend");
+
+        let err = pager
+            .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
+            .expect_err("failing checkpoint backend should surface error");
+        assert!(
+            matches!(err, FrankenError::BusyRecovery),
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_error_surfaces_backend_failure error={err}"
+        );
+
+        let queue_snapshot =
+            checkpoint_coordination_queue_snapshot(&pager_group_commit_queue(&pager));
+        assert_eq!(
+            queue_snapshot.pending_batch_count, 0,
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_error_keeps_foreground_queue_idle"
+        );
+
+        let metadata = pager.published_snapshot();
+        assert!(
+            !metadata.checkpoint_active,
+            "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_error_releases_checkpoint_flag"
+        );
     }
 
     #[test]
