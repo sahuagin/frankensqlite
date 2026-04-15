@@ -958,8 +958,52 @@ fn write_benchmark_artifact_bundle(
         )
     })?;
 
-    let hardware_discovery_summary = format!(
-        "# Hardware Discovery\n\n- Fixture: `{}`\n- Row: `{}`\n- Mode: `{}`\n- Placement profile: `{}`\n- Hardware class: `{}`\n- Hardware signature: `{}`\n- OS: `{}`\n- Arch: `{}`\n- CPU count: `{}`\n- Cargo profile: `{}`\n",
+    let hardware_discovery_summary = render_hardware_discovery_summary(summary, comparison);
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.hardware_discovery_summary_md),
+        hardware_discovery_summary,
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark hardware discovery summary {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    fs::write(
+        bundle_dir.join(&manifest.artifact_names.manifest_json),
+        serde_json::to_vec_pretty(manifest)
+            .map_err(|error| format!("serialize benchmark artifact manifest: {error}"))?,
+    )
+    .map_err(|error| {
+        format!(
+            "write benchmark artifact manifest {}: {error}",
+            bundle_dir.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn describe_optional_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn describe_optional_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+}
+
+fn render_hardware_discovery_summary(
+    summary: &BenchmarkSummary,
+    comparison: &BenchmarkComparisonMetadata,
+) -> String {
+    let build_hygiene = &summary.environment.build_hygiene;
+    format!(
+        "# Hardware Discovery\n\n- Fixture: `{}`\n- Row: `{}`\n- Mode: `{}`\n- Placement profile: `{}`\n- Hardware class: `{}`\n- Hardware signature: `{}`\n- OS: `{}`\n- Arch: `{}`\n- CPU count: `{}`\n- Cargo profile: `{}`\n- Authoritative perf profile: `{}`\n- Matches authoritative perf profile: `{}`\n- Build opt level: `{}`\n- Debug assertions: `{}`\n- Panic strategy: `{}`\n- Profile LTO: `{}`\n- Profile codegen units: `{}`\n- Profile debug symbols: `{}`\n- Profile strip: `{}`\n",
         summary.fixture_id,
         comparison
             .row_identity
@@ -986,31 +1030,16 @@ fn write_benchmark_artifact_bundle(
         summary.environment.arch,
         summary.environment.cpu_count,
         summary.environment.cargo_profile,
-    );
-    fs::write(
-        bundle_dir.join(&manifest.artifact_names.hardware_discovery_summary_md),
-        hardware_discovery_summary,
+        build_hygiene.authoritative_cargo_profile,
+        build_hygiene.matches_authoritative_profile,
+        build_hygiene.opt_level,
+        build_hygiene.debug_assertions,
+        build_hygiene.panic_strategy,
+        describe_optional_bool(build_hygiene.profile_lto),
+        describe_optional_u32(build_hygiene.profile_codegen_units),
+        describe_optional_bool(build_hygiene.profile_debug_symbols),
+        describe_optional_bool(build_hygiene.profile_strip),
     )
-    .map_err(|error| {
-        format!(
-            "write benchmark hardware discovery summary {}: {error}",
-            bundle_dir.display()
-        )
-    })?;
-
-    fs::write(
-        bundle_dir.join(&manifest.artifact_names.manifest_json),
-        serde_json::to_vec_pretty(manifest)
-            .map_err(|error| format!("serialize benchmark artifact manifest: {error}"))?,
-    )
-    .map_err(|error| {
-        format!(
-            "write benchmark artifact manifest {}: {error}",
-            bundle_dir.display()
-        )
-    })?;
-
-    Ok(())
 }
 
 fn attach_canonical_benchmark_metadata(
@@ -7551,7 +7580,10 @@ mod tests {
         PlacementVariant, PlacementViolationDisposition, RetryPolicy, SeedPolicy,
         build_benchmark_artifact_manifest,
     };
-    use fsqlite_e2e::methodology::{EnvironmentCaptureMode, EnvironmentMeta, MethodologyMeta};
+    use fsqlite_e2e::methodology::{
+        AUTHORITATIVE_PERF_CARGO_PROFILE, BuildHygieneMeta, EnvironmentCaptureMode,
+        EnvironmentMeta, MethodologyMeta,
+    };
     use fsqlite_e2e::perf_runner::{
         HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
@@ -8114,6 +8146,34 @@ mod tests {
         cell
     }
 
+    fn sample_build_hygiene(cargo_profile: &str) -> BuildHygieneMeta {
+        match cargo_profile {
+            "release" => BuildHygieneMeta {
+                authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
+                matches_authoritative_profile: false,
+                opt_level: "3".to_owned(),
+                debug_assertions: false,
+                panic_strategy: "abort".to_owned(),
+                profile_lto: Some(true),
+                profile_codegen_units: Some(1),
+                profile_debug_symbols: Some(true),
+                profile_strip: Some(false),
+            },
+            "release-perf" => BuildHygieneMeta {
+                authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
+                matches_authoritative_profile: true,
+                opt_level: "3".to_owned(),
+                debug_assertions: false,
+                panic_strategy: "abort".to_owned(),
+                profile_lto: Some(true),
+                profile_codegen_units: Some(1),
+                profile_debug_symbols: Some(false),
+                profile_strip: Some(true),
+            },
+            _ => BuildHygieneMeta::unknown(),
+        }
+    }
+
     fn sample_benchmark_summary(
         workspace_root: &Path,
         mode: BenchmarkMode,
@@ -8136,6 +8196,7 @@ mod tests {
                 ram_bytes: Some(64 * 1_073_741_824),
                 rustc_version: "rustc 1.91.0-nightly".to_owned(),
                 cargo_profile: "release-perf".to_owned(),
+                build_hygiene: sample_build_hygiene("release-perf"),
             },
             warmup_count: 1,
             measurement_count: 1,
@@ -8225,6 +8286,7 @@ mod tests {
                 ram_bytes: Some(64 * 1_073_741_824),
                 rustc_version: "rustc 1.91.0-nightly".to_owned(),
                 cargo_profile: "release-perf".to_owned(),
+                build_hygiene: sample_build_hygiene("release-perf"),
             },
             warmup_count: 0,
             measurement_count: 1,
@@ -8527,6 +8589,10 @@ mod tests {
         );
         assert_eq!(value["environment"]["capture_mode"], "suppressed");
         assert_eq!(value["environment"]["os"], "suppressed");
+        assert_eq!(
+            value["environment"]["build_hygiene"]["authoritative_cargo_profile"],
+            "release-perf"
+        );
     }
 
     #[test]
@@ -8558,6 +8624,39 @@ mod tests {
         assert!(value.get("environment").is_some());
         assert!(value.get("methodology").is_some());
         assert_eq!(value["environment"]["capture_mode"], "captured");
+        assert_eq!(
+            value["environment"]["build_hygiene"]["authoritative_cargo_profile"],
+            "release-perf"
+        );
+        assert_eq!(
+            value["environment"]["build_hygiene"]["matches_authoritative_profile"],
+            false
+        );
+    }
+
+    #[test]
+    fn hardware_discovery_summary_includes_build_hygiene_contract() {
+        let summary = sample_benchmark_summary(
+            &workspace_root(),
+            BenchmarkMode::FsqliteMvcc,
+            "fsqlite_mvcc",
+            400,
+        );
+        let comparison = summary
+            .comparison
+            .as_ref()
+            .expect("sample summary should include comparison metadata");
+
+        let rendered = render_hardware_discovery_summary(&summary, comparison);
+
+        assert!(rendered.contains("- Cargo profile: `release-perf`"));
+        assert!(rendered.contains("- Authoritative perf profile: `release-perf`"));
+        assert!(rendered.contains("- Matches authoritative perf profile: `true`"));
+        assert!(rendered.contains("- Build opt level: `3`"));
+        assert!(rendered.contains("- Debug assertions: `false`"));
+        assert!(rendered.contains("- Profile LTO: `true`"));
+        assert!(rendered.contains("- Profile debug symbols: `false`"));
+        assert!(rendered.contains("- Profile strip: `true`"));
     }
 
     #[test]

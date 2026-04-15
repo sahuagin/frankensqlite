@@ -184,6 +184,8 @@ debug = true
 [profile.release-perf]
 inherits = "release"
 opt-level = 3
+debug = false
+strip = true
 
 [profile.dev]
 opt-level = 1

@@ -52,6 +52,9 @@ pub const MIN_MEASUREMENT_ITERATIONS: u32 = 20;
 /// have been collected.
 pub const MEASUREMENT_TIME_SECS: u64 = 10;
 
+/// Canonical cargo profile for authoritative throughput measurements.
+pub const AUTHORITATIVE_PERF_CARGO_PROFILE: &str = "release-perf";
+
 /// Methodology metadata embedded in every benchmark report.
 ///
 /// This record is serialized into the report JSON so that consumers can
@@ -111,6 +114,85 @@ pub enum EnvironmentCaptureMode {
     Suppressed,
 }
 
+/// Build/profile hygiene metadata attached to benchmark artifacts.
+///
+/// Host probing can be suppressed for profiler-safe runs, but these fields are
+/// compile-time or repo-contract facts and should remain visible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildHygieneMeta {
+    /// Cargo profile designated as authoritative for throughput comparisons.
+    pub authoritative_cargo_profile: String,
+    /// Whether the current binary matches the designated authoritative profile.
+    pub matches_authoritative_profile: bool,
+    /// Actual Rust codegen optimization level for this binary.
+    pub opt_level: String,
+    /// Whether Rust debug assertions are compiled into this binary.
+    pub debug_assertions: bool,
+    /// Panic strategy compiled into this binary.
+    pub panic_strategy: String,
+    /// Expected LTO state from the repo's Cargo profile contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_lto: Option<bool>,
+    /// Expected codegen-unit count from the repo's Cargo profile contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_codegen_units: Option<u32>,
+    /// Expected debug-symbol state from the repo's Cargo profile contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_debug_symbols: Option<bool>,
+    /// Expected binary strip state from the repo's Cargo profile contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_strip: Option<bool>,
+}
+
+impl BuildHygieneMeta {
+    #[must_use]
+    pub fn capture(cargo_profile: &str) -> Self {
+        let (profile_lto, profile_codegen_units, profile_debug_symbols, profile_strip) =
+            profile_contract_expectations(cargo_profile);
+        Self {
+            authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
+            matches_authoritative_profile: cargo_profile == AUTHORITATIVE_PERF_CARGO_PROFILE,
+            opt_level: option_env!("OPT_LEVEL").unwrap_or("unknown").to_owned(),
+            debug_assertions: cfg!(debug_assertions),
+            panic_strategy: if cfg!(panic = "abort") {
+                "abort"
+            } else {
+                "unwind"
+            }
+            .to_owned(),
+            profile_lto,
+            profile_codegen_units,
+            profile_debug_symbols,
+            profile_strip,
+        }
+    }
+
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self {
+            authoritative_cargo_profile: AUTHORITATIVE_PERF_CARGO_PROFILE.to_owned(),
+            matches_authoritative_profile: false,
+            opt_level: "unknown".to_owned(),
+            debug_assertions: false,
+            panic_strategy: "unknown".to_owned(),
+            profile_lto: None,
+            profile_codegen_units: None,
+            profile_debug_symbols: None,
+            profile_strip: None,
+        }
+    }
+}
+
+fn profile_contract_expectations(
+    cargo_profile: &str,
+) -> (Option<bool>, Option<u32>, Option<bool>, Option<bool>) {
+    match cargo_profile {
+        "release" => (Some(true), Some(1), Some(true), Some(false)),
+        AUTHORITATIVE_PERF_CARGO_PROFILE => (Some(true), Some(1), Some(false), Some(true)),
+        _ => (None, None, None, None),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvironmentMeta {
     /// Whether the environment was fully probed or intentionally suppressed.
@@ -133,6 +215,9 @@ pub struct EnvironmentMeta {
     pub rustc_version: String,
     /// Cargo profile used (e.g. "release", "release-perf").
     pub cargo_profile: String,
+    /// Build/profile contract proving which perf-binary knobs were active.
+    #[serde(default = "BuildHygieneMeta::unknown")]
+    pub build_hygiene: BuildHygieneMeta,
 }
 
 impl EnvironmentMeta {
@@ -151,6 +236,7 @@ impl EnvironmentMeta {
             ram_bytes: detect_ram_bytes(),
             rustc_version: detect_rustc_version(),
             cargo_profile: cargo_profile.to_owned(),
+            build_hygiene: BuildHygieneMeta::capture(cargo_profile),
         }
     }
 
@@ -166,6 +252,7 @@ impl EnvironmentMeta {
             ram_bytes: None,
             rustc_version: "suppressed".to_owned(),
             cargo_profile: cargo_profile.to_owned(),
+            build_hygiene: BuildHygieneMeta::capture(cargo_profile),
         }
     }
 }
@@ -275,6 +362,12 @@ mod tests {
         assert!(env.cpu_count >= 1);
         assert!(!env.rustc_version.is_empty());
         assert_eq!(env.cargo_profile, "release");
+        assert_eq!(
+            env.build_hygiene.authoritative_cargo_profile,
+            AUTHORITATIVE_PERF_CARGO_PROFILE
+        );
+        assert_eq!(env.build_hygiene.debug_assertions, cfg!(debug_assertions));
+        assert!(!env.build_hygiene.opt_level.is_empty());
     }
 
     #[test]
@@ -286,6 +379,7 @@ mod tests {
         assert_eq!(parsed.arch, env.arch);
         assert_eq!(parsed.cpu_count, env.cpu_count);
         assert_eq!(parsed.cargo_profile, "release-perf");
+        assert_eq!(parsed.build_hygiene, env.build_hygiene);
     }
 
     #[test]
@@ -299,6 +393,11 @@ mod tests {
         assert_eq!(parsed.cpu_count, 0);
         assert_eq!(parsed.rustc_version, "suppressed");
         assert_eq!(parsed.cargo_profile, "release");
+        assert_eq!(
+            parsed.build_hygiene.authoritative_cargo_profile,
+            AUTHORITATIVE_PERF_CARGO_PROFILE
+        );
+        assert_eq!(parsed.build_hygiene.profile_lto, Some(true));
     }
 
     #[test]
@@ -318,6 +417,29 @@ mod tests {
         assert_eq!(parsed.capture_mode, EnvironmentCaptureMode::Captured);
         assert_eq!(parsed.arch, "x86_64");
         assert_eq!(parsed.cpu_count, 8);
+        assert_eq!(
+            parsed.build_hygiene.authoritative_cargo_profile,
+            AUTHORITATIVE_PERF_CARGO_PROFILE
+        );
+        assert_eq!(parsed.build_hygiene.opt_level, "unknown");
+    }
+
+    #[test]
+    fn release_perf_profile_contract_is_explicit_in_workspace_cargo_toml() {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let cargo_toml = std::fs::read_to_string(workspace_root.join("Cargo.toml"))
+            .expect("workspace Cargo.toml should be readable");
+        let release_perf_section = cargo_toml
+            .split("[profile.release-perf]")
+            .nth(1)
+            .expect("release-perf profile should exist");
+
+        assert!(release_perf_section.contains("inherits = \"release\""));
+        assert!(release_perf_section.contains("opt-level = 3"));
+        assert!(release_perf_section.contains("debug = false"));
+        assert!(release_perf_section.contains("strip = true"));
     }
 
     #[test]
