@@ -511,6 +511,27 @@ campaign manifest, but unless the operator also supplies external CPU and memory
 binding, the collector will mark them as declared-only rather than cleanly
 comparable topology-enforced runs.
 
+When `BEAD_ID=bd-db300.8.1.2`, the collector also emits:
+
+- `classification.json`
+- `classification.md`
+
+Those artifacts live beside the run-level `report.json` and `summary.md`. They
+combine the fresh declared-only H1.2 packs with the latest comparable
+`bd-db300.8.1.1` baseline report for `frankensqlite`, so H2 gets an explicit
+classification instead of only raw pack deltas.
+
+If you already have the pack manifests and only need to regenerate the
+classification or run-level report after script updates, reuse the existing
+output directory:
+
+```bash
+POSTPROCESS_ONLY=1 \
+OUTPUT_DIR=artifacts/perf/bd-db300.8.1.2/<run_id> \
+BEAD_ID=bd-db300.8.1.2 \
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
 ### Persistent Phase-Attribution Packs
 
 `bd-db300.1.7.2` uses the persistent Criterion harness, not `realdb-e2e bench`.

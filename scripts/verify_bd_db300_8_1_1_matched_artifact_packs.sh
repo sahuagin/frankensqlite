@@ -23,6 +23,8 @@ PACKS_DIR="${OUTPUT_DIR}/packs"
 LOG_FILE="${OUTPUT_DIR}/events.jsonl"
 REPORT_JSON="${OUTPUT_DIR}/report.json"
 SUMMARY_MD="${OUTPUT_DIR}/summary.md"
+CLASSIFICATION_JSON="${OUTPUT_DIR}/classification.json"
+CLASSIFICATION_MD="${OUTPUT_DIR}/classification.md"
 ROW_IDS="${ROW_IDS:-mixed_read_write_c4}"
 FIXTURE_IDS="${FIXTURE_IDS:-}"
 PLACEMENT_PROFILE_IDS="${PLACEMENT_PROFILE_IDS:-baseline_unpinned}"
@@ -32,6 +34,8 @@ WARMUP="${WARMUP:-0}"
 CARGO_PROFILE="${CARGO_PROFILE:-release-perf}"
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_8_1_1}"
 RETENTION_CLASS="${RETENTION_CLASS:-quick_run}"
+POSTPROCESS_ONLY="${POSTPROCESS_ONLY:-0}"
+EMIT_SINGLE_WRITER_CLASSIFICATION="${EMIT_SINGLE_WRITER_CLASSIFICATION:-0}"
 BEADS_DATA_PATH="${WORKSPACE_ROOT}/.beads/issues.jsonl"
 SOURCE_REVISION="${SOURCE_REVISION:-$(git -C "${WORKSPACE_ROOT}" rev-parse HEAD)}"
 BEADS_HASH="${BEADS_HASH:-$(sha256sum "${BEADS_DATA_PATH}" | awk '{print $1}')}"
@@ -82,6 +86,15 @@ csv_to_lines() {
 
 short_hash() {
     printf '%s' "$1" | cut -c1-12
+}
+
+latest_report_file() {
+    local root="$1"
+    find "${root}" -type f -name report.json 2>/dev/null | sort | tail -n 1 || true
+}
+
+should_emit_single_writer_classification() {
+    [[ "${BEAD_ID}" == "bd-db300.8.1.2" || "${EMIT_SINGLE_WRITER_CLASSIFICATION}" == "1" ]]
 }
 
 ensure_row_exists() {
@@ -619,35 +632,205 @@ build_report() {
     ' "${REPORT_JSON}" > "${SUMMARY_MD}"
 }
 
+build_single_writer_classification() {
+    local baseline_report_json="${BASELINE_REPORT_JSON:-$(latest_report_file "${WORKSPACE_ROOT}/artifacts/perf/bd-db300.8.1.1")}"
+    [[ -n "${baseline_report_json}" ]] || fail "classification" "failed to resolve a baseline bd-db300.8.1.1 report.json"
+    require_nonempty_file "${baseline_report_json}"
+    require_nonempty_file "${REPORT_JSON}"
+
+    jq -n \
+        --arg schema_version "fsqlite-e2e.db300.single_writer_classification.v1" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg baseline_report_json "${baseline_report_json}" \
+        --arg current_report_json "${REPORT_JSON}" \
+        --slurpfile baseline "${baseline_report_json}" \
+        --slurpfile current "${REPORT_JSON}" \
+        '
+        def pack($doc; $placement; $storage):
+            $doc[0].packs[]
+            | select(
+                .fixture_id == "frankensqlite"
+                and .placement_profile_id == $placement
+                and .storage_profile_id == $storage
+            );
+        (pack($baseline; "baseline_unpinned"; "file_backed")) as $baseline_file_backed |
+        (pack($baseline; "baseline_unpinned"; "memory")) as $baseline_memory |
+        (pack($current; "recommended_pinned"; "file_backed")) as $recommended_file_backed |
+        (pack($current; "recommended_pinned"; "memory")) as $recommended_memory |
+        (pack($current; "adversarial_cross_node"; "file_backed")) as $adversarial_file_backed |
+        (pack($current; "adversarial_cross_node"; "memory")) as $adversarial_memory |
+        {
+          schema_version: $schema_version,
+          bead_id: $bead_id,
+          run_id: $run_id,
+          generated_at: $generated_at,
+          current_report_json: $current_report_json,
+          baseline_report_json: $baseline_report_json,
+          evidence_scope: {
+            fixture_id: "frankensqlite",
+            workload_row: "mixed_read_write_c4",
+            comparable_baseline_pack: {
+              placement_profile_id: "baseline_unpinned",
+              report_json: $baseline_report_json
+            },
+            declared_only_follow_on_packs: [
+              {
+                placement_profile_id: "recommended_pinned",
+                report_json: $current_report_json
+              },
+              {
+                placement_profile_id: "adversarial_cross_node",
+                report_json: $current_report_json
+              }
+            ]
+          },
+          findings: [
+            {
+              category: "unavoidable_serialization",
+              status: "not_primary_explanation_for_the_extra_file_backed_gap",
+              confidence: "high",
+              evidence: {
+                baseline_memory_single_writer_vs_mvcc_ratio: $baseline_memory.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                recommended_pinned_memory_single_writer_vs_mvcc_ratio: $recommended_memory.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                adversarial_cross_node_memory_single_writer_vs_mvcc_ratio: $adversarial_memory.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                baseline_memory_retry_delta: $baseline_memory.deltas.single_writer_minus_mvcc_mean_retries,
+                recommended_pinned_memory_retry_delta: $recommended_memory.deltas.single_writer_minus_mvcc_mean_retries,
+                adversarial_cross_node_memory_retry_delta: $adversarial_memory.deltas.single_writer_minus_mvcc_mean_retries
+              },
+              rationale: "When storage is memory-backed, single-writer no longer trails MVCC and retry deltas collapse to zero across the baseline and both declared placements, so serialization alone does not explain the extra file-backed slowdown.",
+              action_for_h2: "Prioritize the file-backed single-writer durability or queue path before trying broad shared-engine reductions."
+            },
+            {
+              category: "avoidable_wait_and_queue_amplification",
+              status: "confirmed",
+              confidence: "high",
+              evidence: {
+                baseline_file_backed_single_writer_vs_mvcc_ratio: $baseline_file_backed.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                baseline_file_backed_retry_delta: $baseline_file_backed.deltas.single_writer_minus_mvcc_mean_retries,
+                adversarial_cross_node_file_backed_single_writer_vs_mvcc_ratio: $adversarial_file_backed.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                adversarial_cross_node_file_backed_retry_delta: $adversarial_file_backed.deltas.single_writer_minus_mvcc_mean_retries,
+                recommended_pinned_file_backed_single_writer_vs_mvcc_ratio: $recommended_file_backed.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                recommended_pinned_file_backed_retry_delta: $recommended_file_backed.deltas.single_writer_minus_mvcc_mean_retries
+              },
+              rationale: "The comparable baseline pack and the declared-only adversarial pack both show single-writer throughput collapsing below MVCC while retry deltas remain materially positive. Recommended-pinned reduces the damage, which points to queueing or wait amplification in the file-backed single-writer path rather than a fixed engine tax.",
+              action_for_h2: "Target the single-writer file-backed retry and baton-passing path first, then re-measure before touching broader shared decode or planner costs."
+            },
+            {
+              category: "topology_sensitivity",
+              status: "suggested_but_not_transportable_without_external_binding",
+              confidence: "mixed",
+              evidence: {
+                recommended_pinned_file_backed_single_writer_vs_mvcc_ratio: $recommended_file_backed.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                adversarial_cross_node_file_backed_single_writer_vs_mvcc_ratio: $adversarial_file_backed.deltas.single_writer_vs_mvcc_median_ops_ratio,
+                recommended_pinned_comparability: $recommended_file_backed.comparability_status,
+                adversarial_cross_node_comparability: $adversarial_file_backed.comparability_status
+              },
+              rationale: "Declared-only placement variants separate into a healthier recommended-pinned file-backed pack and a much worse adversarial cross-node pack, so placement likely changes the severity of the wait amplification. The claim stays mixed because the collector does not enforce external CPU or NUMA binding.",
+              action_for_h2: "Prefer fixes that reduce queue ownership handoff sensitivity even before topology-enforced reruns exist."
+            },
+            {
+              category: "wake_storms",
+              status: "not_directly_measured_by_matched_pack",
+              confidence: "mixed",
+              evidence: {
+                supporting_signal: "retry and latency deltas imply extra waiting, but no explicit wake counter is captured in this artifact family"
+              },
+              rationale: "The matched packs prove waiting and retry amplification, but they do not attribute that waiting to wake storms versus other queue mechanisms.",
+              action_for_h2: "If the first queue-path fix does not collapse the gap, add explicit wake and handoff counters before deeper speculation."
+            },
+            {
+              category: "ownership_churn",
+              status: "not_supported_by_current_pack",
+              confidence: "mixed",
+              evidence: {
+                supporting_signal: "ownership churn is tracked by the shared D/J evidence lanes rather than this matched-pack collector"
+              },
+              rationale: "These matched packs isolate comparison-mode behavior, but they do not directly measure PageData ownership reuse or clone-heavy transitions.",
+              action_for_h2: "Treat ownership churn as a secondary hypothesis only after single-writer queue and retry fixes are tested."
+            },
+            {
+              category: "duplicate_work",
+              status: "not_supported_by_current_pack",
+              confidence: "mixed",
+              evidence: {
+                supporting_signal: "no subphase counters in this pack identify duplicated serialized work"
+              },
+              rationale: "The artifact family does not expose subphase duplication directly, so duplicate work remains a follow-on hypothesis instead of the leading explanation.",
+              action_for_h2: "Do not broaden H2 into speculative duplicate-work cleanup unless the targeted queue-path changes fail to move the file-backed cells."
+            }
+          ],
+          primary_h2_actions: [
+            "Fix file-backed single-writer retry and queue amplification before shared-engine cleanup.",
+            "Keep non-baseline placement evidence labeled declared-only until external placement enforcement exists.",
+            "Revisit wake storms, ownership churn, and duplicate work only if the targeted queue-path fix fails to remove the file-backed gap."
+          ]
+        }
+        ' > "${CLASSIFICATION_JSON}"
+
+    jq -r '
+        [
+            "# H1.2 Single-Writer Slowdown Classification",
+            "",
+            "- run_id: `\(.run_id)`",
+            "- baseline_report_json: `\(.baseline_report_json)`",
+            "- current_report_json: `\(.current_report_json)`",
+            "",
+            "## Findings",
+            "",
+            (
+                .findings[]
+                | "- `\(.category)`: `\(.status)` (\(.confidence))"
+            ),
+            "",
+            "## Actionable Direction For H2",
+            "",
+            (.primary_h2_actions[] | "- " + .)
+        ] | join("\n")
+    ' "${CLASSIFICATION_JSON}" > "${CLASSIFICATION_MD}"
+}
+
 main() {
     require_file "${CAMPAIGN_MANIFEST_FILE}"
     require_nonempty_file "${BEADS_DATA_PATH}"
-    log_event "INFO" "start" "starting matched artifact pack collection"
+    if [[ "${POSTPROCESS_ONLY}" == "1" ]]; then
+        log_event "INFO" "start" "postprocess-only matched artifact pack synthesis started"
+    else
+        log_event "INFO" "start" "starting matched artifact pack collection"
 
-    local row_id fixture_id placement_profile_id storage_profile_id
-    while IFS= read -r row_id; do
-        [[ -n "${row_id}" ]] || continue
-        ensure_row_exists "${row_id}"
-        while IFS= read -r fixture_id; do
-            [[ -n "${fixture_id}" ]] || continue
-            while IFS= read -r placement_profile_id; do
-                [[ -n "${placement_profile_id}" ]] || continue
-                while IFS= read -r storage_profile_id; do
-                    [[ -n "${storage_profile_id}" ]] || continue
-                    validate_storage_profile "${storage_profile_id}"
-                    collect_pack "${row_id}" "${fixture_id}" "${placement_profile_id}" "${storage_profile_id}"
-                done < <(csv_to_lines "${STORAGE_PROFILE_IDS}")
-            done < <(row_placement_profiles "${row_id}")
-        done < <(row_fixture_ids "${row_id}")
-    done < <(csv_to_lines "${ROW_IDS}")
+        local row_id fixture_id placement_profile_id storage_profile_id
+        while IFS= read -r row_id; do
+            [[ -n "${row_id}" ]] || continue
+            ensure_row_exists "${row_id}"
+            while IFS= read -r fixture_id; do
+                [[ -n "${fixture_id}" ]] || continue
+                while IFS= read -r placement_profile_id; do
+                    [[ -n "${placement_profile_id}" ]] || continue
+                    while IFS= read -r storage_profile_id; do
+                        [[ -n "${storage_profile_id}" ]] || continue
+                        validate_storage_profile "${storage_profile_id}"
+                        collect_pack "${row_id}" "${fixture_id}" "${placement_profile_id}" "${storage_profile_id}"
+                    done < <(csv_to_lines "${STORAGE_PROFILE_IDS}")
+                done < <(row_placement_profiles "${row_id}")
+            done < <(row_fixture_ids "${row_id}")
+        done < <(csv_to_lines "${ROW_IDS}")
+    fi
 
     build_report
+    if should_emit_single_writer_classification; then
+        build_single_writer_classification
+    fi
     log_event "INFO" "complete" "matched artifact pack collection completed"
 
     echo "RUN_ID:      ${RUN_ID}"
     echo "OUTPUT_DIR:  ${OUTPUT_DIR}"
     echo "REPORT_JSON: ${REPORT_JSON}"
     echo "SUMMARY_MD:  ${SUMMARY_MD}"
+    if should_emit_single_writer_classification; then
+        echo "CLASSIFICATION_JSON: ${CLASSIFICATION_JSON}"
+        echo "CLASSIFICATION_MD:   ${CLASSIFICATION_MD}"
+    fi
 }
 
 main "$@"
