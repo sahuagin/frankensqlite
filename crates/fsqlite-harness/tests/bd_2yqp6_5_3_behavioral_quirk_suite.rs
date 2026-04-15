@@ -286,6 +286,43 @@ fn inline_total_no_overflow_fixture() -> TestFixture {
     }
 }
 
+fn inline_scalar_vs_aggregate_min_max_null_fixture() -> TestFixture {
+    TestFixture {
+        id: "e3_scalar_vs_aggregate_min_max_nulls".to_owned(),
+        description:
+            "Scalar min/max return NULL if any argument is NULL, while aggregate min/max ignore NULL rows"
+                .to_owned(),
+        ops: vec![
+            FixtureOp::Open {
+                path: ":memory:".to_owned(),
+            },
+            FixtureOp::Query {
+                sql: "WITH vals(v) AS (VALUES(NULL), (1), (3)) \
+                      SELECT max(1, NULL, 3) IS NULL, \
+                             min(1, NULL, 3) IS NULL, \
+                             max(v), \
+                             min(v), \
+                             count(v) \
+                      FROM vals"
+                    .to_owned(),
+                expect: QueryExpectation {
+                    rows: vec![vec![
+                        "1".to_owned(),
+                        "1".to_owned(),
+                        "3".to_owned(),
+                        "1".to_owned(),
+                        "2".to_owned(),
+                    ]],
+                    ordered: true,
+                    ..QueryExpectation::default()
+                },
+            },
+        ],
+        fsqlite_modes: vec![FsqliteMode::Compatibility, FsqliteMode::Native],
+        divergence: None,
+    }
+}
+
 fn quirk_scenarios() -> Vec<QuirkScenario> {
     vec![
         load_fixture_scenario(
@@ -377,6 +414,14 @@ fn quirk_scenarios() -> Vec<QuirkScenario> {
             feature_titles: &["Type coercion", "Real (IEEE 754)"],
             fixture_path: None,
             fixture: inline_total_no_overflow_fixture(),
+        },
+        QuirkScenario {
+            id: "e3_scalar_vs_aggregate_min_max_nulls".to_owned(),
+            corpus_scenario_id: "QUIRK-C4-scalar_vs_aggregate_min_max_nulls",
+            category: "null",
+            feature_titles: &["NULL semantics"],
+            fixture_path: None,
+            fixture: inline_scalar_vs_aggregate_min_max_null_fixture(),
         },
     ]
 }
