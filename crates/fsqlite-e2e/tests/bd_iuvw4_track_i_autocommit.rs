@@ -105,10 +105,7 @@ fn bd_iuvw4_track_i_retained_autocommit_reduces_flush_overhead() {
 
     eprintln!(
         "INFO bead_id={BEAD_ID} scenario=RETAINED-AUTOCOMMIT-100 inserts={} flushes={} reuses={} parks={} replay_command={REPLAY_COMMAND}",
-        INSERT_COUNT,
-        flush_count,
-        reuse_count,
-        profile.retained_autocommit_parks,
+        INSERT_COUNT, flush_count, reuse_count, profile.retained_autocommit_parks,
     );
 
     // If retained autocommit is working, flushes should be much less than INSERT_COUNT
@@ -142,10 +139,8 @@ fn bd_iuvw4_track_i_read_after_write_returns_correct_data() {
         let val = format!("value-{rowid}");
         let score = rowid * 100;
 
-        conn.execute(&format!(
-            "INSERT INTO t VALUES ({rowid}, '{val}', {score})"
-        ))
-        .expect("insert");
+        conn.execute(&format!("INSERT INTO t VALUES ({rowid}, '{val}', {score})"))
+            .expect("insert");
 
         let rows: Vec<(i64, String, i64)> = conn
             .query(&format!("SELECT id, val, score FROM t WHERE id = {rowid}"))

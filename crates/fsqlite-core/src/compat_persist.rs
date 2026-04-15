@@ -357,13 +357,8 @@ pub fn persist_to_sqlite_with_header_and_master_entries(
                         direction: index.key_sort_directions.get(i).copied(),
                     })
                     .collect();
-                let sql = build_create_index_sql(
-                    &index.name,
-                    &table_name,
-                    index.is_unique,
-                    &terms,
-                    None,
-                );
+                let sql =
+                    build_create_index_sql(&index.name, &table_name, index.is_unique, &terms, None);
                 Some(if let Some(ref wc) = index.where_clause {
                     format!("{sql} WHERE {wc}")
                 } else {

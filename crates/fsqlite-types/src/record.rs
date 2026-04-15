@@ -2649,7 +2649,10 @@ mod tests {
 
         eprintln!(
             "INFO bead_id=bd-gieaf scenario=SCRATCH-REUSE-1000 warmup_rows={} steady_rows={} capacity_after_warmup={} reallocs_after_warmup={} replay_command=\"cargo test -p fsqlite-types -- bd_gieaf --nocapture\"",
-            WARMUP_ROWS, TOTAL_ROWS - WARMUP_ROWS, capacity_after_warmup, realloc_count_after_warmup
+            WARMUP_ROWS,
+            TOTAL_ROWS - WARMUP_ROWS,
+            capacity_after_warmup,
+            realloc_count_after_warmup
         );
         assert_eq!(
             realloc_count_after_warmup, 0,

@@ -17593,24 +17593,25 @@ mod tests {
 
         // Legacy reset should clear everything
         engine.reset_for_reuse(4, &reset_cx, PageSize::DEFAULT);
-        let fourth_outcome = engine.apply_reusable_table_execution_state(ReusableTableExecutionState {
-            func_registry: Arc::clone(&new_func_registry),
-            collation_registry: Arc::clone(&collation_registry),
-            schema_cookie: 1,
-            autoincrement_seq_by_root_page: HashMap::new(),
-            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
-            table_column_count_by_root_page: Arc::new(HashMap::new()),
-            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
-            column_defaults_by_root_page: Arc::new(HashMap::new()),
-            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
-            index_collations_by_root_page: Arc::new(HashMap::new()),
-            reject_mem_fallback: false,
-            memdb_rows_loaded: false,
-            storage_cursor_memdb_count_shortcuts_safe: false,
-            version_store: None,
-            collect_result_rows: true,
-            max_collected_result_rows: None,
-        });
+        let fourth_outcome =
+            engine.apply_reusable_table_execution_state(ReusableTableExecutionState {
+                func_registry: Arc::clone(&new_func_registry),
+                collation_registry: Arc::clone(&collation_registry),
+                schema_cookie: 1,
+                autoincrement_seq_by_root_page: HashMap::new(),
+                rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+                table_column_count_by_root_page: Arc::new(HashMap::new()),
+                first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+                column_defaults_by_root_page: Arc::new(HashMap::new()),
+                index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+                index_collations_by_root_page: Arc::new(HashMap::new()),
+                reject_mem_fallback: false,
+                memdb_rows_loaded: false,
+                storage_cursor_memdb_count_shortcuts_safe: false,
+                version_store: None,
+                collect_result_rows: true,
+                max_collected_result_rows: None,
+            });
         assert!(
             fourth_outcome.function_cache_cleared,
             "legacy reset_for_reuse clears caches, so next apply should clear them again"
