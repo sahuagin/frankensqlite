@@ -12,7 +12,7 @@
 //! Everything else falls back to the interpreter.
 
 use fsqlite_types::{
-    opcode::{Opcode, VdbeOp, P4},
+    opcode::{Opcode, P4, VdbeOp},
     value::SqliteValue,
 };
 
@@ -214,9 +214,9 @@ fn find_value_sources(
                 set_register_source(
                     &mut sources_by_reg,
                     op.p2,
-                    Some(InsertValueSource::Constant(SqliteValue::Integer(i64::from(
-                        op.p1,
-                    )))),
+                    Some(InsertValueSource::Constant(SqliteValue::Integer(
+                        i64::from(op.p1),
+                    ))),
                 );
             }
             Opcode::Int64 => {

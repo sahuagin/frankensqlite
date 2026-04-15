@@ -14,8 +14,7 @@ use fsqlite_types::SqliteValue;
 use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-1dp9.6.7.8.2";
-const REPLAY_COMMAND: &str =
-    "cargo test -p fsqlite-e2e --test bd_1dp9_6_7_8_2_incremental_wal_refresh -- --nocapture --test-threads=1";
+const REPLAY_COMMAND: &str = "cargo test -p fsqlite-e2e --test bd_1dp9_6_7_8_2_incremental_wal_refresh -- --nocapture --test-threads=1";
 
 static E2E_LOCK: Mutex<()> = Mutex::new(());
 
@@ -56,9 +55,7 @@ fn query_count(conn: &fsqlite::Connection, sql: &str) -> i64 {
 
 #[test]
 fn bd_1dp9_6_7_8_2_steady_state_authoritative_lookup() {
-    let _guard = E2E_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join("authoritative_lookup.db");
@@ -99,9 +96,7 @@ fn bd_1dp9_6_7_8_2_steady_state_authoritative_lookup() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_incremental_refresh_scales_with_new_frames() {
-    let _guard = E2E_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join("incremental_refresh.db");
@@ -158,9 +153,7 @@ fn bd_1dp9_6_7_8_2_incremental_refresh_scales_with_new_frames() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_generation_reset_invalidates_index() {
-    let _guard = E2E_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join("generation_reset.db");
@@ -253,9 +246,7 @@ fn bd_1dp9_6_7_8_2_generation_reset_invalidates_index() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_cross_connection_visibility_with_refresh() {
-    let _guard = E2E_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
     let temp = tempdir().expect("tempdir");
     let db_path = temp.path().join("cross_conn_visibility.db");
@@ -302,9 +293,7 @@ fn bd_1dp9_6_7_8_2_cross_connection_visibility_with_refresh() {
 
 #[test]
 fn bd_1dp9_6_7_8_2_many_pages_authoritative_index_performance() {
-    let _guard = E2E_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _guard = E2E_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
 
     let temp = tempdir().expect("tempdir");
     let fsqlite_db = temp.path().join("many_pages_fsqlite.db");
@@ -338,7 +327,10 @@ fn bd_1dp9_6_7_8_2_many_pages_authoritative_index_performance() {
     let sqlite_insert_start = Instant::now();
     for rowid in 1..=ROW_COUNT {
         sconn
-            .execute("INSERT INTO t VALUES (?1, ?2)", rusqlite::params![rowid, &data])
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                rusqlite::params![rowid, &data],
+            )
             .expect("sqlite insert");
     }
     let sqlite_insert_elapsed = sqlite_insert_start.elapsed();
@@ -359,7 +351,9 @@ fn bd_1dp9_6_7_8_2_many_pages_authoritative_index_performance() {
     for i in 0..100 {
         let rowid = (i * 5) % ROW_COUNT + 1;
         let _: Vec<u8> = sconn
-            .query_row("SELECT data FROM t WHERE id = ?1", [rowid], |row| row.get(0))
+            .query_row("SELECT data FROM t WHERE id = ?1", [rowid], |row| {
+                row.get(0)
+            })
             .expect("sqlite lookup");
     }
     let sqlite_lookup_elapsed = sqlite_lookup_start.elapsed();
