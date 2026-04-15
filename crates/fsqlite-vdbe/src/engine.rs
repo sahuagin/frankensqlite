@@ -440,6 +440,8 @@ fn configure_btree_cursor_page_size<P>(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReusableTableExecutionStateOutcome {
     pub metadata_rebind_count: u32,
+    /// W1: Track function cache clears so callers can verify the optimization.
+    pub function_cache_cleared: bool,
 }
 
 #[derive(Clone)]
@@ -5905,9 +5907,12 @@ impl VdbeEngine {
         }
         if !preserve_runtime_setup {
             self.func_registry = None;
+            // W1: Only clear function caches when not preserving runtime setup.
+            // When preserving, caches are cleared conditionally in
+            // apply_reusable_table_execution_state if func_registry changed.
+            self.scalar_function_cache.clear();
+            self.aggregate_function_cache.clear();
         }
-        self.scalar_function_cache.clear();
-        self.aggregate_function_cache.clear();
         // Keep the existing collation_registry Arc — don't allocate a new one.
         self.clear_statement_cold_state();
         if !preserve_runtime_setup {
@@ -6032,6 +6037,12 @@ impl VdbeEngine {
             .is_none_or(|current| !Arc::ptr_eq(current, &func_registry));
         if func_registry_changed {
             self.func_registry = Some(func_registry);
+            // W1: Clear function caches when func_registry changes, since cached
+            // function lookups are keyed by program counter and would reference
+            // stale entries from the old registry.
+            self.scalar_function_cache.clear();
+            self.aggregate_function_cache.clear();
+            outcome.function_cache_cleared = true;
         }
         note_rebind(func_registry_changed);
 
@@ -17521,6 +17532,88 @@ mod tests {
         assert!(
             third_outcome.metadata_rebind_count > 0,
             "legacy reset_for_reuse should still clear runtime bindings"
+        );
+    }
+
+    #[test]
+    fn test_w1_function_cache_preserved_when_func_registry_unchanged() {
+        // W1 optimization: function caches should be preserved across reusable-lane
+        // resets when the func_registry pointer is unchanged, avoiding unnecessary
+        // cache rebuilds on every prepared-statement execution.
+        let mut engine = VdbeEngine::new(4);
+        let func_registry = Arc::new(FunctionRegistry::new());
+        let collation_registry = Arc::new(std::sync::Mutex::new(CollationRegistry::new()));
+        let state = ReusableTableExecutionState {
+            func_registry: Arc::clone(&func_registry),
+            collation_registry: Arc::clone(&collation_registry),
+            schema_cookie: 1,
+            autoincrement_seq_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+            table_column_count_by_root_page: Arc::new(HashMap::new()),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+            index_collations_by_root_page: Arc::new(HashMap::new()),
+            reject_mem_fallback: false,
+            memdb_rows_loaded: false,
+            storage_cursor_memdb_count_shortcuts_safe: false,
+            version_store: None,
+            collect_result_rows: true,
+            max_collected_result_rows: None,
+        };
+
+        // First apply: fresh engine, caches will be cleared (func_registry was None)
+        let first_outcome = engine.apply_reusable_table_execution_state(state.clone());
+        assert!(
+            first_outcome.function_cache_cleared,
+            "first apply should clear function caches (func_registry was None)"
+        );
+
+        // Reset preserving runtime setup, then re-apply with same func_registry
+        let reset_cx = Cx::new();
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        let second_outcome = engine.apply_reusable_table_execution_state(state.clone());
+        assert!(
+            !second_outcome.function_cache_cleared,
+            "W1: function caches should NOT be cleared when func_registry is unchanged"
+        );
+
+        // Change the func_registry and verify caches ARE cleared
+        let new_func_registry = Arc::new(FunctionRegistry::new());
+        let changed_state = ReusableTableExecutionState {
+            func_registry: Arc::clone(&new_func_registry),
+            ..state
+        };
+        engine.reset_for_reuse_preserving_runtime_setup(4, &reset_cx, PageSize::DEFAULT, false);
+        let third_outcome = engine.apply_reusable_table_execution_state(changed_state);
+        assert!(
+            third_outcome.function_cache_cleared,
+            "function caches should be cleared when func_registry changes"
+        );
+
+        // Legacy reset should clear everything
+        engine.reset_for_reuse(4, &reset_cx, PageSize::DEFAULT);
+        let fourth_outcome = engine.apply_reusable_table_execution_state(ReusableTableExecutionState {
+            func_registry: Arc::clone(&new_func_registry),
+            collation_registry: Arc::clone(&collation_registry),
+            schema_cookie: 1,
+            autoincrement_seq_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+            table_column_count_by_root_page: Arc::new(HashMap::new()),
+            first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
+            index_collations_by_root_page: Arc::new(HashMap::new()),
+            reject_mem_fallback: false,
+            memdb_rows_loaded: false,
+            storage_cursor_memdb_count_shortcuts_safe: false,
+            version_store: None,
+            collect_result_rows: true,
+            max_collected_result_rows: None,
+        });
+        assert!(
+            fourth_outcome.function_cache_cleared,
+            "legacy reset_for_reuse clears caches, so next apply should clear them again"
         );
     }
 
