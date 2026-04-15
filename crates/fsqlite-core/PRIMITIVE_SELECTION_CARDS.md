@@ -1,200 +1,912 @@
 # Primitive-Selection Decision Cards — bd-db300.5.3.2.2
 
-> One card per hot metadata class from HOT_METADATA_INVENTORY.md.
-> Cards for M3, M4, M5, M7, M8, M9, M10, M12 are grouped as "no-change" at the end
-> because they are per-connection locals that don't need new publication primitives.
+> One explicit decision card per hot metadata class from
+> `HOT_METADATA_INVENTORY.md`.
+> This artifact is meant to be strong enough that `bd-db300.5.3.3.1`
+> can implement against it without reopening the selection debate.
 
 ---
 
-## Card 1: M6 — PagerInner Committed State
+## Closure Map
 
-**Current primitive:** `Mutex<PagerInner>` (pager.rs:296). Every `pager.begin()` and `pager.commit()` takes this lock.
+| Metadata Class | Selected Primitive | Change Type | EV | Relevance |
+|----------------|--------------------|-------------|----|-----------|
+| M1 `PublishedPagerState` | Keep seqlock publication, remove `Condvar`, retain bounded retry | Tune current primitive | 6/10 | High |
+| M2 `BoundPagerPublication` | Keep stack-copy local binding | No change | 2/10 | Medium |
+| M3 schema cookie + generation | Keep per-connection scalar invalidation tokens | No change | 1/10 | Medium |
+| M4 cached read snapshot | Keep per-connection parked snapshot reuse | No change | 5/10 | Medium |
+| M5 cached write txn (`:memory:`) | Keep per-connection retained write txn | No change | 7/10 | High for `:memory:` |
+| M6 `PagerInner` committed state | Immutable snapshot publication with generation replacement | New primitive | 8/10 | Critical |
+| M7 WAL frame count + checksum state | Keep per-handle refresh model | No change | 2/10 | Medium |
+| M8 WAL generation identity | Keep copy-sized per-handle identity | No change | 1/10 | Low |
+| M9 MemDB visible commit seq gate | Keep local monotone staleness gate | No change | 3/10 | Medium |
+| M10 cached VDBE engine | Keep per-connection engine reuse | No change | 4/10 | Medium |
+| M11 concurrent registry + page-lock table | Shard the registry, keep CAS lock table fast path | New primitive for registry only | 7/10 | High |
+| M12 parse cache + compiled statement cache | Keep per-connection cache; reject shared publication for now | No change | 4/10 | Medium |
 
-### Chosen primitive: **Immutable Snapshot Publication with Generation Replacement**
+The cards below all include the same closure fields:
+EV, relevance, primary risk, fallback trigger, logging, verification,
+user-visible failure signature, rejected alternatives, baseline comparator,
+adoption wedge, rollback recipe, source status, and interference status.
 
-Publish a frozen `Arc<PagerCommittedSnapshot>` via `ArcSwap` (or hand-rolled atomic pointer swap). Readers load the current snapshot pointer without locking. Writers create a new snapshot, publish it atomically, reclaim the old one via reference counting.
+---
+
+## Card 1: M6 — `PagerInner` Committed State
+
+**Current primitive:** `Mutex<PagerInner>` in `pager.rs`; every `pager.begin()`
+and `pager.commit()` passes through it.
+
+**Chosen primitive:** Immutable snapshot publication with generation
+replacement. Writers materialize a frozen `PagerCommittedSnapshot` and publish
+it atomically; readers bind the latest published snapshot without taking the
+hot `PagerInner` mutex.
 
 **Why this fits:**
-- Readers need `commit_seq`, `db_size`, `freelist_count`, `journal_mode` — all read-only during a transaction.
-- Writers produce a complete new state on every commit — natural snapshot boundary.
-- `Arc` reference counting handles reclamation without explicit epoch tracking.
-- Read side becomes wait-free. Write side allocates a small struct per commit (~64 bytes).
+- Readers need a coherent committed-state summary, not mutable access to the
+  whole `PagerInner`.
+- Writers already have a natural publish boundary at commit.
+- Snapshot reclamation can stay simple via `Arc` ownership.
+- This attacks the hottest remaining shared lock in the file-backed path.
 
-**EV score:** 8/10 — eliminates the #1 Mutex bottleneck on every begin/commit for readers.
-**Relevance:** Critical for c4+ file-backed workloads.
+**EV score:** 8/10
 
-### Rejected alternatives
+**Relevance:** Critical for c4+ file-backed workloads because it removes the
+highest-value shared read-side mutex from the begin/commit path.
 
-| Alternative | Why rejected |
-|------------|-------------|
-| **Seqlock on PagerInner fields** | PagerInner has non-atomic fields (freelist Vec, file handle). Seqlock requires all fields to be readable without locking — Vec cannot be safely torn-read. Would require flattening freelist to an atomic count, losing the actual page list. |
-| **Left-Right** | Overkill. Left-Right gives wait-free reads but requires double-buffered state including the full freelist Vec. Memory cost 2× per pager is unjustified when readers only need the scalar summary fields. |
-| **RwLock** | Marginal improvement. `RwLock` still has reader-side atomic overhead (read-count increment/decrement). Under c8+, reader-side atomics on the same cache line degrade to ~Mutex performance. |
-| **BRAVO** | Designed for heavily read-biased locks. Our read/write ratio is ~2:1, not 100:1. BRAVO's overhead on the write path (checking per-reader slots) is wasted at this ratio. |
-| **Sharded PagerInner** | Pager state is inherently singular (one database file → one committed state). Sharding makes no semantic sense. |
+**Primary risk and countermeasure:**
+- Risk: snapshot publication drifts from the authoritative inner state across
+  DDL, freelist, or checkpoint transitions.
+- Countermeasure: build the snapshot while `PagerInner` is still held, publish
+  only after the committed state is finalized, and shadow-compare snapshot
+  fields against the legacy read path during rollout.
 
-### Retry and reclamation implications
-- **Retry:** None. `Arc::clone` on the snapshot pointer is wait-free.
-- **Reclamation:** `Arc` drop decrements refcount. When the last reader releases, the snapshot is deallocated. No explicit epoch or hazard pointer needed. Worst case: a long-running reader holds an old snapshot alive — bounded by transaction lifetime.
+**Budgeted mode and fallback trigger:**
+- Target mode: immutable snapshot publication on by default after proof.
+- Fallback trigger: snapshot allocation or refcount churn exceeds 5% of commit
+  time, or shadow compare reports any field mismatch.
+- Fallback action: force legacy mutex read path and keep publishing diagnostic
+  snapshots only.
 
-### Fallback trigger
-If per-commit allocation of `Arc<PagerCommittedSnapshot>` measurably hurts throughput (unlikely — ~64 bytes per commit), revert to current Mutex. Detection: `FSQLITE_SNAPSHOT_ALLOCS` counter; if alloc-ns > 5% of commit-ns, fallback.
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M6"`
+- `operation=publish|read|shadow_compare`
+- `snapshot_generation`
+- `visible_commit_seq`
+- `db_size`
+- `freelist_count`
+- `alloc_ns`
+- `snapshot_age_commits`
+- `control_mode`
+- `shadow_verdict`
 
-### User-visible symptom signature
-- **Misbehavior:** Stale snapshot delivered to reader (should be impossible with atomic swap, but: if a reader holds an old Arc across a DDL boundary, it may see pre-DDL schema).
-- **Diagnostic:** `visible_commit_seq` in snapshot < global `commit_seq`. Log field: `snapshot_staleness_commits`.
+**Required verification:**
+- Unit: concurrent read during publish never blocks on the legacy mutex.
+- Unit: published snapshot matches the just-committed inner state.
+- Unit: retired snapshots remain valid until the last reader drops them.
+- E2E: file-backed c4 write-heavy replay shows reduced mutex wait time versus
+  baseline.
+- Topology: c8 cross-node run confirms refcount churn does not erase the gain.
 
-### Logging/test obligations
-- **Logging:** `trace_id, metadata_class=M6, operation=publish|read, snapshot_gen, visible_commit_seq, alloc_ns, reader_count`
-- **Unit tests:** Concurrent read during publish doesn't block; snapshot contents match committed state; old snapshot reclaimed after last reader drops.
-- **E2E:** c4 file-backed write-heavy benchmark before/after; Mutex wait-time eliminated from flamegraph.
-- **Topology:** c8 cross-NUMA: verify no regression from Arc atomic refcount bouncing.
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: stale reads immediately after another connection commits.
+- Diagnostic: published `snapshot_generation` or `visible_commit_seq` trails the
+  live commit sequence; `shadow_verdict=diverged`.
 
-### Adoption wedge
-Shadow-run: keep Mutex path as baseline, add snapshot-read path behind `PRAGMA fsqlite_pager_snapshot_publish = ON`. Compare commit_seq consistency and latency distribution. Graduate to default after 3 clean benchmark runs.
+**Rejected alternatives and why they lost:**
+- Seqlock on `PagerInner` fields: `freelist` and other mutable members are not
+  safe torn-read payloads.
+- Left-Right: duplicates too much pager state for a relatively small summary.
+- `RwLock`: adds reader-side atomic traffic without removing enough contention.
+- BRAVO: wrong shape for a ~2:1 read/write surface.
+- Sharding `PagerInner`: the committed state is singular, not partitionable.
 
-### Rollback recipe
-1. Set `PRAGMA fsqlite_pager_snapshot_publish = OFF`.
-2. All new transactions use Mutex path.
-3. Outstanding snapshot Arcs drain naturally (bounded by max txn lifetime).
-4. No state corruption possible — snapshot is read-only once published.
+**Baseline comparator:** current `Mutex<PagerInner>` read-side access during
+begin/commit.
 
----
+**Adoption wedge / shadow-run plan:**
+- Add a control mode with `legacy`, `shadow_compare`, and `snapshot`.
+- Ship `shadow_compare` first and require clean comparator runs on the canonical
+  file-backed workloads before defaulting to `snapshot`.
 
-## Card 2: M1 — PublishedPagerState (Seqlock Publication Plane)
+**Rollback recipe:**
+1. Force `legacy` mode.
+2. Leave snapshot construction optionally enabled for diagnostics only.
+3. Drain outstanding snapshots naturally via `Arc` lifetime.
 
-**Current primitive:** Seqlock on atomic fields + `publish_lock: Mutex` + `sequence_cv: Condvar` (pager.rs:1234-1251). Write side takes Mutex, bumps sequence odd, writes atomics, bumps sequence even, wakes Condvar.
+**Primary source or paper status:** inventory-backed and code-indexed from
+`HOT_METADATA_INVENTORY.md`; no external paper dependency is required to adopt
+this primitive family.
 
-### Chosen primitive: **Retain Seqlock, Eliminate Condvar, Add Striped Counters**
-
-The seqlock read path is already wait-free and bounded-retry. The problems are:
-1. `publish_lock` Mutex serializes writers (unnecessary if writers already hold PagerInner Mutex during commit).
-2. `sequence_cv` Condvar creates cross-node wake storms under c8+.
-
-Fix: (a) Remove `publish_lock` — publication only happens inside PagerInner Mutex critical section, so it's already serialized. (b) Replace `sequence_cv` Condvar with polling on `sequence` atomic — readers that need to wait for a new commit spin-check `sequence` with exponential backoff (1µs, 2µs, 4µs, max 1ms). This eliminates the Condvar futex syscall and cross-node wake.
-
-**EV score:** 6/10 — moderate improvement; seqlock reads are already fast. Main win is Condvar elimination.
-**Relevance:** c8+ file-backed with frequent cross-connection visibility checks.
-
-### Rejected alternatives
-
-| Alternative | Why rejected |
-|------------|-------------|
-| **Replace seqlock with Arc snapshot** | Seqlock is already essentially free for readers (2 atomic loads + field reads + 1 verify load). Arc swap adds allocation + refcount. Not worth it when seqlock works and fields are all atomics. |
-| **Epoch-based publication** | Over-engineered. The seqlock already provides bounded-retry reads. EBR adds complexity without measurable benefit when retry rate is <1%. |
-| **Remove seqlock entirely (just atomics)** | Fields are individually atomic but readers need a *consistent* snapshot across all fields. Without seqlock, a reader could see `commit_seq` from commit N and `db_size` from commit N+1. Seqlock prevents this torn read. |
-
-### Retry and reclamation implications
-- **Retry:** Unchanged from current seqlock — bounded to ~0-2 retries. `read_retry_count` striped counter already tracks this.
-- **Reclamation:** None — all fields are in-place atomics.
-
-### Fallback trigger
-If polling-based wait causes excessive CPU burn (detect: `FSQLITE_PUBLICATION_POLL_SPINS` counter exceeds 10000/sec per connection), revert to Condvar.
-
-### User-visible symptom signature
-- **Misbehavior:** Reader sees torn snapshot (seqlock retry detects and retries — should never surface). If retry budget exhausted → stale read.
-- **Diagnostic:** `read_retry_count` spike above baseline.
-
-### Logging/test obligations
-- **Logging:** `publication_write_count, read_retry_count, sequence_value, publish_lock_wait_ns` (last field → 0 after Mutex removal)
-- **Unit tests:** Concurrent publish during read → retry count ≤ 3; Condvar removal doesn't cause missed wakeups.
-- **E2E:** c8 file-backed mixed workload; measure publication latency p99 before/after Condvar removal.
-
-### Adoption wedge
-Condvar removal is a pure deletion + polling replacement. Shadow-compare: log retry counts and wait durations side by side. If polling wait p99 < 5µs, graduate.
-
-### Rollback recipe
-1. Re-add Condvar + `publish_lock`.
-2. Replace polling loop with `sequence_cv.wait()`.
-3. No state changes — atomic fields are unchanged.
+**Interference-test requirement / status:**
+- Requirement: verify interaction with WAL policy and admission control under
+  mixed workloads.
+- Current status: baseline file-backed rationale complete; cross-node stress is
+  still required before default-on promotion.
 
 ---
 
-## Card 3: M11 — ConcurrentRegistry + PageLockTable
+## Card 2: M1 — `PublishedPagerState`
 
-**Current primitive:**
-- `ConcurrentRegistry`: `Arc<Mutex<ConcurrentRegistry>>` — global Mutex for session begin/commit/abort.
-- `InProcessPageLockTable`: CAS flat array for pages 1-65536 + sharded Mutex HashMap for pages >65536.
+**Current primitive:** seqlock-style atomic summary with a writer-side
+`publish_lock: Mutex` and `sequence_cv: Condvar`.
 
-### Chosen primitive: **Sharded Registry + Existing CAS Page Locks**
+**Chosen primitive:** retain the seqlock summary, remove the `Condvar`, and keep
+bounded retry as the read-side contract.
 
-Split `ConcurrentRegistry` into N shards (N = number of hardware threads, capped at 64). Each session is assigned to a shard by hash of `session_id`. `begin_concurrent()` only takes the shard Mutex, not the global Mutex. `get_mut()` and `remove_and_recycle()` index into the right shard directly.
+**Why this fits:**
+- The payload is already a tiny fixed-width summary.
+- Readers are retry-capable and only need coherence, not ownership.
+- The expensive parts are wake/sleep choreography and auxiliary serialization,
+  not the seqlock itself.
 
-Page locks stay as-is — CAS on flat array is already optimal for the fast path.
+**EV score:** 6/10
 
-**EV score:** 7/10 — reduces registry contention from O(N) to O(N/shards) per concurrent begin/commit.
-**Relevance:** c8+ file-backed concurrent-writer workloads.
+**Relevance:** High for multi-connection file-backed visibility checks, but
+below M6 because the core seqlock shape is already close to optimal.
 
-### Rejected alternatives
+**Primary risk and countermeasure:**
+- Risk: replacing `Condvar` wakeups with polling burns CPU or starves a waiter
+  under heavy churn.
+- Countermeasure: bounded exponential backoff, striped retry counters, and a
+  forced-legacy mode for shadow comparison.
 
-| Alternative | Why rejected |
-|------------|-------------|
-| **Lock-free registry (crossbeam-epoch)** | ConcurrentRegistry tracks session state (handles, write sets) with non-trivial ownership. Lock-free reclamation of session state is complex and error-prone. The Mutex-per-shard approach is simpler and nearly as fast under realistic shard counts. |
-| **RwLock on registry** | `begin_concurrent()` is a write operation (inserts session). `commit()` is a write operation (removes session). Read-only queries of the registry are rare. RwLock's read-biased optimization doesn't help. |
-| **Per-connection session pre-allocation** | Would avoid registry lookup on begin, but sessions carry write-set state that can't be pre-allocated without knowing transaction size. |
+**Budgeted mode and fallback trigger:**
+- Target mode: `seqlock_polling`.
+- Fallback trigger: polling spin budget exceeds threshold or p99 visibility wait
+  regresses against the `Condvar` baseline.
+- Fallback action: re-enable `Condvar` waiting while preserving the seqlock
+  publication layout.
 
-### Retry and reclamation implications
-- **Retry:** Shard Mutex → no retry, just reduced contention. CAS page locks → unchanged bounded retry.
-- **Reclamation:** Session removal is synchronous under shard Mutex — same as today, just less contention.
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M1"`
+- `operation=publish|read|wait`
+- `sequence_value`
+- `read_retry_count`
+- `poll_spins`
+- `wait_ns`
+- `control_mode`
+- `shadow_verdict`
 
-### Fallback trigger
-If sharded registry introduces session-lookup misrouting bugs (detect: `session_not_found` error rate > 0 in production), revert to global Mutex.
+**Required verification:**
+- Unit: concurrent publish/read never surfaces torn field combinations.
+- Unit: retry count stays bounded under publish churn.
+- Unit: forced legacy and forced polling modes produce identical snapshots.
+- E2E: c8 mixed file-backed workload shows lower wait overhead than the
+  `Condvar` path.
+- Topology: cross-node run measures whether polling changes tail latency.
 
-### User-visible symptom signature
-- **Misbehavior:** `SQLITE_BUSY` errors from page lock CAS failure (expected under hot-page contention; not a primitive failure).
-- **Diagnostic:** `concurrent_registry_lock_wait_ns` per-shard; if any shard is 10× hotter than mean, rebalance hash.
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: unusually stale visibility checks or CPU spikes during read polling.
+- Diagnostic: `read_retry_count`, `poll_spins`, or `wait_ns` spike above the
+  comparator baseline.
 
-### Logging/test obligations
-- **Logging:** `shard_id, session_id, operation=begin|commit|abort, lock_wait_ns, active_sessions_in_shard`
-- **Unit tests:** Sessions assigned to correct shard; concurrent begin/commit across shards doesn't lose sessions.
-- **E2E:** c8 hot-page contention benchmark; registry Mutex wait-time reduced vs. baseline.
+**Rejected alternatives and why they lost:**
+- Arc snapshot swap: adds allocation/refcount cost to an already-small payload.
+- Epoch/EBR publication: too much machinery for a retryable summary.
+- Independent atomics without seqlock: permits torn cross-field reads.
 
-### Adoption wedge
-Feature-gated: `PRAGMA fsqlite_sharded_registry = ON`. Compare against global Mutex baseline. Graduate after c4/c8 file-backed wins confirmed.
+**Baseline comparator:** current seqlock + `publish_lock` + `sequence_cv`
+implementation.
 
-### Rollback recipe
-1. Set `PRAGMA fsqlite_sharded_registry = OFF`.
-2. All new sessions route to global Mutex.
-3. In-flight sessions in shards drain naturally (bounded by txn lifetime).
+**Adoption wedge / shadow-run plan:**
+- Ship `legacy`, `shadow_compare`, and `polling` modes.
+- Require stable retry counts and lower p99 wait on the canonical mixed
+  workloads before promotion.
+
+**Rollback recipe:**
+1. Restore `Condvar` wait path.
+2. Keep counters and shadow-compare instrumentation.
+3. Preserve the seqlock read contract.
+
+**Primary source or paper status:** inventory-backed and already represented in
+code; no new external primitive research is required.
+
+**Interference-test requirement / status:**
+- Requirement: prove admission-control readers are not misled by the new wait
+  distribution.
+- Current status: controller-composition risk identified; replay validation
+  remains mandatory before default-on.
 
 ---
 
-## Cards 4-12: Per-Connection Locals (No Primitive Change)
+## Card 3: M11 — Concurrent Registry + Page-Lock Table
 
-These metadata classes (M2, M3, M4, M5, M7, M8, M9, M10, M12) are per-connection or per-handle locals accessed via `RefCell`, `Cell`, or owned fields. They have **no cross-thread contention** and do not need publication primitives.
+**Current primitive:** global `Arc<Mutex<ConcurrentRegistry>>` for session
+begin/commit/abort, plus CAS fast path in `InProcessPageLockTable`.
 
-| Class | Current | Decision | Rationale |
-|-------|---------|----------|-----------|
-| M2 (BoundPagerPublication) | Stack Copy | **Keep** | Write-once local struct. Zero overhead. |
-| M3 (Schema cookie/generation) | RefCell/Cell | **Keep** | Per-connection scalar. No sharing. |
-| M4 (Cached read snapshot) | RefCell | **Keep** | Per-connection txn handle. Park/reuse pattern already optimal. |
-| M5 (Cached write txn) | RefCell | **Keep** | Per-connection :memory: only. Already eliminates Mutex. |
-| M7 (WAL frame count) | Owned field | **Keep** | Per-handle. Refresh reads disk — no lock. |
-| M8 (WAL generation) | Owned Copy | **Keep** | 12-byte Copy struct per-handle. |
-| M9 (Staleness gate) | RefCell | **Keep** | Per-connection u64. Comparison target (M1) is addressed in Card 2. |
-| M10 (Cached VDBE engine) | RefCell | **Keep** | Per-connection. Already reuses allocations. |
-| M12 (Parse/compiled cache) | RefCell | **Keep** | Per-connection LRU. No cross-thread access. |
+**Chosen primitive:** shard the registry by session id / core-locality while
+keeping the existing CAS page-lock table as the ownership primitive.
 
-**Rejected alternatives for all:** Any shared-primitive approach (RCU, seqlock, etc.) would add overhead to data that is never shared. The per-connection `RefCell` pattern is strictly optimal for single-threaded access within a connection.
+**Why this fits:**
+- The registry is the contended shared control-plane object.
+- The page-lock table already uses the correct exact-ownership primitive.
+- Sharding cuts mutex scope without introducing unsafe or complicated
+  reclamation.
+
+**EV score:** 7/10
+
+**Relevance:** High for c8+ file-backed concurrent-writer workloads where
+session lifecycle contention is material.
+
+**Primary risk and countermeasure:**
+- Risk: shard routing bugs or uneven shard hot spots create session lookup
+  errors or move contention rather than removing it.
+- Countermeasure: deterministic shard mapping, shard-local instrumentation, and
+  global shadow verification that every routed session is found on the expected
+  shard.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: `sharded_registry`.
+- Fallback trigger: `session_not_found`, shard skew, or commit/abort routing
+  mismatch above zero tolerance.
+- Fallback action: route all operations back through the legacy global mutex.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M11"`
+- `operation=begin|commit|abort|lookup`
+- `session_id`
+- `shard_id`
+- `lock_wait_ns`
+- `active_sessions_in_shard`
+- `control_mode`
+- `shadow_verdict`
+
+**Required verification:**
+- Unit: deterministic shard assignment for a given `session_id`.
+- Unit: begin/commit/abort on different shards never lose sessions.
+- Unit: page-lock CAS semantics remain unchanged.
+- E2E: c8 hot-page contention replay shows lower registry wait time versus the
+  global mutex comparator.
+- Topology: cross-node run checks for shard skew and routing imbalance.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: unexpected `SQLITE_BUSY` or session lookup failures during concurrent
+  traffic.
+- Diagnostic: non-zero `session_not_found`, shard skew above threshold, or
+  `shadow_verdict=diverged`.
+
+**Rejected alternatives and why they lost:**
+- Lock-free registry with epoch reclamation: too complex for the ownership
+  shape and error surface.
+- `RwLock` registry: lifecycle ops are mostly writes, so reader bias does not
+  help.
+- Session pre-allocation: does not solve shared registry visibility or variable
+  write-set ownership.
+
+**Baseline comparator:** current single global `ConcurrentRegistry` mutex plus
+existing CAS page locks.
+
+**Adoption wedge / shadow-run plan:**
+- Ship `legacy`, `shadow_compare`, and `sharded` modes.
+- Promote only after comparator runs show lower lock wait without correctness
+  drift.
+
+**Rollback recipe:**
+1. Force `legacy` mode.
+2. Let in-flight sharded sessions drain naturally.
+3. Keep shard instrumentation for postmortem analysis.
+
+**Primary source or paper status:** inventory-backed; no external lock-free
+paper is required because the selected answer is deliberate sharding, not a
+novel concurrent structure.
+
+**Interference-test requirement / status:**
+- Requirement: verify interaction with admission control and hot-page routing.
+- Current status: baseline rationale complete; topology-sensitive replay still
+  required before graduation.
 
 ---
 
-## Composition Interference Notes
+## Card 4: M2 — `BoundPagerPublication`
 
-Per bd-db300.7.8.4 (Controller Composition Proof):
+**Current primitive:** write-once local struct copied at statement entry.
 
-| Card | Composes with | Interference risk | Guard |
-|------|--------------|-------------------|-------|
-| Card 1 (M6 snapshot publish) | D1 WAL policy | LOW — snapshot publish is inside commit; WAL policy affects commit timing but not snapshot structure | None needed |
-| Card 2 (M1 Condvar removal) | E4 admission | MEDIUM — admission controller reads M1 for tail evidence; polling changes read latency distribution | Tainted-sample detector from §4 of composition proof |
-| Card 3 (M11 sharded registry) | E4 admission | LOW — admission sees session count, not registry internals | None needed |
+**Chosen primitive:** keep the stack/local binding exactly local.
+
+**Why this fits:** M2 is a statement-scoped bundle of M1 output, not an
+independent shared publication surface.
+
+**EV score:** 2/10
+
+**Relevance:** Medium because it sits on the hot path, but the leverage is in
+M1, not in wrapping M2 with another primitive.
+
+**Primary risk and countermeasure:**
+- Risk: turning M2 into a shared cache reuses stale visibility evidence across
+  statements.
+- Countermeasure: keep M2 write-once per statement and refresh from M1/M6.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged local binding.
+- Fallback trigger: none specific to M2; if statement-entry bind cost matters,
+  optimize the upstream publication source instead.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M2"`
+- `operation=bind`
+- `visible_commit_seq`
+- `read_retry_count`
+- `statement_id`
+- `is_memory`
+
+**Required verification:**
+- Unit: each file-backed statement binds a fresh local copy.
+- Unit: no cross-statement reuse occurs.
+- E2E: another connection's commit is visible after a fresh bind.
+- Topology: none beyond upstream M1 checks.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: statement runs against a stale publication bind.
+- Diagnostic: local `visible_commit_seq` trails the current published sequence
+  at statement entry.
+
+**Rejected alternatives and why they lost:**
+- Shared `Arc` wrapper: no reuse benefit, adds lifetime coupling.
+- Seqlock around local struct: no shared readers exist.
+- RCU cache of bound structs: wrong scope and stale by construction.
+
+**Baseline comparator:** current stack-copy bind path.
+
+**Adoption wedge / shadow-run plan:** no rollout needed; keep instrumentation
+only.
+
+**Rollback recipe:** unchanged local bind remains the fallback and default.
+
+**Primary source or paper status:** code-indexed inventory only; no external
+primitive source required.
+
+**Interference-test requirement / status:** none independent; M2 inherits M1/M6
+interference behavior.
 
 ---
 
-## Summary: Implementation Priority
+## Card 5: M3 — Schema Cookie + Generation
 
-| Priority | Card | Primitive | Expected impact | Effort |
-|----------|------|-----------|----------------|--------|
-| 1 | Card 1 (M6) | Arc snapshot publication | Eliminate #1 Mutex bottleneck | Medium (new struct + ArcSwap + split begin/commit) |
-| 2 | Card 3 (M11) | Sharded registry | Reduce c8+ session contention | Low (partition existing Mutex) |
-| 3 | Card 2 (M1) | Condvar elimination | Reduce cross-node wake overhead | Low (delete + polling loop) |
+**Current primitive:** per-connection `RefCell<u32>` / `Cell<u64>` invalidation
+tokens.
+
+**Chosen primitive:** keep local scalar invalidation tokens.
+
+**Why this fits:** readers only need cheap mismatch detection so they can
+re-prepare locally; they do not need a shared schema-object publication plane.
+
+**EV score:** 1/10
+
+**Relevance:** Medium for correctness, low for performance.
+
+**Primary risk and countermeasure:**
+- Risk: over-engineering this into a shared publication object creates extra
+  invalidation states and stale-schema failure modes.
+- Countermeasure: keep scalar mismatch checks local and continue reparsing on
+  mismatch.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged local token checks.
+- Fallback trigger: none; if reparses become expensive, optimize schema reload
+  itself, not token publication.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M3"`
+- `schema_cookie`
+- `schema_generation`
+- `operation=check|invalidate`
+- `reprepare_triggered`
+
+**Required verification:**
+- Unit: DDL bumps the cookie/generation as expected.
+- Unit: prepared statements invalidate on mismatch.
+- E2E: cross-connection schema change forces reprepare.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: stale prepared statement or unnecessary reprepare churn.
+- Diagnostic: mismatch counters versus prepare cache hit rate.
+
+**Rejected alternatives and why they lost:**
+- Shared schema-object RCU publication: wrong scope for the current local cache
+  model.
+- Seqlock token pair: unnecessary for two local scalars.
+- BRAVO / lock-based schema publication: adds shared traffic without value.
+
+**Baseline comparator:** current local scalar check at execute/query time.
+
+**Adoption wedge / shadow-run plan:** none; the chosen primitive is the current
+one.
+
+**Rollback recipe:** current local tokens remain the permanent rollback path.
+
+**Primary source or paper status:** inventory-backed and code-local.
+
+**Interference-test requirement / status:** none; M3 is connection-local.
+
+---
+
+## Card 6: M4 — Cached Read Snapshot
+
+**Current primitive:** per-connection parked read-only transaction handle guarded
+by a local cookie.
+
+**Chosen primitive:** keep per-connection parked snapshot reuse.
+
+**Why this fits:** the value is already local, already profitable, and already
+expresses the correct ownership model for a read snapshot.
+
+**EV score:** 5/10
+
+**Relevance:** Medium because it materially reduces begin overhead for read
+paths, but it is not a shared publication surface.
+
+**Primary risk and countermeasure:**
+- Risk: sharing parked snapshots across connections would break ownership and
+  visibility assumptions.
+- Countermeasure: retain connection-local parking with stale-cookie
+  invalidation.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged cache-reuse path.
+- Fallback trigger: cookie mismatch or any write/DDL boundary.
+- Fallback action: fresh `pager.begin()`.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M4"`
+- `operation=park|reuse|invalidate`
+- `cookie_match`
+- `snapshot_age_statements`
+- `cache_hit`
+
+**Required verification:**
+- Unit: reuse path returns a valid read snapshot.
+- Unit: stale cookie or write invalidates the parked snapshot.
+- E2E: repeated read statements reuse locally without cross-connection leakage.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: missed reuse or reuse of a stale read snapshot.
+- Diagnostic: `cache_hit` drops unexpectedly or stale-cookie reuse appears.
+
+**Rejected alternatives and why they lost:**
+- Shared snapshot pool: wrong ownership and reclamation model.
+- RCU registry of parked read snapshots: no cross-connection sharing benefit.
+- Seqlock wrapper: no shared read/write conflict exists here.
+
+**Baseline comparator:** current local park/reuse mechanism versus always
+starting a fresh read txn.
+
+**Adoption wedge / shadow-run plan:** none beyond tracing the existing reuse
+path.
+
+**Rollback recipe:** call the existing invalidation path and fall back to fresh
+begin.
+
+**Primary source or paper status:** inventory-backed and already validated by
+existing local wins.
+
+**Interference-test requirement / status:** none independent; M4 consumes M6 and
+M1 publication but does not publish shared state itself.
+
+---
+
+## Card 7: M5 — Cached Write Transaction (`:memory:` Fast Path)
+
+**Current primitive:** per-connection retained write transaction guarded by a
+local cookie.
+
+**Chosen primitive:** keep retained local write-transaction reuse for `:memory:`
+only.
+
+**Why this fits:** the current path already removes a large amount of pager
+ceremony and is intentionally constrained to a single-connection ownership
+model.
+
+**EV score:** 7/10
+
+**Relevance:** High for `:memory:` throughput, but not a candidate for shared
+metadata publication.
+
+**Primary risk and countermeasure:**
+- Risk: broadening this into a file-backed or shared cross-connection primitive
+  would break concurrency and durability assumptions.
+- Countermeasure: keep the optimization `:memory:`-only and invalidate on DDL,
+  explicit `BEGIN`, or cookie mismatch.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: current retained path for `:memory:`.
+- Fallback trigger: stale cookie, schema change, explicit transactional mode
+  change, or any non-memory backend.
+- Fallback action: fresh write begin.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M5"`
+- `operation=park|reuse|invalidate`
+- `is_memory`
+- `cookie_match`
+- `cache_hit`
+
+**Required verification:**
+- Unit: `commit_and_retain()` reuse works on `:memory:`.
+- Unit: file-backed paths never route through this optimization.
+- E2E: repeated `:memory:` writes reuse without stale schema leakage.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: incorrect reuse after invalidation or missing reuse on the hot path.
+- Diagnostic: reuse/park counters and cookie mismatch events.
+
+**Rejected alternatives and why they lost:**
+- Shared cross-connection write-handle pool: violates ownership and concurrency
+  rules.
+- RCU transaction pool: wrong lifetime model for mutable write state.
+- Seqlock gating: adds shared mechanics to a local handle.
+
+**Baseline comparator:** current retained write-txn path versus always opening a
+fresh write transaction.
+
+**Adoption wedge / shadow-run plan:** no new rollout needed; keep existing
+instrumentation as the proof surface.
+
+**Rollback recipe:** disable reuse and always open a fresh write transaction.
+
+**Primary source or paper status:** inventory-backed and already justified by
+existing measured wins.
+
+**Interference-test requirement / status:** none; M5 is intentionally excluded
+from shared publication.
+
+---
+
+## Card 8: M7 — WAL Frame Count + Running Checksum State
+
+**Current primitive:** per-handle owned fields refreshed from the WAL file.
+
+**Chosen primitive:** keep the per-handle refresh model.
+
+**Why this fits:** the authoritative state is the WAL file plus durable snapshot
+machinery elsewhere; this handle-local cache should remain cheap and private.
+
+**EV score:** 2/10
+
+**Relevance:** Medium for correctness and refresh cost, low as a publication
+primitive candidate.
+
+**Primary risk and countermeasure:**
+- Risk: inventing a shared authoritative frame-count cache creates divergence
+  from on-disk truth.
+- Countermeasure: keep handle-local refresh semantics and optimize authoritative
+  WAL publication separately.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged per-handle refresh.
+- Fallback trigger: none unique to M7; if refresh becomes dominant, address the
+  upstream durable publication plane instead.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M7"`
+- `operation=refresh|append`
+- `frame_count`
+- `checkpoint_seq`
+- `refresh_ns`
+- `rebuild_required`
+
+**Required verification:**
+- Unit: append updates local frame count and checksum correctly.
+- Unit: refresh detects new frames and checkpoint resets.
+- E2E: reader catches up to another writer's frames after refresh.
+- Topology: file-backed mixed-reader/writer replay only.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: reader misses newly visible frames or rebuilds too often.
+- Diagnostic: `rebuild_required` frequency, frame-count deltas, refresh latency.
+
+**Rejected alternatives and why they lost:**
+- Shared RCU frame index: too easy to diverge from the WAL file.
+- Seqlock around local handle state: no shared readers.
+- Global mutex cache: centralizes a handle-local concern.
+
+**Baseline comparator:** current per-handle refresh model.
+
+**Adoption wedge / shadow-run plan:** none; keep the current model and instrument
+it.
+
+**Rollback recipe:** current per-handle refresh remains the rollback path.
+
+**Primary source or paper status:** inventory-backed and code-local.
+
+**Interference-test requirement / status:** no independent controller
+composition; topology sensitivity comes from WAL I/O, not the chosen primitive.
+
+---
+
+## Card 9: M8 — WAL Generation Identity
+
+**Current primitive:** per-handle copy-sized identity
+(`checkpoint_seq`, salts).
+
+**Chosen primitive:** keep the copy-sized identity local to the handle.
+
+**Why this fits:** this is a tiny comparison token, not a shared mutable data
+structure.
+
+**EV score:** 1/10
+
+**Relevance:** Low for performance, moderate for correctness.
+
+**Primary risk and countermeasure:**
+- Risk: wrapping a tiny token in a shared publication primitive creates more
+  invalidation machinery than payload.
+- Countermeasure: keep it as a copied identity and use the existing refresh path
+  when it changes.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged local copy.
+- Fallback trigger: if generation checks ever need a coherent multi-field
+  durable bundle, piggyback through the durable SHM snapshot surface instead of
+  inventing a new wrapper here.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M8"`
+- `operation=compare|refresh`
+- `checkpoint_seq`
+- `salts_changed`
+
+**Required verification:**
+- Unit: checkpoint reset changes the generation identity.
+- Unit: handle refresh rebuilds derived state on identity change.
+- E2E: another connection's checkpoint invalidates stale local generation.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: missed checkpoint generation change or needless rebuilds.
+- Diagnostic: salts mismatch counts and repeated rebuild events.
+
+**Rejected alternatives and why they lost:**
+- Seqlock pair: too much structure for a tiny local token.
+- RCU object swap: same problem with added allocation.
+- Left-Right / BRAVO: no shared reader population exists.
+
+**Baseline comparator:** current local copy-and-compare behavior.
+
+**Adoption wedge / shadow-run plan:** none.
+
+**Rollback recipe:** current behavior is already the rollback path.
+
+**Primary source or paper status:** inventory-backed and code-local.
+
+**Interference-test requirement / status:** none; M8 is handle-local.
+
+---
+
+## Card 10: M9 — MemDB Visible Commit Seq Gate
+
+**Current primitive:** per-connection local staleness gate.
+
+**Chosen primitive:** keep the local monotone gate.
+
+**Why this fits:** the gate is a cheap local check that decides whether MemDB
+needs refresh; making it shared would reintroduce the very coordination it
+avoids.
+
+**EV score:** 3/10
+
+**Relevance:** Medium because it protects correctness on the MemDB fast path.
+
+**Primary risk and countermeasure:**
+- Risk: making the gate shared turns a cheap local invalidation check into a
+  shared publication surface.
+- Countermeasure: keep the gate local and compare only against upstream
+  authoritative publication state.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged local staleness gate.
+- Fallback trigger: stale detection mismatch.
+- Fallback action: refresh MemDB from the authoritative publication source.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M9"`
+- `operation=check|refresh`
+- `visible_commit_seq`
+- `stale_detected`
+- `refresh_reason`
+
+**Required verification:**
+- Unit: stale local gate triggers refresh.
+- Unit: local commits update the gate monotonically.
+- E2E: remote commit invalidates local MemDB view and refreshes correctly.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: stale MemDB read after another commit.
+- Diagnostic: local gate trails authoritative visible sequence.
+
+**Rejected alternatives and why they lost:**
+- Shared seqlock gate: no benefit over local compare.
+- RCU global staleness object: wrong scope and added traffic.
+- Lock-based shared cache: regresses the MemDB fast path.
+
+**Baseline comparator:** current local gate plus refresh path.
+
+**Adoption wedge / shadow-run plan:** none; retain instrumentation only.
+
+**Rollback recipe:** current local gate is the rollback path.
+
+**Primary source or paper status:** inventory-backed and code-local.
+
+**Interference-test requirement / status:** none independent; M9 depends on
+authoritative upstream publication, but is not a shared publication class.
+
+---
+
+## Card 11: M10 — Cached VDBE Engine
+
+**Current primitive:** per-connection cached engine stored locally.
+
+**Chosen primitive:** keep per-connection engine reuse.
+
+**Why this fits:** the engine cache is tightly coupled to connection-local
+schema state and execution ownership.
+
+**EV score:** 4/10
+
+**Relevance:** Medium because it affects repeated execution cost, but it should
+not be turned into shared publication.
+
+**Primary risk and countermeasure:**
+- Risk: shared engine pooling introduces stale-bytecode and ownership bugs.
+- Countermeasure: keep engine reuse local and invalidate on schema/token
+  mismatch.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged local engine reuse.
+- Fallback trigger: schema mismatch or cached-engine divergence.
+- Fallback action: rebuild the engine for the current connection.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M10"`
+- `operation=reuse|rebuild|invalidate`
+- `schema_generation`
+- `cache_hit`
+- `reset_ns`
+
+**Required verification:**
+- Unit: engine reuse works within one connection.
+- Unit: schema change invalidates the cached engine.
+- E2E: repeated prepared execution hits the local engine cache without
+  cross-connection leakage.
+- Topology: none.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: stale bytecode or unexpected recompilation churn.
+- Diagnostic: cache-hit rate and invalidation reasons.
+
+**Rejected alternatives and why they lost:**
+- Shared engine pool: ownership and invalidation become much harder.
+- RCU published engine images: wrong coupling with connection-local state.
+- Lock-based global engine cache: adds shared traffic to the statement path.
+
+**Baseline comparator:** current per-connection engine cache versus always
+  rebuilding.
+
+**Adoption wedge / shadow-run plan:** none.
+
+**Rollback recipe:** disable reuse and rebuild per statement if necessary.
+
+**Primary source or paper status:** inventory-backed and code-local.
+
+**Interference-test requirement / status:** none; M10 is connection-local.
+
+---
+
+## Card 12: M12 — Parse Cache + Compiled Statement Cache
+
+**Current primitive:** per-connection `RefCell`-backed LRU / compiled-statement
+cache.
+
+**Chosen primitive:** keep the per-connection cache and explicitly reject shared
+publication at this stage.
+
+**Why this fits:** the locality evidence is lane- and connection-shaped, and
+shared compile publication would couple invalidation and ownership too early.
+
+**EV score:** 4/10
+
+**Relevance:** Medium because compile reuse matters, but the next question is
+cache-policy evidence, not publication machinery.
+
+**Primary risk and countermeasure:**
+- Risk: a shared compile cache smears schema invalidation and hurts lane
+  locality.
+- Countermeasure: keep caches local until the dedicated compile-cache bead
+  proves a better answer.
+
+**Budgeted mode and fallback trigger:**
+- Target mode: unchanged per-connection cache.
+- Fallback trigger: poor hit rate or invalidation churn.
+- Fallback action: tune cache policy locally or defer to the dedicated compile
+  cache work; do not introduce shared publication here.
+
+**Required logging fields:**
+- `trace_id`
+- `metadata_class="M12"`
+- `operation=parse_hit|parse_miss|compile_hit|compile_miss|invalidate`
+- `schema_cookie`
+- `schema_generation`
+- `cache_size`
+- `lane_id`
+
+**Required verification:**
+- Unit: schema change invalidates affected cached statements.
+- Unit: no cross-connection cache leakage occurs.
+- E2E: repeated statement workloads show warm-hit reuse on a single connection.
+- Topology: any lane-locality work belongs to the compile-cache track, not this
+  bead.
+
+**User-visible symptom signature and operator diagnostic cues:**
+- Symptom: wrong-plan reuse or unnecessary recompilation.
+- Diagnostic: compile-hit rate, invalidation rate, and schema-mismatch counts.
+
+**Rejected alternatives and why they lost:**
+- Shared compile cache: not yet justified by locality evidence.
+- RCU-published AST/bytecode cache: same invalidation and ownership problem.
+- Seqlock cache map: wrong fit for large cached objects.
+
+**Baseline comparator:** current per-connection LRU versus shared-cache
+proposals.
+
+**Adoption wedge / shadow-run plan:** if `bd-db300.6.1.3` later proves a shared
+cache is warranted, that lands as a separate bead with separate validation.
+
+**Rollback recipe:** retain current per-connection cache as the permanent
+fallback.
+
+**Primary source or paper status:** inventory-backed; future shared-cache work
+is intentionally deferred to its own measurement bead.
+
+**Interference-test requirement / status:**
+- Requirement: none for the current keep-local decision.
+- Current status: explicit linkage noted to the compile-cache decision track;
+  no shared-publication interference proof is required until that track changes
+  the primitive.
+
+---
+
+## Rejection Log Summary
+
+The following option families were considered across the cards and rejected
+unless a future bead supplies materially new evidence:
+
+| Primitive Family | Rejection Pattern |
+|------------------|-------------------|
+| Whole-surface `RwLock` / BRAVO | Too much shared reader-side bookkeeping for the actual access shapes |
+| Whole-object Left-Right duplication | Memory and duplication cost do not fit these metadata surfaces |
+| Seqlock everywhere | Only correct for tiny retryable summaries, not mutable ledgers or local-only state |
+| Shared RCU/epoch publication for local-only classes | Adds coupling and invalidation surface without value |
+| Shared compile / engine pools | Prematurely smears ownership and schema invalidation across connections |
+
+Future work must address the specific rejection reason before reopening any of
+the above families.
+
+---
+
+## Implementation Priority
+
+| Priority | Metadata Class | Action | Why Next |
+|----------|----------------|--------|----------|
+| 1 | M6 | Immutable committed-state snapshot publication | Highest-value shared mutex removal |
+| 2 | M11 | Sharded registry with comparator mode | Best remaining concurrency-control-plane win |
+| 3 | M1 | Remove `Condvar`, keep seqlock | Clean tune of an already-correct summary plane |
+| 4 | M2/M3/M4/M5/M7/M8/M9/M10/M12 | Keep local/current primitives and preserve their boundaries | Avoid accidental complexity while the shared hotspots are fixed |
+
+This is the closure contract for `bd-db300.5.3.2.2`: every hot metadata class
+now has an explicit selected primitive, a rejected-alternatives trail, an
+operator-visible failure signature, verification obligations, rollout posture,
+and rollback path.
