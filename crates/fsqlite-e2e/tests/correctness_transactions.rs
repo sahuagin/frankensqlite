@@ -784,7 +784,6 @@ fn test_lazy_memdb_multi_table_clean_read_then_dirty_visibility() {
 }
 
 #[test]
-#[ignore = "known regression: after a clean-table read boundary inside an explicit transaction, a later insert into the dirty table is not yet visible to COUNT(*) through the lazy MemDB compatibility path"]
 fn test_lazy_memdb_multi_table_post_read_insert_count_regression() {
     let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
     let steps = [
