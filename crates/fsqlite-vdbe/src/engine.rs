@@ -177,6 +177,10 @@ use fsqlite_types::{
 use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage, opcode_register_spans,
+    jit::{
+        CompiledProgram, ConstantResultRowTemplate, InsertValueSource, SimpleInsertTemplate,
+        try_compile_program,
+    },
 };
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
@@ -4007,9 +4011,10 @@ static FSQLITE_JIT_HOT_THRESHOLD: AtomicU64 = AtomicU64::new(8);
 static FSQLITE_JIT_CACHE_CAPACITY: AtomicU64 = AtomicU64::new(128);
 
 /// In-memory JIT code-cache entry (scaffold).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct JitCacheEntry {
     code_size_bytes: u64,
+    compiled_program: CompiledProgram,
 }
 
 #[derive(Debug, Default)]
@@ -4770,7 +4775,7 @@ fn record_type_coercion(before: &SqliteValue, after: &SqliteValue) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum JitDecision {
     Disabled,
     Warming {
@@ -4780,6 +4785,7 @@ enum JitDecision {
     CacheHit {
         plan_hash: u64,
         code_size_bytes: u64,
+        compiled_program: CompiledProgram,
     },
     UnsupportedCached {
         plan_hash: u64,
@@ -4789,6 +4795,7 @@ enum JitDecision {
         compile_time_us: u64,
         code_size_bytes: u64,
         evicted_plan_hash: Option<u64>,
+        compiled_program: CompiledProgram,
     },
     CompileFailed {
         plan_hash: u64,
@@ -4910,61 +4917,26 @@ fn hash_program(program: &VdbeProgram) -> u64 {
     hash
 }
 
-fn jit_scaffold_supports_opcode(opcode: Opcode) -> bool {
-    !matches!(
-        opcode,
-        Opcode::OpenRead
-            | Opcode::OpenWrite
-            | Opcode::OpenDup
-            | Opcode::OpenEphemeral
-            | Opcode::OpenAutoindex
-            | Opcode::OpenPseudo
-            | Opcode::SorterOpen
-            | Opcode::Close
-            | Opcode::Column
-            | Opcode::SeekLT
-            | Opcode::SeekLE
-            | Opcode::SeekGE
-            | Opcode::SeekGT
-            | Opcode::SeekRowid
-            | Opcode::Insert
-            | Opcode::Delete
-            | Opcode::SorterData
-            | Opcode::Rowid
-            | Opcode::Last
-            | Opcode::SorterSort
-            | Opcode::Rewind
-            | Opcode::SorterNext
-            | Opcode::Prev
-            | Opcode::Next
-            | Opcode::IdxInsert
-            | Opcode::SorterInsert
-            | Opcode::IdxDelete
-            | Opcode::IdxRowid
-            | Opcode::VOpen
-            | Opcode::VFilter
-            | Opcode::VColumn
-            | Opcode::VNext
-            | Opcode::VUpdate
-            | Opcode::VBegin
-            | Opcode::VCreate
-            | Opcode::VDestroy
-            | Opcode::VCheck
-            | Opcode::VInitIn
-            | Opcode::VRename
-    )
+fn estimate_compiled_program_size(compiled_program: &CompiledProgram) -> u64 {
+    match compiled_program {
+        CompiledProgram::ConstantResultRow(template) => {
+            let value_count = u64::try_from(template.values.len()).unwrap_or(u64::MAX);
+            value_count.saturating_mul(24).saturating_add(64)
+        }
+        CompiledProgram::SimpleInsert(template) => {
+            let value_count = u64::try_from(template.value_sources.len()).unwrap_or(u64::MAX);
+            value_count.saturating_mul(32).saturating_add(96)
+        }
+    }
 }
 
-fn compile_jit_stub(program: &VdbeProgram) -> std::result::Result<u64, &'static str> {
-    if program
-        .ops()
-        .iter()
-        .any(|op| !jit_scaffold_supports_opcode(op.opcode))
-    {
-        return Err("unsupported opcode in JIT scaffold compiler");
-    }
-    let op_count = u64::try_from(program.ops().len()).unwrap_or(u64::MAX);
-    Ok(op_count.saturating_mul(32).max(64))
+fn compile_jit_program(
+    program: &VdbeProgram,
+) -> std::result::Result<(CompiledProgram, u64), &'static str> {
+    let compiled_program =
+        try_compile_program(program.ops()).ok_or("unsupported opcode in JIT scaffold compiler")?;
+    let code_size_bytes = estimate_compiled_program_size(&compiled_program);
+    Ok((compiled_program, code_size_bytes))
 }
 
 fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
@@ -4992,33 +4964,37 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
     if runtime.is_unsupported_plan(plan_hash) {
         return JitDecision::UnsupportedCached { plan_hash };
     }
-    if let Some(code_size_bytes) = runtime
-        .cache
-        .get(&plan_hash)
-        .map(|entry| entry.code_size_bytes)
-    {
+    if let Some(entry) = runtime.cache.get(&plan_hash).cloned() {
         FSQLITE_JIT_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         runtime.touch_lru(plan_hash);
         return JitDecision::CacheHit {
             plan_hash,
-            code_size_bytes,
+            code_size_bytes: entry.code_size_bytes,
+            compiled_program: entry.compiled_program,
         };
     }
 
     FSQLITE_JIT_CACHE_MISSES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
     let compile_started = Instant::now();
-    match compile_jit_stub(program) {
-        Ok(code_size_bytes) => {
+    match compile_jit_program(program) {
+        Ok((compiled_program, code_size_bytes)) => {
             FSQLITE_JIT_COMPILATIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             let compile_time_us =
                 u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let evicted_plan_hash =
-                runtime.insert_cache(plan_hash, JitCacheEntry { code_size_bytes }, cache_capacity);
+            let evicted_plan_hash = runtime.insert_cache(
+                plan_hash,
+                JitCacheEntry {
+                    code_size_bytes,
+                    compiled_program: compiled_program.clone(),
+                },
+                cache_capacity,
+            );
             JitDecision::Compiled {
                 plan_hash,
                 compile_time_us,
                 code_size_bytes,
                 evicted_plan_hash,
+                compiled_program,
             }
         }
         Err(reason) => {
@@ -7146,6 +7122,7 @@ impl VdbeEngine {
             );
         }
 
+        let mut compiled_program = None;
         if jit_enabled {
             match maybe_trigger_jit(program) {
                 JitDecision::Disabled => {}
@@ -7167,6 +7144,7 @@ impl VdbeEngine {
                 JitDecision::CacheHit {
                     plan_hash,
                     code_size_bytes,
+                    compiled_program: cached_program,
                 } => {
                     if jit_info_enabled {
                         tracing::info!(
@@ -7174,9 +7152,10 @@ impl VdbeEngine {
                             program_id,
                             plan_hash = format_args!("{plan_hash:016x}"),
                             code_size_bytes,
-                            "jit trigger cache hit (interpreter fallback path)"
+                            "jit trigger cache hit"
                         );
                     }
+                    compiled_program = Some(cached_program);
                 }
                 JitDecision::UnsupportedCached { plan_hash } => {
                     if jit_debug_enabled {
@@ -7193,6 +7172,7 @@ impl VdbeEngine {
                     compile_time_us,
                     code_size_bytes,
                     evicted_plan_hash,
+                    compiled_program: newly_compiled_program,
                 } => {
                     if jit_info_enabled {
                         let plan_hash_hex = format!("{plan_hash:016x}");
@@ -7211,9 +7191,10 @@ impl VdbeEngine {
                             compile_time_us,
                             code_size_bytes,
                             evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
-                            "jit trigger compile completed (interpreter fallback path)"
+                            "jit trigger compile completed"
                         );
                     }
+                    compiled_program = Some(newly_compiled_program);
                 }
                 JitDecision::CompileFailed {
                     plan_hash,
@@ -7241,6 +7222,77 @@ impl VdbeEngine {
                     }
                 }
             }
+        }
+
+        if let Some(compiled_program) = compiled_program {
+            let outcome = self.execute_compiled_program(
+                &compiled_program,
+                borrowed_bindings,
+                collect_vdbe_metrics,
+                &mut row_handler,
+            )?;
+
+            if !needs_statement_timing {
+                return Ok(outcome);
+            }
+
+            let elapsed = start_time
+                .expect("statement timing state exists when post-execution bookkeeping is enabled")
+                .elapsed();
+            let elapsed_us = elapsed.as_micros();
+            let result_rows = self.results.len();
+
+            if collect_vdbe_metrics {
+                FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.fetch_add(0, AtomicOrdering::Relaxed);
+                FSQLITE_VDBE_STATEMENTS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                #[allow(clippy::cast_possible_truncation)]
+                FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
+                    .fetch_add(elapsed_us as u64, AtomicOrdering::Relaxed);
+            }
+
+            let log_statement_done = || {
+                if statement_debug_enabled {
+                    tracing::debug!(
+                        target: "fsqlite_vdbe::statement",
+                        program_id,
+                        opcode_count = 0_u64,
+                        result_rows,
+                        elapsed_us = elapsed_us as u64,
+                        outcome = ?outcome,
+                        "vdbe statement done",
+                    );
+                }
+
+                if slow_query_info_enabled && elapsed.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let millis = elapsed.as_millis() as u64;
+                    tracing::info!(
+                        target: "fsqlite_vdbe::slow_query",
+                        program_id,
+                        opcode_count = 0_u64,
+                        result_rows,
+                        elapsed_ms = millis,
+                        "slow vdbe statement",
+                    );
+                }
+            };
+
+            if exec_info_enabled {
+                let span = tracing::info_span!(
+                    target: "fsqlite_vdbe",
+                    "vdbe_exec",
+                    opcode_count = 0_u64,
+                    program_id,
+                    result_rows,
+                    elapsed_us = elapsed_us as u64,
+                );
+                let _guard = span.enter();
+                log_statement_done();
+            } else {
+                log_statement_done();
+            }
+
+            return Ok(outcome);
         }
 
         let mut pc: usize = 0;
@@ -11827,6 +11879,182 @@ impl VdbeEngine {
             self.discard_reg_range(op.p1, count);
         }
         Ok(())
+    }
+
+    fn emit_compiled_result_row(
+        &mut self,
+        values: &[SqliteValue],
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<()> {
+        let should_retain_row = self.collect_result_rows
+            && match self.max_collected_result_rows {
+                Some(limit) => self.results.len() < limit,
+                None => true,
+            };
+        if row_handler.is_some() || should_retain_row {
+            let materialize_start = collect_vdbe_metrics.then(Instant::now);
+            let row: smallvec::SmallVec<[SqliteValue; 16]> = values.iter().cloned().collect();
+            if collect_vdbe_metrics {
+                if let Some(materialize_start) = materialize_start {
+                    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                        u64::try_from(materialize_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        AtomicOrdering::Relaxed,
+                    );
+                }
+                record_result_row_metrics(&row);
+            }
+            if let Some(handler) = row_handler.as_mut() {
+                (*handler)(row)?;
+            } else {
+                self.results.push(row);
+            }
+        }
+        Ok(())
+    }
+
+    fn compiled_column_values(
+        &self,
+        value_sources: &[InsertValueSource],
+        borrowed_bindings: Option<&[SqliteValue]>,
+        collect_vdbe_metrics: bool,
+        affinity: Option<&str>,
+    ) -> Vec<SqliteValue> {
+        let binding_source = borrowed_bindings.unwrap_or(self.bindings.as_slice());
+        let mut values = value_sources
+            .iter()
+            .map(|source| match source {
+                InsertValueSource::Binding(binding_index) => binding_source
+                    .get(*binding_index)
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null),
+                InsertValueSource::Constant(value) => value.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(affinity) = affinity {
+            for (value, ch) in values.iter_mut().zip(affinity.chars()) {
+                let before = value.clone();
+                let coerced = value.clone().apply_affinity(char_to_affinity(ch));
+                if collect_vdbe_metrics {
+                    record_type_coercion(&before, &coerced);
+                }
+                *value = coerced;
+            }
+        }
+
+        values
+    }
+
+    fn execute_compiled_constant_result_row(
+        &mut self,
+        template: &ConstantResultRowTemplate,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<ExecOutcome> {
+        self.emit_compiled_result_row(&template.values, collect_vdbe_metrics, row_handler)?;
+        Ok(ExecOutcome::Done)
+    }
+
+    fn execute_compiled_simple_insert(
+        &mut self,
+        template: &SimpleInsertTemplate,
+        borrowed_bindings: Option<&[SqliteValue]>,
+        collect_vdbe_metrics: bool,
+    ) -> Result<ExecOutcome> {
+        if (template.insert_flags & 0x0F) != 2 {
+            return Err(FrankenError::internal(
+                "compiled simple INSERT only supports OE_Abort semantics",
+            ));
+        }
+
+        if !self.open_storage_cursor(template.cursor_id, template.root_page, true) {
+            return Err(FrankenError::internal(format!(
+                "compiled simple INSERT could not open writable cursor {} on root {}",
+                template.cursor_id, template.root_page
+            )));
+        }
+
+        let values = self.compiled_column_values(
+            &template.value_sources,
+            borrowed_bindings,
+            collect_vdbe_metrics,
+            template.affinity.as_deref(),
+        );
+        let payload = encode_record(&values);
+        let concurrent_allocator = self.concurrent_rowid_allocator.clone();
+        let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
+        let previous_last_insert_rowid = self.last_insert_rowid;
+        let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
+
+        let rowid = {
+            let sc = self
+                .storage_cursors
+                .get_mut(&template.cursor_id)
+                .ok_or_else(|| FrankenError::internal("compiled simple INSERT lost its cursor"))?;
+            if !sc.writable {
+                return Err(FrankenError::internal(
+                    "compiled simple INSERT cursor is not writable",
+                ));
+            }
+            let autoinc_max = sc.autoincrement_high_water;
+            let rowid_mode = sc.rowid_mode;
+            let rowid = if let Some(allocator) = concurrent_allocator.as_ref() {
+                Self::allocate_concurrent_storage_rowid(
+                    allocator,
+                    concurrent_schema_epoch,
+                    template.root_page,
+                    rowid_mode,
+                    autoinc_max,
+                    sc,
+                    "rowid overflow in compiled simple INSERT",
+                )?
+            } else {
+                Self::allocate_serialized_storage_rowid(
+                    sc,
+                    autoinc_max,
+                    "rowid overflow in compiled simple INSERT",
+                )?
+            };
+            sc.cursor.table_append_after_last_position(&sc.cx, rowid, &payload)?;
+            sc.last_successful_insert_rowid = Some(rowid);
+            rowid
+        };
+
+        self.changes += 1;
+        self.last_insert_rowid = rowid;
+        self.last_insert_rowid_valid = true;
+        self.last_insert_cursor_id = Some(template.cursor_id);
+        self.set_conflict_skip_idx(false);
+        self.set_pending_insert_rollback(Some(PendingInsertRollback {
+            cursor_id: template.cursor_id,
+            rowid,
+            previous_last_insert_rowid,
+            previous_last_insert_rowid_valid,
+            update_restore: None,
+        }));
+        self.clear_pending_idx_entries();
+        self.pending_next_after_delete.remove(&template.cursor_id);
+        self.mark_storage_root_page_dirty(template.root_page);
+
+        Ok(ExecOutcome::Done)
+    }
+
+    fn execute_compiled_program(
+        &mut self,
+        compiled_program: &CompiledProgram,
+        borrowed_bindings: Option<&[SqliteValue]>,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<ExecOutcome> {
+        match compiled_program {
+            CompiledProgram::ConstantResultRow(template) => {
+                self.execute_compiled_constant_result_row(template, collect_vdbe_metrics, row_handler)
+            }
+            CompiledProgram::SimpleInsert(template) => {
+                self.execute_compiled_simple_insert(template, borrowed_bindings, collect_vdbe_metrics)
+            }
+        }
     }
 
     #[inline(always)]
@@ -26231,14 +26459,16 @@ mod tests {
             .insert_row(7, vec![SqliteValue::Integer(700)]);
 
         let rows = run_with_storage_cursors(db, |b| {
-            let end = b.emit_label();
-            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let start = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, start, P4::None, 0);
+            b.resolve_label(start);
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, empty, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.resolve_label(empty);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-            b.resolve_label(end);
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(700)]]);
