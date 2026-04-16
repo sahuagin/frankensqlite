@@ -258,13 +258,9 @@ impl S3FifoEvictionTracker {
         self.access_trace.clear();
     }
 
-    fn choose_victim<I>(&self, resident_pages: I) -> Option<PageNumber>
-    where
-        I: IntoIterator<Item = PageNumber>,
-    {
-        let resident_pages: Vec<PageNumber> = resident_pages.into_iter().collect();
+    fn choose_victim(&self, resident_pages: &[PageNumber]) -> Option<PageNumber> {
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
-        let mut model = self.build_model(&resident_pages)?;
+        let mut model = self.build_model(resident_pages)?;
         let synthetic_miss = choose_synthetic_miss_page(&resident_set)?;
         let events = model.insert(synthetic_miss);
         events.iter().find_map(|event| match event {
@@ -278,13 +274,9 @@ impl S3FifoEvictionTracker {
         })
     }
 
-    fn queue_snapshot<I>(&self, resident_pages: I) -> Option<S3FifoQueueSnapshot>
-    where
-        I: IntoIterator<Item = PageNumber>,
-    {
-        let resident_pages: Vec<PageNumber> = resident_pages.into_iter().collect();
+    fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
         let resident_set: HashSet<PageNumber> = resident_pages.iter().copied().collect();
-        let model = self.build_model(&resident_pages)?;
+        let model = self.build_model(resident_pages)?;
         Some(S3FifoQueueSnapshot {
             small_len: model
                 .small_pages()
@@ -464,20 +456,14 @@ impl PageCacheEvictionTracker {
         }
     }
 
-    fn choose_victim<I>(&self, resident_pages: I) -> Option<PageNumber>
-    where
-        I: IntoIterator<Item = PageNumber>,
-    {
+    fn choose_victim(&self, resident_pages: &[PageNumber]) -> Option<PageNumber> {
         match self {
             Self::Arbitrary => None,
             Self::S3Fifo(tracker) => tracker.choose_victim(resident_pages),
         }
     }
 
-    fn queue_snapshot<I>(&self, resident_pages: I) -> Option<S3FifoQueueSnapshot>
-    where
-        I: IntoIterator<Item = PageNumber>,
-    {
+    fn queue_snapshot(&self, resident_pages: &[PageNumber]) -> Option<S3FifoQueueSnapshot> {
         match self {
             Self::Arbitrary => None,
             Self::S3Fifo(tracker) => tracker.queue_snapshot(resident_pages),
@@ -768,12 +754,18 @@ impl PageCache {
     ///
     /// Returns `true` if a page was evicted, `false` if the cache was empty.
     pub fn evict_any(&mut self) -> bool {
-        let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
-        let key = self
-            .eviction_policy
-            .borrow()
-            .choose_victim(residents.iter().copied())
-            .or_else(|| residents.first().copied());
+        let policy = self.eviction_policy.borrow().policy();
+        let key = match policy {
+            PageCacheEvictionPolicy::Arbitrary => self.pages.keys().next().copied(),
+            PageCacheEvictionPolicy::S3Fifo(_) => {
+                let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
+                let preferred = {
+                    let tracker = self.eviction_policy.borrow();
+                    tracker.choose_victim(&residents)
+                };
+                preferred.or_else(|| residents.first().copied())
+            }
+        };
         if let Some(key) = key {
             self.pages.remove(&key);
             self.evictions.set(self.evictions.get().saturating_add(1));
@@ -798,11 +790,15 @@ impl PageCache {
     #[must_use]
     pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
         let cached_pages = self.pages.len();
-        let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
-        let queue_snapshot = self
-            .eviction_policy
-            .borrow()
-            .queue_snapshot(residents.iter().copied());
+        let queue_snapshot = {
+            let tracker = self.eviction_policy.borrow();
+            if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+                let residents: Vec<PageNumber> = self.pages.keys().copied().collect();
+                tracker.queue_snapshot(&residents)
+            } else {
+                None
+            }
+        };
         let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
             (
                 snapshot.small_len,
@@ -2484,11 +2480,17 @@ impl ShardedPageCache {
     /// Tries flat slots first, then iterates shards.
     /// Returns `true` if a page was evicted.
     pub fn evict_any(&self) -> bool {
-        let residents = self.resident_pages();
-        let preferred_victim = self
-            .eviction_policy
-            .lock()
-            .choose_victim(residents.iter().copied());
+        let preferred_victim = if self.eviction_tracking_enabled() {
+            let tracker = self.eviction_policy.lock();
+            if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+                let residents = self.resident_pages();
+                tracker.choose_victim(&residents)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if let Some(page_no) = preferred_victim
             && self.evict(page_no)
         {
@@ -2549,16 +2551,20 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 let arr = fast.lock();
-                let residents = arr.resident_pages();
                 let dirty_pages = arr
                     .pages
                     .iter()
                     .filter(|slot| slot.as_ref().is_some_and(CachedPageEntry::is_dirty))
                     .count();
-                let queue_snapshot = self
-                    .eviction_policy
-                    .lock()
-                    .queue_snapshot(residents.iter().copied());
+                let queue_snapshot = {
+                    let tracker = self.eviction_policy.lock();
+                    if matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_)) {
+                        let residents = arr.resident_pages();
+                        tracker.queue_snapshot(&residents)
+                    } else {
+                        None
+                    }
+                };
                 let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
                     (
                         snapshot.small_len,
@@ -2599,10 +2605,22 @@ impl ShardedPageCache {
             .iter()
             .filter_map(PageSlot::stable_snapshot)
             .collect();
+        let capture_queue_snapshot = {
+            let tracker = self.eviction_policy.lock();
+            matches!(&*tracker, PageCacheEvictionTracker::S3Fifo(_))
+        };
         let mut dirty_pages = flat_snapshots
             .iter()
             .filter(|snapshot| snapshot.dirty)
             .count();
+        let mut residents: Vec<PageNumber> = if capture_queue_snapshot {
+            flat_snapshots
+                .iter()
+                .map(|snapshot| snapshot.page_no)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Add overflow shard metrics
         for shard in self.shards.iter() {
@@ -2613,19 +2631,16 @@ impl ShardedPageCache {
             total_evictions = total_evictions.saturating_add(s.evictions);
             total_pages += s.len();
             dirty_pages += s.pages.values().filter(|entry| entry.is_dirty()).count();
+            if capture_queue_snapshot {
+                residents.extend(s.pages.keys().copied());
+            }
         }
 
-        let mut residents: Vec<PageNumber> = flat_snapshots
-            .iter()
-            .map(|snapshot| snapshot.page_no)
-            .collect();
-        for shard in self.shards.iter() {
-            residents.extend(shard.lock().resident_pages());
-        }
-        let queue_snapshot = self
-            .eviction_policy
-            .lock()
-            .queue_snapshot(residents.iter().copied());
+        let queue_snapshot = if capture_queue_snapshot {
+            self.eviction_policy.lock().queue_snapshot(&residents)
+        } else {
+            None
+        };
         let (t1_size, t2_size, b1_size, p_target) = if let Some(snapshot) = queue_snapshot {
             (
                 snapshot.small_len,
@@ -2729,7 +2744,33 @@ impl ShardedPageCache {
     /// Get shard distribution statistics (for testing/debugging).
     #[must_use]
     pub fn shard_distribution(&self) -> Vec<usize> {
-        self.shards.iter().map(|s| s.lock().len()).collect()
+        let mut distribution = vec![0usize; self.shards.len()];
+
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                for page_no in fast.lock().resident_pages() {
+                    let idx = self.shard_index(page_no);
+                    distribution[idx] += 1;
+                }
+            }
+            return distribution;
+        }
+
+        for snapshot in self
+            .flat_slots
+            .slots
+            .iter()
+            .filter_map(PageSlot::stable_snapshot)
+        {
+            let idx = self.shard_index(snapshot.page_no);
+            distribution[idx] += 1;
+        }
+
+        for (idx, shard) in self.shards.iter().enumerate() {
+            distribution[idx] += shard.lock().len();
+        }
+
+        distribution
     }
 
     /// Read a page from VFS and return an owned copy.

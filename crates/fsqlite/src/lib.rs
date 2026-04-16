@@ -3052,12 +3052,66 @@ mod tests {
     }
 
     #[test]
+    fn create_table_rejects_aggregate_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("CREATE TABLE t(a INTEGER, b INTEGER DEFAULT (sum(1)));")
+            .expect_err("aggregate DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn create_table_rejects_hidden_aggregate_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("CREATE TABLE t(a INTEGER, b INTEGER DEFAULT (1 IN (sum(1))));")
+            .expect_err("aggregate hidden inside IN DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn alter_table_add_column_rejects_non_constant_default_expression() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
         let err = conn
             .execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (a + 1);")
             .expect_err("column-reference DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_hidden_aggregate_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (1 IN (sum(1)));")
+            .expect_err("aggregate hidden inside IN DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_aggregate_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (sum(1));")
+            .expect_err("aggregate DEFAULT should be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("default value of column [b] is not constant"),
