@@ -1649,9 +1649,10 @@ fn load_freelist_from_disk<F: VfsFile>(
 
     while trunk != 0 && out.len() < freelist_count as usize {
         if trunk > db_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("freelist trunk page {trunk} exceeds db_size {db_size}"),
-            });
+            // Trunk page is beyond the database file — can't read it.
+            // Stop the chain here; we'll use whatever valid pages we've
+            // collected so far. normalize_freelist cleans up below.
+            break;
         }
         if !visited.insert(trunk) {
             return Err(FrankenError::DatabaseCorrupt {
@@ -1692,13 +1693,12 @@ fn load_freelist_from_disk<F: VfsFile>(
             }
             let base = 8 + idx * 4;
             let leaf = u32::from_be_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
-            if leaf == 0 {
+            if leaf == 0 || leaf > db_size {
+                // Skip invalid entries: zero pages (shouldn't appear) and
+                // pages beyond the database file (stale/corrupt freelist
+                // state). normalize_freelist also filters these, but we
+                // skip early to avoid counting them toward freelist_count.
                 continue;
-            }
-            if leaf > db_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("freelist leaf page {leaf} exceeds db_size {db_size}"),
-                });
             }
             let leaf_page = PageNumber::new(leaf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("invalid freelist leaf page number {leaf}"),
@@ -1732,9 +1732,10 @@ fn load_freelist_from_committed_state<F: VfsFile>(
 
     while trunk != 0 && out.len() < freelist_count as usize {
         if trunk > db_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("freelist trunk page {trunk} exceeds db_size {db_size}"),
-            });
+            // Trunk page is beyond the committed database size — can't
+            // read it. Stop the chain here and use whatever valid pages
+            // we've collected so far.
+            break;
         }
         if !visited.insert(trunk) {
             return Err(FrankenError::DatabaseCorrupt {
@@ -1774,13 +1775,10 @@ fn load_freelist_from_committed_state<F: VfsFile>(
             }
             let base = 8 + idx * 4;
             let leaf = u32::from_be_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
-            if leaf == 0 {
+            if leaf == 0 || leaf > db_size {
+                // Skip invalid entries: zero pages and pages beyond the
+                // committed database size (stale/corrupt freelist state).
                 continue;
-            }
-            if leaf > db_size {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("freelist leaf page {leaf} exceeds db_size {db_size}"),
-                });
             }
             let leaf_page = PageNumber::new(leaf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("invalid freelist leaf page number {leaf}"),
