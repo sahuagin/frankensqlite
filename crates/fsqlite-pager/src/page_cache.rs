@@ -1030,6 +1030,8 @@ struct FastPageArray {
     pages: Vec<Option<CachedPageEntry>>,
     /// Number of non-None entries (tracked for O(1) len()).
     count: usize,
+    /// Round-robin cursor for arbitrary eviction scans.
+    next_eviction_scan_start: usize,
     /// Local hit counter.
     hits: u64,
     /// Local miss counter.
@@ -1046,6 +1048,7 @@ impl FastPageArray {
         Self {
             pages: Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY),
             count: 0,
+            next_eviction_scan_start: 0,
             hits: 0,
             misses: 0,
             admits: 0,
@@ -1124,6 +1127,9 @@ impl FastPageArray {
         let is_new = self.pages[idx].is_none();
         self.pages[idx] = Some(CachedPageEntry::new(buf));
         if is_new {
+            if self.count == 0 {
+                self.next_eviction_scan_start = idx;
+            }
             self.count += 1;
             self.admits = self.admits.saturating_add(1);
         }
@@ -1136,6 +1142,9 @@ impl FastPageArray {
         if let Some(slot) = self.pages.get_mut(idx) {
             if slot.take().is_some() {
                 self.count = self.count.saturating_sub(1);
+                if self.count == 0 {
+                    self.next_eviction_scan_start = 0;
+                }
                 self.evictions = self.evictions.saturating_add(1);
                 return true;
             }
@@ -1145,9 +1154,21 @@ impl FastPageArray {
 
     /// Remove an arbitrary page (for eviction).
     fn remove_any(&mut self) -> Option<PageNumber> {
-        for (idx, slot) in self.pages.iter_mut().enumerate() {
-            if slot.take().is_some() {
+        if self.count == 0 || self.pages.is_empty() {
+            self.next_eviction_scan_start = 0;
+            return None;
+        }
+
+        let len = self.pages.len();
+        let start = self.next_eviction_scan_start.min(len);
+        for idx in start..len {
+            if self.pages[idx].take().is_some() {
                 self.count = self.count.saturating_sub(1);
+                self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                    0
+                } else {
+                    idx + 1
+                };
                 self.evictions = self.evictions.saturating_add(1);
                 // Convert idx back to page number (1-based).
                 // idx is bounded by pages.len() which fits in usize, and we only
@@ -1156,6 +1177,21 @@ impl FastPageArray {
                 return PageNumber::new((idx + 1) as u32);
             }
         }
+        for idx in 0..start {
+            if self.pages[idx].take().is_some() {
+                self.count = self.count.saturating_sub(1);
+                self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                    0
+                } else {
+                    idx + 1
+                };
+                self.evictions = self.evictions.saturating_add(1);
+                #[allow(clippy::cast_possible_truncation)]
+                return PageNumber::new((idx + 1) as u32);
+            }
+        }
+
+        self.next_eviction_scan_start = 0;
         None
     }
 
@@ -1163,6 +1199,7 @@ impl FastPageArray {
     fn clear(&mut self) -> usize {
         let removed = self.count;
         self.count = 0;
+        self.next_eviction_scan_start = 0;
         for slot in &mut self.pages {
             let _ = slot.take();
         }
@@ -1174,6 +1211,7 @@ impl FastPageArray {
     fn cold_reset(&mut self) -> usize {
         let removed = self.count;
         self.count = 0;
+        self.next_eviction_scan_start = 0;
         self.pages = Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY);
         self.evictions = self.evictions.saturating_add(removed as u64);
         removed
@@ -5389,6 +5427,37 @@ mod tests {
         assert!(
             arr.remove_any().is_none(),
             "bead_id={BEAD_FZR07} case=remove_any_empty"
+        );
+    }
+
+    #[test]
+    fn test_fast_page_array_remove_any_honors_sparse_eviction_cursor() {
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        let low = PageNumber::ONE;
+        let high = PageNumber::new(4096).unwrap();
+
+        arr.insert(low, pool.acquire().unwrap());
+        arr.insert(high, pool.acquire().unwrap());
+        arr.next_eviction_scan_start = FastPageArray::pgno_to_idx(high);
+
+        assert_eq!(
+            arr.remove_any(),
+            Some(high),
+            "bead_id={BEAD_FZR07} case=cursor_prefers_high_sparse_slot"
+        );
+        assert_eq!(
+            arr.next_eviction_scan_start, 0,
+            "bead_id={BEAD_FZR07} case=cursor_wraps_after_high_slot"
+        );
+        assert_eq!(
+            arr.remove_any(),
+            Some(low),
+            "bead_id={BEAD_FZR07} case=cursor_wraps_to_low_slot"
+        );
+        assert_eq!(
+            arr.next_eviction_scan_start, 0,
+            "bead_id={BEAD_FZR07} case=cursor_resets_when_empty"
         );
     }
 
