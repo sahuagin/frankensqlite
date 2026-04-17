@@ -26,7 +26,7 @@ pub enum CompiledProgram {
 }
 
 /// One compiled column source for a simple INSERT record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InsertValueSource {
     /// Read the value from the bound parameter slice at the given zero-based slot.
     Binding(usize),
