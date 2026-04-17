@@ -47,6 +47,7 @@ pub mod sheaf_conformal;
 pub mod shm;
 pub mod sketch_telemetry;
 pub mod ssi_abort_policy;
+pub mod ssi_eprocess_gate;
 pub mod ssi_validation;
 pub mod time_travel;
 pub mod two_phase_commit;
@@ -350,6 +351,9 @@ pub use ssi_abort_policy::{
     DroWindowObservation, LossMatrix, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
     SsiDecisionType, SsiEvidenceLedger, SsiFpMonitor, SsiFpMonitorConfig, SsiReadSetSummary,
     TxnCost, Victim, VictimDecision, dro_wasserstein_radius, select_victim,
+};
+pub use ssi_eprocess_gate::{
+    GateAlertState, SsiEProcessConfig, SsiEProcessGate, SsiEProcessSnapshot,
 };
 pub use ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge,
