@@ -1304,6 +1304,12 @@ struct FlatPageSlots {
     mask: usize,
     /// Number of occupied (non-empty, non-tombstone) slots.
     count: AtomicUsize,
+    /// Next slot index to probe first for arbitrary eviction.
+    ///
+    /// Sequential scans can force frequent evictions once the buffer pool
+    /// saturates. Advancing a cursor across the flat table avoids repeatedly
+    /// rescanning the same prefix on every eviction.
+    eviction_cursor: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
     admits: AtomicU64,
@@ -1325,6 +1331,7 @@ impl FlatPageSlots {
             mask: capacity - 1,
             slots: slots.into_boxed_slice(),
             count: AtomicUsize::new(0),
+            eviction_cursor: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             admits: AtomicU64::new(0),
@@ -1492,8 +1499,7 @@ impl FlatPageSlots {
 
     /// Remove an arbitrary page (for eviction) and return its page number.
     fn remove_any_page(&self) -> Option<PageNumber> {
-        // Pseudo-random start to spread eviction pressure.
-        let start = self.count.load(Ordering::Relaxed) & self.mask;
+        let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
             let idx = (start + i) & self.mask;
             let slot_pgno = self.slots[idx].pgno.load(Ordering::Relaxed);
@@ -1511,6 +1517,8 @@ impl FlatPageSlots {
             {
                 let _ = self.slots[idx].data.lock().take();
                 self.count.fetch_sub(1, Ordering::Relaxed);
+                self.eviction_cursor
+                    .store(idx.wrapping_add(1), Ordering::Relaxed);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 return PageNumber::new(slot_pgno);
             }
@@ -1529,6 +1537,7 @@ impl FlatPageSlots {
             }
         }
         self.count.store(0, Ordering::Relaxed);
+        self.eviction_cursor.store(0, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
         self.evictions.fetch_add(removed as u64, Ordering::Relaxed);
         removed
