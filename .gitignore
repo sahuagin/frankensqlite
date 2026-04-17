@@ -127,6 +127,9 @@ visible
 # Beads history snapshots
 .beads/.br_history/
 
+# Beads lock files (write/sync/bv/br advisory flocks)
+.beads/*.lock
+
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
 proptest-regressions/
