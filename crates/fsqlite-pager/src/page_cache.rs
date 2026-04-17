@@ -2558,9 +2558,13 @@ impl ShardedPageCache {
     }
 
     /// Evict all pages from the cache.
+    ///
+    /// Unlike fast-path mode transitions, `clear()` preserves the fast-array's
+    /// backing allocation so callers can cheaply reuse the same sparse working
+    /// set after an explicit cache flush.
     pub fn clear(&self) {
         if let Some(ref fast) = self.fast_array {
-            fast.lock().cold_reset();
+            fast.lock().clear();
         }
         self.flat_slots.clear();
         for shard in self.shards.iter() {
@@ -2773,7 +2777,8 @@ impl ShardedPageCache {
 
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
-                for page_no in fast.lock().resident_pages() {
+                let resident_pages = fast.lock().resident_pages();
+                for page_no in resident_pages {
                     let idx = self.shard_index(page_no);
                     distribution[idx] += 1;
                 }
@@ -5678,7 +5683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sharded_cache_clear_releases_sparse_fast_path_storage() {
+    fn test_sharded_cache_clear_preserves_sparse_fast_path_storage() {
         let mut cache = ShardedPageCache::new(PageSize::DEFAULT);
         let sparse_page = PageNumber::new(4096).unwrap();
 
@@ -5686,8 +5691,9 @@ mod tests {
         cache
             .insert_fresh(sparse_page, |data| data[0] = 0x7C)
             .unwrap();
+        let pages_len_before_clear = cache.fast_array.as_ref().unwrap().lock().pages.len();
         assert!(
-            cache.fast_array.as_ref().unwrap().lock().pages.len() > FAST_ARRAY_INITIAL_CAPACITY,
+            pages_len_before_clear > FAST_ARRAY_INITIAL_CAPACITY,
             "bead_id={BEAD_FZR07} case=clear_sparse_fast_insert_grows_backing_storage"
         );
 
@@ -5695,8 +5701,8 @@ mod tests {
 
         assert_eq!(
             cache.fast_array.as_ref().unwrap().lock().pages.len(),
-            0,
-            "bead_id={BEAD_FZR07} case=clear_releases_sparse_fast_storage"
+            pages_len_before_clear,
+            "bead_id={BEAD_FZR07} case=clear_preserves_sparse_fast_storage"
         );
         assert_eq!(
             cache.fast_array.as_ref().unwrap().lock().len(),
