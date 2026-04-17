@@ -4828,6 +4828,12 @@ where
         true
     }
 
+    /// Report whether the page cache fast path has been enabled.
+    #[must_use]
+    pub fn is_single_connection_cache_fast_path_enabled(&self) -> bool {
+        self.cache.is_fast_path_enabled()
+    }
+
     /// Open a database in true read-only mode for fast analytical queries.
     ///
     /// Unlike [`open_with_cx`], this:
