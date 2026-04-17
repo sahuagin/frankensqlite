@@ -1593,6 +1593,10 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             measure(&format!("fs_batch_{count}"), count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
+                // Workload never issues a time-travel query, so suppress the
+                // O(existing_rows) MemDatabase clone that would otherwise run
+                // at every COMMIT (bd-batched-commit-cliff).
+                let _ = conn.execute("PRAGMA fsqlite_capture_time_travel_snapshots=false");
                 conn.execute(create_sql).unwrap();
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 let num_batches = count.div_ceil(batch_size);
