@@ -2595,6 +2595,124 @@ pub fn prepare_concurrent_commit_with_ssi(
     })
 }
 
+/// Commit a concurrent transaction, running only first-committer-wins and
+/// skipping the Cahill/Fekete SSI edge discovery + pivot check.
+///
+/// This is the "fast path" entry point used when the `SsiEProcessGate` (see
+/// [`crate::ssi_eprocess_gate::SsiEProcessGate`]) certifies that the current
+/// commit's coarse conflict pattern is inside a pivot-free safe region.
+///
+/// **Safety:** FCW is always preserved — it is required for MVCC invariants
+/// INV-1/2/3 (first-committer-wins blocks write-write conflicts regardless
+/// of SSI). Only the edge-discovery + pivot-detection step is skipped. The
+/// returned plan is structurally indistinguishable from the
+/// `used_candidate_free_prepare_fast_path` branch of
+/// [`prepare_concurrent_commit_with_ssi`] — `finalize` treats it as having
+/// no incoming/outgoing edges.
+///
+/// This function must only be called under `write_merge = LAB_UNSAFE`. The
+/// gate consultation happens at the caller; this entry point just implements
+/// the FCW-only shape.
+///
+/// # Errors
+///
+/// Returns `Err` if FCW detects a base-drift conflict (the conservative
+/// write-write check), or if the handle is missing / marked for abort.
+pub fn prepare_concurrent_commit_fcw_only(
+    registry: &mut ConcurrentRegistry,
+    commit_index: &CommitIndex,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    planned_commit_seq: CommitSeq,
+) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
+    let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
+
+    let commit_view = {
+        let handle = registry
+            .get(session_id)
+            .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
+        if !handle.is_active() {
+            return Err((MvccError::InvalidState, FcwResult::Clean));
+        }
+
+        // FCW (Step 1) — mandatory for MVCC write-write invariants.
+        let fcw_result = validate_first_committer_wins(&handle, commit_index);
+        if !matches!(fcw_result, FcwResult::Clean) {
+            Err(fcw_result)
+        } else {
+            Ok((
+                handle.token(),
+                handle.begin_seq(),
+                handle.write_set_pages().into_vec(),
+                handle.held_lock_pages(),
+                handle.is_marked_for_abort(),
+            ))
+        }
+    };
+    let (txn, begin_seq, write_set_pages, held_lock_pages, marked_for_abort) = match commit_view {
+        Ok(view) => view,
+        Err(fcw_result) => {
+            if let Some(mut handle) = registry.get_mut(session_id) {
+                release_tracked_page_locks(lock_table, &handle, txn_id);
+                handle.mark_aborted();
+            } else {
+                lock_table.release_all(txn_id);
+            }
+            return Err((MvccError::BusySnapshot, fcw_result));
+        }
+    };
+
+    if marked_for_abort {
+        tracing::warn!(
+            txn = %txn_id,
+            "prepare_concurrent_commit_fcw_only: marked_for_abort"
+        );
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            release_tracked_page_locks(lock_table, &handle, txn_id);
+            handle.mark_aborted();
+        } else {
+            lock_table.release_all(txn_id);
+        }
+        return Err((MvccError::BusySnapshot, FcwResult::Clean));
+    }
+
+    // Hydrate the witness state so finalize can emit the committed-conflict
+    // history the same way it would on the candidate-free fast path — this
+    // keeps the committed-readers/writers ledger honest even when the gate
+    // skips validation on the *current* commit.
+    let Some((sorted_read_keys, read_key_summary, sorted_write_keys, write_key_summary)) =
+        hydrate_finalize_witness_state(registry, session_id)
+    else {
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            release_tracked_page_locks(lock_table, &handle, txn_id);
+            handle.mark_aborted();
+        } else {
+            lock_table.release_all(txn_id);
+        }
+        return Err((MvccError::InvalidState, FcwResult::Clean));
+    };
+
+    Ok(PreparedConcurrentCommit {
+        session_id,
+        planned_commit_seq,
+        txn_token: txn,
+        begin_seq,
+        read_keys: sorted_read_keys,
+        read_key_summary,
+        write_keys: sorted_write_keys,
+        write_key_summary,
+        write_set_pages,
+        held_lock_pages,
+        has_in_rw: false,
+        has_out_rw: false,
+        incoming_edges: Vec::new(),
+        outgoing_edges: Vec::new(),
+        dro_t3_decision: None,
+        used_uncontended_prepare_fast_path: false,
+        used_candidate_free_prepare_fast_path: true,
+    })
+}
+
 /// Publish a previously prepared concurrent commit after physical pager commit.
 ///
 /// Applies SSI side effects (T3 propagation), records committed conflict

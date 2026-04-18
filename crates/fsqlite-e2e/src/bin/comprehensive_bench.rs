@@ -331,6 +331,19 @@ fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
     ] {
         let _ = conn.execute(pragma);
     }
+    // Opt-in LAB_UNSAFE write-merge mode for A/B perf measurement of the
+    // SSI e-process skip gate. The gate is safe to leave on: under the
+    // benchmark's pivot-free workloads, SSI validation is the dominant
+    // constant-time overhead per commit.
+    if std::env::var("FSQLITE_BENCH_LAB_UNSAFE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let _ = conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;");
+        // Tight alpha so the gate opens reasonably fast on the short
+        // benchmark runs. `alpha = 1e-3` matches the default.
+        let _ = conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;");
+    }
 }
 
 // ─── Report formatting ────────────────────────────────────────────────

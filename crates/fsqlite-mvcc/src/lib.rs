@@ -188,7 +188,8 @@ pub use begin_concurrent::{
     concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_stage_prepared_write_page,
     concurrent_track_write_conflict_page, concurrent_write_metadata_page, concurrent_write_page,
     finalize_prepared_concurrent_commit_with_ssi, is_concurrent_mode,
-    prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
+    prepare_concurrent_commit_fcw_only, prepare_concurrent_commit_with_ssi,
+    validate_first_committer_wins,
 };
 pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};
 pub use cache_aligned::{
