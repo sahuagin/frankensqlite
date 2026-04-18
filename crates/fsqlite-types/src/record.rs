@@ -1487,15 +1487,29 @@ pub fn encode_batch(
         let mut body_size = 0usize;
         for value in row.iter() {
             let (serial_type, payload_len) = serialized_value_layout(value);
-            header_content_size += varint_len(serial_type);
-            body_size += payload_len;
+            header_content_size = header_content_size
+                .checked_add(varint_len(serial_type))
+                .ok_or_else(|| {
+                    fsqlite_error::FrankenError::Internal(
+                        "encode_batch: row header size overflow".to_owned(),
+                    )
+                })?;
+            body_size = body_size.checked_add(payload_len).ok_or_else(|| {
+                fsqlite_error::FrankenError::Internal(
+                    "encode_batch: row body size overflow".to_owned(),
+                )
+            })?;
         }
         let header_size = compute_header_size(header_content_size);
         sizes.push((header_size, body_size));
         total_size = total_size
             .checked_add(header_size)
             .and_then(|t| t.checked_add(body_size))
-            .unwrap_or(usize::MAX);
+            .ok_or_else(|| {
+                fsqlite_error::FrankenError::Internal(
+                    "encode_batch: total batch size overflow".to_owned(),
+                )
+            })?;
     }
 
     // Resize exactly once. Already-allocated capacity is preserved.
