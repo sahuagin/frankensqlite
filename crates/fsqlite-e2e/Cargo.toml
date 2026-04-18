@@ -73,6 +73,10 @@ required-features = ["tui"]
 name = "corruption-demo"
 path = "src/bin/corruption_demo.rs"
 
+[[bin]]
+name = "perf-update-delete"
+path = "src/bin/perf_update_delete.rs"
+
 [[bench]]
 name = "e2e_bench"
 harness = false

@@ -14,32 +14,165 @@
 //!   [iters]  Number of outer iterations for profiling (default 10)
 //!   [which]  "update" | "delete" | "both" (default "both")
 
+use std::fmt;
+use std::process::ExitCode;
 use std::time::Instant;
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let rows: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10_000);
-    let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let which: String = args.next().unwrap_or_else(|| "both".to_owned());
+const DEFAULT_ROWS: usize = 10_000;
+const DEFAULT_ITERS: usize = 10;
 
-    let do_update = which != "delete";
-    let do_delete = which != "update";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkloadKind {
+    Update,
+    Delete,
+    Both,
+}
+
+impl WorkloadKind {
+    fn parse(raw: &str) -> Result<Self, RunError> {
+        match raw {
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "both" => Ok(Self::Both),
+            other => Err(RunError::Usage(format!(
+                "invalid workload '{other}'; expected update, delete, or both"
+            ))),
+        }
+    }
+
+    fn do_update(self) -> bool {
+        matches!(self, Self::Update | Self::Both)
+    }
+
+    fn do_delete(self) -> bool {
+        matches!(self, Self::Delete | Self::Both)
+    }
+}
+
+impl fmt::Display for WorkloadKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Update => f.write_str("update"),
+            Self::Delete => f.write_str("delete"),
+            Self::Both => f.write_str("both"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BenchArgs {
+    rows: usize,
+    iters: usize,
+    workload: WorkloadKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RunError {
+    Usage(String),
+    Runtime(String),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage(message) | Self::Runtime(message) => f.write_str(message),
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("perf-update-delete: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run() -> Result<(), RunError> {
+    let args = parse_args(std::env::args().skip(1))?;
+    run_benchmark(&args)
+}
+
+fn parse_args<I>(args: I) -> Result<BenchArgs, RunError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+
+    let rows = match args.next() {
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            RunError::Usage(format!(
+                "invalid rows '{raw}'; expected a non-negative integer"
+            ))
+        })?,
+        None => DEFAULT_ROWS,
+    };
+    let iters = match args.next() {
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            RunError::Usage(format!(
+                "invalid iters '{raw}'; expected a non-negative integer"
+            ))
+        })?,
+        None => DEFAULT_ITERS,
+    };
+    let workload = match args.next() {
+        Some(raw) => WorkloadKind::parse(&raw)?,
+        None => WorkloadKind::Both,
+    };
+    if let Some(extra) = args.next() {
+        return Err(RunError::Usage(format!(
+            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both]"
+        )));
+    }
+    if iters == 0 {
+        return Err(RunError::Usage(
+            "iters must be greater than zero".to_string(),
+        ));
+    }
+
+    Ok(BenchArgs {
+        rows,
+        iters,
+        workload,
+    })
+}
+
+fn per_row_ns(total_ns: u128, op_count: usize, iters: usize) -> f64 {
+    let total_ops = op_count.saturating_mul(iters);
+    if total_ops == 0 {
+        0.0
+    } else {
+        total_ns as f64 / total_ops as f64
+    }
+}
+
+fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
+    let rows_i64 = i64::try_from(args.rows)
+        .map_err(|_| RunError::Usage("rows must fit within i64".to_string()))?;
+    let update_count = args.rows / 10;
+    let delete_count = args.rows / 20;
 
     eprintln!(
-        "perf-update-delete: rows={rows} iters={iters} which={which} \
-        (do_update={do_update} do_delete={do_delete})",
+        "perf-update-delete: rows={} iters={} which={} (do_update={} do_delete={} update_count={} delete_count={})",
+        args.rows,
+        args.iters,
+        args.workload,
+        args.workload.do_update(),
+        args.workload.do_delete(),
+        update_count,
+        delete_count,
     );
-
-    let update_count = rows / 10;
-    let delete_count = rows / 20;
 
     let t_all = Instant::now();
     let mut total_update_ns: u128 = 0;
     let mut total_delete_ns: u128 = 0;
     let mut total_populate_ns: u128 = 0;
 
-    for iter in 0..iters {
-        let conn = fsqlite::Connection::open(":memory:").unwrap();
+    for iter in 0..args.iters {
+        let conn = fsqlite::Connection::open(":memory:")
+            .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
         conn.execute(
             "CREATE TABLE bench (\
                 id INTEGER PRIMARY KEY,\
@@ -47,52 +180,61 @@ fn main() {
                 name TEXT\
             );",
         )
-        .unwrap();
-        conn.execute("BEGIN").unwrap();
+        .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
+        conn.execute("BEGIN")
+            .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
         let stmt = conn
             .prepare("INSERT INTO bench(id, value, name) VALUES (?1, ?1, 'row');")
-            .unwrap();
+            .map_err(|err| RunError::Runtime(format!("prepare populate statement: {err}")))?;
         let t0 = Instant::now();
-        #[allow(clippy::cast_possible_wrap)]
-        for i in 0..rows as i64 {
+        for i in 0..rows_i64 {
             stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                .unwrap();
+                .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
         }
-        conn.execute("COMMIT").unwrap();
+        conn.execute("COMMIT")
+            .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
         total_populate_ns += t0.elapsed().as_nanos();
 
-        if do_update {
-            conn.execute("BEGIN").unwrap();
+        if args.workload.do_update() {
+            conn.execute("BEGIN")
+                .map_err(|err| RunError::Runtime(format!("begin update transaction: {err}")))?;
             let update = conn
                 .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
-                .unwrap();
+                .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
             let t0 = Instant::now();
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 0..update_count as i64 {
-                let id = i * 10;
+            for i in 0..update_count {
+                let id = i64::try_from(i).map_err(|_| {
+                    RunError::Usage("update_count index overflowed i64".to_string())
+                })? * 10;
                 update
                     .execute_with_params(&[
                         fsqlite::SqliteValue::Integer(id),
                         fsqlite::SqliteValue::Float(999.99),
                     ])
-                    .unwrap();
+                    .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
             }
-            conn.execute("COMMIT").unwrap();
+            conn.execute("COMMIT")
+                .map_err(|err| RunError::Runtime(format!("commit update transaction: {err}")))?;
             total_update_ns += t0.elapsed().as_nanos();
         }
 
-        if do_delete {
-            conn.execute("BEGIN").unwrap();
-            let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
+        if args.workload.do_delete() {
+            conn.execute("BEGIN")
+                .map_err(|err| RunError::Runtime(format!("begin delete transaction: {err}")))?;
+            let delete = conn
+                .prepare("DELETE FROM bench WHERE id = ?1")
+                .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
             let t0 = Instant::now();
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 0..delete_count as i64 {
-                let id = i * 20;
+            for i in 0..delete_count {
+                let id = i64::try_from(i).map_err(|_| {
+                    RunError::Usage("delete_count index overflowed i64".to_string())
+                })? * 20;
                 delete
                     .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                    .unwrap();
+                    .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
             }
-            conn.execute("COMMIT").unwrap();
+            conn.execute("COMMIT")
+                .map_err(|err| RunError::Runtime(format!("commit delete transaction: {err}")))?;
             total_delete_ns += t0.elapsed().as_nanos();
         }
 
@@ -102,13 +244,13 @@ fn main() {
     }
 
     let total_ns = t_all.elapsed().as_nanos();
-    let per_row_update = if do_update {
-        total_update_ns as f64 / (update_count * iters) as f64
+    let per_row_update = if args.workload.do_update() {
+        per_row_ns(total_update_ns, update_count, args.iters)
     } else {
         0.0
     };
-    let per_row_delete = if do_delete {
-        total_delete_ns as f64 / (delete_count * iters) as f64
+    let per_row_delete = if args.workload.do_delete() {
+        per_row_ns(total_delete_ns, delete_count, args.iters)
     } else {
         0.0
     };
@@ -120,4 +262,65 @@ fn main() {
         total_update_ns / 1_000_000,
         total_delete_ns / 1_000_000,
     );
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BenchArgs, DEFAULT_ITERS, DEFAULT_ROWS, RunError, WorkloadKind, parse_args, per_row_ns,
+    };
+
+    #[test]
+    fn parse_args_uses_defaults() {
+        assert_eq!(
+            parse_args(std::iter::empty::<String>()).unwrap(),
+            BenchArgs {
+                rows: DEFAULT_ROWS,
+                iters: DEFAULT_ITERS,
+                workload: WorkloadKind::Both,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_workload() {
+        let err = parse_args(["100".to_string(), "2".to_string(), "bogus".to_string()])
+            .expect_err("invalid workload should fail");
+        assert_eq!(
+            err,
+            RunError::Usage(
+                "invalid workload 'bogus'; expected update, delete, or both".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_zero_iters() {
+        let err =
+            parse_args(["100".to_string(), "0".to_string()]).expect_err("zero iters should fail");
+        assert_eq!(
+            err,
+            RunError::Usage("iters must be greater than zero".to_string())
+        );
+    }
+
+    #[test]
+    fn per_row_ns_returns_zero_for_zero_ops() {
+        assert_eq!(per_row_ns(50_000, 0, 5), 0.0);
+        assert_eq!(per_row_ns(50_000, 3, 0), 0.0);
+    }
+
+    #[test]
+    fn parse_args_accepts_small_row_counts() {
+        assert_eq!(
+            parse_args(["5".to_string(), "1".to_string(), "update".to_string()]).unwrap(),
+            BenchArgs {
+                rows: 5,
+                iters: 1,
+                workload: WorkloadKind::Update,
+            }
+        );
+    }
 }
