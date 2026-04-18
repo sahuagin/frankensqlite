@@ -20,6 +20,9 @@ use std::time::Instant;
 
 const DEFAULT_ROWS: usize = 10_000;
 const DEFAULT_ITERS: usize = 10;
+const BENCH_CREATE_SQL: &str =
+    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)";
+const BENCH_INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkloadKind {
@@ -148,6 +151,25 @@ fn per_row_ns(total_ns: u128, op_count: usize, iters: usize) -> f64 {
     }
 }
 
+fn apply_benchmark_pragmas(conn: &fsqlite::Connection) {
+    for pragma in [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+    ] {
+        let _ = conn.execute(pragma);
+    }
+
+    if std::env::var("FSQLITE_BENCH_LAB_UNSAFE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let _ = conn.execute("PRAGMA fsqlite.write_merge = LAB_UNSAFE;");
+        let _ = conn.execute("PRAGMA fsqlite.ssi_e_process_alpha = 0.001;");
+    }
+}
+
 fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     let rows_i64 = i64::try_from(args.rows)
         .map_err(|_| RunError::Usage("rows must fit within i64".to_string()))?;
@@ -173,18 +195,13 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     for iter in 0..args.iters {
         let conn = fsqlite::Connection::open(":memory:")
             .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
-        conn.execute(
-            "CREATE TABLE bench (\
-                id INTEGER PRIMARY KEY,\
-                value REAL,\
-                name TEXT\
-            );",
-        )
+        apply_benchmark_pragmas(&conn);
+        conn.execute(BENCH_CREATE_SQL)
         .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
         conn.execute("BEGIN")
             .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
         let stmt = conn
-            .prepare("INSERT INTO bench(id, value, name) VALUES (?1, ?1, 'row');")
+            .prepare(BENCH_INSERT_SQL)
             .map_err(|err| RunError::Runtime(format!("prepare populate statement: {err}")))?;
         let t0 = Instant::now();
         for i in 0..rows_i64 {
@@ -269,7 +286,8 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchArgs, DEFAULT_ITERS, DEFAULT_ROWS, RunError, WorkloadKind, parse_args, per_row_ns,
+        BENCH_CREATE_SQL, BENCH_INSERT_SQL, BenchArgs, DEFAULT_ITERS, DEFAULT_ROWS, RunError,
+        WorkloadKind, parse_args, per_row_ns, run_benchmark,
     };
 
     #[test]
@@ -322,5 +340,27 @@ mod tests {
                 workload: WorkloadKind::Update,
             }
         );
+    }
+
+    #[test]
+    fn benchmark_schema_matches_small_record_workload() {
+        assert_eq!(
+            BENCH_CREATE_SQL,
+            "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL NOT NULL)"
+        );
+        assert_eq!(
+            BENCH_INSERT_SQL,
+            "INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))"
+        );
+    }
+
+    #[test]
+    fn run_benchmark_smoke_small_workload() {
+        let args = BenchArgs {
+            rows: 5,
+            iters: 1,
+            workload: WorkloadKind::Both,
+        };
+        run_benchmark(&args).expect("small smoke workload should succeed");
     }
 }
