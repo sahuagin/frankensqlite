@@ -14,12 +14,16 @@ pub mod instrumentation;
 pub mod learned_index;
 pub mod overflow;
 pub mod payload;
+pub mod quotient_filter;
 pub mod swiss_index;
 pub mod swizzle;
 pub mod traits;
 
 #[cfg(test)]
 mod btree_invariant_tests;
+
+#[cfg(test)]
+mod quotient_filter_bench;
 
 pub use be_tree::{
     BeTree, BeTreeConfig, BeTreeMetricsSnapshot, betree_metrics_snapshot, reset_betree_metrics,
@@ -48,6 +52,11 @@ pub use instrumentation::{
 pub use learned_index::{
     LearnedIndex, LearnedIndexConfig, LearnedIndexMetricsSnapshot, learned_index_metrics_snapshot,
     reset_learned_index_metrics,
+};
+pub use quotient_filter::{
+    DEFAULT_Q_BITS as QUOTIENT_FILTER_DEFAULT_Q_BITS,
+    DEFAULT_R_BITS as QUOTIENT_FILTER_DEFAULT_R_BITS, QuotientFilter, QuotientFilterError,
+    hash_rowid as quotient_filter_hash_rowid,
 };
 pub use swizzle::{PageTemperature, SwizzleError, SwizzlePtr, SwizzleState};
 pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};

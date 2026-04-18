@@ -833,6 +833,7 @@ dependencies = [
  "proptest",
  "serde",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
