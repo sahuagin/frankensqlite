@@ -400,6 +400,22 @@ impl PageData {
         }
     }
 
+    /// Returns `true` when this page is backed by single-owner `Owned` bytes
+    /// whose shared-snapshot cache has not yet been materialised.
+    ///
+    /// Callers can use this as a cheap probe before mutating via
+    /// `as_bytes_mut`: a `true` result guarantees that the subsequent mutable
+    /// borrow will NOT trigger a copy-on-write clone (`Arc::make_mut`) and
+    /// thus stays allocation-free.
+    #[inline]
+    #[must_use]
+    pub fn is_single_owner_owned(&self) -> bool {
+        matches!(
+            &self.repr,
+            PageDataRepr::Owned { shared, .. } if shared.get().is_none()
+        )
+    }
+
     /// Extend an owned page buffer with zero bytes in place.
     ///
     /// Returns `true` when the underlying representation stayed owned and was

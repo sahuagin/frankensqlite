@@ -1936,6 +1936,34 @@ fn insert_staged_page(
     }
 }
 
+/// Global counter of same-page-within-transaction writes that reused the
+/// existing `StagedPage` buffer in place instead of allocating a fresh
+/// [`PageBuf`] from the pool and dropping the old one.
+///
+/// Consumers can snapshot this counter via
+/// [`staged_page_overwrite_steals_total`] to verify the allocation
+/// reduction landed on a given workload.
+static STAGED_PAGE_OVERWRITE_STEALS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Snapshot the running total of in-place staged-page overwrites.
+///
+/// Used by microbenchmarks and allocation regression tests. The counter is
+/// monotonic and uses `Relaxed` ordering — call sites MUST NOT derive
+/// correctness invariants from its value.
+#[must_use]
+pub fn staged_page_overwrite_steals_total() -> u64 {
+    u64::try_from(STAGED_PAGE_OVERWRITE_STEALS_TOTAL.load(AtomicOrdering::Relaxed))
+        .unwrap_or(u64::MAX)
+}
+
+/// Reset the running total of staged-page overwrite steals.
+///
+/// Tests and microbenchmarks use this to establish a clean baseline before
+/// measuring a specific workload.
+pub fn reset_staged_page_overwrite_steals_total() {
+    STAGED_PAGE_OVERWRITE_STEALS_TOTAL.store(0, AtomicOrdering::Relaxed);
+}
+
 #[cfg(test)]
 struct WalCommitBatch<'a> {
     new_db_size: u32,
@@ -5248,6 +5276,64 @@ impl StagedPage {
             }
         }
     }
+
+    /// Attempt to overwrite this staged page's bytes in place with `data`.
+    ///
+    /// Returns `true` when the existing backing buffer was reused (no
+    /// allocation, no pool round-trip). Returns `false` when the backing
+    /// either has an outstanding shared snapshot (`published` already set) or
+    /// cannot otherwise be safely mutated, in which case the caller must fall
+    /// back to inserting a fresh [`StagedPage`].
+    ///
+    /// Safety / correctness contract:
+    /// * If `published` is populated, an external reader (MVCC snapshot,
+    ///   cache probe, etc.) already took a shared view of these bytes, so we
+    ///   must never mutate them in place.
+    /// * For `Buffered(PageBuf)` the backing buffer is single-owner by
+    ///   construction, so overwriting its bytes is safe when `published`
+    ///   is empty.
+    /// * For `Owned(PageData)` we only reuse when the internal shared-snapshot
+    ///   cache has not yet been materialised (i.e. the bytes are still
+    ///   single-owner). `PageData::as_bytes_mut` would otherwise perform a
+    ///   copy-on-write via `Arc::make_mut`, which defeats the whole point of
+    ///   the fast path.
+    fn try_overwrite_bytes_in_place(&mut self, data: &[u8]) -> bool {
+        if self.published.get().is_some() {
+            return false;
+        }
+        match &mut self.backing {
+            StagedPageBacking::Buffered(buf) => {
+                if buf.len() != data.len() {
+                    return false;
+                }
+                buf.as_mut_slice().copy_from_slice(data);
+                true
+            }
+            StagedPageBacking::Owned(page_data) => {
+                if page_data.len() != data.len() {
+                    return false;
+                }
+                // Only mutate when the `Owned` variant still holds
+                // single-owner bytes. `as_bytes_mut` would otherwise CoW
+                // through `Arc::make_mut`, which allocates — defeating the
+                // fast path.
+                if !page_data.is_single_owner_owned() {
+                    return false;
+                }
+                page_data.as_bytes_mut().copy_from_slice(data);
+                true
+            }
+        }
+    }
+
+    /// Attempt to overwrite this staged page with an owned [`PageData`].
+    ///
+    /// Same contract as [`Self::try_overwrite_bytes_in_place`], but avoids
+    /// the intermediate byte-slice copy when the caller already owns a
+    /// `PageData` whose bytes can be moved in.
+    fn try_overwrite_page_data_in_place(&mut self, data: &PageData) -> bool {
+        self.try_overwrite_bytes_in_place(data.as_bytes())
+    }
 }
 
 /// Transaction handle produced by [`SimplePager`].
@@ -7054,6 +7140,19 @@ where
             self.freed_pages.swap_remove(pos);
         }
 
+        // Fast path: a second (or Nth) write to the same page within the
+        // same transaction reuses the already-allocated StagedPage buffer
+        // instead of allocating a fresh PageBuf from the pool and dropping
+        // the old one. This is a frequent pattern for cursor-driven
+        // workloads that repeatedly restamp the same B-tree leaf as rows
+        // accumulate.
+        if let Some(existing) = self.write_set.get_mut(&page_no)
+            && existing.try_overwrite_bytes_in_place(data)
+        {
+            STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(());
+        }
+
         let staged = StagedPage::from_bytes(&self.pool, data)?;
         insert_staged_page(
             &mut self.write_set,
@@ -7069,6 +7168,17 @@ where
 
         if let Some(pos) = self.freed_pages.iter().position(|&p| p == page_no) {
             self.freed_pages.swap_remove(pos);
+        }
+
+        // Same-page steal fast path (see `write_page`). The borrow split is
+        // done first so we don't hand the fresh `PageData` to the
+        // StagedPage constructor (and its pool acquire) unless we actually
+        // need a new buffer.
+        if let Some(existing) = self.write_set.get_mut(&page_no)
+            && existing.try_overwrite_page_data_in_place(&data)
+        {
+            STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(());
         }
 
         let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
@@ -21542,6 +21652,137 @@ mod tests {
         assert!(
             frame_refs.iter().all(|frame| frame.db_size_if_commit == 0),
             "all-zero inputs must stay non-commit after flattening"
+        );
+    }
+
+    /// Repeated writes to the same page within a single transaction must
+    /// reuse the existing `StagedPage` buffer in place instead of allocating
+    /// a fresh `PageBuf` from the pool and dropping the old one.
+    ///
+    /// This test exercises both the allocation-count path (pool metrics) and
+    /// the custom steal counter to ensure the fast path is actually taken.
+    #[test]
+    fn test_same_page_write_steals_existing_buffer() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = txn.allocate_page(&cx).unwrap();
+
+        // First write into an empty slot — always allocates a fresh buffer.
+        let initial = vec![0x11_u8; page_size];
+        txn.write_page(&cx, page_no, &initial).unwrap();
+
+        // Capture baselines AFTER the first write so we isolate the repeated
+        // same-page writes. Per-pool metrics are isolated from other tests
+        // running in parallel; the global steal counter is not, so we only
+        // assert a lower bound on its delta.
+        let pool_before = txn.pool.metrics_snapshot();
+        let steals_before = staged_page_overwrite_steals_total();
+
+        // Drive many same-page rewrites. Each one should go through the
+        // steal fast path.
+        let iterations = 10_000_u64;
+        for i in 0..iterations {
+            let mut data = vec![0_u8; page_size];
+            data[0] = u8::try_from(i & 0xFF).expect("mask fits u8");
+            data[1] = u8::try_from((i >> 8) & 0xFF).expect("mask fits u8");
+            txn.write_page(&cx, page_no, &data).unwrap();
+        }
+
+        let pool_after = txn.pool.metrics_snapshot();
+        let steals_after = staged_page_overwrite_steals_total();
+
+        assert!(
+            steals_after.saturating_sub(steals_before) >= iterations,
+            "bead_id=bd-steal-same-page case=all_repeated_writes_stole \
+             steals_before={steals_before} steals_after={steals_after} \
+             iterations={iterations}"
+        );
+        assert_eq!(
+            pool_after.page_buffer_pool_misses, pool_before.page_buffer_pool_misses,
+            "bead_id=bd-steal-same-page case=no_new_pool_misses \
+             before={} after={}",
+            pool_before.page_buffer_pool_misses, pool_after.page_buffer_pool_misses
+        );
+        assert_eq!(
+            pool_after.page_buffer_pool_hits, pool_before.page_buffer_pool_hits,
+            "bead_id=bd-steal-same-page case=no_new_pool_hits \
+             before={} after={}",
+            pool_before.page_buffer_pool_hits, pool_after.page_buffer_pool_hits
+        );
+
+        // Final read must observe the last write.
+        let final_mask = (iterations - 1) & 0xFF;
+        let read_back = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            u64::from(read_back.as_ref()[0]),
+            final_mask,
+            "bead_id=bd-steal-same-page case=last_write_wins_byte0"
+        );
+    }
+
+    /// Once the staged page has been published as a shared snapshot (via
+    /// `StagedPage::published`), subsequent writes MUST fall back to the
+    /// allocate-new-buffer path to preserve the shared view. This guards
+    /// against the fast path silently mutating bytes an MVCC reader already
+    /// sees.
+    #[test]
+    fn test_same_page_write_after_publish_does_not_steal() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = txn.allocate_page(&cx).unwrap();
+
+        let initial = vec![0xA5_u8; page_size];
+        txn.write_page(&cx, page_no, &initial).unwrap();
+
+        // Force a shared-snapshot publication via a read. `get_page` returns
+        // a `PageData` clone whose existence populates the `published`
+        // OnceLock on the underlying `StagedPage`, forbidding in-place
+        // overwrite afterward.
+        let snapshot = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            snapshot.as_ref()[0],
+            0xA5,
+            "bead_id=bd-steal-same-page case=pre_publish_read"
+        );
+
+        // After a publish, another in-place steal on this specific page
+        // must not happen, so the per-pool allocator must take a new hit or
+        // miss. Other tests may still be running and incrementing the
+        // global steal counter concurrently, so the single-write delta
+        // cannot be asserted against the global. Instead, verify via the
+        // per-pool metrics (isolated to this pager) that a fresh buffer
+        // was acquired for the post-publish write.
+        let pool_before = txn.pool.metrics_snapshot();
+        let updated = vec![0x5A_u8; page_size];
+        txn.write_page(&cx, page_no, &updated).unwrap();
+        let pool_after = txn.pool.metrics_snapshot();
+
+        let new_hits = pool_after.page_buffer_pool_hits - pool_before.page_buffer_pool_hits;
+        let new_misses = pool_after.page_buffer_pool_misses - pool_before.page_buffer_pool_misses;
+        assert!(
+            new_hits + new_misses >= 1,
+            "bead_id=bd-steal-same-page case=published_forbids_steal \
+             new_hits={new_hits} new_misses={new_misses}"
+        );
+
+        // Post-write state must reflect the NEW bytes but the previously
+        // captured snapshot MUST still see the old ones.
+        let fresh = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            fresh.as_ref()[0],
+            0x5A,
+            "bead_id=bd-steal-same-page case=post_write_reads_new"
+        );
+        assert_eq!(
+            snapshot.as_ref()[0],
+            0xA5,
+            "bead_id=bd-steal-same-page case=captured_snapshot_unchanged"
         );
     }
 }

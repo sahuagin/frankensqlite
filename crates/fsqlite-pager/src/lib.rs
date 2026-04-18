@@ -34,7 +34,8 @@ pub use pager::{
     PAGER_METADATA_PUBLICATION_CONTRACTS, PagerMetadataPublicationClass,
     PagerMetadataPublicationContract, PagerPublishedSnapshot, ParallelWalPublicationIntent,
     SimplePager, SimplePagerCheckpointWriter, SimpleTransaction, WalCommitSyncPolicy,
-    remove_group_commit_queue,
+    remove_group_commit_queue, reset_staged_page_overwrite_steals_total,
+    staged_page_overwrite_steals_total,
 };
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
