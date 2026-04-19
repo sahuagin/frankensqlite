@@ -2708,6 +2708,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_conflicting_pages_since_snapshot_detects_later_wal_writes() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let p1 = sample_page(0x41);
+        let p2_before = sample_page(0x42);
+        let p2_after = sample_page(0x43);
+        let p3 = sample_page(0x44);
+
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter
+            .append_frame(&cx, 2, &p2_before, 2)
+            .expect("commit tx1");
+        adapter
+            .begin_transaction(&cx)
+            .expect("pin transaction snapshot");
+        let pinned = adapter
+            .pinned_read_snapshot()
+            .expect("transaction should expose pinned WAL snapshot");
+        let conflict_snapshot = TransactionConflictSnapshot {
+            generation: pinned.generation,
+            last_commit_frame: pinned.last_commit_frame,
+            commit_count: pinned.commit_count,
+        };
+
+        adapter
+            .append_frame(&cx, 3, &p3, 0)
+            .expect("append unrelated later page");
+        adapter
+            .append_frame(&cx, 2, &p2_after, 3)
+            .expect("commit later page 2 update");
+
+        let conflicts = adapter
+            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[2, 99])
+            .expect("conflict check should scan later committed frames");
+        assert_eq!(conflicts, vec![2]);
+
+        let unrelated = adapter
+            .conflicting_pages_since_snapshot(&cx, conflict_snapshot, &[99])
+            .expect("unrelated page should stay conflict-free");
+        assert!(unrelated.is_empty());
+    }
+
     // -- CheckpointTargetAdapterRef tests --
 
     #[test]

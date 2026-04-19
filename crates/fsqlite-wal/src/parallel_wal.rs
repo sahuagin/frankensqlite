@@ -18,7 +18,7 @@
 //! - WAL writes are now embarrassingly parallel.
 //! - Epoch mechanism provides natural group commit semantics (Silo/Aether pattern).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::hash::BuildHasher;
@@ -240,18 +240,15 @@ impl<T> ParallelWalLaneStager<T> {
         let lane_id = batch.lane_id;
         let staged_frame_count = usize::try_from(batch.staged_frame_count).unwrap_or(0);
 
-        {
-            let mut lane_batches = self
-                .lane_batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            lane_batches.entry(lane_id).or_default().push_back(batch);
-        }
-
+        let mut lane_batches = self
+            .lane_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut lane_backlog = self
             .lane_backlog_frames
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lane_batches.entry(lane_id).or_default().push_back(batch);
         let backlog = lane_backlog.entry(lane_id).or_insert(0);
         *backlog = backlog.saturating_add(staged_frame_count);
         *backlog
@@ -304,6 +301,65 @@ impl<T> ParallelWalLaneStager<T> {
         }
 
         Some(by_batch_id)
+    }
+
+    /// Discard prepared payloads for batches that already fell back to the
+    /// raw ordered WAL path.
+    ///
+    /// Lane-local preparation is an optimization, not the durability record.
+    /// If a flusher cannot consume the prepared payloads for a group-commit
+    /// epoch, those payloads become stale as soon as the same batches are
+    /// appended via borrowed frame refs. Leaving them queued would make later
+    /// epochs see an old batch id at the front of the lane and permanently
+    /// fall back.
+    pub fn discard_batches_for_flush(&self, contexts: &[TransactionFrameBatchContext]) -> usize {
+        if contexts.is_empty() {
+            return 0;
+        }
+
+        let discard_ids = contexts
+            .iter()
+            .map(|context| context.batch_id)
+            .collect::<HashSet<_>>();
+        let mut removed_batches = 0_usize;
+        let mut removed_frames_by_lane = HashMap::<u16, usize>::new();
+
+        let mut lane_batches = self
+            .lane_batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (lane_id, queue) in lane_batches.iter_mut() {
+            let mut retained = VecDeque::with_capacity(queue.len());
+            while let Some(batch) = queue.pop_front() {
+                if discard_ids.contains(&batch.batch_id) {
+                    removed_batches = removed_batches.saturating_add(1);
+                    let removed_frames =
+                        usize::try_from(batch.staged_frame_count).unwrap_or(usize::MAX);
+                    let entry = removed_frames_by_lane.entry(*lane_id).or_insert(0);
+                    *entry = entry.saturating_add(removed_frames);
+                } else {
+                    retained.push_back(batch);
+                }
+            }
+            *queue = retained;
+        }
+        lane_batches.retain(|_, queue| !queue.is_empty());
+
+        if !removed_frames_by_lane.is_empty() {
+            let mut lane_backlog = self
+                .lane_backlog_frames
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (lane_id, removed_frames) in removed_frames_by_lane {
+                let backlog = lane_backlog.entry(lane_id).or_insert(0);
+                *backlog = backlog.saturating_sub(removed_frames);
+                if *backlog == 0 {
+                    lane_backlog.remove(&lane_id);
+                }
+            }
+        }
+
+        removed_batches
     }
 }
 
@@ -1657,6 +1713,80 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained.get(&10).map(|batch| batch.payload), Some(10));
         assert_eq!(drained.get(&11).map(|batch| batch.payload), Some(11));
+        assert_eq!(stager.current_lane_backlog(0), 0);
+    }
+
+    #[test]
+    fn test_lane_stager_discard_batches_for_flush_removes_stale_payloads() {
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(2),
+            ..ParallelWalControlSurface::default()
+        });
+
+        assert_eq!(stager.record_batch(sample_lane_batch(10, 0, 2, 10)), 2);
+        assert_eq!(stager.record_batch(sample_lane_batch(11, 0, 3, 11)), 5);
+        assert_eq!(stager.record_batch(sample_lane_batch(12, 0, 5, 12)), 10);
+
+        assert_eq!(
+            stager.discard_batches_for_flush(&[sample_lane_context(11, 0)]),
+            1
+        );
+        assert_eq!(
+            stager.current_lane_backlog(0),
+            7,
+            "discarding a stale middle batch must subtract its staged frames without disturbing retained payloads"
+        );
+
+        let retained = [sample_lane_context(10, 0), sample_lane_context(12, 0)];
+        let drained = stager
+            .take_batches_for_flush(&retained)
+            .expect("discarded stale payload should not block later retained batches");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.get(&10).map(|batch| batch.payload), Some(10));
+        assert_eq!(drained.get(&12).map(|batch| batch.payload), Some(12));
+        assert_eq!(stager.current_lane_backlog(0), 0);
+    }
+
+    #[test]
+    fn test_lane_stager_discard_batches_for_flush_is_idempotent() {
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(2),
+            ..ParallelWalControlSurface::default()
+        });
+
+        assert_eq!(stager.record_batch(sample_lane_batch(20, 1, 4, 20)), 4);
+        let context = [sample_lane_context(20, 1)];
+        assert_eq!(stager.discard_batches_for_flush(&context), 1);
+        assert_eq!(stager.current_lane_backlog(1), 0);
+        assert_eq!(
+            stager.discard_batches_for_flush(&context),
+            0,
+            "discarding an already-flushed raw fallback batch should be a no-op"
+        );
+        assert_eq!(stager.current_lane_backlog(1), 0);
+    }
+
+    #[test]
+    fn test_lane_stager_discard_batches_for_flush_ignores_unknown_ids() {
+        let stager = ParallelWalLaneStager::<u32>::new(ParallelWalControlSurface {
+            mode: ParallelWalOperatingMode::Auto,
+            lane_count_override: Some(2),
+            ..ParallelWalControlSurface::default()
+        });
+
+        assert_eq!(stager.record_batch(sample_lane_batch(30, 0, 2, 30)), 2);
+        assert_eq!(
+            stager.discard_batches_for_flush(&[sample_lane_context(99, 0)]),
+            0
+        );
+        assert_eq!(stager.current_lane_backlog(0), 2);
+
+        let drained = stager
+            .take_batches_for_flush(&[sample_lane_context(30, 0)])
+            .expect("unknown discard must not perturb queued batches");
+        assert_eq!(drained.get(&30).map(|batch| batch.payload), Some(30));
         assert_eq!(stager.current_lane_backlog(0), 0);
     }
 
