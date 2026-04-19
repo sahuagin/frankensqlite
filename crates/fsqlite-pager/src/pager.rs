@@ -829,6 +829,14 @@ impl GroupCommitQueue {
         self.parallel_wal_lanes.take_batches_for_flush(&contexts)
     }
 
+    fn discard_prepared_batches_for_flush(&self, batches: &[TransactionFrameBatch]) -> usize {
+        let contexts = batches
+            .iter()
+            .map(|batch| batch.context)
+            .collect::<Vec<_>>();
+        self.parallel_wal_lanes.discard_batches_for_flush(&contexts)
+    }
+
     /// Publish a completed epoch and wake all waiters.
     ///
     /// We take the consolidator mutex before publishing so a waiter cannot
@@ -2099,20 +2107,49 @@ fn conflicting_pages_since_batch_snapshots(
     Ok(conflicts)
 }
 
+fn group_commit_final_db_size(current_db_size: u32, batches: &[TransactionFrameBatch]) -> u32 {
+    batches
+        .iter()
+        .flat_map(|batch| batch.frames.iter())
+        .fold(current_db_size, |db_size, frame| {
+            db_size.max(frame.db_size_if_commit)
+        })
+}
+
+fn promote_group_commit_page_one_headers(
+    batches: &mut [TransactionFrameBatch],
+    final_db_size: u32,
+) -> bool {
+    let mut promoted = false;
+    for batch in batches {
+        for frame in &mut batch.frames {
+            if frame.page_number != 1 || frame.page_data.len() < DATABASE_HEADER_SIZE {
+                continue;
+            }
+            let mut existing_page_count_bytes = [0_u8; 4];
+            existing_page_count_bytes.copy_from_slice(&frame.page_data[28..32]);
+            let existing_page_count = u32::from_be_bytes(existing_page_count_bytes);
+            let promoted_page_count = existing_page_count.max(final_db_size);
+            if promoted_page_count != existing_page_count {
+                frame.page_data[28..32].copy_from_slice(&promoted_page_count.to_be_bytes());
+                promoted = true;
+            }
+        }
+    }
+    promoted
+}
+
 fn flatten_group_commit_batches<'a>(
     current_db_size: u32,
     batches: &'a [TransactionFrameBatch],
 ) -> (Vec<traits::WalFrameRef<'a>>, u32) {
     let total_frames: usize = batches.iter().map(|batch| batch.frames.len()).sum();
     let mut frame_refs: Vec<traits::WalFrameRef<'a>> = Vec::with_capacity(total_frames);
-    let mut final_db_size = current_db_size;
+    let final_db_size = group_commit_final_db_size(current_db_size, batches);
     let mut last_commit_frame_idx = None;
 
     for batch in batches {
         for frame in &batch.frames {
-            if frame.db_size_if_commit > final_db_size {
-                final_db_size = frame.db_size_if_commit;
-            }
             if frame.db_size_if_commit != 0 {
                 last_commit_frame_idx = Some(frame_refs.len());
             }
@@ -2329,14 +2366,41 @@ fn lane_flush_stats(
 fn conflicting_pages_across_group_commit_batches(batches: &[TransactionFrameBatch]) -> Vec<u32> {
     let mut first_batch_by_page = HashMap::<u32, usize>::new();
     let mut conflicts = HashSet::<u32>::new();
+    let mut page_one_conflict_batches = Vec::<usize>::new();
+    let mut page_one_frame_batches = Vec::<usize>::new();
 
     for (batch_idx, batch) in batches.iter().enumerate() {
         let mut seen_in_batch = HashSet::<u32>::new();
+        let mut batch_has_page_one_frame = false;
+        let mut batch_has_page_one_conflict = false;
+
+        for &page_number in &batch.conflict_pages {
+            if page_number == 1 {
+                batch_has_page_one_conflict = true;
+            }
+            if !seen_in_batch.insert(page_number) {
+                continue;
+            }
+            match first_batch_by_page.get(&page_number).copied() {
+                Some(previous_batch_idx) if previous_batch_idx != batch_idx => {
+                    conflicts.insert(page_number);
+                }
+                None => {
+                    first_batch_by_page.insert(page_number, batch_idx);
+                }
+                Some(_) => {}
+            }
+        }
+
         for frame in &batch.frames {
             if frame.page_number == 1 {
                 // Page 1 carries the shared database header and legitimately
                 // appears in disjoint commits; treating it as a hard overlap
-                // would spuriously abort safe group-commit epochs.
+                // would spuriously abort safe group-commit epochs. Explicit
+                // Page 1 rewrites still enter the semantic conflict surface
+                // through `batch.conflict_pages`, and are checked below
+                // against synthetic Page 1 frames from other batches.
+                batch_has_page_one_frame = true;
                 continue;
             }
             if !seen_in_batch.insert(frame.page_number) {
@@ -2352,6 +2416,21 @@ fn conflicting_pages_across_group_commit_batches(batches: &[TransactionFrameBatc
                 Some(_) => {}
             }
         }
+
+        if batch_has_page_one_conflict {
+            page_one_conflict_batches.push(batch_idx);
+        }
+        if batch_has_page_one_frame {
+            page_one_frame_batches.push(batch_idx);
+        }
+    }
+
+    if page_one_conflict_batches.iter().any(|conflict_batch_idx| {
+        page_one_frame_batches
+            .iter()
+            .any(|frame_batch_idx| frame_batch_idx != conflict_batch_idx)
+    }) {
+        conflicts.insert(1);
     }
 
     let mut conflicts = conflicts.into_iter().collect::<Vec<_>>();
@@ -5468,10 +5547,12 @@ struct WalPageOneWritePlan {
 
 impl WalPageOneWritePlan {
     /// In WAL mode, Page 1 rewrite is only required when Page 1 was explicitly
-    /// modified (schema changes, VACUUM, etc.). We defer synthetic Page 1
-    /// updates for:
+    /// modified (schema changes, VACUUM, etc.). Synthetic Page 1 changes are
+    /// kept out of the MVCC conflict surface for:
     ///
-    /// 1. `db_growth` - WAL frame's `db_size_if_commit` captures database size
+    /// 1. `db_growth` - commit preparation may inject a header frame so readers
+    ///    can observe the new page count, but that frame is bookkeeping rather
+    ///    than a direct Page 1 write for first-committer-wins purposes.
     /// 2. `freelist_metadata_dirty` - Freelist changes from allocations/frees
     ///    are implicitly captured by the WAL frames (the pages that were
     ///    allocated/freed are in the WAL). At checkpoint time, the freelist
@@ -5485,6 +5566,10 @@ impl WalPageOneWritePlan {
         self.page_one_dirty
     }
 
+    /// Whether commit preparation needs to advance Page 1's page-count header
+    /// for WAL readers. This is intentionally separate from
+    /// [`Self::requires_page_one_rewrite`] so synthetic growth frames can be
+    /// written without becoming cross-process conflict pages.
     #[must_use]
     fn requires_page_count_advance(self) -> bool {
         self.db_growth
@@ -5715,11 +5800,26 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     fn predicted_conflict_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
+        let committed_db_size = self.committed_db_size_with_inner(inner);
+        let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
+        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+        self.predicted_conflict_pages_for_wal_commit_with_inner(
+            inner,
+            wal_page1_plan,
+            &self.freed_pages,
+        )
+    }
+
+    fn predicted_conflict_pages_for_wal_commit_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+        wal_page1_plan: WalPageOneWritePlan,
+        freed_conflict_pages: &[PageNumber],
+    ) -> Vec<PageNumber> {
         let mut pages = self.predicted_commit_pages_with_inner(inner);
+        pages.extend(freed_conflict_pages.iter().copied());
 
         if self.mode == TransactionMode::Concurrent && self.journal_mode == JournalMode::Wal {
-            let page_one_dirty = self.write_set.contains_key(&PageNumber::ONE);
-
             // bd-3wop3.8 (D1-CRITICAL): In WAL mode, synthetic page 1 changes
             // (change counter, page count, freelist metadata) are safely
             // serialized by the pager inner.lock() during Phase A commit.
@@ -5728,14 +5828,21 @@ impl<V: Vfs> SimpleTransaction<V> {
             // state). Only track page 1 as a conflict when directly modified
             // by schema operations (CREATE TABLE, DROP TABLE, etc.).
             //
+            // Use the caller's pre-synthetic Page 1 plan. Commit preparation
+            // may inject Page 1 later for WAL bookkeeping, and checking
+            // write_set at that point would incorrectly treat synthetic
+            // page-count/header frames as direct Page 1 writes.
+            //
             // This eliminates ~2000 spurious MVCC conflicts on page 1 that
             // occurred when concurrent INSERTs (db_growth) and DELETEs
             // (freelist_dirty) both touched page 1 header metadata.
-            if !page_one_dirty {
+            if !wal_page1_plan.requires_page_one_rewrite() {
                 pages.retain(|page| *page != PageNumber::ONE);
             }
         }
 
+        pages.sort_unstable();
+        pages.dedup();
         pages
     }
 
@@ -6276,7 +6383,7 @@ where
                     u64::try_from(Duration::from_micros(arrival_wait_us).as_nanos())
                         .unwrap_or(u64::MAX);
 
-                let (batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
+                let (mut batches, flush_epoch) = if let Some(prefetched) = prefetched_flush.take() {
                     prefetched
                 } else {
                     let maybe_flush = {
@@ -6347,6 +6454,15 @@ where
                         conflicting_pages = ?conflicting_pages,
                         "aborting physical writer flush because batch membership overlaps on the same page"
                     );
+                    let discarded_prepared_batches =
+                        queue.discard_prepared_batches_for_flush(&batches);
+                    if discarded_prepared_batches > 0 {
+                        tracing::trace!(
+                            target: "fsqlite::wal::lane_staging",
+                            discarded_prepared_batches,
+                            "discarded stale prepared WAL lane payloads before group-commit overlap abort"
+                        );
+                    }
                     let (abort_result, wake_next_epoch) = {
                         let mut consolidator = queue
                             .consolidator
@@ -6366,12 +6482,22 @@ where
                     return Err(error);
                 }
 
-                // bd-db300.3.8.6: Fused single-pass assembly — build frame_refs
-                // and compute final_db_size in one iteration over batches,
-                // eliminating the intermediate `all_frames` Vec allocation.
+                // Compute the consolidated commit size before borrowing frame
+                // refs so synthetic Page 1 headers can be promoted to the same
+                // db_size carried by the final WAL commit marker.
                 let batch_count = batches.len();
+                let flush_base_db_size = {
+                    let inner = inner_arc
+                        .lock()
+                        .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                    inner.db_size
+                };
+                let consolidated_db_size = group_commit_final_db_size(flush_base_db_size, &batches);
+                let promoted_page_one_headers =
+                    promote_group_commit_page_one_headers(&mut batches, consolidated_db_size);
                 let (frame_refs, final_db_size) =
-                    flatten_group_commit_batches(current_db_size, &batches);
+                    flatten_group_commit_batches(flush_base_db_size, &batches);
+                debug_assert_eq!(final_db_size, consolidated_db_size);
                 let frame_count = frame_refs.len();
                 let lane_stats = lane_flush_stats(queue, &batches);
                 let mut fallback_reason = if matches!(
@@ -6387,69 +6513,93 @@ where
                 let mut prepared_batch = if fallback_reason.is_none() {
                     match queue.take_prepared_batches_for_flush(&batches) {
                         Some(mut staged_by_batch_id) => {
-                            match batches
-                                .iter()
-                                .map(|batch| staged_by_batch_id.remove(&batch.context.batch_id))
-                                .collect::<Option<Vec<_>>>()
-                            {
-                                Some(mut ordered_staged_batches) => {
-                                    match merge_prepared_group_commit_batches(
-                                        &ordered_staged_batches,
-                                        final_db_size,
-                                    ) {
-                                        Ok(merged) => {
-                                            if should_shadow_compare_batches(
-                                                &parallel_wal_control,
-                                                &batches,
-                                            ) {
-                                                if prepared_batch_matches_frame_refs(
-                                                    &merged,
-                                                    &frame_refs,
+                            if promoted_page_one_headers {
+                                // Lane-local prepared batches were created
+                                // before the flusher knew the consolidated
+                                // group db_size. Once Page 1 header bytes are
+                                // promoted to that final size, those prepared
+                                // byte streams are stale. They have been
+                                // drained from the lane queues here; discard
+                                // them and rebuild from patched `frame_refs`.
+                                fallback_reason =
+                                    Some(ParallelWalFallbackReason::ControllerEvidenceLost);
+                                None
+                            } else {
+                                match batches
+                                    .iter()
+                                    .map(|batch| staged_by_batch_id.remove(&batch.context.batch_id))
+                                    .collect::<Option<Vec<_>>>()
+                                {
+                                    Some(mut ordered_staged_batches) => {
+                                        match merge_prepared_group_commit_batches(
+                                            &ordered_staged_batches,
+                                            final_db_size,
+                                        ) {
+                                            Ok(merged) => {
+                                                if should_shadow_compare_batches(
+                                                    &parallel_wal_control,
+                                                    &batches,
                                                 ) {
-                                                    shadow_verdict =
-                                                        ParallelWalShadowVerdict::Clean;
-                                                    for staged_batch in &mut ordered_staged_batches
-                                                    {
-                                                        staged_batch.shadow_verdict =
+                                                    if prepared_batch_matches_frame_refs(
+                                                        &merged,
+                                                        &frame_refs,
+                                                    ) {
+                                                        shadow_verdict =
                                                             ParallelWalShadowVerdict::Clean;
-                                                    }
-                                                    Some(merged)
-                                                } else {
-                                                    shadow_verdict =
-                                                        ParallelWalShadowVerdict::Diverged;
-                                                    for staged_batch in &mut ordered_staged_batches
-                                                    {
-                                                        staged_batch.shadow_verdict =
+                                                        for staged_batch in
+                                                            &mut ordered_staged_batches
+                                                        {
+                                                            staged_batch.shadow_verdict =
+                                                                ParallelWalShadowVerdict::Clean;
+                                                        }
+                                                        Some(merged)
+                                                    } else {
+                                                        shadow_verdict =
                                                             ParallelWalShadowVerdict::Diverged;
+                                                        for staged_batch in
+                                                            &mut ordered_staged_batches
+                                                        {
+                                                            staged_batch.shadow_verdict =
+                                                                ParallelWalShadowVerdict::Diverged;
+                                                        }
+                                                        fallback_reason = Some(
+                                                            ParallelWalFallbackReason::PublicationMismatch,
+                                                        );
+                                                        None
                                                     }
-                                                    fallback_reason = Some(
-                                                        ParallelWalFallbackReason::PublicationMismatch,
+                                                } else {
+                                                    shadow_verdict = aggregate_shadow_verdict(
+                                                        &ordered_staged_batches,
                                                     );
-                                                    None
+                                                    Some(merged)
                                                 }
-                                            } else {
-                                                shadow_verdict = aggregate_shadow_verdict(
-                                                    &ordered_staged_batches,
+                                            }
+                                            Err(_) => {
+                                                fallback_reason = Some(
+                                                    ParallelWalFallbackReason::ControllerEvidenceLost,
                                                 );
-                                                Some(merged)
+                                                None
                                             }
                                         }
-                                        Err(_) => {
-                                            fallback_reason = Some(
-                                                ParallelWalFallbackReason::ControllerEvidenceLost,
-                                            );
-                                            None
-                                        }
                                     }
-                                }
-                                None => {
-                                    fallback_reason =
-                                        Some(ParallelWalFallbackReason::ControllerEvidenceLost);
-                                    None
+                                    None => {
+                                        fallback_reason =
+                                            Some(ParallelWalFallbackReason::ControllerEvidenceLost);
+                                        None
+                                    }
                                 }
                             }
                         }
                         None => {
+                            let discarded_prepared_batches =
+                                queue.discard_prepared_batches_for_flush(&batches);
+                            if discarded_prepared_batches > 0 {
+                                tracing::trace!(
+                                    target: "fsqlite::wal::lane_staging",
+                                    discarded_prepared_batches,
+                                    "discarded stale prepared WAL lane payloads after raw fallback"
+                                );
+                            }
                             fallback_reason =
                                 Some(ParallelWalFallbackReason::ControllerEvidenceLost);
                             None
@@ -6501,6 +6651,16 @@ where
                         inner.db_file.lock(cx, LockLevel::Reserved)?;
                         exclusive_lock_us =
                             Instant::now().duration_since(t_excl_start).as_micros() as u64;
+                        let restore_lock_level = if inner.writer_active {
+                            // Immediate/exclusive transactions enter commit
+                            // already owning RESERVED. If WAL append fails,
+                            // the caller must keep that writer lock so a
+                            // retry or rollback cannot be interleaved by a
+                            // different writer.
+                            LockLevel::Reserved
+                        } else {
+                            LockLevel::Shared
+                        };
 
                         let t_append_start = Instant::now();
                         let flush_io_result = (|| -> Result<()> {
@@ -6539,7 +6699,7 @@ where
                             Ok(())
                         })();
 
-                        let restore_result = inner.db_file.unlock(cx, LockLevel::Shared);
+                        let restore_result = inner.db_file.unlock(cx, restore_lock_level);
                         match (flush_io_result, restore_result) {
                             (Ok(()), Ok(())) => Ok(()),
                             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -7520,6 +7680,12 @@ where
             // inner.freelist + pending_freed without mutating inner.freelist.
             // The actual promotion into inner.freelist is deferred to
             // Phase C (after WAL success).
+            //
+            // Capture the semantic Page 1 plan before freelist serialization
+            // injects synthetic Page 1 metadata into the write_set. Otherwise
+            // pure freelist bookkeeping would masquerade as a direct Page 1
+            // write and become a cross-process first-committer-wins conflict.
+            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             pending_freed = self.freed_pages.drain(..).collect();
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
@@ -7538,10 +7704,6 @@ where
                 }
             }
 
-            // In rollback-journal mode page 1 is still the durable commit beacon.
-            // In WAL mode classify page-1 work by semantic trigger so later beads
-            // can remove or defer each class independently.
-            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
             // only when it was explicitly dirty, but also when the database
             // grows (new pages allocated beyond current db_size). Without this,
@@ -7594,7 +7756,11 @@ where
                 );
             }
             cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                self.predicted_conflict_pages_with_inner(&inner)
+                self.predicted_conflict_pages_for_wal_commit_with_inner(
+                    &inner,
+                    wal_page1_plan,
+                    &pending_freed,
+                )
             } else {
                 Vec::new()
             };
@@ -7859,6 +8025,9 @@ where
         let pending_freed: Vec<PageNumber> = self.freed_pages.drain(..).collect();
         let commit_result = {
             let freelist_dirty = freelist_dirty_for_retain;
+            // Match the normal commit path: capture semantic Page 1 intent
+            // before freelist serialization can inject bookkeeping Page 1.
+            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             if freelist_dirty {
                 if let Err(e) = serialize_freelist_to_write_set(
                     cx,
@@ -7876,7 +8045,6 @@ where
                 }
             }
 
-            let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
             // D1-CRITICAL Fix: In WAL mode, page 1 must be written to WAL not
             // only when it was explicitly dirty, but also when the database
             // grows (new pages allocated beyond current db_size). Without this,
@@ -7930,7 +8098,11 @@ where
                 );
             }
             let cross_process_conflict_pages = if self.journal_mode == JournalMode::Wal {
-                self.predicted_conflict_pages_with_inner(&inner)
+                self.predicted_conflict_pages_for_wal_commit_with_inner(
+                    &inner,
+                    wal_page1_plan,
+                    &pending_freed,
+                )
             } else {
                 Vec::new()
             };
@@ -11592,8 +11764,41 @@ mod tests {
     type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
     type SharedCounter = StdArc<StdMutex<usize>>;
     type SharedLockLevels = StdArc<StdMutex<Vec<LockLevel>>>;
+    type SharedGate = StdArc<(StdMutex<bool>, StdCondvar)>;
     static PARALLEL_WAL_LANE_TEST_LOCK: StdLazyLock<StdMutex<()>> =
         StdLazyLock::new(|| StdMutex::new(()));
+
+    fn signal_gate(gate: &SharedGate) {
+        let (lock, cvar) = &**gate;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    fn wait_gate(gate: &SharedGate) {
+        let (lock, cvar) = &**gate;
+        let mut ready = lock.lock().unwrap();
+        while !*ready {
+            ready = cvar.wait(ready).unwrap();
+        }
+    }
+
+    fn wait_gate_timeout(gate: &SharedGate, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let (lock, cvar) = &**gate;
+        let mut ready = lock.lock().unwrap();
+        while !*ready {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next_ready, wait_result) = cvar.wait_timeout(ready, remaining).unwrap();
+            ready = next_ready;
+            if wait_result.timed_out() && !*ready {
+                return false;
+            }
+        }
+        true
+    }
 
     fn prepared_batch_from_frame_refs(
         frames: &[crate::traits::WalFrameRef<'_>],
@@ -11874,6 +12079,37 @@ mod tests {
                 prepare_calls,
                 append_frames_calls,
                 append_prepared_calls,
+            )
+        }
+    }
+
+    struct BlockingFirstPrepareWalBackend {
+        frames: SharedFrames,
+        prepare_calls: SharedCounter,
+        first_prepare_entered: SharedGate,
+        release_first_prepare: SharedGate,
+    }
+
+    impl BlockingFirstPrepareWalBackend {
+        fn new() -> (Self, SharedFrames, SharedGate, SharedGate, SharedCounter) {
+            let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let first_prepare_entered: SharedGate =
+                StdArc::new((StdMutex::new(false), StdCondvar::new()));
+            let release_first_prepare: SharedGate =
+                StdArc::new((StdMutex::new(false), StdCondvar::new()));
+            let prepare_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+
+            (
+                Self {
+                    frames: StdArc::clone(&frames),
+                    prepare_calls: StdArc::clone(&prepare_calls),
+                    first_prepare_entered: StdArc::clone(&first_prepare_entered),
+                    release_first_prepare: StdArc::clone(&release_first_prepare),
+                },
+                frames,
+                first_prepare_entered,
+                release_first_prepare,
+                prepare_calls,
             )
         }
     }
@@ -13078,6 +13314,104 @@ mod tests {
                 ));
             }
             Ok(())
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            let frames = self.frames.lock().unwrap();
+            Ok(frames
+                .iter()
+                .rev()
+                .find(|(pn, _, _)| *pn == page_number)
+                .map(|(_, data, _)| data.clone()))
+        }
+
+        fn committed_txn_count(&mut self, _cx: &Cx) -> fsqlite_error::Result<u64> {
+            Ok(self
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                .count() as u64)
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            Ok(())
+        }
+
+        fn frame_count(&self) -> usize {
+            self.frames.lock().unwrap().len()
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).unwrap_or(u32::MAX);
+            Ok(crate::traits::CheckpointResult {
+                total_frames,
+                frames_backfilled: total_frames,
+                completed: true,
+                wal_was_reset: false,
+                requested_mode: _mode,
+                effective_mode: _mode,
+            })
+        }
+    }
+
+    impl crate::traits::WalBackend for BlockingFirstPrepareWalBackend {
+        fn append_frame(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+            page_data: &[u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            self.frames
+                .lock()
+                .unwrap()
+                .push((page_number, page_data.to_vec(), db_size_if_commit));
+            Ok(())
+        }
+
+        fn append_frames(
+            &mut self,
+            _cx: &Cx,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<()> {
+            let mut written = self.frames.lock().unwrap();
+            for frame in frames {
+                written.push((
+                    frame.page_number,
+                    frame.page_data.to_vec(),
+                    frame.db_size_if_commit,
+                ));
+            }
+            Ok(())
+        }
+
+        fn prepare_append_frames(
+            &self,
+            _frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+            let call_index = {
+                let mut calls = self.prepare_calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            if call_index == 1 {
+                signal_gate(&self.first_prepare_entered);
+                wait_gate(&self.release_first_prepare);
+            }
+            Ok(None)
         }
 
         fn read_page(
@@ -14550,6 +14884,160 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_wal_raw_fallback_discard_removes_stale_prepared_batches() {
+        let queue = GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                ..ParallelWalControlSurface::default()
+            },
+        );
+
+        let page_a = sample_page(0xC1);
+        let page_b = sample_page(0xD2);
+        let frame_refs_a = [crate::traits::WalFrameRef {
+            page_number: 2,
+            page_data: &page_a,
+            db_size_if_commit: 2,
+        }];
+        let frame_refs_b = [crate::traits::WalFrameRef {
+            page_number: 3,
+            page_data: &page_b,
+            db_size_if_commit: 3,
+        }];
+        assert_eq!(
+            queue.record_prepared_batch(lane_staged_batch_for_test(10, 0, &frame_refs_a)),
+            1
+        );
+        assert_eq!(
+            queue.record_prepared_batch(lane_staged_batch_for_test(11, 0, &frame_refs_b)),
+            2
+        );
+
+        let raw_fallback_batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 3,
+                page_data: page_b,
+                db_size_if_commit: 3,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 11,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 10,
+            }),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: page_a,
+                db_size_if_commit: 2,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 10,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 10,
+            }),
+        ];
+
+        assert!(
+            queue
+                .take_prepared_batches_for_flush(&raw_fallback_batches)
+                .is_none(),
+            "bead_id=bd-3wop3.1.2 case=raw_fallback_order_mismatch_forces_frame_ref_path"
+        );
+        assert_eq!(
+            queue.current_lane_backlog(0),
+            2,
+            "bead_id=bd-3wop3.1.2 case=raw_fallback_mismatch_leaves_prepared_batches_until_explicit_cleanup"
+        );
+        assert_eq!(
+            queue.discard_prepared_batches_for_flush(&raw_fallback_batches),
+            2,
+            "bead_id=bd-3wop3.1.2 case=raw_fallback_discards_exact_flushed_prepared_batches"
+        );
+        assert_eq!(
+            queue.current_lane_backlog(0),
+            0,
+            "bead_id=bd-3wop3.1.2 case=raw_fallback_discard_clears_stale_lane_backlog"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_overlap_abort_discards_stale_prepared_batches() {
+        let queue = GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                ..ParallelWalControlSurface::default()
+            },
+        );
+
+        let page_a = sample_page(0xE1);
+        let page_b = sample_page(0xE2);
+        let frame_refs_a = [crate::traits::WalFrameRef {
+            page_number: 2,
+            page_data: &page_a,
+            db_size_if_commit: 2,
+        }];
+        let frame_refs_b = [crate::traits::WalFrameRef {
+            page_number: 2,
+            page_data: &page_b,
+            db_size_if_commit: 2,
+        }];
+        assert_eq!(
+            queue.record_prepared_batch(lane_staged_batch_for_test(20, 0, &frame_refs_a)),
+            1
+        );
+        assert_eq!(
+            queue.record_prepared_batch(lane_staged_batch_for_test(21, 0, &frame_refs_b)),
+            2
+        );
+
+        let overlapping_batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: page_a,
+                db_size_if_commit: 2,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 20,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 10,
+            }),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: page_b,
+                db_size_if_commit: 2,
+            }])
+            .with_context(TransactionFrameBatchContext {
+                batch_id: 21,
+                lane_id: 0,
+                staged_frame_count: 1,
+                staging_elapsed_ns: 10,
+            }),
+        ];
+
+        assert_eq!(
+            conflicting_pages_across_group_commit_batches(&overlapping_batches),
+            vec![2],
+            "bead_id=bd-3wop3.1.2 case=overlap_abort_detects_same_page_batches"
+        );
+        assert_eq!(
+            queue.discard_prepared_batches_for_flush(&overlapping_batches),
+            2,
+            "bead_id=bd-3wop3.1.2 case=overlap_abort_discards_failed_prepared_batches"
+        );
+        assert_eq!(
+            queue.current_lane_backlog(0),
+            0,
+            "bead_id=bd-3wop3.1.2 case=overlap_abort_clears_stale_lane_backlog"
+        );
+    }
+
+    #[test]
     fn test_parallel_wal_lane_staging_does_not_need_consolidator_lock() {
         let queue = GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
@@ -14873,6 +15361,117 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_promoted_epoch_uses_live_db_size_floor() {
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/group_commit_promoted_epoch_live_db_size_floor.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let (backend, frames, first_prepare_entered, release_first_prepare, _prepare_calls) =
+            BlockingFirstPrepareWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface {
+                mode: ParallelWalOperatingMode::Auto,
+                lane_count_override: Some(2),
+                // Force the lane-prepared path to opt out before submit, so
+                // the flusher's raw fallback prepare hook becomes the
+                // deterministic "phase is FLUSHING" synchronization point.
+                max_parallel_commit_bytes: Some(0),
+                ..ParallelWalControlSurface::default()
+            },
+        ));
+        let pool = pager.pool.clone();
+
+        let spawn_commit = |page_number: u32, fill: u8| {
+            let inner = Arc::clone(&inner);
+            let wal_backend = Arc::clone(&wal_backend);
+            let queue = Arc::clone(&queue);
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                let cx = Cx::new();
+                let page_no = PageNumber::new(page_number).unwrap();
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page_no,
+                    StagedPage::from_bytes(&pool, &sample_page(fill)).unwrap(),
+                );
+                SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                    &cx,
+                    &wal_backend,
+                    &inner,
+                    &write_set,
+                    &[page_no],
+                    &[],
+                    &queue,
+                )
+            })
+        };
+
+        let writer_a = spawn_commit(5, 0x51);
+        if !wait_gate_timeout(&first_prepare_entered, Duration::from_secs(1)) {
+            signal_gate(&release_first_prepare);
+            let _ = writer_a.join();
+            panic!("bead_id={BEAD_ID} case=promoted_epoch_first_flush_reached_prepare");
+        }
+
+        let writer_b = spawn_commit(2, 0x22);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut pipelined = false;
+        while Instant::now() < deadline {
+            let observed_pipelined = {
+                let consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                consolidator.has_pipelined_batches()
+            };
+            if observed_pipelined {
+                pipelined = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        if !pipelined {
+            signal_gate(&release_first_prepare);
+            let _ = writer_a.join();
+            let _ = writer_b.join();
+            panic!("bead_id={BEAD_ID} case=promoted_epoch_second_writer_pipelined");
+        }
+
+        signal_gate(&release_first_prepare);
+        writer_a
+            .join()
+            .expect("first writer thread should not panic")
+            .unwrap();
+        writer_b
+            .join()
+            .expect("second writer thread should not panic")
+            .unwrap();
+
+        let written = frames.lock().unwrap();
+        let commit_sizes = written
+            .iter()
+            .map(|(_, _, db_size_if_commit)| *db_size_if_commit)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commit_sizes,
+            vec![5, 5],
+            "bead_id={BEAD_ID} case=promoted_epoch_commit_marker_must_not_shrink_db_size"
+        );
+        assert_eq!(
+            inner.lock().unwrap().db_size,
+            5,
+            "bead_id={BEAD_ID} case=promoted_epoch_inner_db_size_must_not_shrink"
+        );
+    }
+
+    #[test]
     fn test_group_commit_queue_retains_failed_epoch_for_late_waiter() {
         let queue = GroupCommitQueue::new(GroupCommitConfig::default());
         queue.publish_failed_epoch(
@@ -14997,6 +15596,13 @@ mod tests {
             );
         }
 
+        {
+            let mut consolidator = queue
+                .consolidator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(consolidator.complete_flush().unwrap());
+        }
         queue.publish_completed_epoch(1, true);
 
         let guard = queue
@@ -17885,9 +18491,11 @@ mod tests {
         let pending_commit = txn.pending_commit_pages().unwrap();
         let pending_conflict = txn.pending_conflict_pages().unwrap();
 
-        // D1-CRITICAL: Pure WAL growth does NOT put Page 1 in commit surface.
-        // The WAL frame's db_size_if_commit captures database size, so Page 1
-        // update is deferred to checkpoint. This eliminates MVCC conflicts.
+        // D1-CRITICAL: Pure WAL growth does not put Page 1 in the pending
+        // transaction surface before commit preparation. The commit path may
+        // still inject a synthetic Page 1 header frame so WAL readers see the
+        // new page count, but that bookkeeping frame must stay out of the
+        // first-committer-wins conflict surface.
         assert!(
             !pending_commit.contains(&PageNumber::ONE),
             "bead_id={BEAD_ID} case=concurrent_wal_growth_commit_surface_excludes_page_one"
@@ -17903,6 +18511,191 @@ mod tests {
         assert!(
             pending_conflict.contains(&page),
             "bead_id={BEAD_ID} case=concurrent_wal_growth_conflict_surface_keeps_real_data_page"
+        );
+    }
+
+    #[test]
+    fn test_commit_conflict_pages_exclude_synthetic_page_one_after_wal_growth_injection() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &vec![0x7C; ps]).unwrap();
+
+        let wal_page1_plan = {
+            let inner = txn.inner.lock().unwrap();
+            let committed_db_size = txn.committed_db_size_with_inner(&inner);
+            let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            txn.classify_wal_page_one_write(inner.db_size, freelist_dirty)
+        };
+        assert!(
+            !wal_page1_plan.requires_page_one_rewrite(),
+            "bead_id={BEAD_ID} case=synthetic_wal_page1_plan_not_direct_page_one_write"
+        );
+        assert!(
+            wal_page1_plan.requires_page_count_advance(),
+            "bead_id={BEAD_ID} case=synthetic_wal_page1_plan_db_growth"
+        );
+
+        let synthetic_page_one = StagedPage::from_bytes(&txn.pool, &[0xA5; 32]).unwrap();
+        insert_staged_page(
+            &mut txn.write_set,
+            &mut txn.write_pages_sorted,
+            PageNumber::ONE,
+            synthetic_page_one,
+        );
+        assert!(
+            txn.write_set.contains_key(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=commit_prepare_injected_synthetic_page_one"
+        );
+
+        let conflict_pages = {
+            let inner = txn.inner.lock().unwrap();
+            txn.predicted_conflict_pages_for_wal_commit_with_inner(&inner, wal_page1_plan, &[])
+        };
+        assert!(
+            !conflict_pages.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=synthetic_wal_page1_not_cross_process_conflict"
+        );
+        assert!(
+            conflict_pages.contains(&page),
+            "bead_id={BEAD_ID} case=data_page_remains_cross_process_conflict"
+        );
+    }
+
+    #[test]
+    fn test_commit_conflict_pages_exclude_synthetic_page_one_after_freelist_serialization() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &vec![0x8D; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.free_page(&cx, page).unwrap();
+
+        let (wal_page1_plan, pending_freed) = {
+            let mut inner = txn.inner.lock().unwrap();
+            let committed_db_size = txn.committed_db_size_with_inner(&inner);
+            let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            assert!(
+                freelist_dirty,
+                "bead_id={BEAD_ID} case=freelist_serialization_regression_requires_dirty_freelist"
+            );
+            assert!(
+                !wal_page1_plan.requires_page_one_rewrite(),
+                "bead_id={BEAD_ID} case=freelist_serialization_plan_not_direct_page_one_write"
+            );
+
+            let pending_freed = txn.freed_pages.drain(..).collect::<Vec<_>>();
+            serialize_freelist_to_write_set(
+                &cx,
+                &mut inner,
+                &txn.cache,
+                &txn.wal_backend,
+                &txn.pool,
+                &mut txn.write_set,
+                &mut txn.write_pages_sorted,
+                committed_db_size,
+                &pending_freed,
+            )
+            .unwrap();
+            (wal_page1_plan, pending_freed)
+        };
+        assert!(
+            txn.write_set.contains_key(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=freelist_serialization_injected_synthetic_page_one"
+        );
+
+        let conflict_pages = {
+            let inner = txn.inner.lock().unwrap();
+            txn.predicted_conflict_pages_for_wal_commit_with_inner(
+                &inner,
+                wal_page1_plan,
+                &pending_freed,
+            )
+        };
+        assert!(
+            !conflict_pages.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=freelist_synthetic_page1_not_cross_process_conflict"
+        );
+        assert!(
+            conflict_pages.contains(&page),
+            "bead_id={BEAD_ID} case=freelist_trunk_page_remains_cross_process_conflict"
+        );
+    }
+
+    #[test]
+    fn test_commit_conflict_pages_keep_non_trunk_freed_pages_after_drain() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let (first_page, second_page) = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let first_page = seed.allocate_page(&cx).unwrap();
+            let second_page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, first_page, &vec![0x91; ps]).unwrap();
+            seed.write_page(&cx, second_page, &vec![0x92; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (first_page, second_page)
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.free_page(&cx, first_page).unwrap();
+        txn.free_page(&cx, second_page).unwrap();
+
+        let (wal_page1_plan, pending_freed) = {
+            let mut inner = txn.inner.lock().unwrap();
+            let committed_db_size = txn.committed_db_size_with_inner(&inner);
+            let freelist_dirty = txn.freelist_metadata_dirty_with_inner(&inner, committed_db_size);
+            let wal_page1_plan = txn.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+            let pending_freed = txn.freed_pages.drain(..).collect::<Vec<_>>();
+            serialize_freelist_to_write_set(
+                &cx,
+                &mut inner,
+                &txn.cache,
+                &txn.wal_backend,
+                &txn.pool,
+                &mut txn.write_set,
+                &mut txn.write_pages_sorted,
+                committed_db_size,
+                &pending_freed,
+            )
+            .unwrap();
+            (wal_page1_plan, pending_freed)
+        };
+
+        let non_trunk_freed_page = pending_freed
+            .iter()
+            .copied()
+            .find(|page| !txn.write_set.contains_key(page))
+            .expect("at least one freed page should be carried only as freelist metadata");
+        let conflict_pages = {
+            let inner = txn.inner.lock().unwrap();
+            txn.predicted_conflict_pages_for_wal_commit_with_inner(
+                &inner,
+                wal_page1_plan,
+                &pending_freed,
+            )
+        };
+        assert!(
+            conflict_pages.contains(&first_page),
+            "bead_id={BEAD_ID} case=first_freed_page_remains_cross_process_conflict"
+        );
+        assert!(
+            conflict_pages.contains(&second_page),
+            "bead_id={BEAD_ID} case=second_freed_page_remains_cross_process_conflict"
+        );
+        assert!(
+            conflict_pages.contains(&non_trunk_freed_page),
+            "bead_id={BEAD_ID} case=non_trunk_freed_page_survives_drain"
         );
     }
 
@@ -21690,6 +22483,80 @@ mod tests {
     }
 
     #[test]
+    fn test_group_commit_page_one_headers_promote_to_consolidated_db_size() {
+        use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
+
+        fn page_one_with_page_count(fill: u8, page_count: u32) -> Vec<u8> {
+            let mut page = vec![fill; 4096];
+            page[28..32].copy_from_slice(&page_count.to_be_bytes());
+            page
+        }
+
+        fn page_count(page: &[u8]) -> u32 {
+            let mut bytes = [0_u8; 4];
+            bytes.copy_from_slice(&page[28..32]);
+            u32::from_be_bytes(bytes)
+        }
+
+        let mut batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: page_one_with_page_count(0xAA, 12),
+                db_size_if_commit: 12,
+            }]),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: page_one_with_page_count(0xBA, 8),
+                db_size_if_commit: 8,
+            }]),
+        ];
+
+        let final_db_size = group_commit_final_db_size(5, &batches);
+        assert_eq!(
+            final_db_size, 12,
+            "group final db_size should be the max commit marker"
+        );
+        assert!(
+            promote_group_commit_page_one_headers(&mut batches, final_db_size),
+            "a smaller trailing Page 1 header must be promoted before WAL append"
+        );
+        assert_eq!(page_count(&batches[0].frames[0].page_data), 12);
+        assert_eq!(page_count(&batches[1].frames[0].page_data), 12);
+
+        let (frame_refs, flattened_db_size) = flatten_group_commit_batches(5, &batches);
+        assert_eq!(flattened_db_size, 12);
+        assert_eq!(
+            frame_refs
+                .iter()
+                .map(|frame| frame.db_size_if_commit)
+                .collect::<Vec<_>>(),
+            vec![0, 12],
+            "the final WAL commit marker and promoted Page 1 header must agree on group db_size"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_page_one_header_promotion_never_shrinks_existing_count() {
+        use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
+
+        let mut page = vec![0xCC; 4096];
+        page[28..32].copy_from_slice(&20_u32.to_be_bytes());
+        let mut batches = vec![TransactionFrameBatch::new(vec![FrameSubmission {
+            page_number: 1,
+            page_data: page,
+            db_size_if_commit: 12,
+        }])];
+
+        assert!(
+            !promote_group_commit_page_one_headers(&mut batches, 12),
+            "Page 1 promotion should not shrink a header that already advertises a larger database"
+        );
+        let mut bytes = [0_u8; 4];
+        bytes.copy_from_slice(&batches[0].frames[0].page_data[28..32]);
+        assert_eq!(u32::from_be_bytes(bytes), 20);
+    }
+
+    #[test]
     fn test_group_commit_conflict_detection_reports_only_cross_batch_page_overlaps() {
         use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
 
@@ -21751,6 +22618,81 @@ mod tests {
             conflicting_pages_across_group_commit_batches(&batches),
             vec![3, 4],
             "only pages written by multiple distinct transaction batches should force an epoch retry"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_conflict_detection_uses_semantic_conflict_metadata() {
+        use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
+
+        let batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 2,
+                page_data: vec![0xAA; 4096],
+                db_size_if_commit: 10,
+            }])
+            .with_conflict_snapshot(vec![2, 50, 60], None),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 3,
+                page_data: vec![0xBA; 4096],
+                db_size_if_commit: 11,
+            }])
+            .with_conflict_snapshot(vec![50], None),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 60,
+                page_data: vec![0xCA; 4096],
+                db_size_if_commit: 12,
+            }]),
+        ];
+
+        assert_eq!(
+            conflicting_pages_across_group_commit_batches(&batches),
+            vec![50, 60],
+            "group-commit overlap checks must include conflict-only pages such as pending freed pages, not just emitted WAL frames"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_conflict_detection_keeps_synthetic_page_one_batching_safe() {
+        use fsqlite_wal::group_commit::{FrameSubmission, TransactionFrameBatch};
+
+        let synthetic_page_one_batches = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: vec![0xAA; 4096],
+                db_size_if_commit: 10,
+            }]),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: vec![0xBA; 4096],
+                db_size_if_commit: 11,
+            }]),
+        ];
+
+        assert_eq!(
+            conflicting_pages_across_group_commit_batches(&synthetic_page_one_batches),
+            Vec::<u32>::new(),
+            "synthetic Page 1 header/count frames remain batchable when no transaction explicitly rewrote Page 1"
+        );
+
+        let explicit_page_one_with_synthetic = vec![
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: vec![0xCA; 4096],
+                db_size_if_commit: 10,
+            }])
+            .with_conflict_snapshot(vec![1], None),
+            TransactionFrameBatch::new(vec![FrameSubmission {
+                page_number: 1,
+                page_data: vec![0xDA; 4096],
+                db_size_if_commit: 11,
+            }]),
+        ];
+
+        assert_eq!(
+            conflicting_pages_across_group_commit_batches(&explicit_page_one_with_synthetic),
+            vec![1],
+            "an explicit Page 1 rewrite must not batch with another transaction's synthetic Page 1 frame because the synthetic bytes could otherwise overwrite schema/header changes"
         );
     }
 

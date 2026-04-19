@@ -384,8 +384,12 @@ fn run_child(config: &RunConfig, child: &ChildConfig) -> WorkerReport {
         busy_retries: counters.busy_retries,
         bounded_retry_exhaustions: counters.bounded_retry_exhaustions,
         read_your_own_write_pass: success && counters.own_read_checks > 0,
-        cross_process_visibility_pass: success
-            && (config.workers <= 1 || counters.cross_process_read_checks > 0),
+        // Per-worker peer checks are opportunistic coverage: under high
+        // write-conflict contention, one process can legitimately finish its
+        // time window before slower retried peers publish progress. Any actual
+        // peer visibility mismatch makes `success` false; the parent process
+        // runs the authoritative final visibility check after all workers exit.
+        cross_process_visibility_pass: success,
         wrong_row_returns_pass: success,
         busy_timeout_honored_pass: counters.bounded_retry_exhaustions == 0,
         failure: result.err(),
@@ -1200,16 +1204,17 @@ fn worker_process_criterion(workers: &[WorkerProcessReport]) -> CriterionReport 
     let failures: Vec<String> = workers
         .iter()
         .filter_map(|worker| {
-            let report_ok = worker.report.as_ref().is_some_and(|report| report.success);
-            if !worker.killed_for_timeout && worker.exit_code == Some(0) && report_ok {
+            if worker_process_passes(worker) {
                 None
             } else {
                 Some(format!(
-                    "worker {} exit={:?} killed={} report_success={:?} report_error={:?}",
+                    "worker {} exit={:?} killed={} report_success={:?} report_worker_id={:?} report_schema={:?} report_error={:?}",
                     worker.worker_id,
                     worker.exit_code,
                     worker.killed_for_timeout,
                     worker.report.as_ref().map(|report| report.success),
+                    worker.report.as_ref().map(|report| report.worker_id),
+                    worker.report.as_ref().map(|report| report.schema.as_str()),
                     worker.report_error
                 ))
             }
@@ -1227,6 +1232,23 @@ fn worker_process_criterion(workers: &[WorkerProcessReport]) -> CriterionReport 
     }
 }
 
+fn worker_report_identity_matches_process(worker: &WorkerProcessReport) -> bool {
+    worker.report.as_ref().is_some_and(|report| {
+        report.worker_id == worker.worker_id && report.schema == WORKER_REPORT_SCHEMA_V1
+    })
+}
+
+fn worker_report_success_matches_process(worker: &WorkerProcessReport) -> bool {
+    worker_report_identity_matches_process(worker)
+        && worker.report.as_ref().is_some_and(|report| report.success)
+}
+
+fn worker_process_passes(worker: &WorkerProcessReport) -> bool {
+    !worker.killed_for_timeout
+        && worker.exit_code == Some(0)
+        && worker_report_success_matches_process(worker)
+}
+
 fn read_your_own_write_criterion(workers: &[WorkerProcessReport]) -> CriterionReport {
     worker_bool_criterion(
         "read_your_own_write",
@@ -1241,25 +1263,31 @@ fn cross_process_visibility_criterion(
     final_visibility: &CriterionReport,
     worker_count: usize,
 ) -> CriterionReport {
+    let observed_workers = workers.len();
+    let worker_pass = observed_workers == worker_count && workers.iter().all(worker_process_passes);
     if worker_count <= 1 {
         return CriterionReport {
             name: "cross_process_visibility",
-            pass: final_visibility.pass,
+            pass: worker_pass && final_visibility.pass,
             duration_ms: final_visibility.duration_ms,
-            detail: "single-worker run has no peer visibility checks".to_owned(),
+            detail: format!(
+                "single-worker run has no peer visibility checks; worker reports pass={worker_pass}; observed_workers={observed_workers}/{worker_count}; final visibility: {}",
+                final_visibility.detail
+            ),
         };
     }
-    let worker_pass = workers.iter().all(|worker| {
-        worker.report.as_ref().is_some_and(|report| {
-            report.cross_process_visibility_pass && report.cross_process_read_checks > 0
-        })
-    });
+    let peer_checks = workers
+        .iter()
+        .filter_map(|worker| worker.report.as_ref())
+        .fold(0_u64, |total, report| {
+            total.saturating_add(report.cross_process_read_checks)
+        });
     CriterionReport {
         name: "cross_process_visibility",
         pass: worker_pass && final_visibility.pass,
         duration_ms: final_visibility.duration_ms,
         detail: format!(
-            "worker peer checks pass={worker_pass}; final visibility: {}",
+            "worker peer checks pass={worker_pass}; observed_workers={observed_workers}/{worker_count}; peer_checks={peer_checks}; final visibility: {}",
             final_visibility.detail
         ),
     }
@@ -1281,13 +1309,19 @@ fn busy_timeout_criterion(workers: &[WorkerProcessReport]) -> CriterionReport {
             let report_pass = worker
                 .report
                 .as_ref()
-                .is_some_and(|report| report.busy_timeout_honored_pass);
+                .is_some_and(|report| {
+                    worker_report_identity_matches_process(worker)
+                        && report.busy_timeout_honored_pass
+                });
             if !worker.killed_for_timeout && report_pass {
                 None
             } else {
                 Some(format!(
-                    "worker {} killed={} busy_pass={report_pass}",
-                    worker.worker_id, worker.killed_for_timeout
+                    "worker {} killed={} busy_pass={report_pass} report_worker_id={:?} report_schema={:?}",
+                    worker.worker_id,
+                    worker.killed_for_timeout,
+                    worker.report.as_ref().map(|report| report.worker_id),
+                    worker.report.as_ref().map(|report| report.schema.as_str())
                 ))
             }
         })
@@ -1340,6 +1374,12 @@ where
     let mut failures = Vec::new();
     for worker in workers {
         match &worker.report {
+            Some(report) if !worker_report_identity_matches_process(worker) => {
+                failures.push(format!(
+                    "worker {} invalid report identity for {name}: report_worker_id={} report_schema={}",
+                    worker.worker_id, report.worker_id, report.schema
+                ));
+            }
             Some(report) if predicate(report) => {
                 total_checks = total_checks.saturating_add(count(report));
             }
@@ -1757,4 +1797,201 @@ fn wal_path(db_path: &Path) -> PathBuf {
 
 fn shm_path(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-shm", db_path.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn final_visibility(pass: bool) -> CriterionReport {
+        CriterionReport {
+            name: "final_cross_process_visibility",
+            pass,
+            duration_ms: 7,
+            detail: "final detail".to_owned(),
+        }
+    }
+
+    fn worker(
+        worker_id: usize,
+        success: bool,
+        cross_process_read_checks: u64,
+    ) -> WorkerProcessReport {
+        worker_with_report(
+            worker_id,
+            worker_id,
+            WORKER_REPORT_SCHEMA_V1,
+            success,
+            cross_process_read_checks,
+        )
+    }
+
+    fn worker_with_report(
+        worker_id: usize,
+        report_worker_id: usize,
+        report_schema: &str,
+        success: bool,
+        cross_process_read_checks: u64,
+    ) -> WorkerProcessReport {
+        WorkerProcessReport {
+            worker_id,
+            exit_code: Some(0),
+            killed_for_timeout: false,
+            duration_ms: 11,
+            report_path: format!("worker_{worker_id}.json"),
+            stdout_snippet: String::new(),
+            stderr_snippet: String::new(),
+            report: Some(WorkerReport {
+                schema: report_schema.to_owned(),
+                worker_id: report_worker_id,
+                pid: 1234,
+                success,
+                duration_ms: 11,
+                iterations: 1,
+                transactions_committed: 1,
+                inserts: 1,
+                updates: 1,
+                deletes: 0,
+                pk_selects: 1,
+                own_read_checks: 1,
+                cross_process_read_checks,
+                wrong_row_checks: 1,
+                busy_errors: 0,
+                busy_retries: 0,
+                bounded_retry_exhaustions: 0,
+                read_your_own_write_pass: true,
+                cross_process_visibility_pass: success,
+                wrong_row_returns_pass: true,
+                busy_timeout_honored_pass: true,
+                failure: None,
+            }),
+            report_error: None,
+        }
+    }
+
+    #[test]
+    fn worker_process_criterion_fails_mismatched_worker_report_identity() {
+        let report =
+            worker_process_criterion(&[worker_with_report(0, 1, WORKER_REPORT_SCHEMA_V1, true, 3)]);
+
+        assert!(
+            !report.pass,
+            "worker process criterion must reject a successful report with the wrong worker_id"
+        );
+        assert!(
+            report.detail.contains("report_worker_id=Some(1)"),
+            "detail should expose the mismatched worker id: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn worker_process_criterion_fails_wrong_worker_report_schema() {
+        let report = worker_process_criterion(&[worker_with_report(0, 0, "old-schema", true, 3)]);
+
+        assert!(
+            !report.pass,
+            "worker process criterion must reject a successful report with the wrong schema"
+        );
+        assert!(
+            report.detail.contains("report_schema=Some(\"old-schema\")"),
+            "detail should expose the mismatched schema: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn worker_bool_criterion_fails_mismatched_worker_report_identity() {
+        let report = read_your_own_write_criterion(&[worker_with_report(
+            0,
+            7,
+            WORKER_REPORT_SCHEMA_V1,
+            true,
+            3,
+        )]);
+
+        assert!(
+            !report.pass,
+            "generic worker criteria must reject a successful report with the wrong worker_id"
+        );
+        assert!(
+            report.detail.contains("invalid report identity"),
+            "detail should expose the identity failure: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn busy_timeout_criterion_fails_mismatched_worker_report_identity() {
+        let report =
+            busy_timeout_criterion(&[worker_with_report(0, 7, WORKER_REPORT_SCHEMA_V1, true, 3)]);
+
+        assert!(
+            !report.pass,
+            "busy-timeout criterion must reject a report with the wrong worker_id"
+        );
+        assert!(
+            report.detail.contains("report_worker_id=Some(7)"),
+            "detail should expose the identity failure: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn cross_process_visibility_fails_when_multi_worker_report_set_is_incomplete() {
+        let report =
+            cross_process_visibility_criterion(&[worker(0, true, 3)], &final_visibility(true), 2);
+
+        assert!(
+            !report.pass,
+            "cross-process visibility must not pass with a missing worker report"
+        );
+        assert!(
+            report.detail.contains("observed_workers=1/2"),
+            "detail should expose missing worker count: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn cross_process_visibility_fails_mismatched_worker_report_identity() {
+        let report = cross_process_visibility_criterion(
+            &[
+                worker_with_report(0, 0, WORKER_REPORT_SCHEMA_V1, true, 3),
+                worker_with_report(1, 0, WORKER_REPORT_SCHEMA_V1, true, 3),
+            ],
+            &final_visibility(true),
+            2,
+        );
+
+        assert!(
+            !report.pass,
+            "cross-process visibility must reject stale or misattributed worker reports"
+        );
+        assert!(
+            report.detail.contains("worker peer checks pass=false"),
+            "detail should expose failed worker validation: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn cross_process_visibility_single_worker_requires_successful_worker_report() {
+        let report = cross_process_visibility_criterion(&[], &final_visibility(true), 1);
+
+        assert!(
+            !report.pass,
+            "single-worker visibility must still require the expected worker report"
+        );
+        assert!(
+            report.detail.contains("observed_workers=0/1"),
+            "detail should expose missing single-worker report: {}",
+            report.detail
+        );
+        assert!(
+            report.detail.contains("final visibility: final detail"),
+            "detail should preserve authoritative final visibility context: {}",
+            report.detail
+        );
+    }
 }
