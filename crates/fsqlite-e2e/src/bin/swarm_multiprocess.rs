@@ -619,19 +619,31 @@ fn verify_other_worker_visible(
         if other == worker_id {
             continue;
         }
-        let progress = query_progress(conn, config, counters, other)?;
-        if progress.last_id == 0 {
+        let expected_worker_id =
+            i64::try_from(other).map_err(|err| format!("worker id overflow: {err}"))?;
+        let read = with_consistent_read_transaction(
+            conn,
+            config,
+            counters,
+            "cross-process consistency snapshot",
+            |counters| {
+                let progress = query_progress(conn, config, counters, other)?;
+                if progress.last_id == 0 {
+                    return Ok(None);
+                }
+                if progress.worker_id != expected_worker_id {
+                    return Err(format!(
+                        "worker_progress wrong-row return: queried worker={other}, got worker={}",
+                        progress.worker_id
+                    ));
+                }
+                let observed = query_pk(conn, config, counters, progress.last_id)?;
+                Ok(Some((progress, observed)))
+            },
+        )?;
+        let Some((progress, observed)) = read else {
             continue;
-        }
-        if progress.worker_id
-            != i64::try_from(other).map_err(|err| format!("worker id overflow: {err}"))?
-        {
-            return Err(format!(
-                "worker_progress wrong-row return: queried worker={other}, got worker={}",
-                progress.worker_id
-            ));
-        }
-        let observed = query_pk(conn, config, counters, progress.last_id)?;
+        };
         counters.cross_process_read_checks = counters.cross_process_read_checks.saturating_add(1);
         match observed {
             Some(row)
@@ -721,6 +733,34 @@ fn query_progress(
         ));
     }
     progress_row(&rows[0])
+}
+
+fn with_consistent_read_transaction<T, F>(
+    conn: &Connection,
+    config: &RunConfig,
+    counters: &mut WorkerCounters,
+    label: &str,
+    read: F,
+) -> HarnessResult<T>
+where
+    F: FnOnce(&mut WorkerCounters) -> HarnessResult<T>,
+{
+    retry_fsqlite(config, counters, label, || {
+        conn.execute("BEGIN DEFERRED;").map(|_| ())
+    })?;
+    match read(counters) {
+        Ok(value) => {
+            if let Err(error) = conn.commit_transaction() {
+                let _ = conn.rollback_transaction();
+                return Err(format!("{label} commit failed: {error}"));
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.rollback_transaction();
+            Err(error)
+        }
+    }
 }
 
 fn retry_fsqlite<T, F>(
@@ -1090,51 +1130,61 @@ fn run_sqlite_integrity_check(db_path: &Path, config: &RunConfig) -> HarnessResu
 fn verify_final_progress_visibility(db_path: &Path, config: &RunConfig) -> HarnessResult<String> {
     let conn = open_fsqlite(db_path)?;
     configure_fsqlite(&conn, config)?;
-    let rows = conn
-        .query("SELECT worker_id, last_id, last_seq, payload FROM worker_progress;")
-        .map_err(|err| format!("failed to query final worker_progress: {err}"))?;
-    if rows.len() != config.workers {
-        return Err(format!(
-            "worker_progress has {} rows, expected {}",
-            rows.len(),
-            config.workers
-        ));
-    }
-
     let mut committed_workers = 0_usize;
     let mut counters = WorkerCounters::default();
-    for row in &rows {
-        let progress = progress_row(row)?;
-        if progress.last_id == 0 {
-            continue;
-        }
-        committed_workers = committed_workers.saturating_add(1);
-        let observed = query_pk(&conn, config, &mut counters, progress.last_id)?;
-        match observed {
-            Some(found)
-                if found.owner == progress.worker_id
-                    && found.seq == progress.last_seq
-                    && found.payload == progress.payload
-                    && !found.deleted => {}
-            Some(found) => {
+    with_consistent_read_transaction(
+        &conn,
+        config,
+        &mut counters,
+        "final progress consistency snapshot",
+        |counters| {
+            let rows = conn
+                .query("SELECT worker_id, last_id, last_seq, payload FROM worker_progress;")
+                .map_err(|err| format!("failed to query final worker_progress: {err}"))?;
+            if rows.len() != config.workers {
                 return Err(format!(
-                    "final progress visibility mismatch: progress={progress:?}, row={found:?}"
+                    "worker_progress has {} rows, expected {}",
+                    rows.len(),
+                    config.workers
                 ));
             }
-            None => {
-                return Err(format!(
-                    "final progress row points at missing committed row: {progress:?}"
-                ));
-            }
-        }
-    }
 
-    if committed_workers != config.workers {
-        return Err(format!(
-            "only {committed_workers}/{} workers published committed progress",
-            config.workers
-        ));
-    }
+            for row in &rows {
+                let progress = progress_row(row)?;
+                if progress.last_id == 0 {
+                    continue;
+                }
+                committed_workers = committed_workers.saturating_add(1);
+                let observed = query_pk(&conn, config, counters, progress.last_id)?;
+                match observed {
+                    Some(found)
+                        if found.owner == progress.worker_id
+                            && found.seq == progress.last_seq
+                            && found.payload == progress.payload
+                            && !found.deleted => {}
+                    Some(found) => {
+                        return Err(format!(
+                            "final progress visibility mismatch: progress={progress:?}, row={found:?}"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "final progress row points at missing committed row: {progress:?}"
+                        ));
+                    }
+                }
+            }
+
+            if committed_workers != config.workers {
+                return Err(format!(
+                    "only {committed_workers}/{} workers published committed progress",
+                    config.workers
+                ));
+            }
+            Ok(())
+        },
+    )?;
+
     Ok(format!(
         "all {committed_workers} worker progress rows point at visible committed rows"
     ))
