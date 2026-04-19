@@ -4453,6 +4453,7 @@ impl<P: PageWriter> BtCursor<P> {
     ///  - The first freeblock must be at an offset >= `cell_content_offset`.
     ///
     /// This function handles all three constraints.
+    #[allow(dead_code)] // Kept for future freeblock-chain experiments; delete path uses defrag for safety.
     fn insert_freeblock_sorted_coalesced(
         page_bytes: &mut [u8],
         header: &mut cell::BtreePageHeader,
@@ -4631,7 +4632,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor at EOF during remove"));
         }
 
-        let (overflow_head, delete_idx, delete_offset, delete_size, leaf_page_no) = {
+        let (overflow_head, delete_idx, leaf_page_no) = {
             let top = &self.stack[depth - 1];
             if top.header.page_type != cell::BtreePageType::LeafTable {
                 return Err(FrankenError::internal(
@@ -4640,20 +4641,11 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             let delete_idx = usize::from(top.cell_idx);
-            let delete_offset = usize::from(
-                *top.cell_pointers
-                    .get(delete_idx)
-                    .ok_or_else(|| FrankenError::internal("cursor position out of bounds"))?,
-            );
+            if delete_idx >= top.cell_pointers.len() {
+                return Err(FrankenError::internal("cursor position out of bounds"));
+            }
             let cell_ref = self.parse_cell_at(top, top.cell_idx)?;
-            let delete_size = crate::payload::cell_on_page_size(&cell_ref, delete_offset);
-            (
-                cell_ref.overflow_page,
-                delete_idx,
-                delete_offset,
-                delete_size,
-                top.page_no,
-            )
+            (cell_ref.overflow_page, delete_idx, top.page_no)
         };
 
         let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
@@ -4673,37 +4665,69 @@ impl<P: PageWriter> BtCursor<P> {
         }
         ptrs.remove(delete_idx);
 
-        if ptrs.is_empty() {
-            header.first_freeblock = 0;
-            header.fragmented_free_bytes = 0;
-            header.cell_content_offset = self.usable_size;
-            page_data.as_bytes_mut()[header_offset..self.usable_size as usize].fill(0);
-        } else if delete_size >= 4 {
-            // Insert the freed cell as a freeblock, maintaining the SQLite
-            // on-disk format invariants that C sqlite3's btreeComputeFreeSpace()
-            // validates:
-            //
-            //  1. Freeblocks are chained in strictly ascending offset order.
-            //  2. No two freeblocks may be adjacent or overlap (the gap between
-            //     consecutive freeblocks must be > 3 bytes); adjacent freeblocks
-            //     MUST be coalesced into one.
-            //  3. Every freeblock is >= 4 bytes.
-            //
-            // Violating any of these causes "free space corruption".
-            Self::insert_freeblock_sorted_coalesced(
-                page_data.as_bytes_mut(),
-                &mut header,
-                delete_offset,
-                delete_size,
-                self.usable_size as usize,
-                leaf_page_no,
+        // Keep table-leaf deletes conservative: compact the remaining cells
+        // immediately instead of maintaining an incremental freeblock chain.
+        // Small mixed INSERT/UPDATE/DELETE churn can otherwise leave 1-3 byte
+        // gaps between freeblocks, which SQLite's btreeComputeFreeSpace()
+        // reports as "free space corruption". Index leaves already use this
+        // defragment-on-delete strategy; table leaves should prefer the same
+        // SQLite-compatible shape over a fragile micro-optimization.
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+        let mut cells_to_move = Vec::with_capacity(ptrs.len());
+        for (i, &off) in ptrs.iter().enumerate() {
+            let ptr = usize::from(off);
+            let cell_ref = CellRef::parse(
+                page_data.as_bytes(),
+                ptr,
+                header.page_type,
+                self.usable_size,
             )?;
-        } else {
-            header.fragmented_free_bytes = header
-                .fragmented_free_bytes
-                .saturating_add(u8::try_from(delete_size).unwrap_or(u8::MAX));
-            page_data.as_bytes_mut()[delete_offset..delete_offset + delete_size].fill(0);
+            let size = crate::payload::cell_on_page_size(&cell_ref, ptr);
+            cells_to_move.push((ptr, size, i));
         }
+        cells_to_move.sort_unstable_by_key(|(ptr, ..)| std::cmp::Reverse(*ptr));
+
+        let mut new_content_offset = self.usable_size as usize;
+        for (ptr, size, i) in cells_to_move {
+            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell size overflow during delete defragmentation"
+                        .to_owned(),
+                }
+            })?;
+            if new_content_offset < ptr_array_end {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                        .to_owned(),
+                });
+            }
+            page_data
+                .as_bytes_mut()
+                .copy_within(ptr..ptr + size, new_content_offset);
+            ptrs[i] =
+                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell offset {} exceeds u16 range on page {}",
+                        new_content_offset,
+                        leaf_page_no.get()
+                    ),
+                })?;
+        }
+
+        if new_content_offset > ptr_array_end {
+            page_data.as_bytes_mut()[ptr_array_end..new_content_offset].fill(0);
+        }
+        header.first_freeblock = 0;
+        header.fragmented_free_bytes = 0;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
 
         header.cell_count =
             u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
@@ -4717,11 +4741,6 @@ impl<P: PageWriter> BtCursor<P> {
             let page_bytes = page_data.as_bytes_mut();
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
-            let stale_ptr_offset =
-                header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
-            if original_len > ptrs.len() && stale_ptr_offset + 2 <= page_bytes.len() {
-                page_bytes[stale_ptr_offset..stale_ptr_offset + 2].fill(0);
-            }
         }
 
         self.pager.write_page_data(cx, leaf_page_no, page_data)?;
@@ -6542,6 +6561,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             if cursor.is_table {
                 let (_leaf_page_no, new_count) = cursor.remove_table_cell_from_leaf_deferred(cx)?;
                 if new_count == 0 {
+                    cursor.balance_for_delete(cx)?;
+
+                    // If we balanced, the stack was cleared. Re-seek to the
+                    // deleted rowid anchor; the seek lands on the successor
+                    // (or EOF), which is the DELETE cursor contract.
                     if let Some(anc) = anchor {
                         match anc {
                             Anchor::Rowid(r) => {
