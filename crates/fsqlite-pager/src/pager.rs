@@ -5603,7 +5603,13 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// commit and rollback, so callers must not hold arena-allocated
     /// references across a transaction-boundary method call on
     /// `SimpleTransaction`.
+    ///
+    /// Currently unused: the arena infrastructure (field, reset hooks,
+    /// accessor) is landed first; callers can opt in by routing transient
+    /// allocations through this arena in follow-up changes. Kept `dead_code`
+    /// to avoid churn in the surrounding commit/rollback logic.
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn scratch_arena(&self) -> &bumpalo::Bump {
         &self.scratch_arena
     }
