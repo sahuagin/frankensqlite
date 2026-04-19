@@ -427,7 +427,8 @@ fn run_child_workload(
         }
     }
 
-    Ok(())
+    conn.close()
+        .map_err(|err| format!("worker connection close/checkpoint failed: {err}"))
 }
 
 fn commit_mixed_transaction(

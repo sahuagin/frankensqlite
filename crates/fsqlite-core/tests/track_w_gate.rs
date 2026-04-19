@@ -71,10 +71,14 @@ fn wtest_insert_truth_matrix_values_all_params_hits_direct_lane() {
         .unwrap();
     }
     let snap = hot_path_profile_snapshot();
-    assert_eq!(snap.prepared_direct_insert_executions, 20,
-        "VALUES(?1,?2,?3) should use direct-insert lane: {snap:?}");
-    assert_eq!(snap.prepared_insert_fast_lane_hits, 20,
-        "all 20 INSERTs should hit fast lane: {snap:?}");
+    assert_eq!(
+        snap.prepared_direct_insert_executions, 20,
+        "VALUES(?1,?2,?3) should use direct-insert lane: {snap:?}"
+    );
+    assert_eq!(
+        snap.prepared_insert_fast_lane_hits, 20,
+        "all 20 INSERTs should hit fast lane: {snap:?}"
+    );
 }
 
 #[test]
@@ -104,7 +108,7 @@ fn wtest_insert_truth_matrix_column_list_params_hits_direct_lane() {
 }
 
 #[test]
-fn wtest_insert_truth_matrix_expression_values_uses_reusable_lane() {
+fn wtest_insert_truth_matrix_operator_expression_values_hits_direct_lane() {
     let _g = WGateProfileGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE tm3 (id INTEGER PRIMARY KEY, computed TEXT)")
@@ -119,14 +123,17 @@ fn wtest_insert_truth_matrix_expression_values_uses_reusable_lane() {
             .unwrap();
     }
     let snap = hot_path_profile_snapshot();
-    assert!(
-        snap.prepared_insert_fast_lane_hits >= 10,
-        "expression VALUES should still hit fast lane via reusable table program: {snap:?}"
+    assert_eq!(
+        snap.prepared_direct_insert_executions, 10,
+        "operator-only expression VALUES should stay on the compiled direct-insert lane: {snap:?}"
     );
-    assert!(
-        snap.prepared_table_engine_reuses >= 9,
-        "expression-based INSERT should reuse VdbeEngine on 2nd+ execution: {snap:?}"
+    assert_eq!(
+        snap.prepared_table_engine_reuses, 0,
+        "operator-only expression VALUES should not allocate/reuse the VDBE table engine: {snap:?}"
     );
+    let rows = conn.query("SELECT computed FROM tm3 ORDER BY id").unwrap();
+    assert_eq!(rows[0].values()[0], SqliteValue::Text("prefix_0".into()));
+    assert_eq!(rows[9].values()[0], SqliteValue::Text("prefix_9".into()));
 }
 
 #[test]
@@ -262,10 +269,14 @@ fn wtest_update_with_trigger_falls_back_with_attribution() {
         .unwrap();
 
     let snap = hot_path_profile_snapshot();
-    assert_eq!(snap.prepared_update_delete_fast_lane_hits, 0,
-        "trigger UPDATE must NOT hit fast lane: {snap:?}");
-    assert_eq!(snap.prepared_update_delete_fallback_trigger, 1,
-        "trigger UPDATE must attribute fallback to trigger: {snap:?}");
+    assert_eq!(
+        snap.prepared_update_delete_fast_lane_hits, 0,
+        "trigger UPDATE must NOT hit fast lane: {snap:?}"
+    );
+    assert_eq!(
+        snap.prepared_update_delete_fallback_trigger, 1,
+        "trigger UPDATE must attribute fallback to trigger: {snap:?}"
+    );
 
     let log = conn.query("SELECT msg FROM wut_log").unwrap();
     assert_eq!(log.len(), 1);
@@ -299,10 +310,10 @@ fn wtest_delete_with_fk_cascade_falls_back_with_attribution() {
         .unwrap();
 
     let snap = hot_path_profile_snapshot();
-    assert_eq!(snap.prepared_update_delete_fast_lane_hits, 0,
-        "FK CASCADE DELETE must NOT hit fast lane: {snap:?}");
-    assert_eq!(snap.prepared_update_delete_fallback_foreign_key, 1,
-        "FK CASCADE DELETE must attribute fallback to FK: {snap:?}");
+    assert_eq!(
+        snap.prepared_update_delete_fallback_foreign_key, 1,
+        "FK CASCADE DELETE must attribute fallback to FK before any precompiled VDBE handoff: {snap:?}"
+    );
 
     let children = conn.query("SELECT id FROM wfk_child").unwrap();
     assert_eq!(children.len(), 1);
@@ -336,10 +347,8 @@ impl MiniRng {
 fn wtest_mixed_oltp_prepared_lanes_all_active() {
     let _g = WGateProfileGuard::new();
     let conn = Connection::open(":memory:").unwrap();
-    conn.execute(
-        "CREATE TABLE moltp (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
-    )
-    .unwrap();
+    conn.execute("CREATE TABLE moltp (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)")
+        .unwrap();
 
     let insert_stmt = conn
         .prepare("INSERT INTO moltp VALUES (?1, ?2, ?3)")
@@ -347,9 +356,7 @@ fn wtest_mixed_oltp_prepared_lanes_all_active() {
     let update_stmt = conn
         .prepare("UPDATE moltp SET val = ?1 WHERE id = ?2")
         .unwrap();
-    let delete_stmt = conn
-        .prepare("DELETE FROM moltp WHERE id = ?1")
-        .unwrap();
+    let delete_stmt = conn.prepare("DELETE FROM moltp WHERE id = ?1").unwrap();
 
     let mut rng = MiniRng::new(0xDEAD_BEEF);
     let mut alive: Vec<i64> = Vec::new();
@@ -428,7 +435,9 @@ fn wtest_mixed_oltp_prepared_lanes_all_active() {
     let snap = hot_path_profile_snapshot();
 
     eprintln!("=== W-TEST: Mixed OLTP lane metrics ===");
-    eprintln!("ops: insert={insert_count} update={update_count} delete={delete_count} select={select_count}");
+    eprintln!(
+        "ops: insert={insert_count} update={update_count} delete={delete_count} select={select_count}"
+    );
     eprintln!(
         "INSERT: fast_lane={} direct_exec={} engine_reuses={}",
         snap.prepared_insert_fast_lane_hits,
@@ -489,13 +498,14 @@ fn wtest_w1_function_cache_preserved_across_prepared_reuse() {
     let _g = WGateProfileGuard::new();
     let conn = Connection::open(":memory:").unwrap();
     conn.execute(
-        "CREATE TABLE w1t (id INTEGER PRIMARY KEY, val TEXT NOT NULL, computed REAL NOT NULL)",
+        "CREATE TABLE w1t (id INTEGER PRIMARY KEY, val TEXT NOT NULL, computed INTEGER NOT NULL)",
     )
     .unwrap();
 
-    // Expression-based INSERT uses VDBE engine reuse path (tests W1 function cache)
+    // Function-valued INSERTs still use the reusable VDBE table program path;
+    // operator-only expressions are handled by the direct-insert microplan.
     let stmt = conn
-        .prepare("INSERT INTO w1t VALUES (?1, ('name_' || ?1), (?1 * 0.137))")
+        .prepare("INSERT INTO w1t VALUES (?1, ('name_' || ?1), length('name_' || ?1))")
         .unwrap();
 
     reset_hot_path_profile();
@@ -508,7 +518,7 @@ fn wtest_w1_function_cache_preserved_across_prepared_reuse() {
     // After first alloc, all subsequent should be reuses
     assert!(
         snap.prepared_table_engine_reuses >= 49,
-        "W1: expression INSERT should reuse engine 49+ times, got {}: {snap:?}",
+        "W1: function-valued INSERT should reuse engine 49+ times, got {}: {snap:?}",
         snap.prepared_table_engine_reuses
     );
     assert!(
@@ -519,6 +529,10 @@ fn wtest_w1_function_cache_preserved_across_prepared_reuse() {
 
     let count = conn.query("SELECT COUNT(*) FROM w1t").unwrap();
     assert_eq!(count[0].values()[0], SqliteValue::Integer(50));
+    let computed = conn
+        .query("SELECT computed FROM w1t WHERE id = 49")
+        .unwrap();
+    assert_eq!(computed[0].values()[0], SqliteValue::Integer(7));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -532,9 +546,7 @@ fn wtest_w9_same_connection_read_after_write_no_data_loss() {
     conn.execute("CREATE TABLE w9t (id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
-    let insert_stmt = conn
-        .prepare("INSERT INTO w9t VALUES (?1, ?2)")
-        .unwrap();
+    let insert_stmt = conn.prepare("INSERT INTO w9t VALUES (?1, ?2)").unwrap();
 
     // Interleave writes and reads on same connection
     for i in 1..=50 {
@@ -597,7 +609,10 @@ fn wtest_w9_same_connection_update_then_read_sees_new_value() {
 
     reset_hot_path_profile();
     update_stmt
-        .execute_with_params(&[SqliteValue::Text("modified".into()), SqliteValue::Integer(2)])
+        .execute_with_params(&[
+            SqliteValue::Text("modified".into()),
+            SqliteValue::Integer(2),
+        ])
         .unwrap();
 
     let rows = conn.query("SELECT val FROM w9u WHERE id = 2").unwrap();
@@ -629,9 +644,7 @@ fn wtest_w9_same_connection_delete_then_read_sees_removal() {
         .execute_with_params(&[SqliteValue::Integer(2)])
         .unwrap();
 
-    let rows = conn
-        .query("SELECT id FROM w9d ORDER BY id")
-        .unwrap();
+    let rows = conn.query("SELECT id FROM w9d ORDER BY id").unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
@@ -657,9 +670,7 @@ fn wtest_cross_connection_prepared_insert_visible_after_commit() {
     let conn_b = Connection::open(&path).unwrap();
 
     // Prepare INSERT on conn_a
-    let stmt = conn_a
-        .prepare("INSERT INTO xconn VALUES (?1, ?2)")
-        .unwrap();
+    let stmt = conn_a.prepare("INSERT INTO xconn VALUES (?1, ?2)").unwrap();
 
     reset_hot_path_profile();
     stmt.execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("from_a".into())])
@@ -667,11 +678,7 @@ fn wtest_cross_connection_prepared_insert_visible_after_commit() {
 
     // conn_b should see the committed row (autocommit semantics)
     let rows = conn_b.query("SELECT val FROM xconn WHERE id = 1").unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "conn_b must see conn_a's committed INSERT"
-    );
+    assert_eq!(rows.len(), 1, "conn_b must see conn_a's committed INSERT");
     assert_eq!(rows[0].values()[0], SqliteValue::Text("from_a".into()));
 }
 
@@ -690,9 +697,7 @@ fn wtest_cross_connection_prepared_insert_within_explicit_txn() {
 
     let conn_b = Connection::open(&path).unwrap();
 
-    let stmt = conn_a
-        .prepare("INSERT INTO xtxn VALUES (?1, ?2)")
-        .unwrap();
+    let stmt = conn_a.prepare("INSERT INTO xtxn VALUES (?1, ?2)").unwrap();
 
     // Insert within explicit transaction
     conn_a.execute("BEGIN").unwrap();
@@ -811,20 +816,20 @@ fn wtest_fk_pragma_toggle_dynamic_fast_lane_eligibility() {
         .unwrap();
     let on_snap = hot_path_profile_snapshot();
     assert_eq!(
-        on_snap.prepared_update_delete_fast_lane_hits, 0,
-        "FK=ON DELETE should NOT hit fast lane: {on_snap:?}"
-    );
-    assert_eq!(
         on_snap.prepared_update_delete_fallback_foreign_key, 1,
-        "FK=ON DELETE should attribute to FK fallback: {on_snap:?}"
+        "FK=ON DELETE should attribute to FK fallback before any precompiled VDBE handoff: {on_snap:?}"
     );
 
-    // Verify cascade worked when FK=ON
-    let children = conn
-        .query("SELECT id FROM fkt_child ORDER BY id")
-        .unwrap();
-    assert_eq!(children.len(), 1, "FK CASCADE should have deleted child rows");
-    assert_eq!(children[0].values()[0], SqliteValue::Integer(30));
+    // Verify FK=ON cascaded the second delete while the earlier FK=OFF
+    // delete intentionally left child 10 orphaned.
+    let children = conn.query("SELECT id FROM fkt_child ORDER BY id").unwrap();
+    assert_eq!(
+        children.len(),
+        2,
+        "FK=OFF should leave child 10 orphaned, and FK=ON should cascade-delete child 20"
+    );
+    assert_eq!(children[0].values()[0], SqliteValue::Integer(10));
+    assert_eq!(children[1].values()[0], SqliteValue::Integer(30));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
