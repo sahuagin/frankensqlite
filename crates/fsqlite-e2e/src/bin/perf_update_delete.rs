@@ -197,7 +197,7 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
             .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
         apply_benchmark_pragmas(&conn);
         conn.execute(BENCH_CREATE_SQL)
-        .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
+            .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
         conn.execute("BEGIN")
             .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
         let stmt = conn
