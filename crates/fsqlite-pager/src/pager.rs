@@ -4017,6 +4017,7 @@ where
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(HashMap::new()),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
+                scratch_arena: bumpalo::Bump::new(),
             });
         }
 
@@ -4182,6 +4183,7 @@ where
             rolled_back_pages: HashSet::new(),
             txn_read_cache: RefCell::new(HashMap::new()),
             retained_memory_overlay_dirty_pages: BTreeSet::new(),
+            scratch_arena: bumpalo::Bump::new(),
         })
     }
 
@@ -5533,6 +5535,17 @@ pub struct SimpleTransaction<V: Vfs> {
     /// These pages stay authoritative in `txn_read_cache` until a real
     /// release boundary flushes them once.
     retained_memory_overlay_dirty_pages: BTreeSet<PageNumber>,
+    /// Per-transaction bumpalo scratch arena (IMPL-3 / AG-4B).
+    ///
+    /// Amortizes transient allocations over the transaction's lifetime.
+    /// Created fresh on transaction begin, reset at commit AND rollback,
+    /// and dropped when the transaction drops. Never carries allocations
+    /// across transaction boundaries.
+    ///
+    /// Callers access the arena via [`SimpleTransaction::scratch_arena`]
+    /// (returns `&bumpalo::Bump`) — `Bump::alloc` takes `&self`, so
+    /// interior mutability is not required.
+    scratch_arena: bumpalo::Bump,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -5581,6 +5594,18 @@ impl<V: Vfs> SimpleTransaction<V> {
     #[must_use]
     pub fn is_writer(&self) -> bool {
         self.is_writer
+    }
+
+    /// Access the per-transaction bumpalo scratch arena (IMPL-3 / AG-4B).
+    ///
+    /// Returns `&Bump` (not `&mut Bump`) — `Bump::alloc` and related
+    /// allocation entry points all take `&self`. The arena is reset on
+    /// commit and rollback, so callers must not hold arena-allocated
+    /// references across a transaction-boundary method call on
+    /// `SimpleTransaction`.
+    #[must_use]
+    pub(crate) fn scratch_arena(&self) -> &bumpalo::Bump {
+        &self.scratch_arena
     }
 
     /// Check if single-connection fast path is enabled.
@@ -7600,6 +7625,8 @@ where
             drop(inner);
             self.committed = true;
             self.finished = true;
+            // IMPL-3 / AG-4B: reset scratch arena on read-only commit path.
+            self.scratch_arena.reset();
             return Ok(());
         }
         if self.vfs.is_memory()
@@ -7625,6 +7652,8 @@ where
             drop(inner);
             self.committed = true;
             self.finished = true;
+            // IMPL-3 / AG-4B: reset scratch arena on no-writes commit path.
+            self.scratch_arena.reset();
             return Ok(());
         }
 
@@ -7948,6 +7977,11 @@ where
             self.retained_memory_overlay_dirty_pages.clear();
             self.committed = true;
             self.finished = true;
+            // IMPL-3 / AG-4B: reset scratch arena after successful commit so
+            // transient per-transaction allocations do not linger. The arena
+            // is dropped when the transaction drops; this reset is the
+            // amortization hook that keeps the txn-committed state compact.
+            self.scratch_arena.reset();
         } else {
             // Keep the writer lock held on commit failure so no other writer
             // can interleave while the caller decides to retry or roll back.
@@ -8225,6 +8259,11 @@ where
             if !metadata_only_single_connection_fast_path {
                 self.txn_read_cache.borrow_mut().clear();
             }
+            // IMPL-3 / AG-4B: reset scratch arena on retained commit. The
+            // transaction stays active for reuse, but arena-allocated scratch
+            // from the committed logical transaction must not leak into the
+            // next one.
+            self.scratch_arena.reset();
             self.original_db_size = committed_db_size;
             self.published_visible_commit_seq
                 .set(publish_update.visible_commit_seq);
@@ -8436,6 +8475,9 @@ where
         }
         self.committed = false;
         self.finished = true;
+        // IMPL-3 / AG-4B: reset scratch arena so transient allocations do not
+        // carry across transaction boundaries.
+        self.scratch_arena.reset();
         Ok(())
     }
 
