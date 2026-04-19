@@ -12,6 +12,7 @@ pub mod page_buf;
 pub mod page_cache;
 pub mod pager;
 pub mod s3_fifo;
+pub mod submodular_prefetch;
 pub mod traits;
 
 pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
@@ -48,6 +49,7 @@ pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
     S3FifoEvent, S3FifoRolloutGate,
 };
+pub use submodular_prefetch::{Candidate as PrefetchCandidate, expected_gain, greedy_select};
 pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MemoryMockMvccPager,
     MemoryMockTransaction, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,

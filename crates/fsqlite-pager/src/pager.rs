@@ -5614,6 +5614,52 @@ impl<V: Vfs> SimpleTransaction<V> {
         &self.scratch_arena
     }
 
+    /// Submodular greedy prefetch selector (IMPL-8 / AG-O3 + AAC-P4).
+    ///
+    /// Given a set of prefetch candidates and a budget `B`, selects up to `B`
+    /// pages using Nemhauser-Wolsey-Fisher greedy maximization of a monotone
+    /// submodular objective (see [`crate::submodular_prefetch`] for the math
+    /// and the `(1 - 1/e) ≈ 0.6321` approximation bound).
+    ///
+    /// For each selected page, issues a prefetch hint through the same
+    /// fast-path ladder as [`TransactionHandle::prefetch_page_hint`]:
+    /// write-set → per-txn read cache → published snapshot → shared cache.
+    ///
+    /// Existing `prefetch_page_hint` callers are unaffected; this method is
+    /// offered in parallel so callers that have a *set* of plausible pages
+    /// (e.g. B-tree scan look-ahead, CTE materialization) can pay the
+    /// bandwidth budget on the submodular-optimal subset instead of a
+    /// round-robin or top-k heuristic.
+    pub fn prefetch_page_hints_greedy(
+        &self,
+        candidates: &[crate::submodular_prefetch::Candidate],
+        budget: usize,
+        penalty: f64,
+    ) {
+        let selected = crate::submodular_prefetch::greedy_select(candidates, budget, penalty);
+        if selected.is_empty() {
+            return;
+        }
+        for page_no in selected {
+            if let Some(staged) = self.write_set.get(&page_no) {
+                prefetch_l1_read(staged.as_page_bytes().as_ptr());
+                continue;
+            }
+            if let Ok(txn_read_cache) = self.txn_read_cache.try_borrow()
+                && let Some(page) = txn_read_cache.get(&page_no)
+            {
+                prefetch_l1_read(page.as_bytes().as_ptr());
+                continue;
+            }
+            if self.published.page_plane_visible_commit_seq()
+                == self.published_visible_commit_seq.get()
+            {
+                self.published.prefetch_page_hint(page_no);
+            }
+            self.cache.prefetch_page_hint(page_no);
+        }
+    }
+
     /// Check if single-connection fast path is enabled.
     fn single_connection_fast_path_enabled(&self) -> bool {
         self.shared_connection_count
