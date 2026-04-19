@@ -13,6 +13,7 @@ pub mod delta_chain;
 pub mod freelist;
 pub mod instrumentation;
 pub mod learned_index;
+pub mod learned_rowid;
 pub mod overflow;
 pub mod payload;
 pub mod quotient_filter;
@@ -54,6 +55,7 @@ pub use learned_index::{
     LearnedIndex, LearnedIndexConfig, LearnedIndexMetricsSnapshot, learned_index_metrics_snapshot,
     reset_learned_index_metrics,
 };
+pub use learned_rowid::LearnedRowIdIndex;
 pub use quotient_filter::{
     DEFAULT_Q_BITS as QUOTIENT_FILTER_DEFAULT_Q_BITS,
     DEFAULT_R_BITS as QUOTIENT_FILTER_DEFAULT_R_BITS, QuotientFilter, QuotientFilterError,
