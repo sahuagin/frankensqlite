@@ -11,6 +11,7 @@ pub mod obligation;
 pub mod opcode;
 pub mod qsbr;
 pub mod record;
+pub mod record_coder_pacbayes;
 pub mod serial_type;
 pub mod sync_primitives;
 pub mod value;
