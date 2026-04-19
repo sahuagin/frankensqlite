@@ -9,6 +9,7 @@ pub mod cell;
 pub mod cooling;
 pub mod cracking;
 pub mod cursor;
+pub mod delta_chain;
 pub mod freelist;
 pub mod instrumentation;
 pub mod learned_index;
