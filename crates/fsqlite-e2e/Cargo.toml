@@ -120,3 +120,7 @@ path = "src/bin/microbatch_bench.rs"
 [[bin]]
 name = "swarm-multiprocess"
 path = "src/bin/swarm_multiprocess.rs"
+
+[[bin]]
+name = "mt-mvcc-bench"
+path = "src/bin/mt_mvcc_bench.rs"
