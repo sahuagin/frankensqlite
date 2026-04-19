@@ -187,7 +187,7 @@ pub struct GlobalCommitMarker {
 }
 
 /// Magic bytes for the global commit marker: "2PCM".
-pub const COMMIT_MARKER_MAGIC: [u8; 4] = [b'2', b'P', b'C', b'M'];
+pub const COMMIT_MARKER_MAGIC: [u8; 4] = *b"2PCM";
 
 /// Minimum marker size: magic (4) + txn_id (8) + commit_seq (8) +
 /// participant_count (4) + timestamp (8) = 32 bytes.

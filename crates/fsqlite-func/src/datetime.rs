@@ -516,10 +516,9 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
 fn parse_arithmetic_modifier(m: &str) -> Option<f64> {
     let (sign, rest) = if let Some(r) = m.strip_prefix('+') {
         (1.0, r.trim())
-    } else if let Some(r) = m.strip_prefix('-') {
-        (-1.0, r.trim())
     } else {
-        return None;
+        let r = m.strip_prefix('-')?;
+        (-1.0, r.trim())
     };
 
     let mut parts = rest.splitn(2, ' ');
