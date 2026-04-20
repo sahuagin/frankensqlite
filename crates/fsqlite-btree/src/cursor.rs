@@ -56,9 +56,53 @@ fn default_collation_registry() -> &'static Arc<Mutex<CollationRegistry>> {
 }
 use tracing::{Level, debug, trace, warn};
 
+/// OPT-3: throttled cancellation check for cursor ops.
+///
+/// The full `Cx::checkpoint()` path walks e-process oracle consultation +
+/// asupersync native-cancellation-shim checkpoint (which calls
+/// `clock_gettime` on every invocation). On the INSERT profile those two
+/// paths together consumed ~4.8% self-time. The cursor hot path fires
+/// `observe_cursor_cancellation` once per traversal step — thousands of
+/// times per INSERT on deep B-trees — so the full check dominates.
+///
+/// We throttle the expensive check to once per `THROTTLE_INTERVAL`
+/// invocations; between those we only pay the cheap
+/// `cancel_requested: AtomicBool` acquire-load. If a cancellation is
+/// actually requested the atomic load sees it immediately (so latency
+/// is bounded by the time between the requester's release-store and the
+/// next cursor operation, not by the throttle interval).
+///
+/// The throttle counter is thread-local so multiple concurrent cursors
+/// on the same thread share it (they're all doing the "same" work
+/// anyway — the interval bound is per-thread of progress, not per
+/// cursor).
 #[inline]
 fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
-    cx.checkpoint().map_err(|_| FrankenError::Abort)
+    // Cheap path every call: atomic bool load. Must be Acquire so we
+    // synchronize with the requester's Release store of the cancel flag.
+    if cx.is_cancel_requested() {
+        // Cancellation observed on the cheap fast path — drop through
+        // to full checkpoint so the CancelRequested→Cancelling state
+        // machine transition actually fires.
+        return cx.checkpoint().map_err(|_| FrankenError::Abort);
+    }
+
+    // Throttled expensive path: e-process oracle + native-cx
+    // checkpoint. `COUNTER` is per-thread so we don't need a
+    // multi-threaded counter; each cursor op runs on one thread.
+    const THROTTLE_INTERVAL: u32 = 64;
+    thread_local! {
+        static COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let do_full = COUNTER.with(|c| {
+        let next = c.get().wrapping_add(1);
+        c.set(next);
+        next % THROTTLE_INTERVAL == 0
+    });
+    if do_full {
+        return cx.checkpoint().map_err(|_| FrankenError::Abort);
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
