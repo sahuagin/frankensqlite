@@ -5612,12 +5612,13 @@ impl<V: Vfs> SimpleTransaction<V> {
     /// references across a transaction-boundary method call on
     /// `SimpleTransaction`.
     ///
-    /// Currently unused: the arena infrastructure (field, reset hooks,
-    /// accessor) is landed first; callers can opt in by routing transient
-    /// allocations through this arena in follow-up changes. Kept `dead_code`
-    /// to avoid churn in the surrounding commit/rollback logic.
+    /// First wired (OPT-5) by
+    /// [`SimpleTransaction::materialize_retained_memory_overlay_into_write_set`],
+    /// which routes its transient `Vec<PageNumber>` scratch through this
+    /// arena. Additional callers can opt in by allocating purely transient
+    /// buffers (nothing stored into `self` fields that survive the current
+    /// method call) via `bumpalo::collections::Vec::new_in(&self.scratch_arena)`.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn scratch_arena(&self) -> &bumpalo::Bump {
         &self.scratch_arena
     }
@@ -5961,12 +5962,30 @@ impl<V: Vfs> SimpleTransaction<V> {
             return Ok(());
         }
 
-        let overlay_page_nos: Vec<PageNumber> = self
-            .retained_memory_overlay_dirty_pages
-            .iter()
-            .copied()
-            .filter(|page_no| !self.write_set.contains_key(page_no))
-            .collect();
+        // OPT-5: route the transient page-number scratch through the
+        // per-transaction bumpalo arena (IMPL-3 / AG-4B). Lifetime analysis:
+        //
+        //   * `overlay_page_nos` is born here, consumed by `iter().copied()`
+        //     in the next block, and dropped before method return.
+        //   * No reference to the arena-allocated storage escapes this
+        //     method frame — `PageNumber` is `Copy` and the page numbers
+        //     are materialized into fresh heap-owned `PageData` entries
+        //     inserted into `self.write_set`.
+        //   * `self.scratch_arena()` aliases `self` immutably only for the
+        //     lifetime of this local vector. `&mut self` recovers before we
+        //     call `insert_staged_page`, which requires `&mut self.write_set`.
+        //
+        // This converts one glibc `malloc(capacity * sizeof(PageNumber))` per
+        // retained-autocommit commit into a bump-pointer reservation that is
+        // reset for free at commit/rollback.
+        let mut overlay_page_nos: bumpalo::collections::Vec<'_, PageNumber> =
+            bumpalo::collections::Vec::new_in(self.scratch_arena());
+        overlay_page_nos.extend(
+            self.retained_memory_overlay_dirty_pages
+                .iter()
+                .copied()
+                .filter(|page_no| !self.write_set.contains_key(page_no)),
+        );
         if overlay_page_nos.is_empty() {
             return Ok(());
         }
@@ -5974,7 +5993,8 @@ impl<V: Vfs> SimpleTransaction<V> {
         let overlay_pages = {
             let txn_read_cache = self.txn_read_cache.borrow();
             overlay_page_nos
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|page_no| {
                     let page = txn_read_cache.get(&page_no).cloned().ok_or_else(|| {
                         FrankenError::internal(format!(
@@ -5986,6 +6006,8 @@ impl<V: Vfs> SimpleTransaction<V> {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        // Drop the arena-allocated scratch before we re-borrow `&mut self`.
+        drop(overlay_page_nos);
 
         for (page_no, page) in overlay_pages {
             insert_staged_page(
