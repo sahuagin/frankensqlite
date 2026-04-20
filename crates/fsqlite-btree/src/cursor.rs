@@ -123,6 +123,55 @@ fn prefetch_l1_read(_ptr: *const u8) {}
 
 const TABLE_LEAF_INTERPOLATION_MAX_PROBES: usize = 3;
 
+/// Size-dispatched sort for the `(ptr, size, i)` triples built during DELETE
+/// cell-reshuffle in [`BtCursor::remove_cell_from_leaf`], sorted so the largest
+/// `ptr` (first tuple element) comes first (descending primary key).
+///
+/// Profile context (OPT-7): `core::slice::sort::unstable::quicksort` +
+/// `small_sort_general` were at ~2.2% self-time inside `remove_cell_from_leaf`.
+/// The input to this sort is usually small — the typical DELETE hits N in the
+/// 1-8 range, with the hard upper bound near ~60-80 (max cells-per-page on a
+/// 4 KiB page).
+///
+/// Microbenchmark on this x86_64 host (release mode, sort-only per-iteration,
+/// data shaped like real cell offsets; see `bench_remove_cell_from_leaf_sort`):
+/// at N <= 8 the specialized insertion sort runs roughly equal to or slightly
+/// faster than std's `sort_unstable_by_key` (measurements are noisy at 8-15 ns).
+/// Crossover to std's pdqsort happens around N=12-16; beyond that the
+/// generic sort wins because its small-sort path is itself well-tuned and the
+/// closure + key-extraction overhead is amortized across more work.
+///
+/// We therefore dispatch by size: a specialized insertion sort with an
+/// already-sorted fast path for N <= 12 (the common DELETE case), falling
+/// through to `sort_unstable_by_key` otherwise. At the threshold the two
+/// paths are within measurement noise, so this dispatch avoids regressing
+/// full-page DELETE while potentially shaving instructions off the small-N
+/// hot path where the profile samples concentrate.
+#[inline(always)]
+fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
+    // Empirical crossover: insertion sort is competitive or better for small N;
+    // pdqsort wins for larger N. See doc comment for measurements.
+    const INSERTION_SORT_THRESHOLD: usize = 12;
+    if v.len() <= INSERTION_SORT_THRESHOLD {
+        for i in 1..v.len() {
+            // Fast path: already in descending order vs predecessor.
+            // Saves the single-element copy that the shift loop would otherwise do.
+            if v[i - 1].0 >= v[i].0 {
+                continue;
+            }
+            let cur = v[i];
+            let mut j = i;
+            while j > 0 && v[j - 1].0 < cur.0 {
+                v[j] = v[j - 1];
+                j -= 1;
+            }
+            v[j] = cur;
+        }
+    } else {
+        v.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Page reader trait (for testability)
 // ---------------------------------------------------------------------------
@@ -4905,7 +4954,10 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         // Sort by ptr descending so we can shift right safely without overwriting unread data.
-        cells_to_move.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+        // N is typically 1..~80 (capped by cells-per-page); `sort_cells_desc_by_ptr`
+        // uses a specialized insertion sort with an already-sorted fast path for small N
+        // and falls through to `sort_unstable_by_key` above the empirical crossover.
+        sort_cells_desc_by_ptr(&mut cells_to_move);
 
         let mut new_content_offset = self.usable_size as usize;
         for (ptr, size, i) in cells_to_move {
@@ -13009,6 +13061,132 @@ mod tests {
                 found, child_idx,
                 "slot lookup must round-trip for child {} on root page {}",
                 child_page, root
+            );
+        }
+    }
+
+    // ---- OPT-7: sort_cells_desc_by_ptr correctness + micro-benchmark ----
+
+    /// Correctness: the specialized insertion sort must match
+    /// `sort_unstable_by_key(|k| Reverse(k.0))` for primary-key order across
+    /// a variety of inputs (equal-primary ties are allowed to reorder).
+    #[test]
+    fn remove_cell_from_leaf_specialized_sort_matches_std() {
+        use std::cmp::Reverse;
+
+        // Empty.
+        let mut v: Vec<(usize, usize, usize)> = vec![];
+        sort_cells_desc_by_ptr(&mut v);
+        assert!(v.is_empty());
+
+        // Single element.
+        let mut v: Vec<(usize, usize, usize)> = vec![(100, 10, 0)];
+        sort_cells_desc_by_ptr(&mut v);
+        assert_eq!(v, vec![(100, 10, 0)]);
+
+        // Already sorted descending (common fast path).
+        let mut v: Vec<(usize, usize, usize)> =
+            vec![(400, 1, 0), (300, 2, 1), (200, 3, 2), (100, 4, 3)];
+        let mut expected = v.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut v);
+        assert_eq!(v, expected);
+
+        // Reverse-sorted (ascending) — worst case for insertion sort.
+        let mut v: Vec<(usize, usize, usize)> =
+            vec![(100, 4, 3), (200, 3, 2), (300, 2, 1), (400, 1, 0)];
+        let mut expected = v.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut v);
+        assert_eq!(v, expected);
+
+        // Mixed shape, with a duplicate primary key.
+        let mut v: Vec<(usize, usize, usize)> = vec![
+            (250, 5, 0),
+            (100, 5, 1),
+            (400, 5, 2),
+            (150, 5, 3),
+            (400, 5, 4), // duplicate primary
+            (50, 5, 5),
+            (300, 5, 6),
+        ];
+        let mut expected = v.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut v);
+        // std's `sort_unstable_by_key` is unstable, so only primary-key order
+        // must match; tie-breaking between the two 400s may differ.
+        let keys_got: Vec<usize> = v.iter().map(|t| t.0).collect();
+        let keys_exp: Vec<usize> = expected.iter().map(|t| t.0).collect();
+        assert_eq!(keys_got, keys_exp);
+
+        // Larger realistic page: ~80 cells with typical cell-offset distribution.
+        let mut v: Vec<(usize, usize, usize)> = (0..80)
+            .map(|i| (4096 - (i * 50 + 17) % 3900, (i * 7) % 200 + 8, i))
+            .collect();
+        let mut expected = v.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut v);
+        let keys_got: Vec<usize> = v.iter().map(|t| t.0).collect();
+        let keys_exp: Vec<usize> = expected.iter().map(|t| t.0).collect();
+        assert_eq!(keys_got, keys_exp);
+    }
+
+    /// Micro-benchmark: size-dispatched sort vs unconditional std `sort_unstable_by_key`.
+    /// Ignored by default (run with `--release --ignored --nocapture`).
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_remove_cell_from_leaf_sort() {
+        use std::cmp::Reverse;
+
+        // Shapes that match the DELETE hot path (typical N is 1-8, max ~60-80).
+        let shapes: &[(&str, usize)] = &[
+            ("N=1", 1),
+            ("N=2", 2),
+            ("N=4", 4),
+            ("N=8", 8),
+            ("N=12", 12),
+            ("N=16", 16),
+            ("N=32", 32),
+            ("N=60", 60),
+            ("N=80", 80),
+        ];
+
+        const ITERS: usize = 1_000_000;
+
+        for (label, n) in shapes {
+            // Descending-ish but not perfectly sorted input (cells mostly
+            // inserted in order, some gaps after prior deletes).
+            let base: Vec<(usize, usize, usize)> = (0..*n)
+                .map(|i| (4096 - (i * 47 + 11) % 3800, (i * 13) % 200 + 8, i))
+                .collect();
+
+            // Warm-up so both variants see steady-state caches/branches.
+            for _ in 0..1024 {
+                let mut v = base.clone();
+                v.sort_unstable_by_key(|k| Reverse(k.0));
+                let mut v = base.clone();
+                sort_cells_desc_by_ptr(&mut v);
+            }
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                let mut v = base.clone();
+                v.sort_unstable_by_key(|k| Reverse(k.0));
+                std::hint::black_box(&v);
+            }
+            let std_ns = t0.elapsed().as_nanos() as u64 / ITERS as u64;
+
+            let t0 = Instant::now();
+            for _ in 0..ITERS {
+                let mut v = base.clone();
+                sort_cells_desc_by_ptr(&mut v);
+                std::hint::black_box(&v);
+            }
+            let dispatched_ns = t0.elapsed().as_nanos() as u64 / ITERS as u64;
+
+            println!(
+                "[OPT-7 bench] {label}: std={std_ns}ns  dispatched={dispatched_ns}ns  speedup={:.2}x",
+                std_ns as f64 / dispatched_ns.max(1) as f64
             );
         }
     }
