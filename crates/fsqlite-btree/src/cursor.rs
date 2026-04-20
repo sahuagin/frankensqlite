@@ -37,7 +37,23 @@ use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use std::borrow::Cow;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// OPT-1: process-wide shared default `CollationRegistry`.
+///
+/// `CollationRegistry::new()` pre-populates BINARY / NOCASE / RTRIM and
+/// allocates a `HashMap<String, Arc<dyn CollationFunction>>`. Doing that
+/// inside `BtCursor::new` — fired for every INSERT/UPDATE/DELETE — showed
+/// up in the INSERT flamegraph at ~1.3% self-time (0.9% `HashMap::insert`
+/// + 0.39% `Arc::drop_slow`). Callers that need custom collations still
+/// override via `set_index_collation_context`; the overwhelming majority
+/// of cursor constructions (table cursors, all the direct-simple DML
+/// paths) never mutate the registry at all, so they can safely share this
+/// immutable default Arc.
+fn default_collation_registry() -> &'static Arc<Mutex<CollationRegistry>> {
+    static DEFAULT: OnceLock<Arc<Mutex<CollationRegistry>>> = OnceLock::new();
+    DEFAULT.get_or_init(|| Arc::new(Mutex::new(CollationRegistry::new())))
+}
 use tracing::{Level, debug, trace, warn};
 
 #[inline]
@@ -1080,7 +1096,15 @@ impl<P: PageReader> BtCursor<P> {
             is_table,
             index_desc_flags,
             index_collations: Vec::new(),
-            collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
+            // OPT-1: the default registry (BINARY/NOCASE/RTRIM) never changes
+            // and is never mutated except via `set_index_collation_context`.
+            // Per-cursor construction of a fresh `Arc<Mutex<CollationRegistry>>`
+            // was 0.9% + 0.39% (registry insert + Arc drop) on the INSERT
+            // hot path — a new cursor fires for every INSERT/UPDATE/DELETE.
+            // Share the default Arc across all cursors via a OnceLock; callers
+            // that need custom collations still override via
+            // `set_index_collation_context`.
+            collation_registry: Arc::clone(default_collation_registry()),
             // Most cursor lifetimes never approach the theoretical max depth,
             // and the prepared direct-insert append lane can complete without
             // ever pushing a stack entry. Avoid paying a heap allocation up
