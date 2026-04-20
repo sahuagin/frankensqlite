@@ -7,6 +7,7 @@
 //! This crate is intentionally small in early phases: it defines the core MVCC
 //! primitives and the cross-process witness/lock-table coordination types.
 
+pub mod atomic_amortizers;
 pub mod begin_concurrent;
 pub mod bocpd;
 pub mod cache_aligned;
