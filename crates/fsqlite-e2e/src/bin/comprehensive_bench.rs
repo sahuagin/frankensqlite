@@ -252,6 +252,69 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
     }
 }
 
+// ─── BusySnapshot / Busy retry helpers ─────────────────────────────────
+//
+// FrankenSQLite's MVCC can return `BusySnapshot` or `Busy` when a write
+// races against another writer/snapshot. These are transient and must be
+// retried with backoff, analogous to SQLITE_BUSY under WAL.  The bench
+// harness uses a bounded exponential backoff so spurious contention on
+// shared structures (e.g. the single-connection cache, the pager, or
+// transient snapshot conflicts) does not turn into a hard panic.
+
+/// Maximum number of retry attempts per mutation.
+const BENCH_BUSY_MAX_RETRIES: u32 = 32;
+/// Starting backoff in microseconds (doubles each attempt, capped at
+/// ~100ms via the `min(10)` shift clamp).
+const BENCH_BUSY_BACKOFF_US: u64 = 100;
+
+fn is_busy_like(err: &fsqlite::FrankenError) -> bool {
+    matches!(
+        err,
+        fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::LockFailed { .. }
+    )
+}
+
+/// Retry `op` with bounded exponential backoff while it returns a
+/// busy-like error.  Returns the last error if retries are exhausted.
+fn retry_on_busy<T, F>(mut op: F) -> Result<T, fsqlite::FrankenError>
+where
+    F: FnMut() -> Result<T, fsqlite::FrankenError>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy_like(&e) && attempt < BENCH_BUSY_MAX_RETRIES => {
+                let shift = attempt.min(10);
+                let wait_us = BENCH_BUSY_BACKOFF_US << shift;
+                std::thread::sleep(Duration::from_micros(wait_us));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `conn.execute(sql)` with BusySnapshot/Busy retry.
+fn fs_execute(conn: &fsqlite::Connection, sql: &str) -> usize {
+    retry_on_busy(|| conn.execute(sql))
+        .unwrap_or_else(|e| panic!("fsqlite execute failed after retries: {e} (sql={sql})"))
+}
+
+/// `stmt.execute_with_params(params)` with BusySnapshot/Busy retry.
+fn fs_stmt_execute_with_params(
+    stmt: &fsqlite::PreparedStatement<'_>,
+    params: &[fsqlite::SqliteValue],
+) -> usize {
+    retry_on_busy(|| stmt.execute_with_params(params)).unwrap_or_else(|e| {
+        panic!("fsqlite prepared execute_with_params failed after retries: {e}")
+    })
+}
+
 fn collect_rusqlite_rows<P: rusqlite::Params>(
     stmt: &mut rusqlite::Statement<'_>,
     params: P,
@@ -1497,15 +1560,14 @@ fn bench_insert_by_row_count(
             measure(&format!("fsqlite_{count}"), count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(create_sql).unwrap();
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, create_sql);
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             })
         };
 
@@ -1558,12 +1620,11 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 measure(&format!("fs_auto_{count}"), count, || {
                     let conn = fsqlite::Connection::open(":memory:").unwrap();
                     apply_pragmas_fsqlite(&conn);
-                    conn.execute(create_sql).unwrap();
+                    fs_execute(&conn, create_sql);
                     let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                     #[allow(clippy::cast_possible_wrap)]
                     for i in 0..count as i64 {
-                        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                            .unwrap();
+                        fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                     }
                 })
             };
@@ -1610,19 +1671,18 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 // O(existing_rows) MemDatabase clone that would otherwise run
                 // at every COMMIT (bd-batched-commit-cliff).
                 let _ = conn.execute("PRAGMA fsqlite_capture_time_travel_snapshots=false");
-                conn.execute(create_sql).unwrap();
+                fs_execute(&conn, create_sql);
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 let num_batches = count.div_ceil(batch_size);
                 #[allow(clippy::cast_possible_wrap)]
                 for batch in 0..num_batches {
-                    conn.execute("BEGIN").unwrap();
+                    fs_execute(&conn, "BEGIN");
                     let start = (batch * batch_size) as i64;
                     let end = ((batch + 1) * batch_size).min(count) as i64;
                     for i in start..end {
-                        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                            .unwrap();
+                        fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                     }
-                    conn.execute("COMMIT").unwrap();
+                    fs_execute(&conn, "COMMIT");
                 }
             })
         };
@@ -1663,15 +1723,14 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             measure(&format!("fs_txn_{count}"), count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(create_sql).unwrap();
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, create_sql);
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             })
         };
 
@@ -1722,15 +1781,14 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
             measure(&format!("fs_{}", record_size.name()), count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(create_sql).unwrap();
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, create_sql);
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             })
         };
 
@@ -1822,23 +1880,24 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
         let fs = measure(&format!("fs_concurrent_{n_threads}t"), total_rows, || {
             let conn = fsqlite::Connection::open(":memory:").unwrap();
             apply_pragmas_fsqlite(&conn);
-            conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
-                .unwrap();
+            fs_execute(
+                &conn,
+                "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+            );
 
             let stmt = conn
                 .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
                 .unwrap();
             for tid in 0..n_threads {
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let base = tid as i64 * CONCURRENT_RANGE_SIZE;
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
                     let id = base + i;
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(id)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             }
         });
 
@@ -2102,19 +2161,17 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_conn = {
             let conn = fsqlite::Connection::open(":memory:").unwrap();
             apply_pragmas_fsqlite(&conn);
-            conn.execute(record_size.create_table_sql()).unwrap();
-            conn.execute("BEGIN").unwrap();
+            fs_execute(&conn, record_size.create_table_sql());
+            fs_execute(&conn, "BEGIN");
             {
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
             }
-            conn.execute("COMMIT").unwrap();
-            conn.execute("CREATE INDEX idx_name ON bench(name)")
-                .unwrap();
+            fs_execute(&conn, "COMMIT");
+            fs_execute(&conn, "CREATE INDEX idx_name ON bench(name)");
             conn
         };
 
@@ -2380,31 +2437,31 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
             measure(&format!("fs_update_{count}"), update_count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(create_sql).unwrap();
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, create_sql);
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
 
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, "BEGIN");
                 let update = conn
                     .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
                     .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..update_count as i64 {
                     let id = i * 10;
-                    update
-                        .execute_with_params(&[
+                    fs_stmt_execute_with_params(
+                        &update,
+                        &[
                             fsqlite::SqliteValue::Integer(id),
                             fsqlite::SqliteValue::Float(999.99),
-                        ])
-                        .unwrap();
+                        ],
+                    );
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             })
         };
 
@@ -2453,26 +2510,23 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
             measure(&format!("fs_delete_{count}"), delete_count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                conn.execute(create_sql).unwrap();
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, create_sql);
+                fs_execute(&conn, "BEGIN");
                 #[allow(clippy::cast_possible_wrap)]
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(i)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
 
-                conn.execute("BEGIN").unwrap();
+                fs_execute(&conn, "BEGIN");
                 let delete = conn.prepare("DELETE FROM bench WHERE id = ?1").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..delete_count as i64 {
                     let id = i * 20;
-                    delete
-                        .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
-                        .unwrap();
+                    fs_stmt_execute_with_params(&delete, &[fsqlite::SqliteValue::Integer(id)]);
                 }
-                conn.execute("COMMIT").unwrap();
+                fs_execute(&conn, "COMMIT");
             })
         };
 
@@ -2601,19 +2655,19 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
     let fs = measure("fs_oltp", ops, || {
         let conn = fsqlite::Connection::open(":memory:").unwrap();
         apply_pragmas_fsqlite(&conn);
-        conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
-            .unwrap();
+        fs_execute(
+            &conn,
+            "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+        );
         let seed_insert = conn
             .prepare("INSERT INTO bench VALUES (?1, ('name_' || ?1), (?1 * 7))")
             .unwrap();
-        conn.execute("BEGIN").unwrap();
+        fs_execute(&conn, "BEGIN");
         #[allow(clippy::cast_possible_wrap)]
         for i in 1..=seed_rows as i64 {
-            seed_insert
-                .execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
-                .unwrap();
+            fs_stmt_execute_with_params(&seed_insert, &[fsqlite::SqliteValue::Integer(i)]);
         }
-        conn.execute("COMMIT").unwrap();
+        fs_execute(&conn, "COMMIT");
 
         let mut rng = Rng64::new(42);
         #[allow(clippy::cast_possible_wrap)]
@@ -2718,10 +2772,15 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_conn = {
             let conn = fsqlite::Connection::open(":memory:").unwrap();
             apply_pragmas_fsqlite(&conn);
-            conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)")
-                .unwrap();
-            conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT)").unwrap();
-            conn.execute("BEGIN").unwrap();
+            fs_execute(
+                &conn,
+                "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)",
+            );
+            fs_execute(
+                &conn,
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT)",
+            );
+            fs_execute(&conn, "BEGIN");
             #[allow(clippy::cast_possible_wrap)]
             for i in 1..=customer_count as i64 {
                 let region = match i % 4 {
@@ -2730,10 +2789,10 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                     2 => "East",
                     _ => "West",
                 };
-                conn.execute(&format!(
-                    "INSERT INTO customers VALUES ({i}, 'cust_{i}', '{region}')"
-                ))
-                .unwrap();
+                fs_execute(
+                    &conn,
+                    &format!("INSERT INTO customers VALUES ({i}, 'cust_{i}', '{region}')"),
+                );
             }
             #[allow(clippy::cast_possible_wrap)]
             for i in 1..=count as i64 {
@@ -2744,14 +2803,13 @@ fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
                     1 => "shipped",
                     _ => "delivered",
                 };
-                conn.execute(&format!(
-                    "INSERT INTO orders VALUES ({i}, {cid}, {amount}, '{status}')"
-                ))
-                .unwrap();
+                fs_execute(
+                    &conn,
+                    &format!("INSERT INTO orders VALUES ({i}, {cid}, {amount}, '{status}')"),
+                );
             }
-            conn.execute("COMMIT").unwrap();
-            conn.execute("CREATE INDEX idx_orders_cust ON orders(customer_id)")
-                .unwrap();
+            fs_execute(&conn, "COMMIT");
+            fs_execute(&conn, "CREATE INDEX idx_orders_cust ON orders(customer_id)");
             conn
         };
 
@@ -2908,27 +2966,33 @@ fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_conn = {
             let conn = fsqlite::Connection::open(":memory:").unwrap();
             apply_pragmas_fsqlite(&conn);
-            conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER)").unwrap();
-            conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)")
-                .unwrap();
-            conn.execute("BEGIN").unwrap();
+            fs_execute(
+                &conn,
+                "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER)",
+            );
+            fs_execute(
+                &conn,
+                "CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)",
+            );
+            fs_execute(&conn, "BEGIN");
             #[allow(clippy::cast_possible_wrap)]
             for i in 1..=cat_count as i64 {
-                conn.execute(&format!("INSERT INTO categories VALUES ({i}, 'cat_{i}')"))
-                    .unwrap();
+                fs_execute(
+                    &conn,
+                    &format!("INSERT INTO categories VALUES ({i}, 'cat_{i}')"),
+                );
             }
             #[allow(clippy::cast_possible_wrap)]
             for i in 1..=count as i64 {
                 let cid = (i % cat_count as i64) + 1;
                 let price = i as f64 * 3.14;
-                conn.execute(&format!(
-                    "INSERT INTO products VALUES ({i}, 'prod_{i}', {price}, {cid})"
-                ))
-                .unwrap();
+                fs_execute(
+                    &conn,
+                    &format!("INSERT INTO products VALUES ({i}, 'prod_{i}', {price}, {cid})"),
+                );
             }
-            conn.execute("COMMIT").unwrap();
-            conn.execute("CREATE INDEX idx_prod_cat ON products(category_id)")
-                .unwrap();
+            fs_execute(&conn, "COMMIT");
+            fs_execute(&conn, "CREATE INDEX idx_prod_cat ON products(category_id)");
             conn
         };
 
@@ -3117,11 +3181,11 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_conn = {
             let conn = fsqlite::Connection::open(":memory:").unwrap();
             apply_pragmas_fsqlite(&conn);
-            conn.execute(
+            fs_execute(
+                &conn,
                 "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT, tag TEXT)",
-            )
-            .unwrap();
-            conn.execute("BEGIN").unwrap();
+            );
+            fs_execute(&conn, "BEGIN");
             #[allow(clippy::cast_possible_wrap)]
             for i in 1..=count as i64 {
                 let tag = match i % 5 {
@@ -3131,13 +3195,16 @@ fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
                     3 => "analysis",
                     _ => "draft",
                 };
-                conn.execute(&format!(
-                    "INSERT INTO docs VALUES ({i}, 'Document {i}: Important Analysis', \
-                     'This is the body of document {i}. It contains various keywords like performance, benchmark, analysis, results, and optimization. \
-                     The document is about testing and measuring throughput.', '{tag}')"
-                )).unwrap();
+                fs_execute(
+                    &conn,
+                    &format!(
+                        "INSERT INTO docs VALUES ({i}, 'Document {i}: Important Analysis', \
+                         'This is the body of document {i}. It contains various keywords like performance, benchmark, analysis, results, and optimization. \
+                         The document is about testing and measuring throughput.', '{tag}')"
+                    ),
+                );
             }
-            conn.execute("COMMIT").unwrap();
+            fs_execute(&conn, "COMMIT");
             conn
         };
 
