@@ -127,34 +127,25 @@ impl MorselScheduler {
         morsels
     }
 
-    /// Round-robin the morsels across `self.worker_count` workers. Morsel `i`
-    /// lands on worker `i % worker_count`. Workers that receive no morsels
-    /// (possible when `morsels.len() < worker_count`) are **omitted** from
-    /// the returned vector so that callers can iterate directly without a
+    /// Round-robin the morsels across `self.worker_count` workers. Morsel
+    /// `i` lands on worker `i % worker_count`. Workers that receive no
+    /// morsels (possible when `morsels.len() < worker_count`) are omitted
+    /// from the returned vector so callers can iterate directly without a
     /// per-worker empty-check.
     #[must_use]
     pub fn schedule(&self, morsels: Vec<Morsel>) -> Vec<WorkAssignment> {
         if morsels.is_empty() {
             return Vec::new();
         }
-
-        let worker_count = self.worker_count.max(1);
-        let active_workers = worker_count.min(morsels.len());
-        let mut bins: Vec<Vec<Morsel>> = (0..active_workers).map(|_| Vec::new()).collect();
-
+        let worker_count = self.worker_count;
+        let active = worker_count.min(morsels.len());
+        let mut bins: Vec<Vec<Morsel>> = (0..active).map(|_| Vec::new()).collect();
+        // With `active = min(worker_count, morsels.len())`, every residue
+        // `idx % worker_count` produced by the loop below is guaranteed to be
+        // in `0..active`, so direct indexing is safe without bounds logic.
         for (idx, morsel) in morsels.into_iter().enumerate() {
-            // `active_workers == min(worker_count, original morsel count)`,
-            // and the round-robin rule is `idx % worker_count`. Because the
-            // first `active_workers` residues are the ones that actually
-            // receive any morsels (for any idx < total, `idx % worker_count`
-            // hits a bin only when it is `< active_workers`, by construction
-            // since we only drop bins that would stay empty), we index bins
-            // directly by `idx % worker_count` and rely on `active_workers
-            // == worker_count` whenever we have more morsels than workers.
-            let slot = idx % worker_count;
-            bins[slot].push(morsel);
+            bins[idx % worker_count].push(morsel);
         }
-
         bins.into_iter()
             .enumerate()
             .map(|(worker_id, morsels)| WorkAssignment { worker_id, morsels })
@@ -216,28 +207,13 @@ mod tests {
                 start_rowid: i,
             })
             .collect();
-
         let assignments = scheduler.schedule(morsels);
-        assert_eq!(
-            assignments.len(),
-            4,
-            "all 4 workers receive at least one morsel"
-        );
-
-        // Expected round-robin:
-        //   worker 0: indices 0, 4, 8 -> start_rowid 0, 4, 8
-        //   worker 1: indices 1, 5, 9 -> start_rowid 1, 5, 9
-        //   worker 2: indices 2, 6    -> start_rowid 2, 6
-        //   worker 3: indices 3, 7    -> start_rowid 3, 7
+        assert_eq!(assignments.len(), 4);
+        // Round-robin: w0=[0,4,8], w1=[1,5,9], w2=[2,6], w3=[3,7].
         let expected: [&[i64]; 4] = [&[0, 4, 8], &[1, 5, 9], &[2, 6], &[3, 7]];
         for assignment in &assignments {
             let got: Vec<i64> = assignment.morsels.iter().map(|m| m.start_rowid).collect();
-            assert_eq!(
-                got,
-                expected[assignment.worker_id].to_vec(),
-                "worker {} round-robin slice",
-                assignment.worker_id
-            );
+            assert_eq!(got, expected[assignment.worker_id].to_vec());
         }
     }
 
