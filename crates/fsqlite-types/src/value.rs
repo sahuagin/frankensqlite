@@ -318,6 +318,29 @@ impl SmallText {
         }
     }
 
+    /// Get the raw bytes of this text value without going through `&str`.
+    ///
+    /// Unlike [`Self::as_str`] (which revalidates the inline buffer via
+    /// `from_utf8`), this directly returns the stored bytes. The returned
+    /// slice is guaranteed to be valid UTF-8 by construction: every code path
+    /// that writes to a `SmallText` (`new`, `from_string`, `from_arc`,
+    /// `overwrite`) sources its bytes from a `&str` or `Arc<str>`.
+    ///
+    /// This is useful on hot paths where a byte-wise equality check is the
+    /// only operation performed — for example, the record-decode fast path
+    /// that reuses an existing slot when incoming bytes match what is already
+    /// there. Skipping the internal `from_utf8` of `as_str` measurably
+    /// reduces per-column decode cost on INSERT/SELECT workloads.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes_direct(&self) -> &[u8] {
+        match &self.repr {
+            SmallTextRepr::Inline { len, buf } => &buf[..*len as usize],
+            SmallTextRepr::HeapOwned { text, .. } => text.as_bytes(),
+            SmallTextRepr::HeapShared(text) => text.as_bytes(),
+        }
+    }
+
     /// Get the length in bytes.
     #[inline]
     pub fn len(&self) -> usize {

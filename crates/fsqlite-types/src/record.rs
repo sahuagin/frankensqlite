@@ -1758,20 +1758,37 @@ fn decode_value_into(
             );
         }
         SerialTypeClass::Text => {
-            let text = std::str::from_utf8(bytes).ok()?;
+            // Fast path: if the slot already holds a TEXT value whose bytes
+            // exactly match the incoming record bytes, we can skip the
+            // `from_utf8` validation entirely — the existing slot contents
+            // are UTF-8 by construction, and equal bytes means the incoming
+            // bytes are equally valid. This is the common case when a
+            // `SqliteValue` slot is reused across rows that happen to share
+            // a TEXT column value (e.g. repeated enum-like strings, or when
+            // the VDBE decodes the same row back into the same register).
+            //
+            // `as_bytes_direct` avoids the internal `from_utf8` cost of
+            // `SmallText::as_str` for the inline variant.
             if let SqliteValue::Text(existing) = slot {
-                if existing.as_bytes() == bytes {
+                if existing.as_bytes_direct() == bytes {
                     if profile_enabled {
                         note_decoded_value(slot);
                     }
                     return Some(());
                 }
+                // Bytes differ: validate the incoming bytes as UTF-8 once,
+                // then overwrite the slot reusing its heap allocation when
+                // possible.
+                let text = std::str::from_utf8(bytes).ok()?;
                 existing.overwrite(text);
                 if profile_enabled {
                     note_decoded_value(slot);
                 }
                 return Some(());
             }
+            // Slot did not hold a TEXT value — validate once and construct
+            // a fresh `SqliteValue::Text`.
+            let text = std::str::from_utf8(bytes).ok()?;
             replace_decoded_slot(slot, SqliteValue::Text(text.into()));
         }
         SerialTypeClass::Blob => {
@@ -1914,6 +1931,58 @@ mod tests {
 
         parse_record_into(&second, &mut values).expect("second decode");
         assert_eq!(values[0].as_text(), Some("shorter"));
+    }
+
+    #[test]
+    fn decode_text_fast_path_equal_bytes_preserves_value() {
+        // Regression guard for the OPT-6 fast path: when the slot already
+        // holds a TEXT value whose bytes equal the incoming record bytes,
+        // decoding must succeed without rewriting the slot — and the
+        // resulting `&str` view must be identical to the input.
+        let original = "round-trip test string";
+        let mut slot = SqliteValue::Text(SmallText::new(original));
+
+        let serial_type = serial_type_for_text(original.len() as u64);
+        decode_value_into(serial_type, original.as_bytes(), &mut slot, false)
+            .expect("decode via equal-bytes fast path");
+
+        assert_eq!(slot.as_text(), Some(original));
+
+        // Exercise again with an inline-sized string (tests SmallText::Inline
+        // repr + `as_bytes_direct` alignment with the incoming record bytes).
+        let short = "abc";
+        let mut slot = SqliteValue::Text(SmallText::new(short));
+        decode_value_into(
+            serial_type_for_text(short.len() as u64),
+            short.as_bytes(),
+            &mut slot,
+            false,
+        )
+        .expect("decode inline text via equal-bytes fast path");
+        assert_eq!(slot.as_text(), Some(short));
+    }
+
+    #[test]
+    fn decode_text_rejects_invalid_utf8_when_slot_differs() {
+        // Regression guard: even when the fast-path equality check fails,
+        // the subsequent `from_utf8` validation must still reject malformed
+        // bytes. This covers the non-fast-path write into an existing Text
+        // slot.
+        let mut slot = SqliteValue::Text(SmallText::new("previous value"));
+        let invalid: &[u8] = &[0xFF, 0xFE, 0xFD]; // not valid UTF-8
+        let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
+        assert!(result.is_none(), "invalid UTF-8 must be rejected");
+    }
+
+    #[test]
+    fn decode_text_rejects_invalid_utf8_when_slot_non_text() {
+        // Regression guard: the `replace_decoded_slot` arm (slot held a
+        // non-Text value) must also run `from_utf8` validation before
+        // constructing a new `SqliteValue::Text`.
+        let mut slot = SqliteValue::Integer(7);
+        let invalid: &[u8] = &[0xFF, 0xFE, 0xFD];
+        let result = decode_value_into(serial_type_for_text(3), invalid, &mut slot, false);
+        assert!(result.is_none(), "invalid UTF-8 must be rejected");
     }
 
     #[test]
