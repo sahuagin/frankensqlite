@@ -34,6 +34,7 @@ pub mod invariants;
 pub mod left_right;
 pub mod lifecycle;
 pub mod materialize;
+pub mod mica_commit_log;
 pub mod mpc_commit_controller;
 pub mod observability;
 pub mod physical_merge;
