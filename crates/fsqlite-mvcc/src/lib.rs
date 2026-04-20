@@ -49,6 +49,7 @@ pub mod seqlock;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
 pub mod shm;
+pub mod silo_epoch;
 pub mod sketch_telemetry;
 pub mod ssi_abort_policy;
 pub mod ssi_eprocess_gate;
