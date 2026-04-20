@@ -4042,6 +4042,166 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
+    /// Writer-callback variant of
+    /// [`Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only`].
+    ///
+    /// Instead of copying from an existing `&[u8]` payload, the caller passes
+    /// `payload_len` (exact number of payload bytes to reserve in the cell)
+    /// plus a one-shot `writer` closure which receives a `&mut [u8]` of that
+    /// exact length carved inside the page. This lets the caller serialize
+    /// record bytes directly into the page buffer, eliminating the
+    /// intermediate `record_scratch: Vec<u8>` allocation and its memcpy into
+    /// the page on the INSERT hot path.
+    ///
+    /// Returns `Ok(None)` when the local payload would need overflow pages
+    /// (caller must fall back to the generic cell-encode path) OR when the
+    /// remaining free space on the page is too small. Returns `Ok(Some((idx,
+    /// offset)))` on a successful append. Propagates any error from `writer`
+    /// or from size conversions.
+    ///
+    /// # Safety contract
+    ///
+    /// The writer MUST fully initialize exactly `payload_len` bytes of the
+    /// slice it receives (or return `Err`). On `Err` the page buffer state is
+    /// unspecified and the cell header/pointer updates in this function are
+    /// still in effect — callers should abort the statement rather than retry.
+    #[allow(dead_code)] // wired in follow-up commit; primitive landed ahead of caller
+    fn try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer<W>(
+        usable_size: u32,
+        leaf_page_no: PageNumber,
+        page_data: &mut PageData,
+        header: &mut BtreePageHeader,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<Option<(u16, u16)>>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let payload_size = u32::try_from(payload_len).map_err(|_| FrankenError::TooBig)?;
+        let local_size =
+            cell::local_payload_size(payload_size, usable_size, cell::BtreePageType::LeafTable)
+                as usize;
+        let local_size = local_size.min(payload_len);
+        if local_size < payload_len {
+            // Overflow required: callers with a writer-based payload don't
+            // support overflow today — fall back to the generic path.
+            return Ok(None);
+        }
+
+        let mut payload_varint = [0u8; 9];
+        let payload_varint_len = write_varint(&mut payload_varint, u64::from(payload_size));
+        let mut rowid_varint = [0u8; 9];
+        let rowid_len = write_varint(&mut rowid_varint, u64::from_ne_bytes(rowid.to_ne_bytes()));
+        let cell_len = payload_varint_len + rowid_len + local_size;
+
+        let header_offset = cell::header_offset_for_page(leaf_page_no);
+        let insert_idx = header.cell_count;
+        let content_offset = header.content_offset(usable_size);
+        let Some(new_content_offset) = content_offset.checked_sub(cell_len) else {
+            return Ok(None);
+        };
+
+        let ptr_array_end = header_offset
+            + usize::from(header.page_type.header_size())
+            + (usize::from(insert_idx) + 1) * 2;
+        if ptr_array_end > new_content_offset {
+            return Ok(None);
+        }
+
+        let new_cell_offset =
+            u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf cell offset {} exceeds u16 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        let new_cell_count =
+            insert_idx
+                .checked_add(1)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "leaf page {} cell count overflow while appending",
+                        leaf_page_no.get()
+                    ),
+                })?;
+        let ptr_offset = header_offset
+            + usize::from(header.page_type.header_size())
+            + usize::from(insert_idx) * 2;
+
+        header.cell_count = new_cell_count;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "new leaf content offset {} exceeds u32 range on page {}",
+                    new_content_offset,
+                    leaf_page_no.get()
+                ),
+            })?;
+        let mutate_start = std::time::Instant::now();
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            let mut write_offset = new_content_offset;
+            page_bytes[write_offset..write_offset + payload_varint_len]
+                .copy_from_slice(&payload_varint[..payload_varint_len]);
+            write_offset += payload_varint_len;
+            page_bytes[write_offset..write_offset + rowid_len]
+                .copy_from_slice(&rowid_varint[..rowid_len]);
+            write_offset += rowid_len;
+            let payload_slice = &mut page_bytes[write_offset..write_offset + local_size];
+            writer(payload_slice)?;
+            page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
+            header.write(page_bytes, header_offset);
+        }
+        instrumentation::record_fast_table_leaf_payload_append_mutate(
+            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        Ok(Some((insert_idx, new_cell_offset)))
+    }
+
+    /// Writer-callback analogue of
+    /// [`Self::try_append_table_leaf_payload_in_place_no_overflow`].
+    ///
+    /// See the `_mutate_only_with_writer` helper for the payload-writing
+    /// contract; this wrapper additionally stages the mutated page image
+    /// through the pager.
+    #[allow(dead_code)] // wired in follow-up commit; primitive landed ahead of caller
+    fn try_append_table_leaf_payload_in_place_no_overflow_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        leaf_page_no: PageNumber,
+        page_data: &mut PageData,
+        header: &mut BtreePageHeader,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<Option<(u16, u16)>>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let Some((insert_idx, new_cell_offset)) =
+            Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer(
+                self.usable_size,
+                leaf_page_no,
+                page_data,
+                header,
+                rowid,
+                payload_len,
+                writer,
+            )?
+        else {
+            return Ok(None);
+        };
+        let staged_page = page_data.clone();
+        let stage_start = std::time::Instant::now();
+        self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
+        instrumentation::record_fast_table_leaf_payload_append_stage(
+            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        Ok(Some((insert_idx, new_cell_offset)))
+    }
+
     /// Balance the tree after an insert when the leaf page is full.
     ///
     /// `cell_data` is the cell that didn't fit. `insert_idx` is where within

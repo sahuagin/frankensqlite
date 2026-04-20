@@ -1316,6 +1316,173 @@ where
     true
 }
 
+/// Compute the exact total record size (header + body) for a value iterator
+/// against a precomputed-header template.
+///
+/// Returns `Some(total_size)` when every value matches its corresponding slot
+/// contract, or `None` when a slot rejects its value (caller must fall back to
+/// the generic path). The header portion of the record has fixed size
+/// (`header.template.len()`); only the body varies with actual payload bytes.
+///
+/// This is intended for "measure first, write into an exact-sized slot"
+/// workflows (see [`serialize_record_iter_with_precomputed_header_into_slice`]),
+/// where the caller needs to carve space in a page buffer before serializing
+/// to avoid an intermediate `Vec<u8>` copy.
+pub fn record_iter_with_precomputed_header_exact_size<'a, I>(
+    values: I,
+    header: &PrecomputedRecordHeader,
+) -> Option<usize>
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let mut body_size = 0usize;
+    let mut value_iter = values;
+    for slot in &header.slots {
+        let value = value_iter.next()?;
+        let (_serial_byte, payload_len) = slot.kind.serial_byte_and_payload_len(value)?;
+        body_size = body_size.checked_add(payload_len)?;
+    }
+    if value_iter.next().is_some() {
+        return None;
+    }
+    header.template.len().checked_add(body_size)
+}
+
+/// Serialize a record using a compile-time precomputed header template,
+/// writing directly into a caller-provided exact-sized byte slice.
+///
+/// The slice length MUST equal the value returned by
+/// [`record_iter_with_precomputed_header_exact_size`] for the same
+/// `(values, header)` pair — i.e. the caller has already measured the record
+/// and carved a slot in its destination (e.g. a page buffer).
+///
+/// On success returns `Ok(())`. Returns `Err(())` when values don't match the
+/// header contract or when `dst.len()` disagrees with the expected size; the
+/// partial state of `dst` is unspecified on error and the caller must treat
+/// its contents as garbage.
+///
+/// This path avoids an intermediate `Vec<u8>` allocation + memcpy on the
+/// INSERT hot path: previously records went
+/// `record_scratch Vec -> page buffer memcpy`; this writes straight into the
+/// page's pre-reserved payload region.
+#[allow(clippy::result_unit_err)]
+pub fn serialize_record_iter_with_precomputed_header_into_slice<'a, I>(
+    values: I,
+    header: &PrecomputedRecordHeader,
+    dst: &mut [u8],
+) -> Result<(), ()>
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let header_size = header.template.len();
+    if dst.len() < header_size {
+        return Err(());
+    }
+    dst[..header_size].copy_from_slice(&header.template);
+
+    let mut body_offset = header_size;
+    let mut value_iter = values;
+    for slot in &header.slots {
+        let Some(value) = value_iter.next() else {
+            return Err(());
+        };
+        let Some((serial_byte, payload_len)) = slot.kind.serial_byte_and_payload_len(value) else {
+            return Err(());
+        };
+        if slot.kind.needs_runtime_patch() {
+            if slot.header_offset >= header_size {
+                return Err(());
+            }
+            dst[slot.header_offset] = serial_byte;
+        }
+        let end = body_offset.checked_add(payload_len).ok_or(())?;
+        if end > dst.len() {
+            return Err(());
+        }
+        encode_serialized_value(value, payload_len, &mut dst[body_offset..end]);
+        body_offset = end;
+    }
+    if value_iter.next().is_some() {
+        return Err(());
+    }
+    if body_offset != dst.len() {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Compute the exact total record size (header + body) for a value iterator.
+///
+/// The returned size matches what [`serialize_record_iter_into`] would write
+/// given the same values. This lets callers pre-reserve an exact-sized
+/// destination slot (e.g. in a page buffer) before calling
+/// [`serialize_record_iter_into_slice`].
+///
+/// Requires a cloneable iterator because size measurement is a separate pass
+/// from encoding.
+#[must_use]
+pub fn record_iter_exact_size<'a, I>(values: I) -> usize
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    for value in values {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size = header_content_size.saturating_add(varint_len(serial_type));
+        body_size = body_size.saturating_add(payload_len);
+    }
+    let header_size = compute_header_size(header_content_size);
+    header_size.saturating_add(body_size)
+}
+
+/// Serialize a record using the generic encoder, writing directly into a
+/// caller-provided exact-sized byte slice.
+///
+/// The slice length MUST equal the value returned by
+/// [`record_iter_exact_size`] for the same value sequence.
+///
+/// On success returns `Ok(())`. On size mismatch or encoder anomaly returns
+/// `Err(())`; the partial state of `dst` is unspecified on error.
+#[allow(clippy::result_unit_err)]
+pub fn serialize_record_iter_into_slice<'a, I>(values: I, dst: &mut [u8]) -> Result<(), ()>
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    for value in values.clone() {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size = header_content_size
+            .checked_add(varint_len(serial_type))
+            .ok_or(())?;
+        body_size = body_size.checked_add(payload_len).ok_or(())?;
+    }
+    let header_size = compute_header_size(header_content_size);
+    let total_size = header_size.checked_add(body_size).ok_or(())?;
+    if dst.len() != total_size {
+        return Err(());
+    }
+
+    let mut header_offset = write_varint(dst, u64::try_from(header_size).unwrap_or(u64::MAX));
+    let mut body_offset = header_size;
+
+    for value in values {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_offset += write_varint(&mut dst[header_offset..], serial_type);
+        let body_end = body_offset.checked_add(payload_len).ok_or(())?;
+        if body_end > dst.len() {
+            return Err(());
+        }
+        encode_serialized_value(value, payload_len, &mut dst[body_offset..body_end]);
+        body_offset = body_end;
+    }
+    if header_offset != header_size || body_offset != total_size {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Build a reusable record-header template for value tuples whose serial types
 /// all fit in a single-byte varint.
 #[must_use]
@@ -1891,6 +2058,103 @@ mod tests {
         assert!(!data.is_empty());
         let values = parse_record(&data).unwrap();
         assert!(values.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // OPT-A2: zero-copy slice-based serializer smoke tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn opt_a2_slice_serializer_matches_vec_for_empty() {
+        let values: [SqliteValue; 0] = [];
+        let via_vec = serialize_record(&values);
+        let exact = record_iter_exact_size(values.iter());
+        assert_eq!(exact, via_vec.len());
+        let mut dst = vec![0u8; exact];
+        serialize_record_iter_into_slice(values.iter(), dst.as_mut_slice()).unwrap();
+        assert_eq!(dst, via_vec);
+    }
+
+    #[test]
+    fn opt_a2_slice_serializer_matches_vec_for_ints() {
+        let values = [
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(-1),
+            SqliteValue::Integer(127),
+            SqliteValue::Integer(128),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Integer(i64::MIN),
+        ];
+        let via_vec = serialize_record(&values);
+        let exact = record_iter_exact_size(values.iter());
+        assert_eq!(exact, via_vec.len());
+        let mut dst = vec![0u8; exact];
+        serialize_record_iter_into_slice(values.iter(), dst.as_mut_slice()).unwrap();
+        assert_eq!(dst, via_vec);
+    }
+
+    #[test]
+    fn opt_a2_slice_serializer_matches_vec_for_mixed() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(42),
+            SqliteValue::Float(1.5),
+            SqliteValue::Text(SmallText::new("hello")),
+            SqliteValue::Blob(Arc::from(&[1u8, 2, 3, 4][..])),
+        ];
+        let via_vec = serialize_record(&values);
+        let exact = record_iter_exact_size(values.iter());
+        assert_eq!(exact, via_vec.len());
+        let mut dst = vec![0u8; exact];
+        serialize_record_iter_into_slice(values.iter(), dst.as_mut_slice()).unwrap();
+        assert_eq!(dst, via_vec);
+
+        // Round-trip parse.
+        let parsed = parse_record(&dst).unwrap();
+        assert_eq!(parsed.len(), 5);
+        assert!(parsed[0].is_null());
+        assert_eq!(parsed[1].as_integer(), Some(42));
+    }
+
+    #[test]
+    fn opt_a2_slice_serializer_rejects_size_mismatch() {
+        let values = [SqliteValue::Integer(1), SqliteValue::Integer(2)];
+        let exact = record_iter_exact_size(values.iter());
+        // Too small.
+        let mut too_small = vec![0u8; exact - 1];
+        assert!(serialize_record_iter_into_slice(values.iter(), too_small.as_mut_slice()).is_err());
+        // Too large.
+        let mut too_large = vec![0u8; exact + 1];
+        assert!(serialize_record_iter_into_slice(values.iter(), too_large.as_mut_slice()).is_err());
+    }
+
+    #[test]
+    fn opt_a2_precomputed_header_slice_serializer_matches_vec() {
+        let values = [
+            SqliteValue::Integer(10),
+            SqliteValue::Integer(-5),
+            SqliteValue::Integer(0),
+        ];
+        let header = try_build_runtime_precomputed_record_header(&values)
+            .expect("all-integer values should yield a 1-byte-varint header");
+
+        let exact = record_iter_with_precomputed_header_exact_size(values.iter(), &header)
+            .expect("exact size available for header-matching values");
+        let mut dst = vec![0u8; exact];
+        serialize_record_iter_with_precomputed_header_into_slice(
+            values.iter(),
+            &header,
+            dst.as_mut_slice(),
+        )
+        .expect("slice serialize must succeed");
+
+        let mut via_vec = Vec::new();
+        assert!(serialize_record_iter_with_precomputed_header_into(
+            values.iter(),
+            &header,
+            &mut via_vec,
+        ));
+        assert_eq!(dst, via_vec);
     }
 
     #[test]
@@ -2924,6 +3188,62 @@ mod tests {
                 serialize_record(&generic_values),
                 "precomputed header encoding must match the generic record serializer",
             );
+        }
+
+        // -------------------------------------------------------------------
+        // OPT-A2: slice-based serializers must produce byte-identical output
+        // to the Vec-based serializers.  This is the correctness guarantee
+        // that lets callers serialize directly into a page-buffer slot
+        // without an intermediate `record_scratch: Vec<u8>`.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn prop_serialize_record_iter_into_slice_matches_vec(
+            values in proptest::collection::vec(arb_precomputed_header_case(), 0..16)
+                .prop_map(|cases| cases.into_iter().map(|(_, _, g)| g).collect::<Vec<_>>())
+        ) {
+            // Generic encoder: Vec path vs slice path.
+            let via_vec = serialize_record(&values);
+            let exact = record_iter_exact_size(values.iter());
+            prop_assert_eq!(exact, via_vec.len(),
+                "record_iter_exact_size must match serialize_record length");
+
+            let mut dst = vec![0u8; exact];
+            serialize_record_iter_into_slice(values.iter(), dst.as_mut_slice())
+                .expect("slice serialize must succeed at exact size");
+            prop_assert_eq!(dst, via_vec,
+                "slice-based generic serializer must produce byte-identical output");
+        }
+
+        #[test]
+        fn prop_serialize_record_iter_with_precomputed_header_into_slice_matches_vec(
+            cases in proptest::collection::vec(arb_precomputed_header_case(), 1..16)
+        ) {
+            let kinds: Vec<_> = cases.iter().map(|(kind, _, _)| *kind).collect();
+            let source_values: Vec<_> = cases.iter().map(|(_, source, _)| source.clone()).collect();
+            let header = PrecomputedRecordHeader::new(&kinds);
+
+            // Measure then slice-serialize.
+            let exact = record_iter_with_precomputed_header_exact_size(
+                source_values.iter(),
+                &header,
+            ).expect("exact size for supported values");
+            let mut dst = vec![0u8; exact];
+            serialize_record_iter_with_precomputed_header_into_slice(
+                source_values.iter(),
+                &header,
+                dst.as_mut_slice(),
+            ).expect("precomputed-header slice serialize must succeed at exact size");
+
+            // Compare against the Vec path.
+            let mut via_vec = Vec::new();
+            prop_assert!(serialize_record_iter_with_precomputed_header_into(
+                source_values.iter(),
+                &header,
+                &mut via_vec,
+            ));
+            prop_assert_eq!(dst, via_vec,
+                "precomputed-header slice-based serializer must produce byte-identical output");
         }
     }
 
