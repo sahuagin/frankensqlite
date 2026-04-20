@@ -1811,9 +1811,12 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
     let section = report.add_section(
         "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC",
         &format!(
-            "Each writer inserts {} rows into non-overlapping key ranges. \
-             C SQLite uses file-backed WAL with busy_timeout; FrankenSQLite uses in-memory MVCC. \
-             FrankenSQLite currently runs writers sequentially on one connection (MVCC path).",
+            "Each writer inserts {} rows into non-overlapping key ranges on the same \
+             file-backed WAL database. Both engines spawn N OS threads each owning its \
+             own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the \
+             MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + \
+             `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). \
+             This mirrors the standalone `mt_mvcc_bench` harness.",
             CONCURRENT_ROWS_PER_THREAD
         ),
     );
@@ -1876,28 +1879,119 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             }
         });
 
-        // FrankenSQLite: sequential MVCC on one connection.
+        // FrankenSQLite: file-backed WAL with multiple connections, one per
+        // OS thread — mirrors the C SQLite arm exactly. Connection is
+        // !Send + !Sync so each thread must call fsqlite::Connection::open
+        // locally inside its spawn closure. Uses BEGIN CONCURRENT where the
+        // `fsqlite.concurrent_mode` pragma is accepted (the MVCC mode that's
+        // the whole point of FrankenSQLite); falls back to plain BEGIN
+        // otherwise. See also crates/fsqlite-e2e/src/bin/mt_mvcc_bench.rs
+        // for the standalone reference implementation of this pattern.
         let fs = measure(&format!("fs_concurrent_{n_threads}t"), total_rows, || {
-            let conn = fsqlite::Connection::open(":memory:").unwrap();
-            apply_pragmas_fsqlite(&conn);
-            fs_execute(
-                &conn,
-                "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
-            );
+            let runtime = RuntimeBuilder::new()
+                .blocking_threads(n_threads, n_threads)
+                .build()
+                .expect("comprehensive benchmark runtime should build");
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let path = tmp.path().to_str().unwrap().to_owned();
+            {
+                let setup = fsqlite::Connection::open(&path).unwrap();
+                apply_pragmas_fsqlite(&setup);
+                fs_execute(
+                    &setup,
+                    "CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+                );
+            }
 
-            let stmt = conn
-                .prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))")
-                .unwrap();
-            for tid in 0..n_threads {
-                fs_execute(&conn, "BEGIN");
-                #[allow(clippy::cast_possible_wrap)]
-                let base = tid as i64 * CONCURRENT_RANGE_SIZE;
-                #[allow(clippy::cast_possible_wrap)]
-                for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
-                    let id = base + i;
-                    fs_stmt_execute_with_params(&stmt, &[fsqlite::SqliteValue::Integer(id)]);
-                }
-                fs_execute(&conn, "COMMIT");
+            let barrier = Arc::new(Barrier::new(n_threads));
+            let handles: Vec<_> = (0..n_threads)
+                .map(|tid| {
+                    let p = path.clone();
+                    let bar = Arc::clone(&barrier);
+                    spawn_bench_task(&runtime, move || {
+                        // Enter the start gate before any fallible setup so one
+                        // worker error cannot strand the rest at the barrier.
+                        bar.wait();
+                        let conn = fsqlite::Connection::open(&p).unwrap();
+                        apply_pragmas_fsqlite(&conn);
+                        let concurrent_ok =
+                            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
+                        let _ = conn.execute("PRAGMA busy_timeout=5000;");
+
+                        let begin_sql = if concurrent_ok {
+                            "BEGIN CONCURRENT"
+                        } else {
+                            "BEGIN"
+                        };
+
+                        // Mirror `mt_mvcc_bench`'s pattern: wrap the entire
+                        // BEGIN + N*INSERT + COMMIT in a retry loop, because
+                        // a BusySnapshot on any individual statement aborts
+                        // the whole MVCC transaction (rollback required
+                        // before re-BEGIN). Per-statement retries cannot
+                        // recover once the containing txn is poisoned.
+                        #[allow(clippy::cast_possible_wrap)]
+                        let base = tid as i64 * CONCURRENT_RANGE_SIZE;
+                        let mut retry_count = 0_u32;
+                        const TXN_MAX_RETRIES: u32 = 64;
+                        const TXN_BACKOFF_MS: u64 = 5;
+                        'txn: loop {
+                            if let Err(e) = conn.execute(begin_sql) {
+                                if e.is_transient() && retry_count < TXN_MAX_RETRIES {
+                                    retry_count += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        TXN_BACKOFF_MS,
+                                    ));
+                                    continue;
+                                }
+                                panic!("fsqlite BEGIN failed after retries: {e}");
+                            }
+                            let stmt = conn
+                                .prepare(
+                                    "INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))",
+                                )
+                                .unwrap();
+                            #[allow(clippy::cast_possible_wrap)]
+                            for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
+                                match stmt
+                                    .execute_with_params(&[fsqlite::SqliteValue::Integer(base + i)])
+                                {
+                                    Ok(_) => {}
+                                    Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                                        let _ = conn.execute("ROLLBACK");
+                                        retry_count += 1;
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            TXN_BACKOFF_MS,
+                                        ));
+                                        continue 'txn;
+                                    }
+                                    Err(e) => panic!(
+                                        "fsqlite INSERT tid={tid} i={i} failed: {e} \
+                                         (retry_count={retry_count})"
+                                    ),
+                                }
+                            }
+                            match conn.execute("COMMIT") {
+                                Ok(_) => break 'txn,
+                                Err(e) if e.is_transient() && retry_count < TXN_MAX_RETRIES => {
+                                    let _ = conn.execute("ROLLBACK");
+                                    retry_count += 1;
+                                    std::thread::sleep(std::time::Duration::from_millis(
+                                        TXN_BACKOFF_MS,
+                                    ));
+                                }
+                                Err(e) => panic!(
+                                    "fsqlite COMMIT tid={tid} failed: {e} \
+                                     (retry_count={retry_count})"
+                                ),
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.wait();
             }
         });
 
