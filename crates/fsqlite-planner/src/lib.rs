@@ -885,6 +885,207 @@ pub fn estimate_cost_ext(
     cost
 }
 
+// ---------------------------------------------------------------------------
+// PLANNER-3: join ordering with sqlite_stat1 row-count hints
+// ---------------------------------------------------------------------------
+
+/// A table reference paired with cost-model inputs for join ordering.
+///
+/// Used by [`order_join_inputs_with_hints`] to decide the evaluation order of a
+/// multi-table FROM clause. The `has_stats` flag lets the caller distinguish
+/// ANALYZE-populated inputs from pure heuristic fallbacks: when every
+/// reference is marked `has_stats == false`, callers should preserve the
+/// source order (there is nothing to optimize on).
+///
+/// The struct is intentionally minimal so it can be constructed directly by
+/// `crates/fsqlite-core/src/connection.rs` without pulling in the full
+/// bound-statement type surface. Wire-up from connection.rs is staged
+/// separately (see PLANNER-3 follow-up); for now this lives in the planner
+/// and is exercised via unit tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRefWithStats {
+    /// Table name (used only for diagnostics / test assertions).
+    pub name: String,
+    /// Estimated B-tree pages — passed to [`estimate_cost_ext`].
+    pub n_pages: u64,
+    /// Estimated row count — passed to [`estimate_cost_ext`]. `0` means
+    /// "no row-count hint available"; see [`Self::has_stats`].
+    pub n_rows: u64,
+    /// Whether this input was populated from `sqlite_stat1` / ANALYZE.
+    /// When false, ordering callers should fall back to source order.
+    pub has_stats: bool,
+}
+
+impl TableRefWithStats {
+    /// Construct a `TableRefWithStats` from a [`TableStats`] snapshot.
+    ///
+    /// `has_stats` is derived from the stats source: only
+    /// [`StatsSource::Analyze`] (populated from `sqlite_stat1`) counts as
+    /// authoritative for join ordering.
+    #[must_use]
+    pub fn from_table_stats(stats: &TableStats) -> Self {
+        Self {
+            name: stats.name.clone(),
+            n_pages: stats.n_pages,
+            n_rows: stats.n_rows,
+            has_stats: matches!(stats.source, StatsSource::Analyze),
+        }
+    }
+}
+
+/// Threshold above which [`order_join_inputs_with_hints`] falls back to a greedy
+/// smallest-first heuristic instead of exhaustive permutation search.
+///
+/// For N ≤ 4 the permutation count is at most 24, which is trivially cheap.
+/// Beyond that, `N!` grows quickly enough that greedy ordering (sorting by
+/// full-scan cost) is a better trade for planning latency.
+const JOIN_ORDER_EXHAUSTIVE_LIMIT: usize = 4;
+
+/// Decide a join evaluation order for `tables` using per-table cost hints.
+///
+/// Returns a permutation `perm` such that `tables[perm[i]]` is the `i`-th
+/// table to evaluate. The first entry is typically the smallest relation so
+/// it can act as the hash-join build side while larger relations probe it.
+///
+/// Strategy:
+/// - If **no** table has `has_stats == true`, the function returns the
+///   identity permutation (source order). This preserves pre-PLANNER-3
+///   behavior when ANALYZE has not been run.
+/// - For `N <= JOIN_ORDER_EXHAUSTIVE_LIMIT` (4), try every permutation and
+///   pick the one whose summed full-scan cost is minimal. For inner-equi
+///   hash joins, minimizing the cost of probing smaller-first is a sound
+///   approximation: the build side pays `n_pages + n_rows * DECODE` once
+///   and the probe side scans the remaining relations, so sorting by
+///   ascending cost is equivalent to picking the smallest build side.
+/// - For `N > JOIN_ORDER_EXHAUSTIVE_LIMIT`, use greedy smallest-first
+///   ordering (stable sort by per-table full-scan cost).
+///
+/// The permutation is stable: ties break on source order, so deterministic
+/// replays stay reproducible.
+///
+/// # Safety / semantics
+///
+/// This function is *purely advisory*. It does **not** inspect join
+/// predicates or join kinds. Callers that reorder LEFT/RIGHT/FULL OUTER
+/// joins must verify the outer-preservation semantics are still correct
+/// (typically: only reorder INNER joins). Wire-up in connection.rs will
+/// gate the reorder behind an inner-join-only check.
+///
+/// # Wire-up plan for `connection.rs` (punted — PLANNER-3 follow-up)
+///
+/// `try_prepare_simple_join_rows` in `crates/fsqlite-core/src/connection.rs`
+/// builds `table_sources`, `table_rows`, `join_plans`, `col_map`,
+/// `projection_indices`, and `col_collations` in **source order**. A safe
+/// wire would:
+///
+/// 1. Early-bail if any `join.join_type.kind != JoinKind::Inner`
+///    (LEFT/RIGHT/FULL are non-commutative).
+/// 2. After `table_sources` is populated, call
+///    `order_join_inputs_with_hints` with a `TableRefWithStats` built from
+///    `self.sqlite_stat1_row_counts()` (already exposed) plus table-page
+///    estimates.
+/// 3. If the returned permutation is non-identity, apply it to:
+///    - `table_sources` (and the parallel `all_sources`)
+///    - `col_map` (rebuild — it's derived from `table_sources`)
+///    - `col_collations` (rebuild — ditto)
+///    - `projection_indices` (remap via an old→new index table)
+///    - The join-plan build loop (which currently consumes
+///      `from.joins[i]` position-by-position): the equi-pair extraction
+///      looks up columns via `col_map`, so once `col_map` is rebuilt the
+///      same WHERE-style ON predicates still resolve, but `left_width`
+///      must accumulate from the permuted `table_sources[..=i]`.
+///
+/// That last bullet — rebuilding the join-plan loop against a permuted
+/// order while still consuming the AST's `from.joins` in source order — is
+/// why this wire was punted from the initial PLANNER-3 commit. Landing it
+/// requires either (a) refactoring the planner to carry an explicit join
+/// tree instead of a flat source list, or (b) a careful single-site
+/// rewrite with broad test coverage. Neither fit in the PLANNER-3 scope.
+#[must_use]
+pub fn order_join_inputs_with_hints(tables: &[TableRefWithStats]) -> Vec<usize> {
+    let n = tables.len();
+    if n <= 1 {
+        return (0..n).collect();
+    }
+
+    // Fallback: no stats anywhere → preserve source order.
+    if !tables.iter().any(|t| t.has_stats) {
+        return (0..n).collect();
+    }
+
+    // Per-table full-scan cost: build-side picking minimizes this.
+    let scan_cost = |idx: usize| -> f64 {
+        let t = &tables[idx];
+        estimate_cost_ext(&AccessPathKind::FullTableScan, t.n_pages, 0, t.n_rows)
+    };
+
+    if n <= JOIN_ORDER_EXHAUSTIVE_LIMIT {
+        // Exhaustive: try every permutation, score by the sum of scan costs
+        // weighted so that the first (build-side) table dominates. We sum
+        // `cost[i] * (n - i)` — equivalent to "smaller cost first" but with
+        // an explicit weighting that mirrors the left-deep probe chain.
+        let indices: Vec<usize> = (0..n).collect();
+        let mut best_perm = indices.clone();
+        let mut best_score = f64::INFINITY;
+
+        // Heap's-algorithm-style permutation over a small scratch buffer.
+        // We don't need a crate — N is at most 4 here, so a recursive helper
+        // is fine and still O(N!).
+        let mut scratch = indices.clone();
+        permute_scoring(
+            &mut scratch,
+            0,
+            n,
+            &scan_cost,
+            &mut best_score,
+            &mut best_perm,
+        );
+        best_perm
+    } else {
+        // Greedy: stable sort by ascending scan cost. Stable keeps ties in
+        // source order, which matches the "no stats" fallback for the
+        // equal-cost region.
+        let mut indexed: Vec<(usize, f64)> = (0..n).map(|i| (i, scan_cost(i))).collect();
+        // `sort_by` is stable in std.
+        indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.into_iter().map(|(i, _)| i).collect()
+    }
+}
+
+/// Helper: enumerate every permutation of `slice`, scoring each and tracking
+/// the cheapest. Uses Heap's algorithm in-place.
+fn permute_scoring<F>(
+    slice: &mut [usize],
+    k: usize,
+    n: usize,
+    scan_cost: &F,
+    best_score: &mut f64,
+    best_perm: &mut Vec<usize>,
+) where
+    F: Fn(usize) -> f64,
+{
+    if k == n {
+        // Score this permutation: sum of cost[slice[i]] * (n - i).
+        // Lower = better.
+        let mut score = 0.0_f64;
+        for (i, &tbl_idx) in slice.iter().enumerate() {
+            let weight = (n - i) as f64;
+            score = scan_cost(tbl_idx).mul_add(weight, score);
+        }
+        if score < *best_score {
+            *best_score = score;
+            best_perm.clear();
+            best_perm.extend_from_slice(slice);
+        }
+        return;
+    }
+    for i in k..n {
+        slice.swap(k, i);
+        permute_scoring(slice, k + 1, n, scan_cost, best_score, best_perm);
+        slice.swap(k, i);
+    }
+}
+
 const ADAPTIVE_HINT_COST_BIAS: f64 = 0.90;
 
 static INDEX_SELECTION_TOTAL: LazyLock<Mutex<HashMap<&'static str, u64>>> =
@@ -5031,6 +5232,144 @@ mod tests {
             gap_big > gap_small,
             "expected bigger index advantage at high n_rows: small_gap={gap_small}, big_gap={gap_big}"
         );
+    }
+
+    // ===================================================================
+    // PLANNER-3: order_join_inputs_with_hints tests
+    // ===================================================================
+
+    fn stats_ref(name: &str, n_pages: u64, n_rows: u64, has_stats: bool) -> TableRefWithStats {
+        TableRefWithStats {
+            name: name.to_owned(),
+            n_pages,
+            n_rows,
+            has_stats,
+        }
+    }
+
+    #[test]
+    fn test_order_joins_puts_small_relation_first() {
+        // Classic "10 row small table JOIN 10k row big table": the small
+        // relation should end up on the build side (index 0).
+        let inputs = vec![
+            stats_ref("t_big", 200, 10_000, true),
+            stats_ref("t_small", 1, 10, true),
+        ];
+        let perm = order_join_inputs_with_hints(&inputs);
+        assert_eq!(perm.len(), 2);
+        assert_eq!(
+            inputs[perm[0]].name, "t_small",
+            "small table should sort to build-side first, got perm={perm:?}",
+        );
+        assert_eq!(inputs[perm[1]].name, "t_big");
+    }
+
+    #[test]
+    fn test_order_joins_no_stats_preserves_source_order() {
+        // No ANALYZE data: every entry has has_stats = false. Even though
+        // n_rows differs wildly, we preserve the identity permutation so
+        // callers see the same row order they handed in.
+        let inputs = vec![
+            stats_ref("t_first", 200, 10_000, false),
+            stats_ref("t_second", 1, 10, false),
+            stats_ref("t_third", 5, 50, false),
+        ];
+        let perm = order_join_inputs_with_hints(&inputs);
+        assert_eq!(
+            perm,
+            vec![0, 1, 2],
+            "source order must be preserved when no stats are available",
+        );
+    }
+
+    #[test]
+    fn test_order_joins_partial_stats_still_orders() {
+        // At least one table has stats → we reorder. Tables missing stats
+        // default to n_rows == 0, which yields the smallest scan cost, so
+        // they naturally sort to the front. That matches the "assume small
+        // until proven otherwise" heuristic.
+        let inputs = vec![
+            stats_ref("t_big_analyzed", 500, 100_000, true),
+            stats_ref("t_unknown", 0, 0, false),
+        ];
+        let perm = order_join_inputs_with_hints(&inputs);
+        assert_eq!(inputs[perm[0]].name, "t_unknown");
+        assert_eq!(inputs[perm[1]].name, "t_big_analyzed");
+    }
+
+    #[test]
+    fn test_order_joins_trivial_sizes() {
+        // N=0 and N=1 must return the identity.
+        assert_eq!(order_join_inputs_with_hints(&[]), Vec::<usize>::new());
+        let single = vec![stats_ref("only", 10, 100, true)];
+        assert_eq!(order_join_inputs_with_hints(&single), vec![0]);
+    }
+
+    #[test]
+    fn test_order_joins_greedy_above_limit() {
+        // N > 4 uses greedy smallest-first. Verify that five tables with
+        // strictly increasing cost produce the identity permutation, and
+        // that a reversed input is fully sorted.
+        let reversed = vec![
+            stats_ref("a_5", 500, 50_000, true),
+            stats_ref("a_4", 400, 40_000, true),
+            stats_ref("a_3", 300, 30_000, true),
+            stats_ref("a_2", 200, 20_000, true),
+            stats_ref("a_1", 100, 10_000, true),
+        ];
+        let perm = order_join_inputs_with_hints(&reversed);
+        let ordered_names: Vec<&str> = perm.iter().map(|&i| reversed[i].name.as_str()).collect();
+        assert_eq!(
+            ordered_names,
+            vec!["a_1", "a_2", "a_3", "a_4", "a_5"],
+            "greedy path should sort ascending by scan cost",
+        );
+    }
+
+    #[test]
+    fn test_order_joins_exhaustive_minimizes_weighted_cost() {
+        // N=4 goes through the exhaustive permutation search. The tiny
+        // relation should dominate the build-side slot even when it sits
+        // in the middle of the input.
+        let inputs = vec![
+            stats_ref("t_a", 100, 5_000, true),
+            stats_ref("t_b", 50, 2_000, true),
+            stats_ref("t_tiny", 1, 10, true),
+            stats_ref("t_huge", 1_000, 1_000_000, true),
+        ];
+        let perm = order_join_inputs_with_hints(&inputs);
+        assert_eq!(
+            inputs[perm[0]].name, "t_tiny",
+            "exhaustive search should pick the smallest relation first; perm={perm:?}",
+        );
+        assert_eq!(
+            inputs[perm[3]].name, "t_huge",
+            "largest relation should sink to the last probe slot; perm={perm:?}",
+        );
+    }
+
+    #[test]
+    fn test_order_joins_from_table_stats_derives_has_stats() {
+        // TableRefWithStats::from_table_stats should mark Analyze-sourced
+        // entries as has_stats=true, Heuristic as false.
+        let analyzed = TableStats {
+            name: "t_analyzed".to_owned(),
+            n_pages: 10,
+            n_rows: 1000,
+            source: StatsSource::Analyze,
+        };
+        let heur = TableStats {
+            name: "t_heur".to_owned(),
+            n_pages: 10,
+            n_rows: 1000,
+            source: StatsSource::Heuristic,
+        };
+        let a = TableRefWithStats::from_table_stats(&analyzed);
+        let h = TableRefWithStats::from_table_stats(&heur);
+        assert!(a.has_stats);
+        assert!(!h.has_stats);
+        assert_eq!(a.n_rows, 1000);
+        assert_eq!(h.n_pages, 10);
     }
 
     #[test]
