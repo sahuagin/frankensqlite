@@ -129,29 +129,27 @@ const TABLE_LEAF_INTERPOLATION_MAX_PROBES: usize = 3;
 ///
 /// Profile context (OPT-7): `core::slice::sort::unstable::quicksort` +
 /// `small_sort_general` were at ~2.2% self-time inside `remove_cell_from_leaf`.
-/// The input to this sort is usually small — the typical DELETE hits N in the
-/// 1-8 range, with the hard upper bound near ~60-80 (max cells-per-page on a
-/// 4 KiB page).
+/// Post OPT-A2/A3/C1 flamegraph shows the quicksort+smallsort combination is
+/// still ~3.5% on the UPDATE/DELETE workload — defragmentation of full 4 KiB
+/// pages hits N = 40..80 and spills into `sort_unstable_by_key`.
 ///
 /// Microbenchmark on this x86_64 host (release mode, sort-only per-iteration,
 /// data shaped like real cell offsets; see `bench_remove_cell_from_leaf_sort`):
-/// at N <= 8 the specialized insertion sort runs roughly equal to or slightly
-/// faster than std's `sort_unstable_by_key` (measurements are noisy at 8-15 ns).
-/// Crossover to std's pdqsort happens around N=12-16; beyond that the
-/// generic sort wins because its small-sort path is itself well-tuned and the
-/// closure + key-extraction overhead is amortized across more work.
+/// at N <= 16 the specialized insertion sort runs roughly equal to or slightly
+/// faster than std's `sort_unstable_by_key`. Crossover into std's pdqsort
+/// small-sort path happens around N=16-20; beyond that the generic sort
+/// historically won, but its closure + Reverse-wrapper path incurs overhead
+/// per comparison that dwarfs the single integer subtract used here.
 ///
-/// We therefore dispatch by size: a specialized insertion sort with an
-/// already-sorted fast path for N <= 12 (the common DELETE case), falling
-/// through to `sort_unstable_by_key` otherwise. At the threshold the two
-/// paths are within measurement noise, so this dispatch avoids regressing
-/// full-page DELETE while potentially shaving instructions off the small-N
-/// hot path where the profile samples concentrate.
+/// Dispatch strategy:
+/// - N <= 20: inline insertion sort with already-sorted early-continue,
+///   covering the majority of DELETE samples the flamegraph highlights.
+/// - N >  20: `sort_unstable_by` with a direct `b.0.cmp(&a.0)` reverse
+///   comparison. Avoids the `Reverse<usize>` newtype allocation that
+///   `sort_unstable_by_key(|k| Reverse(k.0))` materializes per comparison.
 #[inline(always)]
 fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
-    // Empirical crossover: insertion sort is competitive or better for small N;
-    // pdqsort wins for larger N. See doc comment for measurements.
-    const INSERTION_SORT_THRESHOLD: usize = 12;
+    const INSERTION_SORT_THRESHOLD: usize = 20;
     if v.len() <= INSERTION_SORT_THRESHOLD {
         for i in 1..v.len() {
             // Fast path: already in descending order vs predecessor.
@@ -168,7 +166,9 @@ fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
             v[j] = cur;
         }
     } else {
-        v.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+        // sort_unstable_by avoids the Reverse<usize> wrapper allocation that
+        // sort_unstable_by_key materialises on every comparison.
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     }
 }
 
