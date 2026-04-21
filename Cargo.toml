@@ -142,7 +142,7 @@ ftui = { version = "0.2.1", default-features = false }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = "0.3.22"
 bitflags = { version = "2.9", features = ["serde"] }
 smallvec = "1.13"
