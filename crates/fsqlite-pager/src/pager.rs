@@ -8551,6 +8551,10 @@ where
         self.freed_pages.clear();
         self.savepoint_stack.clear();
         self.rolled_back_pages.clear();
+        // #70 ghost-commit guard: after rollback, staged writes were
+        // explicitly discarded, so a subsequent commit entry with an empty
+        // write_set must not trip the defensive assertion.
+        self.writes_observed = false;
         let mut inner = self
             .inner
             .lock()
@@ -8759,8 +8763,17 @@ where
         self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
         self.allocated_from_eof = entry.allocated_from_eof_snapshot.clone();
         self.freed_pages = entry.freed_pages_snapshot.clone();
+        // #70 ghost-commit guard: rollback-to-savepoint replaces write_set
+        // with the snapshot. If the snapshot is empty, no writes are pending
+        // — commit will be a legitimate no-op and the guard should not flag
+        // it. If the snapshot is non-empty, writes are still pending and
+        // writes_observed should stay consistent with that.
+        let snapshot_was_empty = entry.write_set_snapshot.is_empty();
         self.write_set = new_write_set;
         self.write_pages_sorted = entry.write_pages_sorted_snapshot.clone();
+        if snapshot_was_empty {
+            self.writes_observed = false;
+        }
 
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
