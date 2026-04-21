@@ -3999,6 +3999,12 @@ where
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let published_snapshot = self.published.snapshot();
+            // Honor the "inner is at least as fresh as published" invariant by
+            // taking the per-field max of the two views; this guards against
+            // a transaction starting with stale visibility when a recent
+            // commit already advanced inner.* but the publication plane has
+            // not yet been re-advertised. (Regression-covered by
+            // self_alloc_extension_not_conflict; see 18faea82.)
             let bound_visible_commit_seq =
                 std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
             let bound_db_size = published_snapshot.db_size.max(original_db_size);
@@ -4019,8 +4025,8 @@ where
                 wal_backend: Arc::clone(&self.wal_backend),
                 committed_snapshot: Arc::clone(&self.committed_snapshot),
                 shared_connection_count: self.shared_connection_count.get().cloned(),
-                published_visible_commit_seq: Cell::new(published_snapshot.visible_commit_seq),
-                published_db_size: Cell::new(published_snapshot.db_size),
+                published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
+                published_db_size: Cell::new(bound_db_size),
                 write_set: PagePageMap::default(),
                 write_pages_sorted: Vec::new(),
                 freed_pages: Vec::new(),
