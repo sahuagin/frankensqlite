@@ -3999,6 +3999,9 @@ where
             let original_db_size = inner.db_size;
             let journal_mode = inner.journal_mode;
             let published_snapshot = self.published.snapshot();
+            let bound_visible_commit_seq =
+                std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
+            let bound_db_size = published_snapshot.db_size.max(original_db_size);
             let pool = self.pool.clone();
             let cleanup_cx = cx.clone();
             let memory_db_bump_alloc =
@@ -4119,6 +4122,31 @@ where
                 },
                 clear_published_pages,
             );
+        }
+
+        let published_snapshot = self.published.snapshot();
+        let publication_lagged = published_snapshot.visible_commit_seq < inner.commit_seq
+            || published_snapshot.db_size < inner.db_size
+            || published_snapshot.journal_mode != inner.journal_mode
+            || published_snapshot.freelist_count != inner.freelist.len()
+            || published_snapshot.checkpoint_active != inner.checkpoint_active;
+        if publication_lagged {
+            let publication_update = PublishedPagerUpdate {
+                visible_commit_seq: std::cmp::max(
+                    published_snapshot.visible_commit_seq,
+                    inner.commit_seq,
+                ),
+                db_size: published_snapshot.db_size.max(inner.db_size),
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            };
+            let clear_published_pages = published_snapshot.visible_commit_seq
+                != publication_update.visible_commit_seq
+                || published_snapshot.db_size != publication_update.db_size
+                || published_snapshot.journal_mode != publication_update.journal_mode;
+            self.published
+                .publish_clear_if(cx, publication_update, clear_published_pages);
         }
 
         let eager_writer = matches!(
