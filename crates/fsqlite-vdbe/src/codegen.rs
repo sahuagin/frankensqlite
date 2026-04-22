@@ -7057,7 +7057,8 @@ fn codegen_join_select(
     let left_table = find_table(schema, left_name)?;
 
     // Build list of join sources: (table_schema, alias, join_kind, on_expr)
-    let mut join_tables: Vec<(&TableSchema, Option<String>, JoinKind, Option<&Expr>)> = Vec::new();
+    let mut join_tables: Vec<(&TableSchema, Option<String>, JoinKind, Option<&Expr>)> =
+        Vec::with_capacity(from.joins.len());
     for join in &from.joins {
         let (right_name, right_alias) = match &join.table {
             TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.clone()),
@@ -7168,7 +7169,7 @@ fn codegen_join_select(
         P4::Table(left_table.name.clone()),
         0,
     );
-    let mut right_cursors: Vec<i32> = Vec::new();
+    let mut right_cursors: Vec<i32> = Vec::with_capacity(join_tables.len());
     for (i, (rt, _, _, _)) in join_tables.iter().enumerate() {
         let cursor_id = (i + 1) as i32;
         b.emit_op(
@@ -7226,8 +7227,8 @@ fn codegen_join_select(
     };
 
     // For each right table, emit a nested Rewind+Next loop.
-    let mut next_labels: Vec<Label> = Vec::new();
-    let mut done_right_labels: Vec<Label> = Vec::new();
+    let mut next_labels: Vec<Label> = Vec::with_capacity(right_cursors.len());
+    let mut done_right_labels: Vec<Label> = Vec::with_capacity(right_cursors.len());
     for &rc in &right_cursors {
         let next_right_label = b.emit_label();
         let done_right_label = b.emit_label();
@@ -8189,7 +8190,7 @@ fn parse_aggregate_columns(
     columns: &[ResultColumn],
     table: &TableSchema,
 ) -> Result<Vec<AggColumn>, CodegenError> {
-    let mut agg_cols = Vec::new();
+    let mut agg_cols = Vec::with_capacity(columns.len());
     for col in columns {
         match col {
             ResultColumn::Expr {
@@ -9002,8 +9003,8 @@ fn parse_group_by_output(
         })
         .collect();
 
-    let mut output_cols = Vec::new();
-    let mut agg_columns = Vec::new();
+    let mut output_cols = Vec::with_capacity(columns.len());
+    let mut agg_columns = Vec::with_capacity(columns.len());
 
     for col in columns {
         match col {

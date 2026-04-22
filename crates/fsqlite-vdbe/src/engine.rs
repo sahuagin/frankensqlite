@@ -861,7 +861,7 @@ impl MemTable {
         columns: &[usize],
         collations: &[Option<String>],
     ) -> Option<Vec<u8>> {
-        let mut key = Vec::new();
+        let mut key = Vec::with_capacity(columns.len() * 8);
         for (position, &col_idx) in columns.iter().enumerate() {
             let value = values.get(col_idx)?;
             if matches!(value, SqliteValue::Null) {
@@ -1461,7 +1461,7 @@ impl SorterCursor {
         }
 
         // K-way merge using a simple tournament approach.
-        let mut merged: Vec<SorterRow> = Vec::new();
+        let mut merged: Vec<SorterRow> = Vec::with_capacity(self.rows_sorted_total as usize);
 
         // Advance all iterators to their first element.
         for iter in &mut run_iters {

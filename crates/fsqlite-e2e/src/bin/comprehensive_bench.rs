@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Comprehensive FrankenSQLite vs C SQLite benchmark.
 //!
 //! Measures insertion throughput across multiple dimensions:
