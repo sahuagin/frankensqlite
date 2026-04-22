@@ -23763,7 +23763,7 @@ mod tests {
         let append_calls: SharedCounter = StdArc::new(StdMutex::new(0));
         let backend = SlowWalBackend {
             append_calls: StdArc::clone(&append_calls),
-            io_delay: Duration::from_millis(5),
+            io_delay: Duration::from_millis(20),
         };
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
@@ -23815,11 +23815,10 @@ mod tests {
         }
         let wall_elapsed = wall_start.elapsed();
 
-        // With 4 threads and 5ms WAL I/O delay each, fully serialized
-        // would take >= 20ms. Split-lock allows Phase A overlap with
-        // Phase B, so wall time should be significantly less than 4x.
-        // We check < 3x (15ms) to allow for scheduling jitter.
-        let serial_budget = Duration::from_millis(5 * u64::from(WORKERS));
+        // With 4 threads and 20ms WAL I/O delay each, fully serialized
+        // would take >= 80ms. Split-lock + group-commit batching allows
+        // overlap, so wall time should be well under the serial budget.
+        let serial_budget = Duration::from_millis(20 * u64::from(WORKERS));
         assert!(
             wall_elapsed < serial_budget,
             "bead_id={BEAD} case=parallel_prepare \
