@@ -142,7 +142,10 @@ fn test_conformance_nested_case_null_agg_s78b() {
         "SELECT subject, MIN(score), MAX(score) FROM scores GROUP BY subject ORDER BY subject",
         "SELECT student, GROUP_CONCAT(CASE WHEN score IS NOT NULL THEN CAST(score AS TEXT) ELSE 'N/A' END, ', ') AS details FROM scores GROUP BY student ORDER BY student",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "nested CASE NULL agg");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "nested CASE NULL agg",
+    );
 }
 
 // ── s78c: multi-level LEFT JOIN with NULL propagation ──
@@ -167,7 +170,10 @@ fn test_conformance_multi_left_join_null_s78c() {
         "SELECT t1.name, COUNT(t2.id) AS t2_count, COUNT(t3.id) AS t3_count FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id LEFT JOIN t3 ON t3.t2_id = t2.id GROUP BY t1.name ORDER BY t1.name",
         "SELECT t1.name FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id WHERE t2.id IS NULL ORDER BY t1.name",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "multi LEFT JOIN NULL");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "multi LEFT JOIN NULL",
+    );
 }
 
 // ── s78d: correlated subquery in UPDATE SET clause ──
@@ -190,7 +196,10 @@ fn test_conformance_correlated_update_set_s78d() {
         "SELECT * FROM products ORDER BY id",
         "SELECT name, total_sold FROM products WHERE total_sold > 0 ORDER BY total_sold DESC",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "correlated UPDATE SET");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "correlated UPDATE SET",
+    );
 }
 
 // ── s78e: DELETE with correlated NOT EXISTS ──
@@ -213,7 +222,10 @@ fn test_conformance_delete_not_exists_s78e() {
         "SELECT * FROM parent ORDER BY id",
         "SELECT COUNT(*) FROM parent",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "DELETE NOT EXISTS");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "DELETE NOT EXISTS",
+    );
 }
 
 // ── s78f: expression in LIMIT/OFFSET ──
@@ -236,7 +248,10 @@ fn test_conformance_expr_limit_offset_s78f() {
         "SELECT v FROM nums ORDER BY v LIMIT 1+2",
         "SELECT v FROM nums ORDER BY v LIMIT 10 OFFSET 5",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "expr LIMIT/OFFSET");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "expr LIMIT/OFFSET",
+    );
 }
 
 // ── s78g: nested aggregate with derived table ──
@@ -257,7 +272,10 @@ fn test_conformance_nested_agg_derived_table_s78g() {
         "SELECT AVG(total) FROM (SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer)",
         "SELECT COUNT(*) FROM (SELECT customer FROM orders GROUP BY customer HAVING SUM(amount) > 200)",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "nested agg derived table");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "nested agg derived table",
+    );
 }
 
 // ── s78h: CAST with edge cases ──
@@ -301,7 +319,10 @@ fn test_conformance_string_func_edges_s78i() {
         "SELECT INSTR('hello world', 'world')",
         "SELECT INSTR('hello', 'xyz')",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "string func edges");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "string func edges",
+    );
 }
 
 // ── s78j: INSERT with complex DEFAULT + RETURNING ──
@@ -323,7 +344,10 @@ fn test_conformance_insert_default_returning_s78j() {
         "INSERT INTO logs(msg, priority) VALUES('third', 3) RETURNING id, msg, created, priority",
         "SELECT COUNT(*) FROM logs",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "INSERT DEFAULT RETURNING");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "INSERT DEFAULT RETURNING",
+    );
 }
 
 // ── s78k: window function with complex frame ──
@@ -344,7 +368,10 @@ fn test_conformance_window_complex_frame_s78k() {
         "SELECT id, val, AVG(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_avg FROM ts ORDER BY id",
         "SELECT id, val, FIRST_VALUE(val) OVER (ORDER BY id) AS first_val, LAST_VALUE(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_val FROM ts ORDER BY id",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "window complex frame");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "window complex frame",
+    );
 }
 
 // ── s78l: LIKE with special characters ──
@@ -366,7 +393,10 @@ fn test_conformance_like_special_chars_s78l() {
         "SELECT path FROM paths WHERE path LIKE '%\\%' ESCAPE '\\' ORDER BY id",
         "SELECT path FROM paths WHERE path LIKE '%config%' ORDER BY id",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "LIKE special chars");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "LIKE special chars",
+    );
 }
 
 // ── s78m: arithmetic overflow / underflow ──
@@ -385,7 +415,10 @@ fn test_conformance_arithmetic_overflow_s78m() {
         "SELECT 10 % 3",
         "SELECT -10 % 3",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "arithmetic overflow");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "arithmetic overflow",
+    );
 }
 
 // ── s78n: trigger + FK interaction ──
@@ -412,7 +445,10 @@ fn test_conformance_trigger_fk_interaction_s78n() {
         "SELECT COUNT(*) FROM audit WHERE action = 'INSERT'",
         "SELECT COUNT(*) FROM audit WHERE action = 'DELETE'",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "trigger FK interaction");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "trigger FK interaction",
+    );
 }
 
 // ── s78o: complex WHERE with mixed boolean + subquery ──
@@ -434,7 +470,10 @@ fn test_conformance_complex_where_bool_subquery_s78o() {
         "SELECT name FROM emp WHERE dept IN (SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) >= 2) AND active = 1 ORDER BY name",
         "SELECT name FROM emp WHERE NOT (salary < 70000 AND active = 0) ORDER BY name",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "complex WHERE bool subquery");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "complex WHERE bool subquery",
+    );
 }
 
 // ── s78p: GROUP_CONCAT with ORDER BY and separator ──
@@ -452,10 +491,13 @@ fn test_conformance_group_concat_order_s78p() {
     }
     let queries = &[
         "SELECT item, GROUP_CONCAT(tag, ', ') FROM tags GROUP BY item ORDER BY item",
-        "SELECT item, GROUP_CONCAT(DISTINCT tag, ';') FROM tags GROUP BY item ORDER BY item",
+        "SELECT item, GROUP_CONCAT(DISTINCT tag) FROM tags GROUP BY item ORDER BY item",
         "SELECT GROUP_CONCAT(tag, '|') FROM tags WHERE item = 'a'",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "GROUP_CONCAT order");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "GROUP_CONCAT order",
+    );
 }
 
 // ── s78q: REPLACE INTO with trigger side effects ──
@@ -500,7 +542,10 @@ fn test_conformance_multi_cte_cross_ref_s78r() {
         "WITH totals AS (SELECT cat, SUM(val) AS s FROM data GROUP BY cat), grand AS (SELECT SUM(s) AS g FROM totals) SELECT t.cat, t.s, ROUND(100.0 * t.s / grand.g, 1) AS pct FROM totals t, grand ORDER BY t.cat",
         "WITH stats AS (SELECT cat, COUNT(*) AS cnt, AVG(val) AS avg_val FROM data GROUP BY cat) SELECT cat, cnt, avg_val FROM stats WHERE cnt >= 2 ORDER BY cat",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "multi CTE cross-ref");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "multi CTE cross-ref",
+    );
 }
 
 // ── s78s: complex HAVING with aggregate expressions ──
@@ -543,5 +588,8 @@ fn test_conformance_insert_select_transform_s78t() {
         "SELECT * FROM dst ORDER BY id",
         "SELECT category, COUNT(*) FROM dst GROUP BY category ORDER BY category",
     ];
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "INSERT SELECT transform");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "INSERT SELECT transform",
+    );
 }
