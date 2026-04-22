@@ -9944,6 +9944,7 @@ mod probe_tests {
             escape: None,
             not: false,
             op: fsqlite_ast::LikeOp::Like,
+            span: Span::ZERO,
         };
         let terms = [WhereTerm {
             expr: &like_expr,

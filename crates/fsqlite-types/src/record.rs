@@ -2185,6 +2185,39 @@ mod tests {
     }
 
     #[test]
+    fn opt_a2_precomputed_header_vec_serializer_reuses_capacity_without_tail() {
+        let values = [
+            SqliteValue::Integer(127),
+            SqliteValue::Text(SmallText::new("abc")),
+            SqliteValue::Blob(Arc::from([0xDE_u8, 0xAD, 0xBE].as_slice())),
+            SqliteValue::Null,
+        ];
+        let header = PrecomputedRecordHeader::new(&[
+            PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
+            PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
+            PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
+            PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
+        ]);
+        let expected = serialize_record(&values);
+        let exact = record_iter_with_precomputed_header_exact_size(values.iter(), &header)
+            .expect("exact size available for one-byte-varint values");
+        assert_eq!(exact, expected.len());
+
+        let mut buf = vec![0xA5; 1024];
+        let capacity = buf.capacity();
+        assert!(serialize_record_iter_with_precomputed_header_into(
+            values.iter(),
+            &header,
+            &mut buf,
+        ));
+
+        assert_eq!(buf, expected);
+        assert_eq!(buf.len(), exact);
+        assert_eq!(buf.capacity(), capacity);
+        assert_eq!(parse_record(&buf).unwrap(), values);
+    }
+
+    #[test]
     fn null_record() {
         let values = vec![SqliteValue::Null];
         let data = serialize_record(&values);
