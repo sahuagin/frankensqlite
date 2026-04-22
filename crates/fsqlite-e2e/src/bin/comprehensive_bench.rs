@@ -33,7 +33,16 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V1: &str = "fsqlite-e2e.comprehensive-bench-report.v1";
+const JSON_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-report.v2";
+const CI_REGRESSION_GATE_SCHEMA_V1: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v1";
+const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
+const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
+const CI_REGRESSION_BASELINE_AVG_RATIO: f64 = 2.74;
+const CI_REGRESSION_GATE_STATUS_PENDING_BASELINE: &str = "schema_draft_pending_w5_7_baseline";
+const CI_REGRESSION_GATE_THRESHOLD_SOURCE: &str =
+    "thresholds pending bd-0winn comprehensive-bench refresh";
+const CONCURRENT_WRITERS_SECTION_TITLE: &str =
+    "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 
 // ─── Record size definitions ───────────────────────────────────────────
 
@@ -437,6 +446,7 @@ struct CliOptions {
     emit_timestamped_json: bool,
     json_out_path: Option<String>,
     json_stdout: bool,
+    print_json_schema: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -517,7 +527,33 @@ struct JsonBenchmarkReport {
     config: JsonRunConfig,
     environment: DetectedEnvironment,
     summary: ReportSummaryStats,
+    ci_regression_gate: JsonCiRegressionGateDraft,
     sections: Vec<JsonSection>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonCiRegressionGateDraft {
+    schema_version: String,
+    bead_id: String,
+    depends_on_bead_id: String,
+    status: String,
+    thresholds: JsonCiRegressionThresholdsDraft,
+    observed: JsonCiRegressionObservedMetrics,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonCiRegressionThresholdsDraft {
+    avg_ratio_baseline: f64,
+    avg_ratio_max: Option<f64>,
+    mt_p95_ratio_max: Option<f64>,
+    threshold_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonCiRegressionObservedMetrics {
+    avg_ratio: Option<f64>,
+    max_mt_p95_ratio: Option<f64>,
+    max_mt_p95_scenario_id: Option<String>,
 }
 
 fn compute_report_summary(report: &BenchReport) -> ReportSummaryStats {
@@ -560,6 +596,60 @@ fn row_ratio(row: &ReportRow) -> Option<f64> {
         return None;
     }
     Some(fsqlite.median().as_nanos() as f64 / csqlite_nanos as f64)
+}
+
+fn row_p95_ratio(row: &ReportRow) -> Option<f64> {
+    let csqlite = row.csqlite.as_ref()?;
+    let fsqlite = row.fsqlite.as_ref()?;
+    let csqlite_p95_nanos = csqlite.p95().as_nanos();
+    if csqlite_p95_nanos == 0 {
+        return None;
+    }
+    Some(fsqlite.p95().as_nanos() as f64 / csqlite_p95_nanos as f64)
+}
+
+fn max_multithread_p95_ratio(report: &BenchReport) -> (Option<f64>, Option<String>) {
+    report
+        .sections
+        .iter()
+        .filter(|section| section.title == CONCURRENT_WRITERS_SECTION_TITLE)
+        .flat_map(|section| {
+            let section_id = stable_slug(&section.title);
+            section.rows.iter().filter_map(move |row| {
+                row_p95_ratio(row).map(|ratio| {
+                    let scenario_id = format!("{}__{}", section_id, stable_slug(&row.scenario));
+                    (ratio, scenario_id)
+                })
+            })
+        })
+        .max_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map_or((None, None), |(ratio, scenario_id)| {
+            (Some(ratio), Some(scenario_id))
+        })
+}
+
+fn build_ci_regression_gate(
+    report: &BenchReport,
+    summary: ReportSummaryStats,
+) -> JsonCiRegressionGateDraft {
+    let (max_mt_p95_ratio, max_mt_p95_scenario_id) = max_multithread_p95_ratio(report);
+    JsonCiRegressionGateDraft {
+        schema_version: CI_REGRESSION_GATE_SCHEMA_V1.to_owned(),
+        bead_id: CI_REGRESSION_GATE_BEAD_ID.to_owned(),
+        depends_on_bead_id: CI_REGRESSION_BASELINE_BEAD_ID.to_owned(),
+        status: CI_REGRESSION_GATE_STATUS_PENDING_BASELINE.to_owned(),
+        thresholds: JsonCiRegressionThresholdsDraft {
+            avg_ratio_baseline: CI_REGRESSION_BASELINE_AVG_RATIO,
+            avg_ratio_max: None,
+            mt_p95_ratio_max: None,
+            threshold_source: CI_REGRESSION_GATE_THRESHOLD_SOURCE.to_owned(),
+        },
+        observed: JsonCiRegressionObservedMetrics {
+            avg_ratio: summary.average_ratio,
+            max_mt_p95_ratio,
+            max_mt_p95_scenario_id,
+        },
+    }
 }
 
 fn stable_slug(value: &str) -> String {
@@ -763,13 +853,164 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V1.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V2.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
         environment,
         summary,
+        ci_regression_gate: build_ci_regression_gate(report, summary),
         sections,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn benchmark_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v2.json",
+        "title": "FrankenSQLite comprehensive benchmark JSON report",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "schema_version",
+            "generated_at_utc",
+            "total_elapsed_ms",
+            "config",
+            "environment",
+            "summary",
+            "ci_regression_gate",
+            "sections"
+        ],
+        "properties": {
+            "schema_version": {
+                "const": JSON_REPORT_SCHEMA_V2
+            },
+            "generated_at_utc": {
+                "type": "string"
+            },
+            "total_elapsed_ms": {
+                "type": "integer",
+                "minimum": 0
+            },
+            "config": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["quick", "warmup_iterations", "min_iterations", "max_iterations", "target_duration_secs", "row_counts"]
+            },
+            "environment": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["arch", "build_profile"]
+            },
+            "summary": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["total_scenarios", "franken_faster", "comparable", "csqlite_faster", "average_ratio"],
+                "properties": {
+                    "total_scenarios": {"type": "integer", "minimum": 0},
+                    "franken_faster": {"type": "integer", "minimum": 0},
+                    "comparable": {"type": "integer", "minimum": 0},
+                    "csqlite_faster": {"type": "integer", "minimum": 0},
+                    "average_ratio": {
+                        "type": ["number", "null"],
+                        "description": "Primary avg_ratio CI metric: FrankenSQLite median time divided by C SQLite median time across comparable rows."
+                    }
+                }
+            },
+            "ci_regression_gate": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["schema_version", "bead_id", "depends_on_bead_id", "status", "thresholds", "observed"],
+                "properties": {
+                    "schema_version": {"const": CI_REGRESSION_GATE_SCHEMA_V1},
+                    "bead_id": {"const": CI_REGRESSION_GATE_BEAD_ID},
+                    "depends_on_bead_id": {"const": CI_REGRESSION_BASELINE_BEAD_ID},
+                    "status": {"const": CI_REGRESSION_GATE_STATUS_PENDING_BASELINE},
+                    "thresholds": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["avg_ratio_baseline", "avg_ratio_max", "mt_p95_ratio_max", "threshold_source"],
+                        "properties": {
+                            "avg_ratio_baseline": {"type": "number"},
+                            "avg_ratio_max": {"type": ["number", "null"]},
+                            "mt_p95_ratio_max": {"type": ["number", "null"]},
+                            "threshold_source": {"type": "string"}
+                        }
+                    },
+                    "observed": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["avg_ratio", "max_mt_p95_ratio", "max_mt_p95_scenario_id"],
+                        "properties": {
+                            "avg_ratio": {"type": ["number", "null"]},
+                            "max_mt_p95_ratio": {
+                                "type": ["number", "null"],
+                                "description": "Worst fsqlite/csqlite p95 latency ratio among multithreaded concurrent-writer rows."
+                            },
+                            "max_mt_p95_scenario_id": {"type": ["string", "null"]}
+                        }
+                    }
+                }
+            },
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["section_id", "title", "description", "rows"],
+                    "properties": {
+                        "section_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["scenario_id", "scenario", "csqlite", "fsqlite", "ratio_fsqlite_over_csqlite"],
+                                "properties": {
+                                    "scenario_id": {"type": "string"},
+                                    "scenario": {"type": "string"},
+                                    "csqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
+                                    "fsqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
+                                    "ratio_fsqlite_over_csqlite": {"type": ["number", "null"]}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "$defs": {
+            "measurement": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["median_ms", "mean_ms", "min_ms", "p95_ms", "p99_ms", "stddev_ms", "cv_pct", "rows_per_sec", "us_per_row", "iterations"],
+                "properties": {
+                    "median_ms": {"type": "number", "minimum": 0},
+                    "mean_ms": {"type": "number", "minimum": 0},
+                    "min_ms": {"type": "number", "minimum": 0},
+                    "p95_ms": {"type": "number", "minimum": 0},
+                    "p99_ms": {"type": "number", "minimum": 0},
+                    "stddev_ms": {"type": "number", "minimum": 0},
+                    "cv_pct": {"type": "number", "minimum": 0},
+                    "rows_per_sec": {"type": "number", "minimum": 0},
+                    "us_per_row": {"type": "number", "minimum": 0},
+                    "iterations": {"type": "integer", "minimum": 1}
+                }
+            }
+        }
+    })
+}
+
+fn print_benchmark_json_schema() {
+    match serde_json::to_string_pretty(&benchmark_json_schema()) {
+        Ok(json) => println!("{json}"),
+        Err(err) => {
+            eprintln!("ERROR: Could not serialize benchmark JSON schema: {err}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1405,6 +1646,7 @@ fn print_usage() {
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-out report.json --no-html
   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --json-stdout --no-html
+  cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --print-json-schema
 
 Flags:
   --quick              Run the reduced benchmark matrix.
@@ -1414,6 +1656,7 @@ Flags:
   --json               Write the JSON report to a timestamped file.
   --json-out <path>    Write the JSON report to an explicit path.
   --json-stdout        Emit only the structured JSON report to stdout.
+  --print-json-schema  Emit the standardized benchmark JSON schema and exit.
   --help, -h           Show this help text."
     );
 }
@@ -1427,6 +1670,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
         emit_timestamped_json: false,
         json_out_path: None,
         json_stdout: false,
+        print_json_schema: false,
     };
 
     let mut index = 1;
@@ -1468,6 +1712,10 @@ fn parse_cli_args(args: &[String]) -> Result<CliOptions, String> {
             }
             "--json-stdout" => {
                 options.json_stdout = true;
+                index += 1;
+            }
+            "--print-json-schema" => {
+                options.print_json_schema = true;
                 index += 1;
             }
             unknown => {
@@ -1809,7 +2057,7 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
 
 fn bench_concurrent_writers(report: &mut BenchReport) {
     let section = report.add_section(
-        "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC",
+        CONCURRENT_WRITERS_SECTION_TITLE,
         &format!(
             "Each writer inserts {} rows into non-overlapping key ranges on the same \
              file-backed WAL database. Both engines spawn N OS threads each owning its \
@@ -2144,6 +2392,7 @@ mod tests {
                 emit_timestamped_json: false,
                 json_out_path: Some("bench.json".to_owned()),
                 json_stdout: true,
+                print_json_schema: false,
             }
         );
     }
@@ -2193,8 +2442,21 @@ mod tests {
             },
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V1);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V2);
         assert_eq!(json.summary.total_scenarios, 1);
+        assert_eq!(
+            json.ci_regression_gate.schema_version,
+            CI_REGRESSION_GATE_SCHEMA_V1
+        );
+        assert_eq!(json.ci_regression_gate.bead_id, CI_REGRESSION_GATE_BEAD_ID);
+        assert_eq!(
+            json.ci_regression_gate.depends_on_bead_id,
+            CI_REGRESSION_BASELINE_BEAD_ID
+        );
+        assert_eq!(
+            json.ci_regression_gate.thresholds.avg_ratio_baseline,
+            CI_REGRESSION_BASELINE_AVG_RATIO
+        );
         assert_eq!(json.sections.len(), 1);
         assert_eq!(json.sections[0].section_id, "insert-throughput");
         assert_eq!(
@@ -2206,6 +2468,86 @@ mod tests {
                 .average_ratio
                 .expect("average ratio should exist for comparable row")
                 > 1.0
+        );
+    }
+
+    #[test]
+    fn ci_regression_gate_tracks_multithread_p95_ratio() {
+        let mut report = BenchReport::new();
+        let section = report.add_section(CONCURRENT_WRITERS_SECTION_TITLE, "test");
+        section.add_row(
+            "2 writers x 1000 rows",
+            Some(sample_measurement("csqlite", 2_000, &[10, 10, 10])),
+            Some(sample_measurement("frankensqlite", 2_000, &[20, 25, 30])),
+        );
+        section.add_row(
+            "8 writers x 1000 rows",
+            Some(sample_measurement("csqlite", 8_000, &[10, 10, 10])),
+            Some(sample_measurement("frankensqlite", 8_000, &[15, 15, 15])),
+        );
+
+        let json = build_json_report(
+            &report,
+            Duration::from_secs(1),
+            JsonRunConfig {
+                quick: true,
+                filter: Some("concurrent".to_owned()),
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: vec![100],
+                html_output_path: None,
+                json_output_path: Some("report.json".to_owned()),
+                json_stdout: false,
+            },
+            DetectedEnvironment {
+                os: None,
+                arch: "x86_64".to_owned(),
+                kernel_release: None,
+                cpu_model: None,
+                cpu_cores: Some(8),
+                ram_gb: None,
+                active_toolchain: None,
+                rust_version: None,
+                cargo_version: None,
+                git_commit_sha: None,
+                git_branch: Some("main".to_owned()),
+                build_profile: "release-perf".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            json.ci_regression_gate.observed.max_mt_p95_scenario_id,
+            Some(
+                "concurrent-writers-c-sqlite-wal-vs-frankensqlite-mvcc__2-writers-x-1000-rows"
+                    .to_owned(),
+            )
+        );
+        assert_eq!(json.ci_regression_gate.observed.max_mt_p95_ratio, Some(3.0));
+    }
+
+    #[test]
+    fn benchmark_json_schema_exposes_gate_metrics() {
+        let schema = benchmark_json_schema();
+
+        assert_eq!(
+            schema["properties"]["schema_version"]["const"],
+            JSON_REPORT_SCHEMA_V2
+        );
+        assert_eq!(
+            schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
+            CI_REGRESSION_GATE_BEAD_ID
+        );
+        assert_eq!(
+            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]["avg_ratio_baseline"]
+                ["type"],
+            "number"
+        );
+        assert_eq!(
+            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["max_mt_p95_ratio"]
+                ["type"][0],
+            "number"
         );
     }
 }
@@ -3447,6 +3789,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if options.print_json_schema {
+        print_benchmark_json_schema();
+        return;
+    }
 
     let row_counts = if options.quick {
         ROW_COUNTS_QUICK
