@@ -21759,8 +21759,15 @@ mod tests {
     }
 
     #[test]
-    fn test_publish_commit_sweeps_pages_when_db_size_shrinks() {
+    fn test_publish_commit_sweeps_pages_but_keeps_db_size_monotonic() {
         init_publication_test_tracing();
+        // Commit 49d0b194 ("keep db_size strictly monotonic across cross-
+        // process peers") changed `publish_commit` so it uses `fetch_max` on
+        // db_size rather than `store`. A shrink update at this layer still
+        // sweeps pages above the new smaller size (so readers of a lower
+        // snapshot can't reach stale pages) but the published db_size stays
+        // at the high-water mark. The authoritative shrink is delivered by
+        // `publish_truncate_checkpoint`, not `publish_commit`.
         let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
         let cx = Cx::new();
         let page_two = PageNumber::new(2).unwrap();
@@ -21807,8 +21814,8 @@ mod tests {
         );
         assert_eq!(
             published.snapshot().db_size,
-            4,
-            "bead_id=bd-wwqen.3 case=shrink_commit_updates_published_db_size"
+            8,
+            "bead_id=bd-wwqen.3 case=shrink_commit_leaves_published_db_size_monotonic"
         );
     }
 
@@ -21883,18 +21890,47 @@ mod tests {
 
     #[test]
     fn test_stale_larger_commit_publish_does_not_reopen_newer_shrunken_snapshot() {
+        // Authoritative shrinks go through publish_truncate_checkpoint — it is
+        // the only publisher permitted to reduce db_size (see 49d0b194). A
+        // subsequent stale publish_commit must not regress visible_commit_seq
+        // and must not re-open the shrunken snapshot.
         init_publication_test_tracing();
         let published = PublishedPagerState::new(8, CommitSeq::new(8), JournalMode::Wal, 0);
         let cx = Cx::new();
         let page_two = PageNumber::new(2).unwrap();
         let page_seven = PageNumber::new(7).unwrap();
 
+        // Seed a page above the upcoming shrink boundary so we can verify the
+        // truncate removes it and a stale publish_commit does not restore it.
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(8),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_seven,
+            PageData::from_vec(sample_page(0x77)),
+        );
+
         let current_page_two = PageData::from_vec(sample_page(0x22));
-        let shrink_write_set = HashMap::from([(
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(9),
+                db_size: 8,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
             page_two,
-            StagedPage::from_page_data(current_page_two.clone()),
-        )]);
-        published.publish_commit(
+            current_page_two.clone(),
+        );
+
+        // Truncate-checkpoint is the shrink publisher.
+        published.publish_truncate_checkpoint(
             &cx,
             PublishedPagerUpdate {
                 visible_commit_seq: CommitSeq::new(9),
@@ -21903,7 +21939,22 @@ mod tests {
                 freelist_count: 0,
                 checkpoint_active: false,
             },
-            &shrink_write_set,
+            4,
+        );
+
+        // Re-publish page_two post-truncate so it survives the sweep that
+        // truncate_checkpoint performed on every page (including page 1).
+        published.publish_insert_single(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(9),
+                db_size: 4,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            page_two,
+            current_page_two.clone(),
         );
 
         let stale_page_two = PageData::from_vec(sample_page(0x99));
