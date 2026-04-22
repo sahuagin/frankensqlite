@@ -485,14 +485,14 @@ pub enum AccessPathKind {
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub enum AccessPathProbe {
     /// `WHERE rowid = <target>`
-    RowidEquality { target: Expr },
+    RowidEquality { target: Box<Expr> },
     /// `WHERE <column> = <target>` backed by an index.
-    Equality { column: String, target: Expr },
+    Equality { column: String, target: Box<Expr> },
     /// `WHERE <column> {>|>=} <lo> AND <column> {<|<=} <hi>` backed by an index.
     Range {
         column: String,
-        lower: Option<(Expr, bool)>,
-        upper: Option<(Expr, bool)>,
+        lower: Option<(Box<Expr>, bool)>,
+        upper: Option<(Box<Expr>, bool)>,
     },
 }
 
@@ -1678,6 +1678,8 @@ fn best_access_path_internal(
         };
     }
 
+    best.probe = extract_access_path_probe(&best, indexes, where_terms);
+
     let chosen_index = best.index.as_deref().unwrap_or("(none)");
     let selectivity = match &best.kind {
         AccessPathKind::IndexScanRange { selectivity }
@@ -2362,6 +2364,135 @@ fn has_rowid_equality(terms: &[WhereTerm<'_>]) -> bool {
     terms
         .iter()
         .any(|t| matches!(t.kind, WhereTermKind::RowidEquality))
+}
+
+/// Extract the non-column side of a binary comparison expression.
+fn extract_comparison_operand(expr: &Expr) -> Option<Expr> {
+    let Expr::BinaryOp { left, right, .. } = expr else {
+        return None;
+    };
+    if extract_where_column(left).is_some() {
+        Some(right.as_ref().clone())
+    } else if extract_where_column(right).is_some() {
+        Some(left.as_ref().clone())
+    } else {
+        None
+    }
+}
+
+/// Given a finalized [`AccessPath`] and the WHERE terms that produced it,
+/// extract probe expressions so downstream consumers do not re-parse the
+/// WHERE clause.
+fn extract_access_path_probe(
+    best: &AccessPath,
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+) -> Option<AccessPathProbe> {
+    match &best.kind {
+        AccessPathKind::FullTableScan => None,
+        AccessPathKind::RowidLookup => {
+            let term = where_terms
+                .iter()
+                .find(|t| matches!(t.kind, WhereTermKind::RowidEquality))?;
+            let target = extract_comparison_operand(term.expr)?;
+            Some(AccessPathProbe::RowidEquality {
+                target: Box::new(target),
+            })
+        }
+        AccessPathKind::IndexScanEquality => {
+            let index_name = best.index.as_deref()?;
+            let idx = indexes
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
+            let leading_col = idx.columns.first()?;
+            let term = where_terms.iter().find(|t| {
+                matches!(t.kind, WhereTermKind::Equality)
+                    && t.column
+                        .as_ref()
+                        .is_some_and(|c| c.column.eq_ignore_ascii_case(leading_col))
+            })?;
+            let target = extract_comparison_operand(term.expr)?;
+            Some(AccessPathProbe::Equality {
+                column: leading_col.clone(),
+                target: Box::new(target),
+            })
+        }
+        AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. } => {
+            let index_name = best.index.as_deref()?;
+            let idx = indexes
+                .iter()
+                .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
+            let leading_col = idx.columns.first()?;
+            let mut lower: Option<(Box<Expr>, bool)> = None;
+            let mut upper: Option<(Box<Expr>, bool)> = None;
+            for term in where_terms {
+                let col = match &term.column {
+                    Some(c) if c.column.eq_ignore_ascii_case(leading_col) => c,
+                    _ => continue,
+                };
+                if matches!(term.kind, WhereTermKind::Equality) {
+                    let target = extract_comparison_operand(term.expr)?;
+                    return Some(AccessPathProbe::Equality {
+                        column: col.column.clone(),
+                        target: Box::new(target),
+                    });
+                }
+                if !matches!(term.kind, WhereTermKind::Range) {
+                    continue;
+                }
+                if let Expr::BinaryOp {
+                    left, op, right, ..
+                } = term.expr
+                {
+                    let col_on_left = extract_where_column(left).is_some();
+                    match op {
+                        AstBinaryOp::Gt => {
+                            let val = if col_on_left { right } else { left };
+                            if col_on_left {
+                                lower = Some((Box::new(val.as_ref().clone()), false));
+                            } else {
+                                upper = Some((Box::new(val.as_ref().clone()), false));
+                            }
+                        }
+                        AstBinaryOp::Ge => {
+                            let val = if col_on_left { right } else { left };
+                            if col_on_left {
+                                lower = Some((Box::new(val.as_ref().clone()), true));
+                            } else {
+                                upper = Some((Box::new(val.as_ref().clone()), true));
+                            }
+                        }
+                        AstBinaryOp::Lt => {
+                            let val = if col_on_left { right } else { left };
+                            if col_on_left {
+                                upper = Some((Box::new(val.as_ref().clone()), false));
+                            } else {
+                                lower = Some((Box::new(val.as_ref().clone()), false));
+                            }
+                        }
+                        AstBinaryOp::Le => {
+                            let val = if col_on_left { right } else { left };
+                            if col_on_left {
+                                upper = Some((Box::new(val.as_ref().clone()), true));
+                            } else {
+                                lower = Some((Box::new(val.as_ref().clone()), true));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if lower.is_some() || upper.is_some() {
+                Some(AccessPathProbe::Range {
+                    column: leading_col.clone(),
+                    lower,
+                    upper,
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// Extract a pure trailing-wildcard prefix from a GLOB pattern (e.g.
@@ -6666,6 +6797,7 @@ mod tests {
                     estimated_cost: 100.0,
                     estimated_rows: 1000.0,
                     time_travel: None,
+                    probe: None,
                 },
                 AccessPath {
                     table: "t2".to_owned(),
@@ -6674,6 +6806,7 @@ mod tests {
                     estimated_cost: 15.0,
                     estimated_rows: 10.0,
                     time_travel: None,
+                    probe: None,
                 },
             ],
             join_segments: vec![JoinPlanSegment {
@@ -9382,6 +9515,7 @@ mod tests {
             estimated_cost: 1.0,
             estimated_rows: 1.0,
             time_travel: None,
+            probe: None,
         });
         let first = planner.order_joins_with_cache(
             sql_template,
@@ -9404,6 +9538,7 @@ mod tests {
             estimated_cost: 1.0,
             estimated_rows: 1.0,
             time_travel: None,
+            probe: None,
         });
         let second = planner.order_joins_with_cache(
             sql_template,
@@ -9470,5 +9605,173 @@ fn test_join_order_returns_each_table_once() {
     assert_eq!(join_order.len(), tables.len());
     for table in &tables {
         assert!(plan.join_order.iter().any(|name| name == &table.name));
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use fsqlite_ast::{BinaryOp as AstBinaryOp, ColumnRef, Expr, Literal, Span};
+
+    fn col(name: &str) -> Box<Expr> {
+        Box::new(Expr::Column(
+            ColumnRef {
+                table: None,
+                column: name.to_owned(),
+            },
+            Span::ZERO,
+        ))
+    }
+
+    fn lit_int(v: i64) -> Box<Expr> {
+        Box::new(Expr::Literal(Literal::Integer(v), Span::ZERO))
+    }
+
+    fn eq_expr(col_name: &str, val: i64) -> Expr {
+        Expr::BinaryOp {
+            left: col(col_name),
+            op: AstBinaryOp::Eq,
+            right: lit_int(val),
+        }
+    }
+
+    #[test]
+    fn extract_probe_rowid_equality() {
+        let expr = eq_expr("rowid", 42);
+        let terms = [WhereTerm {
+            expr: &expr,
+            column: Some(WhereColumn {
+                table: None,
+                column: "rowid".to_owned(),
+            }),
+            kind: WhereTermKind::RowidEquality,
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::RowidLookup,
+            index: None,
+            estimated_cost: 1.0,
+            estimated_rows: 1.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &[], &terms);
+        assert!(
+            matches!(&probe, Some(AccessPathProbe::RowidEquality { target }) if **target == Expr::Literal(Literal::Integer(42), Span::ZERO))
+        );
+    }
+
+    #[test]
+    fn extract_probe_index_equality() {
+        let expr = eq_expr("name", 7);
+        let terms = [WhereTerm {
+            expr: &expr,
+            column: Some(WhereColumn {
+                table: None,
+                column: "name".to_owned(),
+            }),
+            kind: WhereTermKind::Equality,
+        }];
+        let indexes = [IndexInfo {
+            name: "idx_name".to_owned(),
+            columns: vec!["name".to_owned()],
+            is_unique: false,
+            expressions: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanEquality,
+            index: Some("idx_name".to_owned()),
+            estimated_cost: 5.0,
+            estimated_rows: 1.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        match &probe {
+            Some(AccessPathProbe::Equality { column, target }) => {
+                assert_eq!(column, "name");
+                assert_eq!(**target, Expr::Literal(Literal::Integer(7), Span::ZERO));
+            }
+            other => panic!("expected Equality probe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_probe_index_range() {
+        let gt_expr = Expr::BinaryOp {
+            left: col("age"),
+            op: AstBinaryOp::Gt,
+            right: lit_int(18),
+        };
+        let lt_expr = Expr::BinaryOp {
+            left: col("age"),
+            op: AstBinaryOp::Le,
+            right: lit_int(65),
+        };
+        let terms = [
+            WhereTerm {
+                expr: &gt_expr,
+                column: Some(WhereColumn {
+                    table: None,
+                    column: "age".to_owned(),
+                }),
+                kind: WhereTermKind::Range,
+            },
+            WhereTerm {
+                expr: &lt_expr,
+                column: Some(WhereColumn {
+                    table: None,
+                    column: "age".to_owned(),
+                }),
+                kind: WhereTermKind::Range,
+            },
+        ];
+        let indexes = [IndexInfo {
+            name: "idx_age".to_owned(),
+            columns: vec!["age".to_owned()],
+            is_unique: false,
+            expressions: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanRange { selectivity: 0.5 },
+            index: Some("idx_age".to_owned()),
+            estimated_cost: 50.0,
+            estimated_rows: 100.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        match &probe {
+            Some(AccessPathProbe::Range {
+                column,
+                lower,
+                upper,
+            }) => {
+                assert_eq!(column, "age");
+                let (lo_expr, lo_inc) = lower.as_ref().expect("expected lower bound");
+                assert_eq!(**lo_expr, Expr::Literal(Literal::Integer(18), Span::ZERO));
+                assert!(!lo_inc, "GT should be exclusive");
+                let (hi_expr, hi_inc) = upper.as_ref().expect("expected upper bound");
+                assert_eq!(**hi_expr, Expr::Literal(Literal::Integer(65), Span::ZERO));
+                assert!(hi_inc, "LE should be inclusive");
+            }
+            other => panic!("expected Range probe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_probe_full_scan_returns_none() {
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::FullTableScan,
+            index: None,
+            estimated_cost: 1000.0,
+            estimated_rows: 1000.0,
+            time_travel: None,
+            probe: None,
+        };
+        assert!(extract_access_path_probe(&ap, &[], &[]).is_none());
     }
 }

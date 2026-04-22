@@ -714,6 +714,7 @@ mod tests {
                     estimated_cost: 100.0,
                     estimated_rows: 10_000.0,
                     time_travel: None,
+                    probe: None,
                 },
                 AccessPath {
                     table: "orders".to_owned(),
@@ -722,6 +723,7 @@ mod tests {
                     estimated_cost: 15.0,
                     estimated_rows: 10.0,
                     time_travel: None,
+                    probe: None,
                 },
             ],
             join_segments: vec![crate::JoinPlanSegment {
