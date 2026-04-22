@@ -1554,7 +1554,11 @@ impl<P: PageReader> BtCursor<P> {
         let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
         if ptr_offset + 2 > page.len() {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("cell pointer {cell_idx} extends past page in count_all_rows"),
+                detail: format!(
+                    "cell pointer {cell_idx} extends past page {} (ptr_offset={ptr_offset} len={})",
+                    page_no.get(),
+                    page.len()
+                ),
             });
         }
         Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))
