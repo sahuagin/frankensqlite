@@ -13,7 +13,7 @@
 //! - Maximum load factor: 0.70 (Knuth Vol. 3 analysis for linear probing)
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -34,6 +34,61 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 const DEFAULT_LEASE_SECS: u64 = 5;
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 const OCCUPANCY_STRIPE_COUNT: usize = 16;
+const REBUILD_DRAIN_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(100);
+const REBUILD_DRAIN_HANDOFF_BASE_SPINS: u32 = 64;
+const REBUILD_DRAIN_HANDOFF_MAX_SPINS: u32 = 2_048;
+const REBUILD_DRAIN_HANDOFF_YIELD_EVERY: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RebuildDrainWait {
+    spin_loops: u32,
+    yielded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RebuildDrainHandoff {
+    next_attempt: u32,
+}
+
+impl RebuildDrainHandoff {
+    fn next_wait(&mut self, started: Instant, timeout: Duration) -> Option<RebuildDrainWait> {
+        if started.elapsed() >= timeout {
+            return None;
+        }
+
+        let attempt = self.next_attempt.saturating_add(1);
+        self.next_attempt = attempt;
+        Some(RebuildDrainWait {
+            spin_loops: rebuild_drain_spin_loops(attempt),
+            yielded: rebuild_drain_should_yield(attempt),
+        })
+    }
+}
+
+const fn rebuild_drain_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = REBUILD_DRAIN_HANDOFF_BASE_SPINS << shift;
+    if spins > REBUILD_DRAIN_HANDOFF_MAX_SPINS {
+        REBUILD_DRAIN_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn rebuild_drain_should_yield(attempt: u32) -> bool {
+    attempt >= REBUILD_DRAIN_HANDOFF_YIELD_EVERY && attempt % REBUILD_DRAIN_HANDOFF_YIELD_EVERY == 0
+}
+
+fn perform_rebuild_drain_handoff(wait: RebuildDrainWait) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+
+    if wait.yielded {
+        std::thread::yield_now();
+    }
+}
 
 #[cfg(unix)]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
@@ -1108,8 +1163,9 @@ impl SharedPageLockTable {
         is_active_txn: impl Fn(u64) -> bool,
         timeout: Duration,
     ) -> Result<RebuildResult, RebuildLeaseError> {
-        let mut elapsed_ms = 0_u64;
-        let mut remaining_budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let started = Instant::now();
+        let mut next_full_scan_at = Duration::ZERO;
+        let mut handoff = RebuildDrainHandoff::default();
 
         // Step 1: Acquire lease.
         self.acquire_rebuild_lease(pid, pid_birth, now_secs)?;
@@ -1121,15 +1177,19 @@ impl SharedPageLockTable {
             return Err(e);
         }
 
-        // Step 3: Drain with polling.
+        // Step 3: Drain with bounded handoff.
         let mut orphaned_cleaned = 0_u32;
-        let mut loops_since_full_scan = 0_u32;
         loop {
+            let elapsed = started.elapsed();
+
             // Run full table scans (orphaned cleanup and exact remaining count)
-            // only periodically (every ~100ms) to avoid pegging the CPU and
-            // memory bus with millions of atomic loads per millisecond.
-            if loops_since_full_scan % 100 == 0 {
+            // only periodically to avoid pegging the CPU and memory bus with
+            // millions of atomic loads per millisecond. The handoff schedule
+            // below is no longer a 1 ms sleep loop, so this cadence is elapsed-
+            // time based rather than loop-count based.
+            if elapsed >= next_full_scan_at {
                 orphaned_cleaned += self.drain_orphaned(&is_active_txn);
+                next_full_scan_at = elapsed.saturating_add(REBUILD_DRAIN_FULL_SCAN_INTERVAL);
 
                 // Log progress occasionally.
                 if let Some(status) = self.drain_progress() {
@@ -1149,10 +1209,9 @@ impl SharedPageLockTable {
                     }
                 }
             }
-            loops_since_full_scan += 1;
 
             // Check timeout.
-            if remaining_budget_ms == 0 {
+            if elapsed >= timeout {
                 // Cancel: must still finalize if quiescent, otherwise
                 // leave drain in progress for next attempt.
                 let draining_idx = self.draining_table.load(Ordering::Acquire);
@@ -1165,7 +1224,7 @@ impl SharedPageLockTable {
                     return Ok(RebuildResult {
                         cleared: 0,
                         orphaned_cleaned,
-                        elapsed: Duration::from_millis(elapsed_ms),
+                        elapsed,
                         epoch: self.rebuild_epoch.load(Ordering::Acquire),
                         timed_out: true,
                     });
@@ -1173,10 +1232,24 @@ impl SharedPageLockTable {
                 break;
             }
 
-            // Brief yield to let transactions release locks.
-            std::thread::sleep(Duration::from_millis(1));
-            elapsed_ms = elapsed_ms.saturating_add(1);
-            remaining_budget_ms = remaining_budget_ms.saturating_sub(1);
+            let Some(wait) = handoff.next_wait(started, timeout) else {
+                let draining_idx = self.draining_table.load(Ordering::Acquire);
+                let quiescent = draining_idx != DRAINING_NONE
+                    && self.tables[draining_idx as usize].is_quiescent();
+
+                if !quiescent {
+                    self.rebuild_pid.store(0, Ordering::Release);
+                    return Ok(RebuildResult {
+                        cleared: 0,
+                        orphaned_cleaned,
+                        elapsed: started.elapsed(),
+                        epoch: self.rebuild_epoch.load(Ordering::Acquire),
+                        timed_out: true,
+                    });
+                }
+                break;
+            };
+            perform_rebuild_drain_handoff(wait);
         }
 
         // Steps 4+5: Clear and finalize.
@@ -1186,7 +1259,7 @@ impl SharedPageLockTable {
         Ok(RebuildResult {
             cleared,
             orphaned_cleaned,
-            elapsed: Duration::from_millis(elapsed_ms),
+            elapsed: started.elapsed(),
             epoch: self.rebuild_epoch.load(Ordering::Acquire),
             timed_out: false,
         })
@@ -1335,6 +1408,116 @@ mod tests {
             .expect("shared_lock_table log buffer lock")
             .clone();
         (result, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[derive(Debug)]
+    struct RebuildDrainScheduleSummary {
+        total_spin_loops: u64,
+        max_spin_loops: u32,
+        yield_count: u32,
+        p95_spin_loops: u32,
+        full_scan_interval: Duration,
+    }
+
+    fn summarize_rebuild_drain_schedule(attempts: u32) -> RebuildDrainScheduleSummary {
+        let waits = (1..=attempts)
+            .map(|attempt| RebuildDrainWait {
+                spin_loops: rebuild_drain_spin_loops(attempt),
+                yielded: rebuild_drain_should_yield(attempt),
+            })
+            .collect::<Vec<_>>();
+        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
+        let max_spin_loops = waits.iter().map(|wait| wait.spin_loops).max().unwrap_or(0);
+        let yield_count = u32::try_from(waits.iter().filter(|wait| wait.yielded).count())
+            .expect("test wait count fits u32");
+        let mut spin_samples = waits.iter().map(|wait| wait.spin_loops).collect::<Vec<_>>();
+        spin_samples.sort_unstable();
+
+        RebuildDrainScheduleSummary {
+            total_spin_loops,
+            max_spin_loops,
+            yield_count,
+            p95_spin_loops: percentile_rebuild_drain_spin_loops(&spin_samples, 95),
+            full_scan_interval: REBUILD_DRAIN_FULL_SCAN_INTERVAL,
+        }
+    }
+
+    fn percentile_rebuild_drain_spin_loops(sorted_spin_loops: &[u32], percentile: u8) -> u32 {
+        assert!(
+            !sorted_spin_loops.is_empty(),
+            "percentile requires at least one spin sample"
+        );
+        let index = usize::from(percentile)
+            .saturating_mul(sorted_spin_loops.len())
+            .saturating_sub(1)
+            / 100;
+        sorted_spin_loops[index.min(sorted_spin_loops.len().saturating_sub(1))]
+    }
+
+    #[test]
+    fn test_rebuild_drain_handoff_spin_loops_grow_then_cap() {
+        assert_eq!(
+            rebuild_drain_spin_loops(1),
+            REBUILD_DRAIN_HANDOFF_BASE_SPINS
+        );
+        assert_eq!(
+            rebuild_drain_spin_loops(2),
+            REBUILD_DRAIN_HANDOFF_BASE_SPINS * 2
+        );
+        assert_eq!(
+            rebuild_drain_spin_loops(3),
+            REBUILD_DRAIN_HANDOFF_BASE_SPINS * 4
+        );
+        assert_eq!(rebuild_drain_spin_loops(6), REBUILD_DRAIN_HANDOFF_MAX_SPINS);
+        assert_eq!(
+            rebuild_drain_spin_loops(32),
+            REBUILD_DRAIN_HANDOFF_MAX_SPINS
+        );
+    }
+
+    #[test]
+    fn test_rebuild_drain_handoff_yield_cadence_is_bounded() {
+        for attempt in 1..REBUILD_DRAIN_HANDOFF_YIELD_EVERY {
+            assert!(
+                !rebuild_drain_should_yield(attempt),
+                "attempt {attempt} should stay on CPU before the first bounded yield"
+            );
+        }
+        assert!(rebuild_drain_should_yield(
+            REBUILD_DRAIN_HANDOFF_YIELD_EVERY
+        ));
+        assert!(!rebuild_drain_should_yield(
+            REBUILD_DRAIN_HANDOFF_YIELD_EVERY + 1
+        ));
+        assert!(rebuild_drain_should_yield(
+            REBUILD_DRAIN_HANDOFF_YIELD_EVERY * 2
+        ));
+    }
+
+    #[test]
+    fn test_rebuild_drain_handoff_respects_deadline() {
+        let mut handoff = RebuildDrainHandoff::default();
+        let started = Instant::now();
+        assert!(
+            handoff.next_wait(started, Duration::ZERO).is_none(),
+            "expired deadline must stop rebuild drain handoff"
+        );
+
+        let fresh_wait = handoff
+            .next_wait(Instant::now(), Duration::from_secs(1))
+            .expect("fresh deadline should allow a bounded handoff wait");
+        assert_eq!(fresh_wait.spin_loops, REBUILD_DRAIN_HANDOFF_BASE_SPINS);
+        assert!(!fresh_wait.yielded);
+    }
+
+    #[test]
+    fn test_rebuild_drain_schedule_summary_bounds_wake_amplification() {
+        let summary = summarize_rebuild_drain_schedule(8);
+        assert_eq!(summary.total_spin_loops, 8_128);
+        assert_eq!(summary.max_spin_loops, REBUILD_DRAIN_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.yield_count, 2);
+        assert_eq!(summary.p95_spin_loops, REBUILD_DRAIN_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.full_scan_interval, REBUILD_DRAIN_FULL_SCAN_INTERVAL);
     }
 
     // -- bd-11x0 test 1: Rotate swaps active table --
