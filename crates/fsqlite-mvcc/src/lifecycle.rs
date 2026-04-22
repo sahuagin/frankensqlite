@@ -1709,12 +1709,10 @@ impl TransactionManager {
         let eager_cleanup = horizon >= snapshot_high;
         let compact_threshold = self.adaptive_compact_threshold();
         let maybe_prune = |i: usize, pgno: PageNumber| {
-            let chain_len = pre_publish_chain_lens
-                .get(i)
-                .map_or_else(
-                    || self.version_store.chain_length(pgno),
-                    |&cached| cached.saturating_add(1),
-                );
+            let chain_len = pre_publish_chain_lens.get(i).map_or_else(
+                || self.version_store.chain_length(pgno),
+                |&cached| cached.saturating_add(1),
+            );
             self.record_chain_length_sample(chain_len);
             if eager_cleanup || chain_len > compact_threshold {
                 let freed = self.version_store.prune_page_chain_eager(pgno, horizon);
