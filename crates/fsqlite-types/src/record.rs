@@ -2198,6 +2198,7 @@ mod tests {
             PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
             PrecomputedSerialTypeKind::AnyOneByteVarintOrNull,
         ]);
+        assert_eq!(header.column_count(), values.len());
         let expected = serialize_record(&values);
         let exact = record_iter_with_precomputed_header_exact_size(values.iter(), &header)
             .expect("exact size available for one-byte-varint values");
