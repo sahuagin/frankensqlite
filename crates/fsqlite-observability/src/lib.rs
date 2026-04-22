@@ -138,8 +138,11 @@ pub static GLOBAL_IO_URING_LATENCY_METRICS: LazyLock<IoUringLatencyMetrics> =
 pub struct IoUringLatencySnapshot {
     pub read_samples_total: u64,
     pub write_samples_total: u64,
+    /// Total unix-path fallbacks across reads, writes, and legacy generic call sites.
     pub unix_fallbacks_total: u64,
+    /// Unix-path fallbacks emitted by io_uring read attempts.
     pub read_unix_fallbacks_total: u64,
+    /// Unix-path fallbacks emitted by io_uring write attempts.
     pub write_unix_fallbacks_total: u64,
     pub read_tail_violations_total: u64,
     pub write_tail_violations_total: u64,
@@ -327,10 +330,12 @@ pub fn record_io_uring_unix_fallback() {
     GLOBAL_IO_URING_LATENCY_METRICS.record_unix_fallback();
 }
 
+/// Record a read operation that used the unix VFS path instead of io_uring.
 pub fn record_io_uring_read_unix_fallback() {
     GLOBAL_IO_URING_LATENCY_METRICS.record_read_unix_fallback();
 }
 
+/// Record a write operation that used the unix VFS path instead of io_uring.
 pub fn record_io_uring_write_unix_fallback() {
     GLOBAL_IO_URING_LATENCY_METRICS.record_write_unix_fallback();
 }
