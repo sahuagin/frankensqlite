@@ -24,7 +24,7 @@
 //!
 //! # Shape
 //!
-//! - [`EpochGroupCommit::new`] spawns a background advancer thread.
+//! - [`EpochGroupCommit::new`] spawns a background advancer task.
 //! - [`EpochGroupCommit::submit`] returns a [`CommitWaiter`] that becomes
 //!   ready exactly when the epoch it was submitted into is closed and
 //!   flushed.
@@ -36,20 +36,20 @@
 //!
 //! # Guarantees
 //!
-//! - Every submitted waiter is eventually resolved (advancer thread runs
+//! - Every submitted waiter is eventually resolved (advancer task runs
 //!   forever until [`EpochGroupCommit`] is dropped).
 //! - A waiter submitted at epoch `E` is resolved only after the flush
 //!   callback for epoch `E` returns, so on wakeup the caller can assume
 //!   its WAL frames are durable.
 //! - Dropping an `EpochGroupCommit` signals the advancer to exit, drains
 //!   any outstanding waiters (marking them ready so no one blocks
-//!   forever), and joins the thread.
+//!   forever), and joins the task.
 
+use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 use fsqlite_types::glossary::TxnId;
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 /// Handle returned from [`EpochGroupCommit::submit`]; becomes ready once
@@ -103,17 +103,22 @@ pub struct EpochGroupCommit {
     pending: Mutex<Vec<PendingEntry>>,
     /// Set to `true` on drop; the advancer observes this and exits.
     shutdown: Arc<AtomicBool>,
+    /// Wakes the advancer task promptly during shutdown instead of waiting
+    /// for the full epoch window to elapse.
+    advancer_wake: Arc<WaiterNotifier>,
     /// Flush callback invoked at each boundary after the pending list is
     /// stolen. Arc-wrapped so `advance_epoch` (called synchronously from
     /// the caller) can share it with the background thread.
     flush: Arc<FlushFn>,
-    /// JoinHandle for the advancer thread. `None` after `Drop` joins it.
+    /// Runtime that owns the advancer blocking task.
+    advancer_runtime: Runtime,
+    /// Handle for the advancer task. `None` after `Drop` joins it.
     ///
     /// Wrapped in `Mutex<Option<_>>` so we can hand out an `Arc<Self>`
-    /// and then *stash* the handle after spawning the thread, without
+    /// and then *stash* the handle after spawning the task, without
     /// needing `Arc::get_mut` (which races with the advancer's
     /// `Weak::upgrade`).
-    advancer: Mutex<Option<JoinHandle<()>>>,
+    advancer: Mutex<Option<BlockingTaskHandle>>,
 }
 
 impl std::fmt::Debug for EpochGroupCommit {
@@ -132,7 +137,7 @@ impl std::fmt::Debug for EpochGroupCommit {
 impl EpochGroupCommit {
     /// Create an `EpochGroupCommit` with a no-op flush callback.
     ///
-    /// Spawns a background advancer thread that closes the current epoch
+    /// Spawns a background advancer task that closes the current epoch
     /// every `epoch_duration_us` microseconds. Use [`Self::new_with_flush`]
     /// to install a real WAL flush callback.
     #[must_use]
@@ -146,32 +151,54 @@ impl EpochGroupCommit {
     /// frames are durable.
     #[must_use]
     pub fn new_with_flush(epoch_duration_us: u64, flush: FlushFn) -> Arc<Self> {
+        let advancer_runtime = RuntimeBuilder::new()
+            .worker_threads(0)
+            .blocking_threads(1, 1)
+            .thread_name_prefix("silo-epoch")
+            .build()
+            .expect("silo epoch advancer runtime");
+
         // Build state first, then spawn the advancer with a Weak handle
-        // so the background thread does not keep the controller alive.
+        // so the background task does not keep the controller alive.
         let this = Arc::new(Self {
             current_epoch: AtomicU64::new(1),
             epoch_duration_us,
             pending: Mutex::new(Vec::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            advancer_wake: Arc::new(WaiterNotifier::default()),
             flush: Arc::new(flush),
+            advancer_runtime,
             advancer: Mutex::new(None),
         });
 
         let weak = Arc::downgrade(&this);
-        let advancer = thread::Builder::new()
-            .name("silo-epoch-advancer".to_string())
-            .spawn(move || {
-                let sleep_dur = Duration::from_micros(epoch_duration_us);
+        let wake = Arc::clone(&this.advancer_wake);
+        let shutdown = Arc::clone(&this.shutdown);
+        let advancer = this
+            .advancer_runtime
+            .spawn_blocking(move || {
+                let epoch_window = Duration::from_micros(epoch_duration_us);
                 loop {
-                    thread::sleep(sleep_dur);
-                    let Some(state) = weak.upgrade() else { return };
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    {
+                        let mut guard = wake.lock.lock();
+                        let _ = wake.cv.wait_for(&mut guard, epoch_window);
+                    }
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(state) = weak.upgrade() else {
+                        return;
+                    };
                     if state.shutdown.load(Ordering::Acquire) {
                         return;
                     }
                     state.advance_epoch();
                 }
             })
-            .expect("silo-epoch-advancer thread spawn");
+            .expect("silo epoch advancer runtime must configure a blocking pool");
 
         // Stash the handle without requiring unique Arc ownership.
         *this.advancer.lock() = Some(advancer);
@@ -276,6 +303,11 @@ impl EpochGroupCommit {
 impl Drop for EpochGroupCommit {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        {
+            let guard = self.advancer_wake.lock.lock();
+            self.advancer_wake.cv.notify_all();
+            drop(guard);
+        }
         // Drain any stragglers so no one blocks forever.
         let drained: Vec<PendingEntry> = std::mem::take(&mut *self.pending.lock());
         for entry in drained {
@@ -286,9 +318,8 @@ impl Drop for EpochGroupCommit {
         }
         let handle = self.advancer.lock().take();
         if let Some(h) = handle {
-            // Best-effort join; advancer will notice `shutdown` on its
-            // next wakeup, which is bounded by `epoch_duration_us`.
-            let _ = h.join();
+            h.cancel();
+            h.wait();
         }
     }
 }

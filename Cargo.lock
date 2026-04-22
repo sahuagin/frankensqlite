@@ -1154,6 +1154,7 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.1.2"
 dependencies = [
+ "asupersync",
  "blake3",
  "crc32c",
  "criterion",

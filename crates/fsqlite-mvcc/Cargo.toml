@@ -21,6 +21,7 @@ linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 mvcc-flat-combining = []
 
 [dependencies]
+asupersync = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 crossbeam-epoch = { workspace = true }
