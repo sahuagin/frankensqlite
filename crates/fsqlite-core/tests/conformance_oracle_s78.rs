@@ -593,3 +593,229 @@ fn test_conformance_insert_select_transform_s78t() {
         "INSERT SELECT transform",
     );
 }
+
+// ── s78u: printf/format function ──
+
+#[test]
+fn test_conformance_printf_format_s78u() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT printf('%d', 42)",
+        "SELECT printf('%05d', 42)",
+        "SELECT printf('%.2f', 3.14159)",
+        "SELECT printf('%s world', 'hello')",
+        "SELECT printf('%010.3f', 1.5)",
+    ];
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "printf format");
+}
+
+// ── s78v: hex / zeroblob / quote ──
+
+#[test]
+fn test_conformance_hex_zeroblob_quote_s78v() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT hex('hello')",
+        "SELECT hex(42)",
+        "SELECT hex(NULL)",
+        "SELECT length(zeroblob(10))",
+        "SELECT typeof(zeroblob(5))",
+        "SELECT quote(42)",
+        "SELECT quote('hello')",
+        "SELECT quote(NULL)",
+        "SELECT quote(3.14)",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "hex/zeroblob/quote",
+    );
+}
+
+// ── s78w: unicode / char / unicode function ──
+
+#[test]
+fn test_conformance_unicode_char_s78w() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let queries = &[
+        "SELECT unicode('A')",
+        "SELECT unicode('a')",
+        "SELECT char(65)",
+        "SELECT char(65, 66, 67)",
+        "SELECT length('café')",
+        "SELECT upper('café')",
+        "SELECT lower('CAFÉ')",
+    ];
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "unicode/char");
+}
+
+// ── s78x: nested subquery in ORDER BY ──
+
+#[test]
+fn test_conformance_subquery_in_order_by_s78x() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        "CREATE TABLE dept(id INTEGER PRIMARY KEY, name TEXT, rank INTEGER)",
+        "INSERT INTO dept VALUES(1,'Eng',1),(2,'Sales',3),(3,'HR',2)",
+        "INSERT INTO emp VALUES(1,'Alice',1),(2,'Bob',2),(3,'Charlie',3),(4,'Diana',1)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT e.name FROM emp e ORDER BY (SELECT d.rank FROM dept d WHERE d.id = e.dept_id), e.name",
+        "SELECT e.name, (SELECT d.name FROM dept d WHERE d.id = e.dept_id) AS dept_name FROM emp e ORDER BY dept_name, e.name",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "subquery in ORDER BY",
+    );
+}
+
+// ── s78y: DISTINCT with expressions ──
+
+#[test]
+fn test_conformance_distinct_expressions_s78y() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE vals(id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO vals VALUES(1,10),(2,20),(3,10),(4,30),(5,20),(6,10)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT DISTINCT v FROM vals ORDER BY v",
+        "SELECT COUNT(DISTINCT v) FROM vals",
+        "SELECT SUM(DISTINCT v) FROM vals",
+        "SELECT DISTINCT v * 2 AS doubled FROM vals ORDER BY doubled",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "DISTINCT expressions",
+    );
+}
+
+// ── s78z: complex UPDATE with multiple SET clauses ──
+
+#[test]
+fn test_conformance_complex_update_multi_set_s78z() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE inventory(id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, price REAL, updated TEXT DEFAULT 'no')",
+        "INSERT INTO inventory VALUES(1,'widget',100,9.99,'no'),(2,'gadget',50,19.99,'no'),(3,'doohickey',200,4.99,'no')",
+        "UPDATE inventory SET qty = qty - 10, price = price * 1.1, updated = 'yes' WHERE qty > 50",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT * FROM inventory ORDER BY id",
+        "SELECT name, updated FROM inventory WHERE updated = 'yes' ORDER BY name",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "complex UPDATE multi SET",
+    );
+}
+
+// ── s78aa: BETWEEN with various types ──
+
+#[test]
+fn test_conformance_between_types_s78aa() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE mixed(id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT)",
+        "INSERT INTO mixed VALUES(1,10,1.5,'apple'),(2,20,2.5,'banana'),(3,30,3.5,'cherry'),(4,40,4.5,'date'),(5,50,5.5,'elderberry')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT * FROM mixed WHERE i BETWEEN 20 AND 40 ORDER BY id",
+        "SELECT * FROM mixed WHERE r BETWEEN 2.0 AND 4.0 ORDER BY id",
+        "SELECT * FROM mixed WHERE t BETWEEN 'banana' AND 'date' ORDER BY id",
+        "SELECT * FROM mixed WHERE i NOT BETWEEN 10 AND 30 ORDER BY id",
+    ];
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "BETWEEN types");
+}
+
+// ── s78ab: multiple aggregates in single query ──
+
+#[test]
+fn test_conformance_multi_agg_single_query_s78ab() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE samples(id INTEGER PRIMARY KEY, grp TEXT, val REAL)",
+        "INSERT INTO samples VALUES(1,'A',10.0),(2,'A',20.0),(3,'A',30.0),(4,'B',15.0),(5,'B',25.0),(6,'C',100.0)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT grp, COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM samples GROUP BY grp ORDER BY grp",
+        "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val), TOTAL(val) FROM samples",
+        "SELECT grp, COUNT(*) AS n, SUM(val)/COUNT(*) AS manual_avg, AVG(val) AS builtin_avg FROM samples GROUP BY grp ORDER BY grp",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "multi agg single query",
+    );
+}
+
+// ── s78ac: ALTER TABLE ADD COLUMN then query ──
+
+#[test]
+fn test_conformance_alter_add_column_s78ac() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t VALUES(1,'Alice'),(2,'Bob')",
+        "ALTER TABLE t ADD COLUMN age INTEGER DEFAULT 0",
+        "UPDATE t SET age = 30 WHERE name = 'Alice'",
+        "INSERT INTO t VALUES(3, 'Charlie', 25)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT * FROM t ORDER BY id",
+        "SELECT name, age FROM t WHERE age > 0 ORDER BY name",
+    ];
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "ALTER ADD COLUMN");
+}
+
+// ── s78ad: last_insert_rowid / changes / total_changes ──
+
+#[test]
+fn test_conformance_last_insert_rowid_s78ad() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO t VALUES(NULL, 'first')",
+        "INSERT INTO t VALUES(NULL, 'second')",
+        "INSERT INTO t VALUES(NULL, 'third')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = &[
+        "SELECT * FROM t ORDER BY id",
+        "SELECT last_insert_rowid()",
+        "SELECT MAX(id) FROM t",
+    ];
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "last_insert_rowid",
+    );
+}
