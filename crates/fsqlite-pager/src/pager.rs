@@ -15410,10 +15410,7 @@ mod tests {
                 frames: &[crate::traits::WalFrameRef<'_>],
             ) -> fsqlite_error::Result<()> {
                 // Non-prepared fallback path: count meta-only (no frame bytes to inspect).
-                let meta_commits = frames
-                    .iter()
-                    .filter(|f| f.db_size_if_commit != 0)
-                    .count();
+                let meta_commits = frames.iter().filter(|f| f.db_size_if_commit != 0).count();
                 self.per_batch
                     .lock()
                     .unwrap()
@@ -15484,16 +15481,16 @@ mod tests {
                 let mut byte_commits = 0_usize;
                 for i in 0..prepared.frame_count() {
                     let slice = prepared.frame_slice(i);
-                    let byte_db_size =
-                        u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
+                    let byte_db_size = u32::from_be_bytes([slice[4], slice[5], slice[6], slice[7]]);
                     if byte_db_size != 0 {
                         byte_commits += 1;
                     }
                 }
-                self.per_batch
-                    .lock()
-                    .unwrap()
-                    .push((meta_commits, byte_commits, prepared.frame_count()));
+                self.per_batch.lock().unwrap().push((
+                    meta_commits,
+                    byte_commits,
+                    prepared.frame_count(),
+                ));
                 *self.total_frames.lock().unwrap() += prepared.frame_count();
                 Ok(())
             }

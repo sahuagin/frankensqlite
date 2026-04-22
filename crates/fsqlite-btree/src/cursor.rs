@@ -11493,10 +11493,9 @@ mod tests {
             let has_room = content_offset
                 .checked_sub(probe_cell.len() * cells_needed_for_assert)
                 .is_some_and(|after_three| {
-                    let ptr_array_after =
-                        header_offset
-                            + header_size
-                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                    let ptr_array_after = header_offset
+                        + header_size
+                        + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
                     ptr_array_after <= after_three
                 });
             if has_room {
@@ -11546,10 +11545,7 @@ mod tests {
             .rightmost_leaf_cache
             .as_ref()
             .expect("successful append should preserve the rightmost-leaf cache");
-        assert_eq!(
-            cached_after.rowid,
-            start_rowid - 1 + i64::from(appended)
-        );
+        assert_eq!(cached_after.rowid, start_rowid - 1 + i64::from(appended));
     }
 
     #[test]
@@ -11601,10 +11597,9 @@ mod tests {
             let has_room = content_offset
                 .checked_sub(probe_cell.len() * cells_needed_for_assert)
                 .is_some_and(|after_three| {
-                    let ptr_array_after =
-                        header_offset
-                            + header_size
-                            + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
+                    let ptr_array_after = header_offset
+                        + header_size
+                        + (usize::from(cached.header.cell_count) + cells_needed_for_assert) * 2;
                     ptr_array_after <= after_three
                 });
             if has_room {
