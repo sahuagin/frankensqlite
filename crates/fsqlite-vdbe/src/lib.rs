@@ -1304,6 +1304,7 @@ pub mod pragma {
     }
 
     #[derive(Debug, Clone)]
+    #[allow(clippy::struct_excessive_bools)]
     pub struct ConnectionPragmaState {
         /// Journal mode (`delete`, `truncate`, `persist`, `memory`, `wal`, `off`).
         pub journal_mode: String,
@@ -1343,6 +1344,8 @@ pub mod pragma {
         /// MVCC serialized writer lease duration in seconds.
         /// `PRAGMA fsqlite.mvcc_writer_lease_secs`.
         pub mvcc_writer_lease_secs: u64,
+        /// `PRAGMA writable_schema` toggle — allows direct DML on sqlite_master.
+        pub writable_schema: bool,
     }
 
     impl Default for ConnectionPragmaState {
@@ -1366,6 +1369,7 @@ pub mod pragma {
                 raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
                 mvcc_max_chain_length: 64,
                 mvcc_writer_lease_secs: 30,
+                writable_schema: false,
             }
         }
     }
