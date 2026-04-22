@@ -510,7 +510,7 @@ fn main() {
     );
 
     println!(
-        "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
+        "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
     );
     for &n in &opts.threads {
         if n == 0 {
@@ -527,7 +527,11 @@ fn main() {
         let time_ratio = if cs_ms > 0.0 { fs_ms / cs_ms } else { 0.0 };
 
         println!(
-            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {:>14.2} | {:>14.2} | {:>14.2} | {:>13.2} | {:>13.2} | {:>13.2} | {time_ratio:>10.2}x | {:>14} | {:>13}",
+            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {:>15.0} | {:>15.0} | {:>14.0} | {:>14.0} | {:>14.2} | {:>14.2} | {:>14.2} | {:>13.2} | {:>13.2} | {:>13.2} | {time_ratio:>10.2}x | {:>14} | {:>13}",
+            fs.p95_writes_per_sec(),
+            fs.p99_writes_per_sec(),
+            cs.p95_writes_per_sec(),
+            cs.p99_writes_per_sec(),
             fs_ms,
             fs.p95_elapsed_ms(),
             fs.p99_elapsed_ms(),
