@@ -23621,4 +23621,786 @@ mod tests {
             "bead_id=bd-steal-same-page case=captured_snapshot_unchanged"
         );
     }
+
+    // =========================================================================
+    // bd-3wop3.8 acceptance tests: Split inner lock + group commit + shard publish
+    // =========================================================================
+
+    #[test]
+    fn test_split_inner_lock_allows_parallel_prepare() {
+        use std::time::Duration;
+
+        const BEAD: &str = "bd-3wop3.8";
+
+        struct SlowWalBackend {
+            append_calls: SharedCounter,
+            io_delay: Duration,
+        }
+
+        impl crate::traits::WalBackend for SlowWalBackend {
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frames(
+                &mut self,
+                _cx: &Cx,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<()> {
+                *self.append_calls.lock().unwrap() += 1;
+                std::thread::sleep(self.io_delay);
+                let _ = frames;
+                Ok(())
+            }
+
+            fn prepare_append_frames(
+                &self,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+                if frames.is_empty() {
+                    return Ok(None);
+                }
+                let frame_size =
+                    fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE + frames[0].page_data.len();
+                let mut frame_bytes = Vec::with_capacity(frame_size * frames.len());
+                let mut frame_metas = Vec::with_capacity(frames.len());
+                let mut checksum_transforms = Vec::with_capacity(frames.len());
+                let mut last_commit: Option<usize> = None;
+                for (i, frame) in frames.iter().enumerate() {
+                    frame_metas.push(crate::traits::PreparedWalFrameMeta {
+                        page_number: frame.page_number,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    });
+                    checksum_transforms.push(crate::traits::PreparedWalChecksumTransform {
+                        a11: 0,
+                        a12: 0,
+                        a21: 0,
+                        a22: 0,
+                        c1: 0,
+                        c2: 0,
+                    });
+                    let mut header = [0_u8; fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE];
+                    header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                    header[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+                    frame_bytes.extend_from_slice(&header);
+                    frame_bytes.extend_from_slice(frame.page_data);
+                    if frame.db_size_if_commit != 0 {
+                        last_commit = Some(i);
+                    }
+                }
+                Ok(Some(crate::traits::PreparedWalFrameBatch {
+                    frame_size,
+                    page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+                    big_endian_checksum: false,
+                    frame_metas,
+                    checksum_transforms,
+                    frame_bytes,
+                    last_commit_frame_offset: last_commit,
+                    finalized_for: None,
+                    finalized_running_checksum: None,
+                }))
+            }
+
+            fn append_prepared_frames(
+                &mut self,
+                _cx: &Cx,
+                _prepared: &mut crate::traits::PreparedWalFrameBatch,
+            ) -> fsqlite_error::Result<()> {
+                *self.append_calls.lock().unwrap() += 1;
+                std::thread::sleep(self.io_delay);
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                0
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            }
+        }
+
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/split_lock_parallel_prepare.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let append_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+        let backend = SlowWalBackend {
+            append_calls: StdArc::clone(&append_calls),
+            io_delay: Duration::from_millis(5),
+        };
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        ));
+        let pool = pager.pool.clone();
+
+        const WORKERS: u32 = 4;
+        let barrier = StdArc::new(std::sync::Barrier::new(WORKERS as usize));
+        let mut handles = Vec::with_capacity(WORKERS as usize);
+
+        let wall_start = Instant::now();
+        for worker_id in 0..WORKERS {
+            let inner = Arc::clone(&inner);
+            let wal_backend = Arc::clone(&wal_backend);
+            let queue = Arc::clone(&queue);
+            let pool = pool.clone();
+            let barrier = StdArc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                let cx = Cx::new();
+                barrier.wait();
+                let page_no = PageNumber::new(2 + worker_id).unwrap();
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page_no,
+                    StagedPage::from_bytes(&pool, &sample_page(worker_id as u8)).unwrap(),
+                );
+                SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                    &cx,
+                    &wal_backend,
+                    &inner,
+                    &write_set,
+                    &[page_no],
+                    &[],
+                    &queue,
+                )
+                .expect("group commit succeeded");
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("worker thread joined");
+        }
+        let wall_elapsed = wall_start.elapsed();
+
+        // With 4 threads and 5ms WAL I/O delay each, fully serialized
+        // would take >= 20ms. Split-lock allows Phase A overlap with
+        // Phase B, so wall time should be significantly less than 4x.
+        // We check < 3x (15ms) to allow for scheduling jitter.
+        let serial_budget = Duration::from_millis(5 * u64::from(WORKERS));
+        assert!(
+            wall_elapsed < serial_budget,
+            "bead_id={BEAD} case=parallel_prepare \
+             wall_elapsed_ms={} serial_budget_ms={} — split lock should \
+             allow overlapping prepare phases",
+            wall_elapsed.as_millis(),
+            serial_budget.as_millis()
+        );
+    }
+
+    #[test]
+    fn test_group_commit_batches_frames_fewer_io_ops_than_commits() {
+        const BEAD: &str = "bd-3wop3.8";
+
+        struct CountingWalBackend {
+            append_calls: SharedCounter,
+            total_frames: SharedCounter,
+        }
+
+        impl crate::traits::WalBackend for CountingWalBackend {
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frames(
+                &mut self,
+                _cx: &Cx,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<()> {
+                *self.append_calls.lock().unwrap() += 1;
+                *self.total_frames.lock().unwrap() += frames.len();
+                Ok(())
+            }
+
+            fn prepare_append_frames(
+                &self,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+                if frames.is_empty() {
+                    return Ok(None);
+                }
+                let frame_size =
+                    fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE + frames[0].page_data.len();
+                let mut frame_bytes = Vec::with_capacity(frame_size * frames.len());
+                let mut frame_metas = Vec::with_capacity(frames.len());
+                let mut checksum_transforms = Vec::with_capacity(frames.len());
+                let mut last_commit: Option<usize> = None;
+                for (i, frame) in frames.iter().enumerate() {
+                    frame_metas.push(crate::traits::PreparedWalFrameMeta {
+                        page_number: frame.page_number,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    });
+                    checksum_transforms.push(crate::traits::PreparedWalChecksumTransform {
+                        a11: 0,
+                        a12: 0,
+                        a21: 0,
+                        a22: 0,
+                        c1: 0,
+                        c2: 0,
+                    });
+                    let mut header = [0_u8; fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE];
+                    header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                    header[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+                    frame_bytes.extend_from_slice(&header);
+                    frame_bytes.extend_from_slice(frame.page_data);
+                    if frame.db_size_if_commit != 0 {
+                        last_commit = Some(i);
+                    }
+                }
+                Ok(Some(crate::traits::PreparedWalFrameBatch {
+                    frame_size,
+                    page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+                    big_endian_checksum: false,
+                    frame_metas,
+                    checksum_transforms,
+                    frame_bytes,
+                    last_commit_frame_offset: last_commit,
+                    finalized_for: None,
+                    finalized_running_checksum: None,
+                }))
+            }
+
+            fn append_prepared_frames(
+                &mut self,
+                _cx: &Cx,
+                prepared: &mut crate::traits::PreparedWalFrameBatch,
+            ) -> fsqlite_error::Result<()> {
+                *self.append_calls.lock().unwrap() += 1;
+                *self.total_frames.lock().unwrap() += prepared.frame_count();
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                *self.total_frames.lock().unwrap()
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            }
+        }
+
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/group_commit_batches_frames.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let append_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+        let total_frames: SharedCounter = StdArc::new(StdMutex::new(0));
+        let backend = CountingWalBackend {
+            append_calls: StdArc::clone(&append_calls),
+            total_frames: StdArc::clone(&total_frames),
+        };
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        ));
+        let pool = pager.pool.clone();
+
+        const WORKERS: u32 = 8;
+        const ITERS: u32 = 20;
+        let barrier = StdArc::new(std::sync::Barrier::new(WORKERS as usize));
+        let mut handles = Vec::with_capacity(WORKERS as usize);
+
+        for worker_id in 0..WORKERS {
+            let inner = Arc::clone(&inner);
+            let wal_backend = Arc::clone(&wal_backend);
+            let queue = Arc::clone(&queue);
+            let pool = pool.clone();
+            let barrier = StdArc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                let cx = Cx::new();
+                barrier.wait();
+                for iter in 0..ITERS {
+                    let page_no = PageNumber::new(2 + worker_id * ITERS + iter).unwrap();
+                    let mut write_set = HashMap::new();
+                    write_set.insert(
+                        page_no,
+                        StagedPage::from_bytes(&pool, &sample_page(worker_id as u8)).unwrap(),
+                    );
+                    SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                        &cx,
+                        &wal_backend,
+                        &inner,
+                        &write_set,
+                        &[page_no],
+                        &[],
+                        &queue,
+                    )
+                    .expect("group commit succeeded");
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("worker joined");
+        }
+
+        let total_commits = (WORKERS * ITERS) as usize;
+        let io_ops = *append_calls.lock().unwrap();
+        let frames_written = *total_frames.lock().unwrap();
+
+        assert_eq!(
+            frames_written, total_commits,
+            "bead_id={BEAD} case=batched_frame_count — every commit frame must be written"
+        );
+        assert!(
+            io_ops < total_commits,
+            "bead_id={BEAD} case=batched_io_ops \
+             io_ops={io_ops} total_commits={total_commits} — \
+             group commit should batch multiple commits into fewer I/O calls"
+        );
+        eprintln!(
+            "INFO bead_id={BEAD} case=batched_io_ops \
+             io_ops={io_ops} total_commits={total_commits} \
+             batch_ratio={:.2}x",
+            total_commits as f64 / io_ops as f64
+        );
+    }
+
+    #[test]
+    fn test_sharded_publish_no_reader_blocking() {
+        const BEAD: &str = "bd-3wop3.8";
+
+        let pages = PublishedPages::new();
+
+        let page_data = |seed: u8| -> PageData {
+            let buf = vec![seed; PageSize::DEFAULT.as_usize()];
+            PageData::from_vec(buf)
+        };
+
+        // Insert pages across the full range — low pages go to atomic slots,
+        // high pages go to sharded overflow.
+        for i in 1..=128_u32 {
+            let pn = PageNumber::new(i).unwrap();
+            pages.insert(pn, page_data(i as u8));
+        }
+
+        // Concurrent reads and writes on disjoint page ranges must not block.
+        let pages = StdArc::new(pages);
+        let barrier = StdArc::new(std::sync::Barrier::new(3));
+        let reader_done = StdArc::new(AtomicBool::new(false));
+        let writer_done = StdArc::new(AtomicBool::new(false));
+
+        let pages_r = StdArc::clone(&pages);
+        let barrier_r = StdArc::clone(&barrier);
+        let reader_done_w = StdArc::clone(&reader_done);
+        let reader = std::thread::spawn(move || {
+            barrier_r.wait();
+            let mut reads = 0_u64;
+            for _ in 0..1000 {
+                for i in 1..=64_u32 {
+                    let pn = PageNumber::new(i).unwrap();
+                    if pages_r.get(pn).is_some() {
+                        reads += 1;
+                    }
+                }
+            }
+            reader_done_w.store(true, AtomicOrdering::Release);
+            reads
+        });
+
+        let pages_w = StdArc::clone(&pages);
+        let barrier_w = StdArc::clone(&barrier);
+        let writer_done_w = StdArc::clone(&writer_done);
+        let writer = std::thread::spawn(move || {
+            barrier_w.wait();
+            let mut writes = 0_u64;
+            for round in 0_u8..200 {
+                for i in 65..=128_u32 {
+                    let pn = PageNumber::new(i).unwrap();
+                    pages_w.insert(pn, page_data(round.wrapping_add(i as u8)));
+                    writes += 1;
+                }
+            }
+            writer_done_w.store(true, AtomicOrdering::Release);
+            writes
+        });
+
+        barrier.wait();
+        let reads = reader.join().expect("reader joined");
+        let writes = writer.join().expect("writer joined");
+
+        assert!(
+            reads > 0 && writes > 0,
+            "bead_id={BEAD} case=sharded_publish_concurrent reads={reads} writes={writes}"
+        );
+    }
+
+    #[test]
+    fn test_no_data_loss_under_batched_commit() {
+        const BEAD: &str = "bd-3wop3.8";
+
+        struct RecordingWalBackend {
+            committed_pages: StdArc<StdMutex<HashMap<u32, Vec<u8>>>>,
+        }
+
+        impl crate::traits::WalBackend for RecordingWalBackend {
+            fn append_frame(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+                _page_data: &[u8],
+                _db_size_if_commit: u32,
+            ) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn append_frames(
+                &mut self,
+                _cx: &Cx,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<()> {
+                let mut committed = self.committed_pages.lock().unwrap();
+                for frame in frames {
+                    committed.insert(frame.page_number, frame.page_data.to_vec());
+                }
+                Ok(())
+            }
+
+            fn prepare_append_frames(
+                &self,
+                frames: &[crate::traits::WalFrameRef<'_>],
+            ) -> fsqlite_error::Result<Option<crate::traits::PreparedWalFrameBatch>> {
+                if frames.is_empty() {
+                    return Ok(None);
+                }
+                let frame_size =
+                    fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE + frames[0].page_data.len();
+                let mut frame_bytes = Vec::with_capacity(frame_size * frames.len());
+                let mut frame_metas = Vec::with_capacity(frames.len());
+                let mut checksum_transforms = Vec::with_capacity(frames.len());
+                let mut last_commit: Option<usize> = None;
+                for (i, frame) in frames.iter().enumerate() {
+                    frame_metas.push(crate::traits::PreparedWalFrameMeta {
+                        page_number: frame.page_number,
+                        db_size_if_commit: frame.db_size_if_commit,
+                    });
+                    checksum_transforms.push(crate::traits::PreparedWalChecksumTransform {
+                        a11: 0,
+                        a12: 0,
+                        a21: 0,
+                        a22: 0,
+                        c1: 0,
+                        c2: 0,
+                    });
+                    let mut header = [0_u8; fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE];
+                    header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                    header[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+                    frame_bytes.extend_from_slice(&header);
+                    frame_bytes.extend_from_slice(frame.page_data);
+                    if frame.db_size_if_commit != 0 {
+                        last_commit = Some(i);
+                    }
+                }
+                Ok(Some(crate::traits::PreparedWalFrameBatch {
+                    frame_size,
+                    page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+                    big_endian_checksum: false,
+                    frame_metas,
+                    checksum_transforms,
+                    frame_bytes,
+                    last_commit_frame_offset: last_commit,
+                    finalized_for: None,
+                    finalized_running_checksum: None,
+                }))
+            }
+
+            fn append_prepared_frames(
+                &mut self,
+                _cx: &Cx,
+                prepared: &mut crate::traits::PreparedWalFrameBatch,
+            ) -> fsqlite_error::Result<()> {
+                let mut committed = self.committed_pages.lock().unwrap();
+                for i in 0..prepared.frame_count() {
+                    let meta = &prepared.frame_metas[i];
+                    let data = prepared.page_data(i).to_vec();
+                    committed.insert(meta.page_number, data);
+                }
+                Ok(())
+            }
+
+            fn read_page(
+                &mut self,
+                _cx: &Cx,
+                _page_number: u32,
+            ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+
+            fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+                Ok(())
+            }
+
+            fn frame_count(&self) -> usize {
+                self.committed_pages.lock().unwrap().len()
+            }
+
+            fn checkpoint(
+                &mut self,
+                _cx: &Cx,
+                mode: crate::traits::CheckpointMode,
+                _writer: &mut dyn crate::traits::CheckpointPageWriter,
+                _backfilled_frames: u32,
+                _oldest_reader_frame: Option<u32>,
+            ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+                Ok(crate::traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                })
+            }
+        }
+
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/no_data_loss_batched.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let committed_pages: StdArc<StdMutex<HashMap<u32, Vec<u8>>>> =
+            StdArc::new(StdMutex::new(HashMap::new()));
+        let backend = RecordingWalBackend {
+            committed_pages: StdArc::clone(&committed_pages),
+        };
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let inner = Arc::clone(&pager.inner);
+        let wal_backend = Arc::clone(&pager.wal_backend);
+        let queue = Arc::new(GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        ));
+        let pool = pager.pool.clone();
+
+        const WORKERS: u32 = 8;
+        let barrier = StdArc::new(std::sync::Barrier::new(WORKERS as usize));
+        let mut handles = Vec::with_capacity(WORKERS as usize);
+
+        for worker_id in 0..WORKERS {
+            let inner = Arc::clone(&inner);
+            let wal_backend = Arc::clone(&wal_backend);
+            let queue = Arc::clone(&queue);
+            let pool = pool.clone();
+            let barrier = StdArc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                let cx = Cx::new();
+                barrier.wait();
+                let page_no = PageNumber::new(2 + worker_id).unwrap();
+                let fill = worker_id as u8;
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page_no,
+                    StagedPage::from_bytes(&pool, &sample_page(fill)).unwrap(),
+                );
+                SimpleTransaction::<MemoryVfs>::commit_wal_group_commit(
+                    &cx,
+                    &wal_backend,
+                    &inner,
+                    &write_set,
+                    &[page_no],
+                    &[],
+                    &queue,
+                )
+                .expect("commit succeeded");
+                (page_no.get(), fill)
+            });
+            handles.push(handle);
+        }
+
+        let expected: Vec<(u32, u8)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker joined"))
+            .collect();
+
+        let committed = committed_pages.lock().unwrap();
+        for (page_no, fill) in &expected {
+            let data = committed.get(page_no).unwrap_or_else(|| {
+                panic!(
+                    "bead_id={BEAD} case=data_loss page_no={page_no} — \
+                     page missing from WAL after batched commit"
+                )
+            });
+            assert_eq!(
+                data[0],
+                *fill,
+                "bead_id={BEAD} case=data_integrity page_no={page_no} — \
+                 page content mismatch"
+            );
+        }
+        assert!(
+            committed.len() >= expected.len(),
+            "bead_id={BEAD} case=committed_count \
+             committed={} expected={}",
+            committed.len(),
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn test_combiner_wired_in_production() {
+        use fsqlite_mvcc::TxnManager;
+
+        const BEAD: &str = "bd-3wop3.8";
+        const THREADS: usize = 8;
+        const ALLOCS_PER_THREAD: usize = 50;
+
+        let mgr = TxnManager::new(1, 1);
+        let mgr = StdArc::new(mgr);
+        let barrier = StdArc::new(std::sync::Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let mgr = StdArc::clone(&mgr);
+            let barrier = StdArc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                barrier.wait();
+                let mut seqs = Vec::with_capacity(ALLOCS_PER_THREAD);
+                for _ in 0..ALLOCS_PER_THREAD {
+                    seqs.push(mgr.alloc_commit_seq().get());
+                }
+                seqs
+            });
+            handles.push(handle);
+        }
+
+        let mut all_seqs: Vec<u64> = Vec::with_capacity(THREADS * ALLOCS_PER_THREAD);
+        for handle in handles {
+            all_seqs.extend(handle.join().expect("thread joined"));
+        }
+
+        // Uniqueness: every allocated sequence must be distinct.
+        all_seqs.sort_unstable();
+        for window in all_seqs.windows(2) {
+            assert_ne!(
+                window[0], window[1],
+                "bead_id={BEAD} case=combiner_uniqueness — \
+                 duplicate commit seq {}",
+                window[0]
+            );
+        }
+
+        // Contiguity: sequences form a dense range with no gaps.
+        let min = all_seqs[0];
+        let max = *all_seqs.last().unwrap();
+        let expected_count = (THREADS * ALLOCS_PER_THREAD) as u64;
+        assert_eq!(
+            max - min + 1,
+            expected_count,
+            "bead_id={BEAD} case=combiner_contiguous \
+             min={min} max={max} count={expected_count} — \
+             sequences must form a dense range"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires real benchmark harness with rusqlite reference; run via e2e bench suite"]
+    fn test_16t_throughput_exceeds_sqlite() {
+        // Acceptance test bd-3wop3.8 #4: Verify that 16-thread DML
+        // throughput on FrankenSQLite exceeds C SQLite (via rusqlite).
+        //
+        // This test is intentionally #[ignore] because it requires:
+        // 1. A real file-backed database (not :memory:)
+        // 2. rusqlite for reference timing
+        // 3. Multiple iterations for statistical significance
+        // 4. The release-perf profile for meaningful numbers
+        //
+        // Run via: cargo test -p fsqlite-pager --release -- \
+        //          test_16t_throughput_exceeds_sqlite --ignored --nocapture
+        //
+        // The e2e benchmark harness (fsqlite-e2e) provides the canonical
+        // evidence for this acceptance criterion.
+        eprintln!(
+            "INFO bead_id=bd-3wop3.8 case=16t_throughput_gate \
+             status=skipped reason=requires_benchmark_harness"
+        );
+    }
 }

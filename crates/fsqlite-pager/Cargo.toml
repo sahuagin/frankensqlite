@@ -43,6 +43,7 @@ asupersync.workspace = true
 proptest = { workspace = true }
 tempfile = { workspace = true }
 blake3 = { workspace = true }
+fsqlite-mvcc = { path = "../fsqlite-mvcc", version = "0.1" }
 fsqlite-wal = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
