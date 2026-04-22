@@ -32,7 +32,10 @@ pub use connection_pool::{
     best_practices as connection_pool_best_practices, simulate_connection_pool,
     validate_connection_pool,
 };
-pub use page_cache::PageCacheEfficiencySnapshot;
+pub use page_cache::{
+    PageCacheEfficiencyAssessment, PageCacheEfficiencyLevel, PageCacheEfficiencySnapshot,
+    PageCachePressureLevel,
+};
 
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/connection-pooling.md")]
