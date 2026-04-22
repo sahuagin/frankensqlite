@@ -1578,6 +1578,18 @@ mod tests {
     }
 
     #[test]
+    fn io_uring_generic_fallback_preserves_operation_split() {
+        let metrics = IoUringLatencyMetrics::new(4);
+
+        metrics.record_unix_fallback();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.unix_fallbacks_total, 1);
+        assert_eq!(snapshot.read_unix_fallbacks_total, 0);
+        assert_eq!(snapshot.write_unix_fallbacks_total, 0);
+    }
+
+    #[test]
     fn io_uring_latency_conformal_upper_bound_is_tail_safe() {
         let metrics = IoUringLatencyMetrics::new(16);
         let mut saw_violation = false;
