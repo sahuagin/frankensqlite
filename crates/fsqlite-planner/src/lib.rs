@@ -2472,6 +2472,17 @@ fn extract_access_path_probe(
                         upper: hi_bound,
                     });
                 }
+                if matches!(term.kind, WhereTermKind::Between) {
+                    if let Expr::Between { low, high, not, .. } = term.expr {
+                        if !not {
+                            return Some(AccessPathProbe::Range {
+                                column: col.column.clone(),
+                                lower: Some((Box::new(low.as_ref().clone()), true)),
+                                upper: Some((Box::new(high.as_ref().clone()), true)),
+                            });
+                        }
+                    }
+                }
                 if !matches!(term.kind, WhereTermKind::Range) {
                     continue;
                 }
@@ -10013,5 +10024,60 @@ mod probe_tests {
             probe: None,
         };
         assert!(extract_access_path_probe(&ap, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn extract_probe_between_as_inclusive_range() {
+        let between_expr: &'static Expr = Box::leak(Box::new(Expr::Between {
+            expr: Box::new(Expr::Column(ColumnRef::bare("age"), Span::ZERO)),
+            low: Box::new(Expr::Literal(Literal::Integer(18), Span::ZERO)),
+            high: Box::new(Expr::Literal(Literal::Integer(65), Span::ZERO)),
+            not: false,
+            span: Span::ZERO,
+        }));
+        let terms = [WhereTerm {
+            expr: between_expr,
+            column: Some(WhereColumn {
+                table: None,
+                column: "age".to_owned(),
+            }),
+            kind: WhereTermKind::Between,
+        }];
+        let indexes = [IndexInfo {
+            name: "idx_age".to_owned(),
+            table: "t".to_owned(),
+            columns: vec!["age".to_owned()],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanRange { selectivity: 0.1 },
+            index: Some("idx_age".to_owned()),
+            estimated_cost: 10.0,
+            estimated_rows: 100.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        match &probe {
+            Some(AccessPathProbe::Range {
+                column,
+                lower,
+                upper,
+            }) => {
+                assert_eq!(column, "age");
+                let (lo_expr, lo_inc) = lower.as_ref().expect("expected lower bound");
+                assert_eq!(**lo_expr, Expr::Literal(Literal::Integer(18), Span::ZERO));
+                assert!(lo_inc, "BETWEEN lower bound must be inclusive");
+                let (hi_expr, hi_inc) = upper.as_ref().expect("expected upper bound");
+                assert_eq!(**hi_expr, Expr::Literal(Literal::Integer(65), Span::ZERO));
+                assert!(hi_inc, "BETWEEN upper bound must be inclusive");
+            }
+            other => panic!("expected Range probe from Between, got {other:?}"),
+        }
     }
 }
