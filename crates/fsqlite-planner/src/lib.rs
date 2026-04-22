@@ -494,6 +494,12 @@ pub enum AccessPathProbe {
         lower: Option<(Box<Expr>, bool)>,
         upper: Option<(Box<Expr>, bool)>,
     },
+    /// `WHERE <column> IN (<v1>, <v2>, ...)` backed by an index — one seek per
+    /// value.
+    InList {
+        column: String,
+        values: Vec<Box<Expr>>,
+    },
 }
 
 /// A concrete access path chosen by the planner.
@@ -2405,17 +2411,27 @@ fn extract_access_path_probe(
                 .iter()
                 .find(|i| i.name.eq_ignore_ascii_case(index_name))?;
             let leading_col = idx.columns.first()?;
-            let term = where_terms.iter().find(|t| {
+            if let Some(term) = where_terms.iter().find(|t| {
                 matches!(t.kind, WhereTermKind::Equality)
                     && t.column
                         .as_ref()
                         .is_some_and(|c| c.column.eq_ignore_ascii_case(leading_col))
-            })?;
-            let target = extract_comparison_operand(term.expr)?;
-            Some(AccessPathProbe::Equality {
-                column: leading_col.clone(),
-                target: Box::new(target),
-            })
+            }) {
+                let target = extract_comparison_operand(term.expr)?;
+                return Some(AccessPathProbe::Equality {
+                    column: leading_col.clone(),
+                    target: Box::new(target),
+                });
+            }
+            if let Some(term) = where_terms.iter().find(|t| {
+                matches!(t.kind, WhereTermKind::InList { .. })
+                    && t.column
+                        .as_ref()
+                        .is_some_and(|c| c.column.eq_ignore_ascii_case(leading_col))
+            }) {
+                return extract_in_list_probe(term.expr, leading_col);
+            }
+            None
         }
         AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. } => {
             let index_name = best.index.as_deref()?;
@@ -2493,6 +2509,25 @@ fn extract_access_path_probe(
             }
         }
     }
+}
+
+fn extract_in_list_probe(expr: &Expr, column: &str) -> Option<AccessPathProbe> {
+    if let Expr::In {
+        set: InSet::List(items),
+        not: false,
+        ..
+    } = expr
+    {
+        let values: Vec<Box<Expr>> = items.iter().map(|item| Box::new(item.clone())).collect();
+        if values.is_empty() {
+            return None;
+        }
+        return Some(AccessPathProbe::InList {
+            column: column.to_owned(),
+            values,
+        });
+    }
+    None
 }
 
 /// Extract a pure trailing-wildcard prefix from a GLOB pattern (e.g.
@@ -9770,6 +9805,113 @@ mod probe_tests {
             }
             other => panic!("expected Range probe, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extract_probe_in_list() {
+        let in_expr = Expr::In {
+            expr: col("status"),
+            set: InSet::List(vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(2), Span::ZERO),
+                Expr::Literal(Literal::Integer(3), Span::ZERO),
+            ]),
+            not: false,
+            span: Span::ZERO,
+        };
+        let terms = [WhereTerm {
+            expr: &in_expr,
+            column: Some(WhereColumn {
+                table: None,
+                column: "status".to_owned(),
+            }),
+            kind: WhereTermKind::InList { count: 3 },
+        }];
+        let indexes = [IndexInfo {
+            name: "idx_status".to_owned(),
+            table: "t".to_owned(),
+            columns: vec!["status".to_owned()],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanEquality,
+            index: Some("idx_status".to_owned()),
+            estimated_cost: 15.0,
+            estimated_rows: 30.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        match &probe {
+            Some(AccessPathProbe::InList { column, values }) => {
+                assert_eq!(column, "status");
+                assert_eq!(values.len(), 3);
+                assert_eq!(*values[0], Expr::Literal(Literal::Integer(1), Span::ZERO));
+                assert_eq!(*values[2], Expr::Literal(Literal::Integer(3), Span::ZERO));
+            }
+            other => panic!("expected InList probe, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_probe_in_list_prefers_equality_over_in() {
+        let eq_expression = eq_expr("status", 5);
+        let in_expr = Expr::In {
+            expr: col("status"),
+            set: InSet::List(vec![
+                Expr::Literal(Literal::Integer(1), Span::ZERO),
+                Expr::Literal(Literal::Integer(5), Span::ZERO),
+            ]),
+            not: false,
+            span: Span::ZERO,
+        };
+        let terms = [
+            WhereTerm {
+                expr: &eq_expression,
+                column: Some(WhereColumn {
+                    table: None,
+                    column: "status".to_owned(),
+                }),
+                kind: WhereTermKind::Equality,
+            },
+            WhereTerm {
+                expr: &in_expr,
+                column: Some(WhereColumn {
+                    table: None,
+                    column: "status".to_owned(),
+                }),
+                kind: WhereTermKind::InList { count: 2 },
+            },
+        ];
+        let indexes = [IndexInfo {
+            name: "idx_status".to_owned(),
+            table: "t".to_owned(),
+            columns: vec!["status".to_owned()],
+            unique: false,
+            n_pages: 1,
+            source: StatsSource::Heuristic,
+            partial_where: None,
+            expression_columns: vec![],
+        }];
+        let ap = AccessPath {
+            table: "t".to_owned(),
+            kind: AccessPathKind::IndexScanEquality,
+            index: Some("idx_status".to_owned()),
+            estimated_cost: 5.0,
+            estimated_rows: 1.0,
+            time_travel: None,
+            probe: None,
+        };
+        let probe = extract_access_path_probe(&ap, &indexes, &terms);
+        assert!(
+            matches!(&probe, Some(AccessPathProbe::Equality { .. })),
+            "equality should be preferred when both equality and IN terms exist"
+        );
     }
 
     #[test]
