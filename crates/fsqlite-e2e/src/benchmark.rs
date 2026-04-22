@@ -1500,7 +1500,12 @@ mod tests {
         PLACEMENT_PROFILE_BASELINE_UNPINNED, build_benchmark_artifact_manifest,
         expand_beads_benchmark_campaign, load_beads_benchmark_campaign,
     };
-    use crate::report::CorrectnessReport;
+    use crate::report::{
+        BtreeRuntimeHotPathProfile, CorrectnessReport, HotPathRetryBreakdown,
+        HotPathRetryKindBreakdown, HotPathRetryPhaseBreakdown, HotPathValueHistogram,
+        ParserHotPathProfile, ResultRowHotPathProfile, VdbeHotPathProfile, VfsHotPathProfile,
+        WalHotPathProfile,
+    };
 
     fn dummy_report(wall_ms: u64, ops: u64) -> EngineRunReport {
         #[allow(clippy::cast_precision_loss)]
@@ -2061,5 +2066,221 @@ mod tests {
                 .iter()
                 .any(|finding| finding.contains("fsqlite_single_writer row is missing"))
         );
+    }
+
+    fn sample_hot_path_profile() -> FsqliteHotPathProfile {
+        FsqliteHotPathProfile {
+            collection_mode: "test".to_owned(),
+            parser: ParserHotPathProfile {
+                tokenize_tokens_total: 500,
+                tokenize_calls_total: 42,
+                tokenize_duration_sum_micros: 1200,
+                parsed_statements_total: 20,
+                semantic_errors_total: 0,
+            },
+            vdbe: VdbeHotPathProfile {
+                actual_opcodes_executed_total: 8_000,
+                actual_statements_total: 20,
+                actual_statement_duration_us_total: 5_000,
+                ..VdbeHotPathProfile::default()
+            },
+            vfs: VfsHotPathProfile {
+                read_ops: 150,
+                write_ops: 75,
+                ..VfsHotPathProfile::default()
+            },
+            wal: WalHotPathProfile {
+                frames_written_total: 30,
+                group_commits_total: 5,
+                ..WalHotPathProfile::default()
+            },
+            decoded_values: HotPathValueHistogram::default(),
+            workload_input_types: HotPathValueHistogram::default(),
+            result_rows: ResultRowHotPathProfile::default(),
+            allocator_pressure: None,
+            btree: Some(BtreeRuntimeHotPathProfile {
+                seek_total: 200,
+                insert_total: 100,
+                delete_total: 10,
+                page_splits_total: 3,
+                swiss_probes_total: 50,
+                swizzle_faults_total: 0,
+                swizzle_in_total: 0,
+                swizzle_out_total: 0,
+            }),
+            runtime_retry: HotPathRetryBreakdown {
+                total_retries: 2,
+                total_aborts: 0,
+                kind: HotPathRetryKindBreakdown {
+                    busy: 1,
+                    busy_snapshot: 1,
+                    busy_recovery: 0,
+                    busy_other: 0,
+                },
+                phase: HotPathRetryPhaseBreakdown::default(),
+                max_batch_attempts: 2,
+                top_snapshot_conflict_pages: Vec::new(),
+                last_busy_message: None,
+            },
+            statement_hotspots: Vec::new(),
+        }
+    }
+
+    fn dummy_report_with_hot_path(wall_ms: u64, ops: u64) -> EngineRunReport {
+        let mut report = dummy_report(wall_ms, ops);
+        report.hot_path_profile = Some(sample_hot_path_profile());
+        report
+    }
+
+    #[test]
+    fn mode_specific_counters_populated_from_hot_path_profile() {
+        let config = fast_config();
+        let fsqlite_meta = BenchmarkMeta {
+            engine: "fsqlite".to_owned(),
+            ..test_meta()
+        };
+        let summary = run_benchmark(&config, &fsqlite_meta, |_| {
+            Ok::<_, String>(dummy_report_with_hot_path(100, 1_000))
+        });
+        assert!(
+            summary.aggregated_hot_path.is_some(),
+            "run_benchmark should capture the last iteration's hot_path_profile"
+        );
+
+        let metadata = BenchmarkComparisonMetadata::anonymous(&summary, "fsqlite_mvcc");
+
+        assert_eq!(
+            comparable_counter_ids(&metadata).as_slice(),
+            BENCHMARK_COMPARABLE_COUNTER_IDS,
+            "comparable counters must be unchanged"
+        );
+
+        let mode_ids: Vec<&str> = metadata
+            .counter_schema
+            .mode_specific
+            .iter()
+            .map(|m| m.counter_id.as_str())
+            .collect();
+        assert!(
+            mode_ids.contains(&MODE_SPECIFIC_COUNTER_VDBE_OPCODES),
+            "should contain VDBE opcodes counter"
+        );
+        assert!(
+            mode_ids.contains(&MODE_SPECIFIC_COUNTER_BTREE_SEEKS),
+            "should contain B-tree seeks counter"
+        );
+        assert!(
+            mode_ids.contains(&MODE_SPECIFIC_COUNTER_WAL_FRAMES),
+            "should contain WAL frames counter"
+        );
+        assert!(
+            mode_ids.len() >= 9,
+            "should have at least 9 mode-specific counters (9 base + 3 btree), got {}",
+            mode_ids.len()
+        );
+    }
+
+    #[test]
+    fn cross_mode_rows_mechanically_comparable_without_custom_translation() {
+        let config = fast_config();
+
+        let sqlite_summary = run_benchmark(&config, &test_meta(), |_| {
+            Ok::<_, String>(dummy_report(100, 1_000))
+        });
+        let mvcc_summary = run_benchmark(
+            &config,
+            &BenchmarkMeta {
+                engine: "fsqlite".to_owned(),
+                ..test_meta()
+            },
+            |_| Ok::<_, String>(dummy_report_with_hot_path(80, 1_000)),
+        );
+        let sw_summary = run_benchmark(
+            &config,
+            &BenchmarkMeta {
+                engine: "fsqlite".to_owned(),
+                ..test_meta()
+            },
+            |_| Ok::<_, String>(dummy_report_with_hot_path(90, 1_000)),
+        );
+
+        let sqlite_meta =
+            BenchmarkComparisonMetadata::anonymous(&sqlite_summary, "sqlite_reference");
+        let mvcc_meta = BenchmarkComparisonMetadata::anonymous(&mvcc_summary, "fsqlite_mvcc");
+        let sw_meta =
+            BenchmarkComparisonMetadata::anonymous(&sw_summary, "fsqlite_single_writer");
+
+        let sqlite_comparable_ids = comparable_counter_ids(&sqlite_meta);
+        let mvcc_comparable_ids = comparable_counter_ids(&mvcc_meta);
+        let sw_comparable_ids = comparable_counter_ids(&sw_meta);
+        assert_eq!(
+            sqlite_comparable_ids, mvcc_comparable_ids,
+            "comparable counter ids must be identical across SQLite and MVCC"
+        );
+        assert_eq!(
+            mvcc_comparable_ids, sw_comparable_ids,
+            "comparable counter ids must be identical across MVCC and single-writer"
+        );
+
+        assert!(
+            sqlite_meta.counter_schema.mode_specific.is_empty(),
+            "SQLite reference should have no mode-specific counters"
+        );
+        assert!(
+            !mvcc_meta.counter_schema.mode_specific.is_empty(),
+            "MVCC with hot-path should have mode-specific counters"
+        );
+        assert!(
+            !sw_meta.counter_schema.mode_specific.is_empty(),
+            "single-writer with hot-path should have mode-specific counters"
+        );
+
+        let mvcc_mode_ids: Vec<&str> = mvcc_meta
+            .counter_schema
+            .mode_specific
+            .iter()
+            .map(|m| m.counter_id.as_str())
+            .collect();
+        let sw_mode_ids: Vec<&str> = sw_meta
+            .counter_schema
+            .mode_specific
+            .iter()
+            .map(|m| m.counter_id.as_str())
+            .collect();
+        assert_eq!(
+            mvcc_mode_ids, sw_mode_ids,
+            "FrankenSQLite mode-specific counter ids must be identical across MVCC and single-writer"
+        );
+
+        for mode in [&sqlite_meta, &mvcc_meta, &sw_meta] {
+            assert!(
+                !mode.row_identity.fixture_id.is_empty(),
+                "row_identity.fixture_id must be present"
+            );
+            assert!(
+                !mode.row_identity.workload.is_empty(),
+                "row_identity.workload must be present"
+            );
+            assert!(
+                !mode.row_identity.mode_id.is_empty(),
+                "row_identity.mode_id must be present"
+            );
+            assert!(
+                !mode.row_identity.build_profile_id.is_empty(),
+                "row_identity.build_profile_id must be present"
+            );
+        }
+
+        let json_sqlite = serde_json::to_value(&sqlite_meta).unwrap();
+        let json_mvcc = serde_json::to_value(&mvcc_meta).unwrap();
+        let json_sw = serde_json::to_value(&sw_meta).unwrap();
+        for json_row in [&json_sqlite, &json_mvcc, &json_sw] {
+            let obj = json_row.as_object().unwrap();
+            assert!(obj.contains_key("row_identity"));
+            assert!(obj.contains_key("counter_schema"));
+            let cs = obj["counter_schema"].as_object().unwrap();
+            assert!(cs.contains_key("comparable"));
+            assert!(cs.contains_key("mode_specific"));
+        }
     }
 }
