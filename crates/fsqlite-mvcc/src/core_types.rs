@@ -2073,6 +2073,8 @@ const FAST_COMMIT_ARRAY_SIZE: usize = 65536;
 /// HashMap probe + RwLock release + reader-count decrement.  The flat array
 /// replaces this with 1 atomic load.
 pub struct CommitIndex {
+    /// Highest commit sequence published through this index.
+    latest_global: AtomicU64,
     /// O(1) atomic read/write for small page numbers.
     /// Index `i` stores the raw `CommitSeq` value for page `i + 1`.
     /// Value 0 means no committed version exists.
@@ -2088,6 +2090,7 @@ impl CommitIndex {
             .map(|_| AtomicU64::new(0))
             .collect();
         Self {
+            latest_global: AtomicU64::new(0),
             fast_array: fast_array.into_boxed_slice(),
             shards: Box::new(std::array::from_fn(|_| {
                 CacheAligned::new(LeftRightCommitIndexShard::new())
@@ -2107,6 +2110,7 @@ impl CommitIndex {
             seq.get() != 0,
             "CommitIndex::update called with CommitSeq(0); the flat array uses 0 as empty sentinel"
         );
+        self.latest_global.fetch_max(seq.get(), Ordering::Release);
         let pgno = page.get() as usize;
         if pgno <= FAST_COMMIT_ARRAY_SIZE {
             // O(1) atomic write to flat array — this is the hot path.
@@ -2141,6 +2145,7 @@ impl CommitIndex {
             return;
         }
         let raw = seq.get();
+        self.latest_global.fetch_max(raw, Ordering::Release);
 
         // Issue a single Release fence upfront.  After this fence, all
         // prior writes on this thread (version-store publishes, page-data
@@ -2185,6 +2190,18 @@ impl CommitIndex {
         shard.latest(page)
     }
 
+    /// Highest commit sequence published through any page in the index.
+    #[inline]
+    #[must_use]
+    pub fn latest_seq(&self) -> Option<CommitSeq> {
+        let raw = self.latest_global.load(Ordering::Acquire);
+        if raw == 0 {
+            None
+        } else {
+            Some(CommitSeq::new(raw))
+        }
+    }
+
     #[allow(clippy::unused_self)]
     fn shard_index(&self, page: PageNumber) -> usize {
         (page.get() as usize) & (LOCK_TABLE_SHARDS - 1)
@@ -2210,6 +2227,7 @@ impl std::fmt::Debug for CommitIndex {
             .field("sharded_page_count", &sharded_pages)
             .field("fast_array_populated", &fast_populated)
             .field("fast_array_capacity", &self.fast_array.len())
+            .field("latest_global", &self.latest_global.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -3484,9 +3502,11 @@ mod tests {
 
         index.update(page, CommitSeq::new(5));
         assert_eq!(index.latest(page), Some(CommitSeq::new(5)));
+        assert_eq!(index.latest_seq(), Some(CommitSeq::new(5)));
 
         index.update(page, CommitSeq::new(10));
         assert_eq!(index.latest(page), Some(CommitSeq::new(10)));
+        assert_eq!(index.latest_seq(), Some(CommitSeq::new(10)));
     }
 
     #[test]
@@ -3575,6 +3595,7 @@ mod tests {
 
         assert_eq!(index.latest(fast_page), Some(seq));
         assert_eq!(index.latest(sharded_page), Some(seq));
+        assert_eq!(index.latest_seq(), Some(seq));
     }
 
     #[test]
