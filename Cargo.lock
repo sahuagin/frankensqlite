@@ -921,6 +921,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "proptest",
  "serde",
+ "smallvec",
  "tracing",
  "xxhash-rust",
 ]

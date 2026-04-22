@@ -34,10 +34,13 @@ use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
 use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
+use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::cell::RefCell;
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
 use std::sync::{Arc, Mutex, OnceLock};
+use xxhash_rust::xxh3::xxh3_64;
 
 /// OPT-1: process-wide shared default `CollationRegistry`.
 ///
@@ -551,6 +554,8 @@ struct StackEntry {
     /// bd-perf (V1.1): Vec instead of Box<[u16]> — eliminates the
     /// Box::from(Vec) reallocation+copy on every page load.
     cell_pointers: Vec<u16>,
+    /// Page-image mutation signature for validating cached cell-slot parses.
+    mutation_counter: u32,
     /// Current cell index. For interior pages, this indicates which child
     /// was descended into. For leaf pages, this is the current position.
     /// A value equal to `cell_count` means "past the right-most child" on
@@ -563,6 +568,98 @@ struct StackEntry {
 // ---------------------------------------------------------------------------
 
 const TABLE_SEEK_CACHE_SLOTS: usize = 4;
+const CELL_SLOT_CACHE_ENTRIES: usize = 64;
+
+type CachedCellSlots = SmallVec<[CachedCellSlot; 32]>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedCellSlot {
+    left_child: Option<PageNumber>,
+    rowid: Option<i64>,
+    payload_size: u32,
+    local_size: u32,
+    payload_offset: usize,
+    overflow_page: Option<PageNumber>,
+}
+
+impl CachedCellSlot {
+    fn from_cell_ref(cell: &CellRef) -> Self {
+        Self {
+            left_child: cell.left_child,
+            rowid: cell.rowid,
+            payload_size: cell.payload_size,
+            local_size: cell.local_size,
+            payload_offset: cell.payload_offset,
+            overflow_page: cell.overflow_page,
+        }
+    }
+
+    fn into_cell_ref(self) -> CellRef {
+        CellRef {
+            left_child: self.left_child,
+            rowid: self.rowid,
+            payload_size: self.payload_size,
+            local_size: self.local_size,
+            payload_offset: self.payload_offset,
+            overflow_page: self.overflow_page,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellSlotCacheEntry {
+    page_no: PageNumber,
+    mutation_counter: u32,
+    slots: CachedCellSlots,
+}
+
+#[derive(Debug, Default)]
+struct CellSlotCache {
+    entries: Vec<CellSlotCacheEntry>,
+}
+
+impl CellSlotCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    fn get(
+        &mut self,
+        page_no: PageNumber,
+        mutation_counter: u32,
+        cell_idx: u16,
+    ) -> Option<CachedCellSlot> {
+        let entry_idx = self.entries.iter().position(|entry| {
+            entry.page_no == page_no && entry.mutation_counter == mutation_counter
+        })?;
+        let slot = self.entries[entry_idx]
+            .slots
+            .get(usize::from(cell_idx))
+            .copied()?;
+        if entry_idx != 0 {
+            let entry = self.entries.remove(entry_idx);
+            self.entries.insert(0, entry);
+        }
+        Some(slot)
+    }
+
+    fn insert(&mut self, page_no: PageNumber, mutation_counter: u32, slots: CachedCellSlots) {
+        if let Some(existing_idx) = self.entries.iter().position(|entry| {
+            entry.page_no == page_no && entry.mutation_counter == mutation_counter
+        }) {
+            self.entries.remove(existing_idx);
+        }
+        self.entries.insert(
+            0,
+            CellSlotCacheEntry {
+                page_no,
+                mutation_counter,
+                slots,
+            },
+        );
+        self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TableSeekCacheEntry {
@@ -732,6 +829,15 @@ pub struct BtCursor<P> {
     /// repopulated from the live cell pointer array. Eliminates the per-
     /// `remove_cell_from_leaf` allocation (N * 24 bytes for N cells).
     defrag_cells_scratch: Vec<(usize, usize, usize)>,
+    /// PERF-W5-1: LRU cache of parsed cell slots keyed by page and page-image
+    /// mutation signature.
+    ///
+    /// Non-append INSERTs repeatedly binary-search the same leaf page and used
+    /// to pay `CellRef::parse` for the same slot across probes. Cache entries
+    /// are tied to the loaded page image's mutation signature, so page splits,
+    /// merges, defragmentation, and freeblock rewrites naturally miss after the
+    /// page bytes change.
+    cell_slot_cache: RefCell<CellSlotCache>,
     /// Last rowid successfully inserted via `table_insert`.
     ///
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
@@ -780,6 +886,7 @@ impl<P> BtCursor<P> {
         self.rightmost_leaf_cache = None;
         self.last_known_depth = None;
         self.seek_cache.fill(None);
+        self.cell_slot_cache.get_mut().clear();
         self.bump_row_image_epoch();
     }
 
@@ -837,6 +944,7 @@ impl<P> BtCursor<P> {
             self.usable_size
         );
         self.page_size = page_size;
+        self.cell_slot_cache.get_mut().clear();
     }
 
     fn clear_seek_cache(&mut self) {
@@ -849,6 +957,15 @@ impl<P> BtCursor<P> {
 
     fn bump_row_image_epoch(&mut self) {
         self.row_image_epoch = self.row_image_epoch.wrapping_add(1);
+    }
+
+    fn page_mutation_counter(&self, page_data: &PageData) -> u32 {
+        let page = page_data.as_bytes();
+        let hash_len = page.len().min(self.usable_size as usize);
+        let hash = xxh3_64(&page[..hash_len]);
+        #[allow(clippy::cast_possible_truncation)]
+        let folded = (hash ^ (hash >> 32)) as u32;
+        folded.max(1)
     }
 
     fn is_on_rightmost_insert_edge(&self) -> bool {
@@ -1228,6 +1345,7 @@ impl<P: PageReader> BtCursor<P> {
             cell_buf: Vec::new(),
             defrag_ptrs_scratch: Vec::new(),
             defrag_cells_scratch: Vec::new(),
+            cell_slot_cache: RefCell::new(CellSlotCache::default()),
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
             last_known_depth: None,
@@ -1448,7 +1566,8 @@ impl<P: PageReader> BtCursor<P> {
         // Stack: (page_no, next_cell_idx, cell_count, right_child, header_size).
         // Zero-allocation hot path: reads page data + header only, no Vec<u16>
         // cell_pointers per page.
-        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>, usize)> = Vec::new();
+        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>, usize)> =
+            Vec::with_capacity(8);
         let mut total: i64 = 0;
         let mut current_page = self.root_page;
 
@@ -1733,12 +1852,14 @@ impl<P: PageReader> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let mutation_counter = self.page_mutation_counter(&page_data);
 
         Ok(StackEntry {
             page_no,
             page_data,
             header,
             cell_pointers,
+            mutation_counter,
             cell_idx: 0,
         })
     }
@@ -1755,13 +1876,35 @@ impl<P: PageReader> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let mutation_counter = self.page_mutation_counter(&page_data);
         Ok(StackEntry {
             page_no,
             page_data,
             header,
             cell_pointers,
+            mutation_counter,
             cell_idx: 0,
         })
+    }
+
+    fn build_cached_cell_slots(&self, entry: &StackEntry) -> Result<CachedCellSlots> {
+        let mut slots = CachedCellSlots::with_capacity(usize::from(entry.header.cell_count));
+        for idx in 0..entry.header.cell_count {
+            let idx_usize = usize::from(idx);
+            let offset = if idx_usize < entry.cell_pointers.len() {
+                usize::from(entry.cell_pointers[idx_usize])
+            } else {
+                usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+            };
+            let cell = CellRef::parse(
+                entry.page_data.as_bytes(),
+                offset,
+                entry.header.page_type,
+                self.usable_size,
+            )?;
+            slots.push(CachedCellSlot::from_cell_ref(&cell));
+        }
+        Ok(slots)
     }
 
     /// Parse a cell at the given index on the top-of-stack page.
@@ -1774,23 +1917,27 @@ impl<P: PageReader> BtCursor<P> {
                 ),
             });
         }
-        let idx_usize = idx as usize;
-        // Prefer the cached pointer when the stack entry has it materialised
-        // (the common case after `load_page`). Descent-only paths may skip
-        // materialising `cell_pointers` to save work; fall back to reading
-        // the pointer inline from page bytes so we never mis-bound against a
-        // cleared scratch Vec.
-        let offset = if idx_usize < entry.cell_pointers.len() {
-            usize::from(entry.cell_pointers[idx_usize])
-        } else {
-            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
-        };
-        CellRef::parse(
-            entry.page_data.as_bytes(),
-            offset,
-            entry.header.page_type,
-            self.usable_size,
-        )
+
+        if let Some(slot) =
+            self.cell_slot_cache
+                .borrow_mut()
+                .get(entry.page_no, entry.mutation_counter, idx)
+        {
+            return Ok(slot.into_cell_ref());
+        }
+
+        let slots = self.build_cached_cell_slots(entry)?;
+        let slot =
+            slots
+                .get(usize::from(idx))
+                .copied()
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("cached cell index {} out of bounds ({})", idx, slots.len()),
+                })?;
+        self.cell_slot_cache
+            .borrow_mut()
+            .insert(entry.page_no, entry.mutation_counter, slots);
+        Ok(slot.into_cell_ref())
     }
 
     /// Move the cursor to the first entry in the subtree rooted at `page_no`.
@@ -2673,13 +2820,7 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, mid)?);
-            let cell = CellRef::parse(
-                entry.page_data.as_bytes(),
-                cell_offset,
-                entry.header.page_type,
-                self.usable_size,
-            )?;
+            let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
             let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
 
@@ -3206,12 +3347,14 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
+                let mutation_counter = self.page_mutation_counter(&cached.page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
                     page_data: cached.page_data.clone(),
                     header: cached.header,
                     cell_pointers: cached.cell_pointers.clone(),
+                    mutation_counter,
                     cell_idx,
                 });
                 self.at_eof = false;
@@ -5624,12 +5767,14 @@ impl<P: PageWriter> BtCursor<P> {
             cached.cell_pointers.push(new_cell_offset);
             let stack_page_data = cached.page_data.clone();
             let stack_cell_pointers = cached.cell_pointers.clone();
+            let mutation_counter = self.page_mutation_counter(&stack_page_data);
             self.stack.clear();
             self.stack.push(StackEntry {
                 page_no: cached.page_no,
                 page_data: stack_page_data,
                 header: cached.header,
                 cell_pointers: stack_cell_pointers,
+                mutation_counter,
                 cell_idx: insert_idx,
             });
             self.at_eof = false;
@@ -5663,12 +5808,14 @@ impl<P: PageWriter> BtCursor<P> {
                 cached.cell_pointers.push(new_cell_offset);
                 let stack_page_data = cached.page_data.clone();
                 let stack_cell_pointers = cached.cell_pointers.clone();
+                let mutation_counter = self.page_mutation_counter(&stack_page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
                     page_data: stack_page_data,
                     header: cached.header,
                     cell_pointers: stack_cell_pointers,
+                    mutation_counter,
                     cell_idx: insert_idx,
                 });
                 self.at_eof = false;
@@ -5871,6 +6018,7 @@ impl<P: PageWriter> BtCursor<P> {
         )? {
             let cell_pointers =
                 cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+            let mutation_counter = self.page_mutation_counter(&page_data);
             self.last_insert_rowid = Some(rowid);
             self.stack.clear();
             self.stack.push(StackEntry {
@@ -5878,6 +6026,7 @@ impl<P: PageWriter> BtCursor<P> {
                 page_data: page_data.clone(),
                 header,
                 cell_pointers: cell_pointers.clone(),
+                mutation_counter,
                 cell_idx: insert_idx,
             });
             self.at_eof = false;
@@ -5913,6 +6062,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(Some((insert_idx, _))) => {
                 let cell_pointers =
                     cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+                let mutation_counter = self.page_mutation_counter(&page_data);
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
                 self.stack.clear();
@@ -5921,6 +6071,7 @@ impl<P: PageWriter> BtCursor<P> {
                     page_data: page_data.clone(),
                     header,
                     cell_pointers: cell_pointers.clone(),
+                    mutation_counter,
                     cell_idx: insert_idx,
                 });
                 self.at_eof = false;
@@ -8106,11 +8257,11 @@ mod tests {
 
         // Build cells from the end of the page.
         let mut cell_end = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(entries.len());
 
         for &(rowid, payload) in entries {
             // Cell: [payload_size varint] [rowid varint] [payload]
-            let mut cell = Vec::new();
+            let mut cell = Vec::with_capacity(payload.len() + 18);
             let mut vbuf = [0u8; 9];
             let n = write_varint(&mut vbuf, payload.len() as u64);
             cell.extend_from_slice(&vbuf[..n]);
@@ -8142,6 +8293,85 @@ mod tests {
         }
 
         page
+    }
+
+    fn stack_cell_cache_matches_fresh_parse<P: PageWriter>(
+        cursor: &BtCursor<P>,
+    ) -> std::result::Result<(), String> {
+        for entry in &cursor.stack {
+            for idx in 0..entry.header.cell_count {
+                let cached = cursor.parse_cell_at(entry, idx).map_err(|err| {
+                    format!(
+                        "cached parse failed for page {} cell {idx}: {err}",
+                        entry.page_no
+                    )
+                })?;
+                let cell_offset = usize::from(
+                    BtCursor::<P>::read_stack_entry_cell_pointer_inline(entry, idx).map_err(
+                        |err| {
+                            format!(
+                                "fresh pointer read failed for page {} cell {idx}: {err}",
+                                entry.page_no
+                            )
+                        },
+                    )?,
+                );
+                let fresh = CellRef::parse(
+                    entry.page_data.as_bytes(),
+                    cell_offset,
+                    entry.header.page_type,
+                    cursor.usable_size,
+                )
+                .map_err(|err| {
+                    format!(
+                        "fresh parse failed for page {} cell {idx} at offset {cell_offset}: {err}",
+                        entry.page_no
+                    )
+                })?;
+                if CachedCellSlot::from_cell_ref(&cached) != CachedCellSlot::from_cell_ref(&fresh) {
+                    return Err(format!(
+                        "cached cell slot diverged from fresh parse for page {} cell {idx}",
+                        entry.page_no
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_cell_slot_cache_invalidation_tracks_page_image_mutation() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(root.get(), build_leaf_table(&[(1, b"one"), (2, b"two")]));
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        let first_entry = cursor.load_page(&cx, root).unwrap();
+        let first_cell = cursor.parse_cell_at(&first_entry, 0).unwrap();
+        assert_eq!(first_cell.rowid, Some(1));
+        let first_counter = first_entry.mutation_counter;
+        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+
+        let second_cell = cursor.parse_cell_at(&first_entry, 1).unwrap();
+        assert_eq!(second_cell.rowid, Some(2));
+        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+
+        cursor
+            .pager
+            .write_page(
+                &cx,
+                root,
+                &build_leaf_table(&[(10, b"ten"), (20, b"twenty")]),
+            )
+            .unwrap();
+        let mutated_entry = cursor.reload_page_fresh(&cx, root).unwrap();
+        assert_ne!(mutated_entry.mutation_counter, first_counter);
+        let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
+        assert_eq!(mutated_cell.rowid, Some(10));
+        assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
     }
 
     #[test]
@@ -8261,11 +8491,11 @@ mod tests {
         let header_size = 12usize; // interior
 
         let mut cell_end = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(children.len());
 
         for &(left_child, rowid) in children {
             // Interior table cell: [left_child: u32 BE] [rowid: varint]
-            let mut cell = Vec::new();
+            let mut cell = Vec::with_capacity(13);
             cell.extend_from_slice(&left_child.get().to_be_bytes());
             let mut vbuf = [0u8; 9];
             #[allow(clippy::cast_sign_loss)]
@@ -8306,11 +8536,11 @@ mod tests {
         let header_size = 12usize; // interior
 
         let mut cell_end = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(children.len());
 
         for &(left_child, key) in children {
             // Interior index cell: [left_child: u32 BE] [payload_size varint] [payload]
-            let mut cell = Vec::new();
+            let mut cell = Vec::with_capacity(4 + 9 + key.len());
             cell.extend_from_slice(&left_child.get().to_be_bytes());
             let mut vbuf = [0u8; 9];
             let n = write_varint(&mut vbuf, key.len() as u64);
@@ -8347,10 +8577,10 @@ mod tests {
         let header_size = 8usize; // leaf
 
         let mut cell_end = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(entries.len());
 
         for &key in entries {
-            let mut cell = Vec::new();
+            let mut cell = Vec::with_capacity(9 + key.len());
             let mut vbuf = [0u8; 9];
             let n = write_varint(&mut vbuf, key.len() as u64);
             cell.extend_from_slice(&vbuf[..n]);
@@ -13212,6 +13442,50 @@ mod tests {
                         target
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn prop_cell_slot_cache_matches_fresh_parse_after_random_mutations(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=300_i64, proptest::collection::vec(proptest::num::u8::ANY, 0..64))
+                        .prop_map(|(rowid, payload)| (true, rowid, payload)),
+                    1 => (1..=300_i64,).prop_map(|(rowid,)| (false, rowid, Vec::new())),
+                ],
+                1..120
+            )
+        ) {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = MemPageStore::with_empty_table(root, USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), root, USABLE, true);
+            let mut reference = BTreeMap::<i64, Vec<u8>>::new();
+
+            for (is_insert, rowid, payload) in ops {
+                if is_insert {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        reference.entry(rowid)
+                    {
+                        cursor.table_insert(&cx, rowid, &payload).unwrap();
+                        entry.insert(payload);
+                    }
+                } else if reference.contains_key(&rowid) {
+                    let seek = cursor.table_move_to(&cx, rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(&rowid);
+                    }
+                }
+
+                if let Some(target) = reference.keys().next().copied() {
+                    cursor.table_move_to(&cx, target).unwrap();
+                } else {
+                    cursor.first(&cx).unwrap();
+                }
+
+                stack_cell_cache_matches_fresh_parse(&cursor)
+                    .map_err(proptest::test_runner::TestCaseError::fail)?;
             }
         }
 
