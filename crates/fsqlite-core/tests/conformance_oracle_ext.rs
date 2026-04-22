@@ -32283,7 +32283,7 @@ fn test_conformance_fk_cascade_3_plus_levels_s76c() {
         "CREATE TABLE stores (id INTEGER PRIMARY KEY, region_id INTEGER NOT NULL REFERENCES regions(id) ON DELETE CASCADE, name TEXT NOT NULL)",
         "CREATE TABLE employees (id INTEGER PRIMARY KEY, store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE, name TEXT NOT NULL)",
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE, amount REAL NOT NULL)",
-        // Seed with single-row inserts to avoid multi-row INSERT issues
+        "BEGIN",
         "INSERT INTO regions VALUES (1, 'North')",
         "INSERT INTO regions VALUES (2, 'South')",
         "INSERT INTO stores VALUES (10, 1, 'Store-A')",
@@ -32302,6 +32302,7 @@ fn test_conformance_fk_cascade_3_plus_levels_s76c() {
         "INSERT INTO sales VALUES (6, 300, 150.0)",
         "INSERT INTO sales VALUES (7, 301, 80.0)",
         "INSERT INTO sales VALUES (8, 301, 90.0)",
+        "COMMIT",
     ] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();

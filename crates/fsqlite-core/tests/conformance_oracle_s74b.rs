@@ -528,10 +528,9 @@ fn test_conformance_trigger_after_insert_update_s74aq() {
 fn test_conformance_insert_returning_s74ar() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &["CREATE TABLE s74ar_t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER DEFAULT 0)"] {
-        fconn.execute(s).unwrap();
-        rconn.execute_batch(s).unwrap();
-    }
+    let s = "CREATE TABLE s74ar_t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER DEFAULT 0)";
+    fconn.execute(s).unwrap();
+    rconn.execute_batch(s).unwrap();
     let queries = &[
         "INSERT INTO s74ar_t(name, score) VALUES('Alice', 95) RETURNING id, name, score",
         "INSERT INTO s74ar_t(name) VALUES('Bob') RETURNING *",

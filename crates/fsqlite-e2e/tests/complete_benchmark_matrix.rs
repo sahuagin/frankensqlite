@@ -515,6 +515,8 @@ fn sample_benchmark_summary(
             median_ops_per_sec: throughput_ops_per_sec,
             peak_ops_per_sec: throughput_ops_per_sec * 1.02,
         },
+        comparison: None,
+        aggregated_hot_path: None,
         iterations: vec![IterationRecord {
             iteration: 0,
             wall_time_ms: 10,
@@ -524,7 +526,6 @@ fn sample_benchmark_summary(
             aborts: 0,
             error: None,
         }],
-        comparison: None,
     }
 }
 

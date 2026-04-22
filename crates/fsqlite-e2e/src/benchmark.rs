@@ -2207,8 +2207,7 @@ mod tests {
         let sqlite_meta =
             BenchmarkComparisonMetadata::anonymous(&sqlite_summary, "sqlite_reference");
         let mvcc_meta = BenchmarkComparisonMetadata::anonymous(&mvcc_summary, "fsqlite_mvcc");
-        let sw_meta =
-            BenchmarkComparisonMetadata::anonymous(&sw_summary, "fsqlite_single_writer");
+        let sw_meta = BenchmarkComparisonMetadata::anonymous(&sw_summary, "fsqlite_single_writer");
 
         let sqlite_comparable_ids = comparable_counter_ids(&sqlite_meta);
         let mvcc_comparable_ids = comparable_counter_ids(&mvcc_meta);
