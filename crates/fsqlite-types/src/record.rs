@@ -1289,10 +1289,9 @@ where
     let header_size = header.template.len();
     let total_capacity = header_size + header.max_body_size;
     buf.clear();
-    buf.resize(total_capacity, 0);
-    buf[..header_size].copy_from_slice(&header.template);
+    buf.reserve(total_capacity);
+    buf.extend_from_slice(&header.template);
 
-    let mut body_offset = header_size;
     let mut value_iter = values;
     for slot in &header.slots {
         let Some(value) = value_iter.next() else {
@@ -1304,15 +1303,12 @@ where
         if slot.kind.needs_runtime_patch() {
             buf[slot.header_offset] = serial_byte;
         }
-        let end = body_offset + payload_len;
-        encode_serialized_value(value, payload_len, &mut buf[body_offset..end]);
-        body_offset = end;
+        append_serialized_value(value, payload_len, buf);
     }
     if value_iter.next().is_some() {
         return false;
     }
 
-    buf.truncate(body_offset);
     true
 }
 
@@ -2049,6 +2045,31 @@ fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u
             buf.copy_from_slice(b);
         }
     }
+}
+
+fn append_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut Vec<u8>) {
+    let start_len = buf.len();
+    match value {
+        SqliteValue::Null => {} // serial type 0: no data
+        SqliteValue::Integer(i) => {
+            if payload_len != 0 {
+                let bytes = i.to_be_bytes();
+                buf.extend_from_slice(&bytes[8 - payload_len..]);
+            }
+        }
+        SqliteValue::Float(f) => {
+            if !f.is_nan() {
+                buf.extend_from_slice(&f.to_bits().to_be_bytes());
+            }
+        }
+        SqliteValue::Text(s) => {
+            buf.extend_from_slice(s.as_bytes());
+        }
+        SqliteValue::Blob(b) => {
+            buf.extend_from_slice(b);
+        }
+    }
+    debug_assert_eq!(buf.len() - start_len, payload_len);
 }
 
 #[cfg(test)]
