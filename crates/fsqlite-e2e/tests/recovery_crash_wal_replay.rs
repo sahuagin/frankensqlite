@@ -17,6 +17,7 @@ use serde_json::json;
 use tempfile::tempdir;
 
 const SCENARIO_COMPLETENESS_BEAD_ID: &str = "bd-mblr.4";
+const PHASE5_RECOVERY_BEAD_ID: &str = "bd-1okty";
 const SCENARIO_COMPLETENESS_SEED: u64 = 0x006D_626C_722E_3401;
 const SCENARIO_COMPLETENESS_REPLAY: &str =
     "cargo test -p fsqlite-e2e --test recovery_crash_wal_replay -- --nocapture --test-threads=1";
@@ -84,6 +85,11 @@ fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &
 
     let fsqlite =
         Connection::open(db_path.to_string_lossy().as_ref()).expect("open recovered fsqlite db");
+    let concurrent_mode_default = fsqlite.is_concurrent_mode_default();
+    assert!(
+        concurrent_mode_default,
+        "[{label}] recovered FrankenSQLite connection must keep concurrent mode enabled by default"
+    );
     let f_rows = ordered_values_fsqlite(&fsqlite);
     assert_eq!(
         f_rows, expected,
@@ -92,6 +98,17 @@ fn assert_recovered_rows_match_oracle(db_path: &Path, expected: &[i64], label: &
     assert_eq!(
         f_rows, c_rows,
         "[{label}] recovered logical rows differed between FrankenSQLite and stock SQLite"
+    );
+    emit_phase5_recovery_log(
+        label,
+        json!({
+            "row_count": f_rows.len(),
+            "expected_row_count": expected.len(),
+            "fsqlite_concurrent_mode_default": concurrent_mode_default,
+            "stock_sqlite_integrity_checked": true,
+            "logical_rows_match": true,
+            "storage_mode": "wal_crash_replay"
+        }),
     );
 }
 
@@ -104,6 +121,20 @@ fn emit_crash_replay_log(test_name: &str, phase: &str, extra: serde_json::Value)
             "replay_command": SCENARIO_COMPLETENESS_REPLAY,
             "test_name": test_name,
             "phase": phase,
+            "extra": extra
+        })
+    );
+}
+
+fn emit_phase5_recovery_log(scenario_id: &str, extra: serde_json::Value) {
+    eprintln!(
+        "PHASE5_RECOVERY_EVIDENCE:{}",
+        json!({
+            "bead_id": PHASE5_RECOVERY_BEAD_ID,
+            "run_id": format!("{PHASE5_RECOVERY_BEAD_ID}-{scenario_id}"),
+            "scenario_id": scenario_id,
+            "seed": SCENARIO_COMPLETENESS_SEED,
+            "replay_command": SCENARIO_COMPLETENESS_REPLAY,
             "extra": extra
         })
     );
