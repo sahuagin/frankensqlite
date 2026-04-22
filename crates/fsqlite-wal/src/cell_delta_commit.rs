@@ -195,7 +195,8 @@ pub fn build_cell_delta_frames<I>(
 where
     I: Iterator<Item = CellDeltaDescriptor>,
 {
-    let mut frames = Vec::new();
+    let (lower, _) = deltas.size_hint();
+    let mut frames = Vec::with_capacity(lower);
 
     for desc in deltas {
         let frame = CellDeltaWalFrame::new(

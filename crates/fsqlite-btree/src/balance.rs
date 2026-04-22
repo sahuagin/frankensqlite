@@ -537,9 +537,9 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     }
 
     // Read all sibling pages and gather cells.
-    let mut all_cells: Vec<GatheredCell> = Vec::new();
-    let mut sibling_types: Vec<BtreePageType> = Vec::new();
-    let mut old_right_children: Vec<Option<PageNumber>> = Vec::new();
+    let mut all_cells: Vec<GatheredCell> = Vec::with_capacity(sibling_count * 32);
+    let mut sibling_types: Vec<BtreePageType> = Vec::with_capacity(sibling_count);
+    let mut old_right_children: Vec<Option<PageNumber>> = Vec::with_capacity(sibling_count);
     let mut original_sibling_pages: Vec<(PageNumber, PageData)> = Vec::with_capacity(sibling_count);
 
     for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
@@ -691,7 +691,8 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     }
 
     // Populate new pages and collect divider info for parent.
-    let mut new_dividers: Vec<(PageNumber, Vec<u8>)> = Vec::new();
+    let mut new_dividers: Vec<(PageNumber, Vec<u8>)> =
+        Vec::with_capacity(new_page_count.saturating_sub(1));
     let mut pending_page_writes: Vec<(PageNumber, Vec<u8>, Option<PageData>)> =
         Vec::with_capacity(new_page_count);
     let mut cell_cursor = 0usize;
@@ -1468,7 +1469,7 @@ fn compute_interior_distribution(
         return Ok(vec![0]);
     }
 
-    let mut distribution: Vec<usize> = Vec::new();
+    let mut distribution: Vec<usize> = Vec::with_capacity(cells.len().div_ceil(64).max(1));
     let mut cursor = 0usize;
 
     while cursor < total_cells {
@@ -1794,7 +1795,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     let old_divider_count = old_sibling_count.saturating_sub(1);
 
     // Collect cells to keep: everything except the old dividers.
-    let mut kept_cells: Vec<GatheredCell> = Vec::new();
+    let mut kept_cells: Vec<GatheredCell> =
+        Vec::with_capacity(ptrs.len().saturating_sub(old_divider_count));
 
     for (i, &ptr) in ptrs.iter().enumerate() {
         if i >= first_child && i < first_child + old_divider_count {
@@ -2658,7 +2660,7 @@ mod tests {
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
         let mut content_offset = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(entries.len());
 
         for &(rowid, payload) in entries {
             let mut cell_buf = [0u8; 256];
@@ -2716,7 +2718,7 @@ mod tests {
     fn build_interior_table(cells: &[(PageNumber, i64)], right_child: PageNumber) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
         let mut content_offset = USABLE as usize;
-        let mut cell_offsets: Vec<u16> = Vec::new();
+        let mut cell_offsets: Vec<u16> = Vec::with_capacity(cells.len());
 
         for &(left_child, rowid) in cells {
             let mut cell_buf = [0u8; 64];

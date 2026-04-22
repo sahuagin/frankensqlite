@@ -955,6 +955,7 @@ impl GroupCommitQueue {
         }
 
         self.signal_completed_epoch_waiters(epoch, wake_next_epoch);
+        self.prune_stale_epoch_metadata(epoch);
     }
 
     /// Publish a failed epoch and wake all waiters.
@@ -973,6 +974,26 @@ impl GroupCommitQueue {
         failed_epochs.insert(epoch, GroupCommitEpochFailure::from_error(error));
         drop(failed_epochs);
         self.signal_failed_epoch_waiters(epoch, wake_next_epoch);
+    }
+
+    /// Evict epoch metadata older than `current_epoch - RETENTION` from
+    /// both the failure and persisted-trace maps.
+    fn prune_stale_epoch_metadata(&self, current_epoch: u64) {
+        const RETENTION: u64 = 128;
+        let cutoff = current_epoch.saturating_sub(RETENTION);
+        if cutoff == 0 {
+            return;
+        }
+        self.failed_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|&epoch, _| epoch > cutoff);
+        if group_commit_trace_enabled() {
+            self.persisted_epochs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|&epoch, _| epoch > cutoff);
+        }
     }
 
     /// Check if a given epoch has completed (for waiters).
@@ -24376,6 +24397,38 @@ mod tests {
             "bead_id={BEAD} case=combiner_contiguous \
              min={min} max={max} count={expected_count} — \
              sequences must form a dense range"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_epoch_maps_bounded_under_sustained_load() {
+        const BEAD: &str = "bd-vn2ea";
+        let queue = GroupCommitQueue::with_parallel_wal_control(
+            GroupCommitConfig::default(),
+            ParallelWalControlSurface::default(),
+        );
+
+        let total_epochs: u64 = 500;
+        for epoch in 1..=total_epochs {
+            let error = FrankenError::Busy;
+            queue.publish_failed_epoch(epoch, &error, false);
+            queue.publish_completed_epoch(epoch, false);
+        }
+
+        let failed_len = queue
+            .failed_epochs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        assert!(
+            failed_len <= 128,
+            "bead_id={BEAD} case=epoch_map_gc \
+             failed_epochs_len={failed_len} max=128 — \
+             stale epoch metadata should be pruned"
+        );
+        eprintln!(
+            "INFO bead_id={BEAD} case=epoch_map_gc \
+             failed_epochs_len={failed_len} total_epochs={total_epochs}"
         );
     }
 

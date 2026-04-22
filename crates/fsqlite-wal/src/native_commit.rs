@@ -190,7 +190,7 @@ impl GroupCommitBatch {
 
     /// Drain all fully-committed entries (both fsyncs complete).
     fn drain_committed(&mut self) -> Vec<(CommitSubmission, CommitSeq, u64)> {
-        let mut committed = Vec::new();
+        let mut committed = Vec::with_capacity(self.pending.len());
         while let Some(front) = self.pending.front() {
             if front.barriers.all_complete() {
                 let pc = self.pending.pop_front().expect("checked non-empty");
@@ -475,7 +475,7 @@ impl WriteCoordinator {
     ///
     /// Returns the markers that were appended.
     pub fn append_markers_and_fsync2(&mut self) -> Vec<CommitMarker> {
-        let mut markers = Vec::new();
+        let mut markers = Vec::with_capacity(self.batch.pending.len());
 
         for pc in &mut self.batch.pending {
             if pc.barriers.fsync1_complete && !pc.barriers.fsync2_complete {
@@ -612,7 +612,8 @@ impl WriteCoordinator {
 
     /// Derive a deterministic ObjectId for a CommitProof.
     fn derive_proof_object_id(proof: &CommitProof) -> ObjectId {
-        let mut canonical = Vec::new();
+        let mut canonical =
+            Vec::with_capacity(16 + 8 + proof.edges.len() * 16 + proof.evidence_refs.len() * 32);
         canonical.extend_from_slice(b"fsqlite:proof:v1");
         canonical.extend_from_slice(&proof.commit_seq.get().to_le_bytes());
         for edge in &proof.edges {
