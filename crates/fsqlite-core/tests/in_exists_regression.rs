@@ -712,3 +712,91 @@ fn test_large_not_in_null_above_threshold() {
         "99 NOT IN (1..20, NULL) must be NULL"
     );
 }
+
+/// bd-1dp9.6.2: Direct MemDB fast path for
+/// `SELECT COUNT(*) FROM table WHERE col IN (SELECT ...)`.
+///
+/// After IN-subquery rewriting, the connection-level evaluator
+/// can bypass VDBE bytecode and scan MemDB rows directly with a
+/// HashSet probe, avoiding per-row VDBE interpretation overhead.
+#[test]
+fn test_count_star_in_list_fast_path_correctness() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, category_id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE categories(id INTEGER PRIMARY KEY, label TEXT)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO categories VALUES({i}, 'cat{i}')"))
+            .unwrap();
+    }
+    for i in 1..=1000 {
+        let cat = (i % 10) + 1;
+        conn.execute(&format!(
+            "INSERT INTO products VALUES({i}, {cat}, 'prod{i}')"
+        ))
+        .unwrap();
+    }
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(500),
+        "500 products have category_id in 1..=5"
+    );
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id = 1)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(100),
+        "100 products have category_id = 1"
+    );
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id > 100)")
+        .unwrap();
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Integer(0),
+        "no products match a category_id > 100"
+    );
+}
+
+/// bd-1dp9.6.2: Verify the fast path completes well within budget.
+/// Pre-B2 IN catastrophe at 10K rows was >3 seconds; the direct
+/// MemDB scan should finish in single-digit milliseconds.
+#[test]
+fn guard_count_star_in_subquery_completes_within_budget() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, tag INTEGER)")
+        .unwrap();
+    conn.execute("CREATE TABLE tags(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    for i in 1..=10 {
+        conn.execute(&format!("INSERT INTO tags VALUES({i})"))
+            .unwrap();
+    }
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=10_000 {
+        let tag = (i % 10) + 1;
+        conn.execute(&format!("INSERT INTO items VALUES({i}, {tag})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let budget = std::time::Duration::from_millis(500);
+    let start = std::time::Instant::now();
+    let rows = conn
+        .query("SELECT COUNT(*) FROM items WHERE tag IN (SELECT id FROM tags WHERE id <= 5)")
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(rows[0].values()[0], SqliteValue::Integer(5000));
+    assert!(
+        elapsed < budget,
+        "COUNT(*) WHERE IN (SELECT ...) over 10K rows took {elapsed:?}, budget {budget:?}"
+    );
+}
