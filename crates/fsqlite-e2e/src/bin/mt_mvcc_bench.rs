@@ -24,13 +24,13 @@
 //! Output is a tab-separated table suitable for grepping / redirection:
 //!
 //! ```text
-//! threads | fsqlite_wps | sqlite_wps | ratio
-//!       1 | 12345       | 23456      | 0.53x
-//!       2 | 22000       | 40000      | 0.55x
+//! threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_ms_p50 | ...
+//!       1 | 12345       | 23456      | 0.53x            | 81.00          | ...
 //! ```
 //!
-//! `ratio = fsqlite_wps / sqlite_wps`. Values above 1.0x mean FrankenSQLite
-//! is faster than C SQLite WAL under equal multi-threaded load.
+//! `throughput_ratio = fsqlite_wps / sqlite_wps`. Values above 1.0x mean
+//! FrankenSQLite is faster than C SQLite WAL under equal multi-threaded load.
+//! `time_ratio = fsqlite_batch_ms / sqlite_batch_ms`; lower is better.
 //!
 //! ## CLI
 //!
@@ -49,7 +49,7 @@
 //!   to `MAX_RETRIES`; hard failures are counted in `failed_rows` and
 //!   included in the report so you can tell when the numbers are bogus.
 //! * Each iteration creates a fresh tempfile so there's no state carried
-//!   across runs. `--iters=3` reports the best (min wall-clock) of 3.
+//!   across runs. `--iters=3` reports p50/p95/p99 across those 3 samples.
 
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -168,6 +168,73 @@ impl RunResult {
             n / secs
         }
     }
+
+    fn elapsed_ms(&self) -> f64 {
+        self.best_elapsed.as_secs_f64() * 1_000.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunStats {
+    samples: Vec<RunResult>,
+}
+
+impl RunStats {
+    fn new(samples: Vec<RunResult>) -> Self {
+        Self { samples }
+    }
+
+    fn total_failed_rows(&self) -> usize {
+        self.samples.iter().map(|sample| sample.failed_rows).sum()
+    }
+
+    fn p50_writes_per_sec(&self) -> f64 {
+        self.percentile_by(RunResult::writes_per_sec, 0.50)
+    }
+
+    fn p95_writes_per_sec(&self) -> f64 {
+        self.percentile_by(RunResult::writes_per_sec, 0.95)
+    }
+
+    fn p99_writes_per_sec(&self) -> f64 {
+        self.percentile_by(RunResult::writes_per_sec, 0.99)
+    }
+
+    fn p50_elapsed_ms(&self) -> f64 {
+        self.percentile_by(RunResult::elapsed_ms, 0.50)
+    }
+
+    fn p95_elapsed_ms(&self) -> f64 {
+        self.percentile_by(RunResult::elapsed_ms, 0.95)
+    }
+
+    fn p99_elapsed_ms(&self) -> f64 {
+        self.percentile_by(RunResult::elapsed_ms, 0.99)
+    }
+
+    fn percentile_by(&self, value: fn(&RunResult) -> f64, percentile: f64) -> f64 {
+        let values = self.samples.iter().map(value).collect();
+        percentile_value(values, percentile)
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    if values.len() == 1 {
+        return values[0];
+    }
+    let rank = percentile.clamp(0.0, 1.0) * (values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return values[lower];
+    }
+    let fraction = rank - lower as f64;
+    values[lower] + ((values[upper] - values[lower]) * fraction)
 }
 
 // ─── FrankenSQLite workload ──────────────────────────────────────────────
@@ -425,15 +492,12 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize) -> RunResult {
 
 // ─── Driver ───────────────────────────────────────────────────────────────
 
-fn best_of<F: FnMut() -> RunResult>(iters: usize, mut f: F) -> RunResult {
-    let mut best = f();
-    for _ in 1..iters {
-        let r = f();
-        if r.best_elapsed < best.best_elapsed {
-            best = r;
-        }
+fn collect_samples<F: FnMut() -> RunResult>(iters: usize, mut f: F) -> RunStats {
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        samples.push(f());
     }
-    best
+    RunStats::new(samples)
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -445,31 +509,33 @@ fn main() {
         opts.rows_per_thread, opts.threads, opts.iters,
     );
 
-    println!("threads | fsqlite_wps | sqlite_wps | ratio");
+    println!(
+        "threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed"
+    );
     for &n in &opts.threads {
         if n == 0 {
             continue;
         }
-        let fs = best_of(opts.iters, || run_fsqlite(n, opts.rows_per_thread));
-        let cs = best_of(opts.iters, || run_rusqlite(n, opts.rows_per_thread));
+        let fs = collect_samples(opts.iters, || run_fsqlite(n, opts.rows_per_thread));
+        let cs = collect_samples(opts.iters, || run_rusqlite(n, opts.rows_per_thread));
 
-        let fs_wps = fs.writes_per_sec();
-        let cs_wps = cs.writes_per_sec();
-        let ratio = if cs_wps > 0.0 { fs_wps / cs_wps } else { 0.0 };
-
-        let fs_fail_note = if fs.failed_rows > 0 {
-            format!(" (failed={})", fs.failed_rows)
-        } else {
-            String::new()
-        };
-        let cs_fail_note = if cs.failed_rows > 0 {
-            format!(" (failed={})", cs.failed_rows)
-        } else {
-            String::new()
-        };
+        let fs_wps = fs.p50_writes_per_sec();
+        let cs_wps = cs.p50_writes_per_sec();
+        let throughput_ratio = if cs_wps > 0.0 { fs_wps / cs_wps } else { 0.0 };
+        let fs_ms = fs.p50_elapsed_ms();
+        let cs_ms = cs.p50_elapsed_ms();
+        let time_ratio = if cs_ms > 0.0 { fs_ms / cs_ms } else { 0.0 };
 
         println!(
-            "{n:>7} | {fs_wps:>11.0}{fs_fail_note} | {cs_wps:>10.0}{cs_fail_note} | {ratio:.2}x"
+            "{n:>7} | {fs_wps:>11.0} | {cs_wps:>10.0} | {throughput_ratio:>16.2}x | {:>14.2} | {:>14.2} | {:>14.2} | {:>13.2} | {:>13.2} | {:>13.2} | {time_ratio:>10.2}x | {:>14} | {:>13}",
+            fs_ms,
+            fs.p95_elapsed_ms(),
+            fs.p99_elapsed_ms(),
+            cs_ms,
+            cs.p95_elapsed_ms(),
+            cs.p99_elapsed_ms(),
+            fs.total_failed_rows(),
+            cs.total_failed_rows()
         );
     }
 }
