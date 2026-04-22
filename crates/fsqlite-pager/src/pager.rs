@@ -21069,11 +21069,14 @@ mod tests {
             final_bytes.as_slice(),
             "bead_id={TRACK_U_BEAD_ID} case=double_write_keeps_last_page_image"
         );
-        // bd-3wop3.8 (0a3e90fb): db_growth no longer emits a synthetic Page-1
-        // metadata frame unless the transaction explicitly dirties Page 1
-        // (schema change, VACUUM, etc.). A pure-data double-write allocates
-        // only non-Page-1 pages, so Page 1 must NOT appear in the WAL frame
-        // stream.
+        // bd-3wop3.8 (0a3e90fb) narrowed the WAL-mode Page-1 write gate in
+        // SimpleTransaction::commit to
+        //   requires_page_one_rewrite() || requires_page_count_advance()
+        // — Page 1 is only emitted when the txn explicitly dirties it
+        // (schema change, VACUUM) OR causes db_growth. This test's main
+        // transaction double-writes the SAME pre-seeded page with no
+        // allocation and no schema change, so neither gate fires and Page 1
+        // must not appear in the WAL frame stream.
         assert_eq!(
             written
                 .iter()
@@ -21083,7 +21086,7 @@ mod tests {
             "bead_id={TRACK_U_BEAD_ID} case=double_write_emits_no_synthetic_page_one_frame"
         );
 
-        track_u_log_counts("dirty_bitmap_double_write", 1, 0, page_frames.len());
+        track_u_log_counts("dirty_bitmap_double_write", 1, 1, page_frames.len());
     }
 
     #[test]
@@ -21132,10 +21135,11 @@ mod tests {
             flushed_pages, expected_pages,
             "bead_id={TRACK_U_BEAD_ID} case=commit_flushes_every_dirty_page_once"
         );
-        // bd-3wop3.8 (0a3e90fb): db_growth no longer emits a synthetic Page-1
-        // metadata frame. The test commits 100 non-Page-1 page writes with no
-        // schema changes, so Page 1 stays clean and MUST NOT appear in the
-        // WAL frame stream.
+        // See sibling test for the bd-3wop3.8 (0a3e90fb) background: in WAL
+        // mode Page 1 is only written when the commit explicitly dirties it
+        // or grows the db. The measured commit writes 100 pre-seeded pages
+        // (no allocation → no db_growth) with no schema change, so Page 1
+        // must not appear in the WAL frame stream.
         assert_eq!(
             written
                 .iter()
@@ -21929,7 +21933,10 @@ mod tests {
             current_page_two.clone(),
         );
 
-        // Truncate-checkpoint is the shrink publisher.
+        // Truncate-checkpoint is the shrink publisher. It retains pages
+        // below max_page (so page_two at offset 2 survives) and evicts
+        // page 1 + everything above max_page (so page_seven at offset 7 is
+        // swept). db_size is `store`-set to 4, not `fetch_max`'d.
         published.publish_truncate_checkpoint(
             &cx,
             PublishedPagerUpdate {
@@ -21940,21 +21947,6 @@ mod tests {
                 checkpoint_active: false,
             },
             4,
-        );
-
-        // Re-publish page_two post-truncate so it survives the sweep that
-        // truncate_checkpoint performed on every page (including page 1).
-        published.publish_insert_single(
-            &cx,
-            PublishedPagerUpdate {
-                visible_commit_seq: CommitSeq::new(9),
-                db_size: 4,
-                journal_mode: JournalMode::Wal,
-                freelist_count: 0,
-                checkpoint_active: false,
-            },
-            page_two,
-            current_page_two.clone(),
         );
 
         let stale_page_two = PageData::from_vec(sample_page(0x99));
