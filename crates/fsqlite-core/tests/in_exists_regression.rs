@@ -294,6 +294,7 @@ fn guard_large_in_subquery_completes_within_budget() {
     conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, val TEXT)")
         .unwrap();
 
+    conn.execute("BEGIN").unwrap();
     for i in 1..=1000 {
         conn.execute(&format!("INSERT INTO lookup VALUES({i})"))
             .unwrap();
@@ -302,6 +303,7 @@ fn guard_large_in_subquery_completes_within_budget() {
         conn.execute(&format!("INSERT INTO data VALUES({i}, 'v{i}')"))
             .unwrap();
     }
+    conn.execute("COMMIT").unwrap();
 
     let start = std::time::Instant::now();
     let rows = conn
@@ -331,6 +333,7 @@ fn guard_correlated_exists_completes_within_budget() {
     conn.execute("CREATE TABLE child(id INTEGER, pid INTEGER)")
         .unwrap();
 
+    conn.execute("BEGIN").unwrap();
     for i in 1..=500 {
         conn.execute(&format!("INSERT INTO parent VALUES({i})"))
             .unwrap();
@@ -344,6 +347,7 @@ fn guard_correlated_exists_completes_within_budget() {
             }
         }
     }
+    conn.execute("COMMIT").unwrap();
 
     let start = std::time::Instant::now();
     let rows = conn
@@ -374,6 +378,7 @@ fn test_direct_probe_exists_simple_correlated() {
         .unwrap();
     conn.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
+    conn.execute("BEGIN").unwrap();
     for i in 1..=100 {
         conn.execute(&format!("INSERT INTO customers VALUES({i}, 'c{i}')"))
             .unwrap();
@@ -384,6 +389,7 @@ fn test_direct_probe_exists_simple_correlated() {
         conn.execute(&format!("INSERT INTO orders VALUES({i}, {cid})"))
             .unwrap();
     }
+    conn.execute("COMMIT").unwrap();
 
     let start = std::time::Instant::now();
     let rows = conn
