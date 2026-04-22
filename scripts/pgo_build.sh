@@ -25,6 +25,7 @@
 #   PGO_DIR=/tmp/frankensqlite-pgo
 #   PGO_RUN_ID=manual-001
 #   PGO_PROFDATA=/tmp/frankensqlite-pgo/manual-001/merged.profdata
+#   PGO_LOCAL_ARTIFACT_DIR=reports/pgo-artifacts/manual-001
 #   PGO_FEATURE=pgo
 #   TRAINING_ARGS="--quick --no-html"
 #   BENCH_ARGS="--quick --no-html"
@@ -43,10 +44,8 @@ PGO_RUN_ID="${PGO_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 RUN_DIR="${PGO_DIR}/${PGO_RUN_ID}"
 PROFRAW_DIR="${RUN_DIR}/profraw"
 PROFDATA="${PGO_PROFDATA:-${RUN_DIR}/merged.profdata}"
-CARGO_TARGET_BASE="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_fsqlite_pgo}"
-BASELINE_TARGET="${CARGO_TARGET_BASE}/baseline"
-GENERATE_TARGET="${CARGO_TARGET_BASE}/pgo-generate"
-PGO_TARGET="${CARGO_TARGET_BASE}/pgo-use"
+LOCAL_ARTIFACT_DIR="${PGO_LOCAL_ARTIFACT_DIR:-${WORKSPACE_ROOT}/reports/pgo-artifacts/${PGO_RUN_ID}}"
+REQUESTED_CARGO_TARGET_BASE="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/rch_target_fsqlite_pgo}"
 PGO_FEATURE="${PGO_FEATURE:-pgo}"
 TRAINING_ARGS="${TRAINING_ARGS:---quick --no-html}"
 BENCH_ARGS="${BENCH_ARGS:---quick --no-html}"
@@ -93,6 +92,14 @@ if [[ -z "${LLVM_PROFDATA}" ]]; then
     exit 1
 fi
 
+CARGO_TARGET_BASE="${REQUESTED_CARGO_TARGET_BASE}"
+if [[ "${USE_RCH}" -eq 1 && "${REQUESTED_CARGO_TARGET_BASE}" != "${WORKSPACE_ROOT}"/* ]]; then
+    CARGO_TARGET_BASE="${LOCAL_ARTIFACT_DIR}/targets"
+fi
+BASELINE_TARGET="${CARGO_TARGET_BASE}/baseline"
+GENERATE_TARGET="${CARGO_TARGET_BASE}/pgo-generate"
+PGO_TARGET="${CARGO_TARGET_BASE}/pgo-use"
+
 CARGO_FEATURE_ARGS=()
 if [[ -n "${PGO_FEATURE}" ]]; then
     CARGO_FEATURE_ARGS=(--features "${PGO_FEATURE}")
@@ -136,6 +143,7 @@ echo "cargo_feature=${PGO_FEATURE:-<none>}"
 echo "baseline_target=${BASELINE_TARGET}"
 echo "generate_target=${GENERATE_TARGET}"
 echo "pgo_target=${PGO_TARGET}"
+echo "local_artifact_dir=${LOCAL_ARTIFACT_DIR}"
 
 echo "[0/5] Baseline build (release-perf, cargo feature gate)..."
 run_cargo "${BASELINE_TARGET}" "" \
