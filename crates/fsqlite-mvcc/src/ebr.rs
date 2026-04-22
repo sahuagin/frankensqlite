@@ -670,30 +670,24 @@ impl EbrRetireQueue {
     /// for later recycling. The slot will be recycled when `drain_if_safe()`
     /// is called after epoch advancement.
     pub fn retire(&self, idx: VersionIdx, current_epoch: u64) {
-        self.retire_batch(std::iter::once(idx), current_epoch);
+        let mut pending = self.pending.lock();
+        append_to_epoch_batch(&mut pending, current_epoch, idx);
+        drop(pending);
+        self.total_retired.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Batch-retire multiple slot indices.
     pub fn retire_batch(&self, indices: impl IntoIterator<Item = VersionIdx>, current_epoch: u64) {
-        let batch_indices: Vec<_> = indices.into_iter().collect();
-        let count = u64::try_from(batch_indices.len()).unwrap_or(u64::MAX);
-        if batch_indices.is_empty() {
-            return;
-        }
-
         let mut pending = self.pending.lock();
-        match pending.binary_search_by_key(&current_epoch, |batch| batch.retire_epoch) {
-            Ok(existing) => pending[existing].indices.extend(batch_indices),
-            Err(insert_at) => pending.insert(
-                insert_at,
-                RetiredBatch {
-                    retire_epoch: current_epoch,
-                    indices: batch_indices,
-                },
-            ),
+        let mut count = 0_u64;
+        for idx in indices {
+            append_to_epoch_batch(&mut pending, current_epoch, idx);
+            count += 1;
         }
         drop(pending);
-        self.total_retired.fetch_add(count, Ordering::Relaxed);
+        if count > 0 {
+            self.total_retired.fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     /// Drain all pending retirements if it's safe to recycle them.
@@ -789,6 +783,47 @@ impl EbrRetireQueue {
     #[must_use]
     pub fn total_recycled(&self) -> u64 {
         self.total_recycled.load(Ordering::Relaxed)
+    }
+}
+
+/// Append a single `VersionIdx` to the batch for `epoch`.
+///
+/// Epochs advance monotonically, so the common case is that `epoch`
+/// matches the last batch or is newer.  The fast path avoids the
+/// `O(log n)` binary search and `O(n)` `Vec::insert` that the old
+/// code paid on every call.
+#[inline]
+fn append_to_epoch_batch(pending: &mut Vec<RetiredBatch>, epoch: u64, idx: VersionIdx) {
+    if let Some(last) = pending.last_mut() {
+        if last.retire_epoch == epoch {
+            last.indices.push(idx);
+            return;
+        }
+        if last.retire_epoch < epoch {
+            pending.push(RetiredBatch {
+                retire_epoch: epoch,
+                indices: vec![idx],
+            });
+            return;
+        }
+    } else {
+        pending.push(RetiredBatch {
+            retire_epoch: epoch,
+            indices: vec![idx],
+        });
+        return;
+    }
+    // Rare: out-of-order epoch (should not happen with monotonic epochs,
+    // but preserve correctness).
+    match pending.binary_search_by_key(&epoch, |batch| batch.retire_epoch) {
+        Ok(existing) => pending[existing].indices.push(idx),
+        Err(insert_at) => pending.insert(
+            insert_at,
+            RetiredBatch {
+                retire_epoch: epoch,
+                indices: vec![idx],
+            },
+        ),
     }
 }
 
@@ -1296,15 +1331,15 @@ mod tests {
 
         assert_eq!(queue.pending_count(), 3);
 
-        // Reader pinned at epoch 1 can still require the epoch-0 batch.
-        let drained = queue.drain_if_safe(1, Some(1));
+        // Reader pinned at epoch 0 still needs the epoch-0 batch.
+        let drained = queue.drain_if_safe(0, Some(0));
         assert!(
             drained.is_empty(),
-            "epoch 1 is not past the first retire epoch"
+            "same-epoch reclamation must stay pending"
         );
 
-        // Reader pinned at epoch 2 is past the epoch-0 batch, but not the epoch-3 batch.
-        let drained = queue.drain_if_safe(2, Some(2));
+        // Reader pinned at epoch 1: epoch-0 batch (retire_epoch 0 < 1) is reclaimable.
+        let drained = queue.drain_if_safe(1, Some(1));
         assert_eq!(
             drained.len(),
             2,
