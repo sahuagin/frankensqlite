@@ -1202,6 +1202,7 @@ dependencies = [
  "dashmap",
  "foldhash 0.2.0",
  "fsqlite-error",
+ "fsqlite-mvcc",
  "fsqlite-observability",
  "fsqlite-types",
  "fsqlite-vfs",

@@ -2313,7 +2313,7 @@ mod tests {
 
     #[test]
     fn benchmark_honest_gate_report_marks_c1_and_persistent_rows_individually() {
-        let report = build_benchmark_honest_gate_report(&[
+        let summaries = vec![
             scorecard_summary(
                 "sqlite_reference",
                 "fixture",
@@ -2356,8 +2356,9 @@ mod tests {
                 3.0,
                 120.0,
             ),
-        ])
-        .expect("critical summaries should produce a report");
+        ];
+        let report = build_benchmark_honest_gate_report(&summaries)
+            .expect("critical summaries should produce a report");
 
         assert_eq!(report.honest_gate_summary.verdict, OverlayGateVerdict::Fail);
         assert_eq!(report.honest_gate_summary.expected_critical_row_count, 3);

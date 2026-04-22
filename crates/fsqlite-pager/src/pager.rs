@@ -24310,8 +24310,7 @@ mod tests {
                 )
             });
             assert_eq!(
-                data[0],
-                *fill,
+                data[0], *fill,
                 "bead_id={BEAD} case=data_integrity page_no={page_no} — \
                  page content mismatch"
             );
