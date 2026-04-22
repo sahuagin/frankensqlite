@@ -15066,7 +15066,9 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_lane_identity_is_stable_within_thread() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let queue = GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface {
@@ -15090,7 +15092,9 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_lane_reuse_after_worker_churn() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let queue = StdArc::new(GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface {
@@ -15529,7 +15533,9 @@ mod tests {
             }
         }
 
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/waiter_path_stress.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
@@ -15962,7 +15968,9 @@ mod tests {
 
     #[test]
     fn test_parallel_wal_concurrent_writers_on_disjoint_lanes_commit_successfully() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/parallel_wal_disjoint_lane_commit.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
@@ -16046,7 +16054,9 @@ mod tests {
 
     #[test]
     fn test_group_commit_promoted_epoch_uses_live_db_size_floor() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/group_commit_promoted_epoch_live_db_size_floor.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
@@ -16904,7 +16914,9 @@ mod tests {
 
     #[test]
     fn test_commit_service_policy_logs_sparse_queue_metadata() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         GLOBAL_CONSOLIDATION_METRICS.reset();
         init_publication_test_tracing();
 
@@ -16957,7 +16969,9 @@ mod tests {
 
     #[test]
     fn test_commit_service_policy_logs_tail_guard_metadata() {
-        let _guard = PARALLEL_WAL_LANE_TEST_LOCK.lock().unwrap();
+        let _guard = PARALLEL_WAL_LANE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         GLOBAL_CONSOLIDATION_METRICS.reset();
         for _ in 0..8 {
             GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(0, 0, 0, true, 2_000, 0, 0, 0, 0, 0);
