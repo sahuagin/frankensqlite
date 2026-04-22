@@ -119,7 +119,10 @@ fn test_conformance_collate_nocase_min_max_group_by_s79a() {
         "SELECT category, MIN(name), MAX(name) FROM products GROUP BY category ORDER BY category",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE MIN/MAX GROUP BY");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE MIN/MAX GROUP BY",
+    );
 }
 
 // ── s79b: COLLATE NOCASE with COUNT(DISTINCT) ──
@@ -138,11 +141,12 @@ fn test_conformance_collate_nocase_count_distinct_s79b() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "SELECT COUNT(DISTINCT tag) FROM tags",
-    ];
+    let queries = &["SELECT COUNT(DISTINCT tag) FROM tags"];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE COUNT DISTINCT");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE COUNT DISTINCT",
+    );
 }
 
 // ── s79c: COLLATE NOCASE ORDER BY ──
@@ -167,7 +171,10 @@ fn test_conformance_collate_nocase_order_by_s79c() {
         "SELECT DISTINCT w FROM words ORDER BY w",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE ORDER BY");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE ORDER BY",
+    );
 }
 
 // ── s79d: COLLATE NOCASE in WHERE with aggregates ──
@@ -192,7 +199,10 @@ fn test_conformance_collate_nocase_where_agg_s79d() {
         "SELECT MIN(name), MAX(name), SUM(qty) FROM items",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE WHERE+AGG");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE WHERE+AGG",
+    );
 }
 
 // ── s79e: Nested aggregate expressions ──
@@ -219,7 +229,10 @@ fn test_conformance_nested_agg_expr_s79e() {
         "SELECT AVG(score) * 2, TOTAL(score) / COUNT(*) FROM scores",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "nested aggregate expressions");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "nested aggregate expressions",
+    );
 }
 
 // ── s79f: CASE with aggregates in SELECT ──
@@ -244,7 +257,10 @@ fn test_conformance_case_with_agg_s79f() {
         "SELECT SUM(CASE WHEN status='shipped' THEN amount ELSE 0 END) AS shipped_total FROM orders",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "CASE with aggregates");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "CASE with aggregates",
+    );
 }
 
 // ── s79g: Multi-table aggregate with JOIN ──
@@ -271,7 +287,10 @@ fn test_conformance_multi_table_agg_join_s79g() {
         "SELECT d.name, SUM(e.salary) FROM departments d LEFT JOIN employees e ON d.id = e.dept_id GROUP BY d.name ORDER BY d.name",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "multi-table aggregate JOIN");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "multi-table aggregate JOIN",
+    );
 }
 
 // ── s79h: Subquery in HAVING clause ──
@@ -294,7 +313,10 @@ fn test_conformance_subquery_in_having_s79h() {
         "SELECT product, SUM(amount) AS total FROM sales GROUP BY product HAVING SUM(amount) > (SELECT AVG(amount) FROM sales) ORDER BY product",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "subquery in HAVING");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "subquery in HAVING",
+    );
 }
 
 // ── s79i: Window functions with COLLATE NOCASE ──
@@ -319,7 +341,10 @@ fn test_conformance_window_collate_nocase_s79i() {
         "SELECT name, age, RANK() OVER (ORDER BY name) FROM people ORDER BY name, age",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "window with COLLATE NOCASE");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "window with COLLATE NOCASE",
+    );
 }
 
 // ── s79j: COLLATE NOCASE in UNION/INTERSECT/EXCEPT ──
@@ -347,7 +372,10 @@ fn test_conformance_collate_nocase_compound_s79j() {
         "SELECT x FROM t1 EXCEPT SELECT x FROM t2 ORDER BY x",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE compound");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE compound",
+    );
 }
 
 // ── s79k: Aggregate with FILTER clause ──
@@ -395,7 +423,10 @@ fn test_conformance_collate_nocase_in_s79l() {
         "SELECT COUNT(*) FROM names WHERE name NOT IN ('alice')",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COLLATE NOCASE IN");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COLLATE NOCASE IN",
+    );
 }
 
 // ── s79m: BETWEEN with mixed types ──
@@ -420,7 +451,10 @@ fn test_conformance_between_mixed_types_s79m() {
         "SELECT COUNT(*) FROM vals WHERE v BETWEEN -10 AND 10",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "BETWEEN mixed types");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "BETWEEN mixed types",
+    );
 }
 
 // ── s79n: Complex expression in ORDER BY ──
@@ -445,7 +479,10 @@ fn test_conformance_complex_order_by_expr_s79n() {
         "SELECT a, b FROM t ORDER BY CASE WHEN a > 2 THEN 0 ELSE 1 END, b",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "complex ORDER BY expressions");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "complex ORDER BY expressions",
+    );
 }
 
 // ── s79o: INSERT...RETURNING with expressions ──
@@ -455,9 +492,7 @@ fn test_conformance_insert_returning_expr_s79o() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    let setup = &[
-        "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT, n INTEGER DEFAULT 0)",
-    ];
+    let setup = &["CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT, n INTEGER DEFAULT 0)"];
     for s in setup {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -468,7 +503,10 @@ fn test_conformance_insert_returning_expr_s79o() {
         "INSERT INTO t(val) VALUES('world') RETURNING id, val || '!', typeof(n)",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "INSERT RETURNING expressions");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "INSERT RETURNING expressions",
+    );
 }
 
 // ── s79p: Multi-column UNIQUE conflict with INSERT OR ──
@@ -494,7 +532,10 @@ fn test_conformance_multi_col_unique_conflict_s79p() {
         "SELECT * FROM pairs ORDER BY a, b",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "multi-col UNIQUE conflict");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "multi-col UNIQUE conflict",
+    );
 }
 
 // ── s79q: Recursive CTE with aggregate ──
@@ -509,7 +550,10 @@ fn test_conformance_recursive_cte_agg_s79q() {
         "WITH RECURSIVE fib(a, b) AS (VALUES(0, 1) UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT COUNT(*), MAX(a) FROM fib",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "recursive CTE aggregate");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "recursive CTE aggregate",
+    );
 }
 
 // ── s79r: UPDATE...RETURNING ──
@@ -585,5 +629,8 @@ fn test_conformance_coalesce_null_chain_s79t() {
         "SELECT NULLIF(COALESCE(a, b), COALESCE(c, d)) FROM data ORDER BY rowid",
     ];
 
-    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "COALESCE NULL chain");
+    assert_no_mismatches(
+        &oracle_compare(&fconn, &rconn, queries),
+        "COALESCE NULL chain",
+    );
 }
