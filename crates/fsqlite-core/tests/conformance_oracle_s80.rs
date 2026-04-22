@@ -148,9 +148,7 @@ fn test_conformance_delete_complex_where_s80b() {
         rconn.execute_batch(s).unwrap();
     }
 
-    for dml in &[
-        "DELETE FROM logs WHERE level = 'DEBUG' OR (level = 'INFO' AND ts < 1002)",
-    ] {
+    for dml in &["DELETE FROM logs WHERE level = 'DEBUG' OR (level = 'INFO' AND ts < 1002)"] {
         fconn.execute(dml).unwrap();
         rconn.execute_batch(dml).unwrap();
     }
@@ -202,9 +200,7 @@ fn test_conformance_prepared_reuse_s80d() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    let setup = &[
-        "CREATE TABLE kv(k INTEGER PRIMARY KEY, v TEXT)",
-    ];
+    let setup = &["CREATE TABLE kv(k INTEGER PRIMARY KEY, v TEXT)"];
     for s in setup {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -219,10 +215,7 @@ fn test_conformance_prepared_reuse_s80d() {
     for i in 0..20 {
         let v = format!("val_{i}");
         f_stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(i),
-                SqliteValue::Text(v.clone().into()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(i), SqliteValue::Text(v.clone().into())])
             .unwrap();
         r_stmt.execute(rusqlite::params![i, v]).unwrap();
     }
@@ -261,7 +254,8 @@ fn test_conformance_update_subquery_where_s80e() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let dml = "UPDATE orders SET status = 'priority' WHERE customer_id IN (SELECT customer_id FROM vips)";
+    let dml =
+        "UPDATE orders SET status = 'priority' WHERE customer_id IN (SELECT customer_id FROM vips)";
     fconn.execute(dml).unwrap();
     rconn.execute_batch(dml).unwrap();
 
@@ -293,8 +287,7 @@ fn test_conformance_delete_exists_s80f() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let dml =
-        "DELETE FROM products WHERE EXISTS (SELECT 1 FROM discontinued WHERE discontinued.product_id = products.id)";
+    let dml = "DELETE FROM products WHERE EXISTS (SELECT 1 FROM discontinued WHERE discontinued.product_id = products.id)";
     fconn.execute(dml).unwrap();
     rconn.execute_batch(dml).unwrap();
 
@@ -500,11 +493,7 @@ fn test_conformance_delete_all_s80l() {
     );
 
     assert_no_mismatches(
-        &oracle_compare(
-            &fconn,
-            &rconn,
-            &["SELECT id, val FROM temp_data"],
-        ),
+        &oracle_compare(&fconn, &rconn, &["SELECT id, val FROM temp_data"]),
         "after re-insert",
     );
 }
@@ -591,11 +580,7 @@ fn test_conformance_update_rowid_ref_s80o() {
     rconn.execute_batch(dml).unwrap();
 
     assert_no_mismatches(
-        &oracle_compare(
-            &fconn,
-            &rconn,
-            &["SELECT rowid, val FROM t ORDER BY rowid"],
-        ),
+        &oracle_compare(&fconn, &rconn, &["SELECT rowid, val FROM t ORDER BY rowid"]),
         "UPDATE rowid ref",
     );
 }

@@ -122,10 +122,7 @@ fn test_conformance_three_table_join_s81a() {
         "SELECT c.name, COUNT(i.id), SUM(o.total) FROM customers c JOIN orders o ON c.id = o.customer_id JOIN items i ON o.id = i.order_id GROUP BY c.name ORDER BY c.name",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "three-table JOIN",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "three-table JOIN");
 }
 
 // ── s81b: LEFT JOIN preserving NULLs ──
@@ -152,10 +149,7 @@ fn test_conformance_left_join_nulls_s81b() {
         "SELECT d.name FROM departments d LEFT JOIN employees e ON d.id = e.dept_id WHERE e.id IS NULL",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "LEFT JOIN NULLs",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "LEFT JOIN NULLs");
 }
 
 // ── s81c: Self-join for hierarchical data ──
@@ -208,10 +202,7 @@ fn test_conformance_join_agg_having_s81d() {
         "SELECT a.name, COUNT(b.id), MAX(b.sales) FROM authors a JOIN books b ON a.id = b.author_id GROUP BY a.name ORDER BY a.name",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "JOIN agg HAVING",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "JOIN agg HAVING");
 }
 
 // ── s81e: Derived table (subquery in FROM) ──
@@ -235,10 +226,7 @@ fn test_conformance_derived_table_s81e() {
         "SELECT * FROM (SELECT region, COUNT(*) AS cnt, AVG(amount) AS avg_amt FROM sales GROUP BY region) WHERE cnt > 2",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "derived table",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "derived table");
 }
 
 // ── s81f: CROSS JOIN ──
@@ -264,10 +252,7 @@ fn test_conformance_cross_join_s81f() {
         "SELECT COUNT(*) FROM colors CROSS JOIN sizes",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "CROSS JOIN",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "CROSS JOIN");
 }
 
 // ── s81g: JOIN with OR predicates ──
@@ -288,9 +273,8 @@ fn test_conformance_join_or_predicate_s81g() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "SELECT t1.id, t2.id FROM t1, t2 WHERE t1.a = t2.x OR t1.b = t2.y ORDER BY t1.id, t2.id",
-    ];
+    let queries =
+        &["SELECT t1.id, t2.id FROM t1, t2 WHERE t1.a = t2.x OR t1.b = t2.y ORDER BY t1.id, t2.id"];
 
     assert_no_mismatches(
         &oracle_compare(&fconn, &rconn, queries),
@@ -320,10 +304,7 @@ fn test_conformance_join_window_s81h() {
         "SELECT c.name, p.name, p.price, ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY p.price DESC) AS rank FROM categories c JOIN products p ON c.id = p.cat_id ORDER BY c.name, rank",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "JOIN window",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "JOIN window");
 }
 
 // ── s81i: CTE with JOIN ──
@@ -346,10 +327,7 @@ fn test_conformance_cte_join_s81i() {
         "WITH shipped AS (SELECT customer, SUM(amount) AS total FROM orders WHERE status='shipped' GROUP BY customer), pending AS (SELECT customer, SUM(amount) AS total FROM orders WHERE status='pending' GROUP BY customer) SELECT COALESCE(s.customer, p.customer) AS customer, COALESCE(s.total, 0) AS shipped_total, COALESCE(p.total, 0) AS pending_total FROM shipped s LEFT JOIN pending p ON s.customer = p.customer UNION SELECT p.customer, 0, p.total FROM pending p WHERE p.customer NOT IN (SELECT customer FROM shipped) ORDER BY customer",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "CTE JOIN",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "CTE JOIN");
 }
 
 // ── s81j: JOIN with DISTINCT ──
@@ -375,10 +353,7 @@ fn test_conformance_join_distinct_s81j() {
         "SELECT i.name, COUNT(DISTINCT t.tag) FROM items i JOIN tags t ON i.id = t.item_id GROUP BY i.name ORDER BY i.name",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "JOIN DISTINCT",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "JOIN DISTINCT");
 }
 
 // ── s81k: Correlated subquery in SELECT list with JOIN ──
@@ -427,9 +402,8 @@ fn test_conformance_multi_col_join_key_s81l() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "SELECT t1.val, t2.info FROM t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.y ORDER BY t1.val",
-    ];
+    let queries =
+        &["SELECT t1.val, t2.info FROM t1 JOIN t2 ON t1.a = t2.x AND t1.b = t2.y ORDER BY t1.val"];
 
     assert_no_mismatches(
         &oracle_compare(&fconn, &rconn, queries),
@@ -459,10 +433,7 @@ fn test_conformance_join_case_select_s81m() {
         "SELECT s.name, sc.subject, sc.score, CASE WHEN sc.score >= 90 THEN 'A' WHEN sc.score >= 80 THEN 'B' WHEN sc.score >= 70 THEN 'C' ELSE 'F' END AS grade FROM students s JOIN scores sc ON s.id = sc.student_id ORDER BY s.name, sc.subject",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "JOIN CASE SELECT",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "JOIN CASE SELECT");
 }
 
 // ── s81n: LEFT JOIN with COALESCE ──
@@ -519,10 +490,7 @@ fn test_conformance_four_table_join_s81o() {
         "SELECT a.val, b.val, c.val, d.val FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id JOIN d ON c.id = d.c_id ORDER BY a.val, b.val, c.val, d.val",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "four-table JOIN",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "four-table JOIN");
 }
 
 // ── s81p: JOIN with UNION ──
@@ -547,10 +515,7 @@ fn test_conformance_join_union_s81p() {
         "SELECT name, revenue, 'domestic' AS source FROM domestic UNION ALL SELECT name, revenue, 'international' FROM intl ORDER BY revenue DESC",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "JOIN UNION",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "JOIN UNION");
 }
 
 // ── s81q: Subquery in JOIN ON clause ──
@@ -575,10 +540,7 @@ fn test_conformance_subquery_join_on_s81q() {
         "SELECT t1.id, t1.val, t2.val FROM t1 JOIN t2 ON t1.id = t2.id WHERE t1.val > (SELECT AVG(val) FROM t1) ORDER BY t1.id",
     ];
 
-    assert_no_mismatches(
-        &oracle_compare(&fconn, &rconn, queries),
-        "subquery JOIN ON",
-    );
+    assert_no_mismatches(&oracle_compare(&fconn, &rconn, queries), "subquery JOIN ON");
 }
 
 // ── s81r: JOIN preserving ORDER BY on multiple columns ──
