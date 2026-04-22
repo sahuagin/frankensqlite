@@ -1,0 +1,36 @@
+{
+  "bead": "bd-m4s2c",
+  "related_bead": "bd-0winn",
+  "run_id": "bd-m4s2c-20260422T204202Z",
+  "date": "2026-04-22",
+  "agent": "cod4",
+  "head": "b11cd2323cf5d653d7ba1a5edddb11cc8a6a002b",
+  "status": "blocked",
+  "completed": [
+    "fingerprint.json",
+    "mt-mvcc-scenarios-3-4.command",
+    "mt-mvcc-scenarios-3-4.exit",
+    "mt-mvcc-scenarios-3-4.stderr",
+    "hotspot-table.md",
+    "hypothesis-ledger.md",
+    "summary.md"
+  ],
+  "blockers": [
+    {
+      "target": "comprehensive-bench",
+      "evidence": "profile_build_plain.stderr",
+      "exit": 101,
+      "summary": "serde_json::json! recursion limit reached at crates/fsqlite-e2e/src/bin/comprehensive_bench.rs:869"
+    },
+    {
+      "target": "perf-update-delete profile build",
+      "evidence": "cpu_update_script.stderr",
+      "exit": 101,
+      "summary": "fsqlite-core compile failure: JoinTableSource has no Clone implementation at crates/fsqlite-core/src/connection.rs:18208"
+    }
+  ],
+  "baseline_reference": {
+    "date": "2026-04-19",
+    "avg_ratio": 2.74
+  }
+}
