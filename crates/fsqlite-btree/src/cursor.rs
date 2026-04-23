@@ -4080,7 +4080,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page_no.get()
                 ),
             })?;
-        let mutate_start = std::time::Instant::now();
+        let mutate_start = instrumentation::profile_start();
         {
             let page_bytes = page_data.as_bytes_mut();
             page_bytes[new_content_offset..new_content_offset + cell_data.len()]
@@ -4088,16 +4088,12 @@ impl<P: PageWriter> BtCursor<P> {
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
-        instrumentation::record_fast_table_leaf_full_cell_append_mutate(
-            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_full_cell_append_mutate(mutate_start);
 
         let staged_page = page_data.clone();
-        let stage_start = std::time::Instant::now();
+        let stage_start = instrumentation::profile_start();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
-        instrumentation::record_fast_table_leaf_full_cell_append_stage(
-            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_full_cell_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -4168,7 +4164,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page_no.get()
                 ),
             })?;
-        let mutate_start = std::time::Instant::now();
+        let mutate_start = instrumentation::profile_start();
         {
             let page_bytes = page_data.as_bytes_mut();
             let mut write_offset = new_content_offset;
@@ -4183,9 +4179,7 @@ impl<P: PageWriter> BtCursor<P> {
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
-        instrumentation::record_fast_table_leaf_payload_append_mutate(
-            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_payload_append_mutate(mutate_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -4211,11 +4205,9 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         };
         let staged_page = page_data.clone();
-        let stage_start = std::time::Instant::now();
+        let stage_start = instrumentation::profile_start();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
-        instrumentation::record_fast_table_leaf_payload_append_stage(
-            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_payload_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -4316,7 +4308,7 @@ impl<P: PageWriter> BtCursor<P> {
                     leaf_page_no.get()
                 ),
             })?;
-        let mutate_start = std::time::Instant::now();
+        let mutate_start = instrumentation::profile_start();
         {
             let page_bytes = page_data.as_bytes_mut();
             let mut write_offset = new_content_offset;
@@ -4331,9 +4323,7 @@ impl<P: PageWriter> BtCursor<P> {
             page_bytes[ptr_offset..ptr_offset + 2].copy_from_slice(&new_cell_offset.to_be_bytes());
             header.write(page_bytes, header_offset);
         }
-        instrumentation::record_fast_table_leaf_payload_append_mutate(
-            u64::try_from(mutate_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_payload_append_mutate(mutate_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -4372,11 +4362,9 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         };
         let staged_page = page_data.clone();
-        let stage_start = std::time::Instant::now();
+        let stage_start = instrumentation::profile_start();
         self.pager.write_page_data(cx, leaf_page_no, staged_page)?;
-        instrumentation::record_fast_table_leaf_payload_append_stage(
-            u64::try_from(stage_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
+        instrumentation::record_fast_table_leaf_payload_append_stage(stage_start);
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
@@ -4447,7 +4435,7 @@ impl<P: PageWriter> BtCursor<P> {
                                 )
                                 .unwrap_or_else(|_| rowid.saturating_sub(1))
                             });
-                        let quick_balance_start = std::time::Instant::now();
+                        let quick_balance_start = instrumentation::profile_start();
                         match balance::balance_quick_known_divider_rowid(
                             cx,
                             &mut self.pager,
@@ -4460,8 +4448,7 @@ impl<P: PageWriter> BtCursor<P> {
                         ) {
                             Ok(Some(result)) => {
                                 instrumentation::record_quick_balance_attempt(
-                                    u64::try_from(quick_balance_start.elapsed().as_nanos())
-                                        .unwrap_or(u64::MAX),
+                                    quick_balance_start,
                                     true,
                                 );
                                 self.note_split_event();
@@ -4481,8 +4468,7 @@ impl<P: PageWriter> BtCursor<P> {
                             }
                             Ok(None) => {
                                 instrumentation::record_quick_balance_attempt(
-                                    u64::try_from(quick_balance_start.elapsed().as_nanos())
-                                        .unwrap_or(u64::MAX),
+                                    quick_balance_start,
                                     false,
                                 );
                             }
@@ -4493,7 +4479,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             let mut outcome = if leaf_entry.header.page_type == cell::BtreePageType::LeafTable {
-                let local_split_start = std::time::Instant::now();
+                let local_split_start = instrumentation::profile_start();
                 match balance::balance_table_leaf_local_split(
                     cx,
                     &mut self.pager,
@@ -4507,21 +4493,13 @@ impl<P: PageWriter> BtCursor<P> {
                     parent_is_root,
                 )? {
                     Some(outcome) => {
-                        instrumentation::record_local_split_attempt(
-                            u64::try_from(local_split_start.elapsed().as_nanos())
-                                .unwrap_or(u64::MAX),
-                            true,
-                        );
+                        instrumentation::record_local_split_attempt(local_split_start, true);
                         self.note_split_event();
                         outcome
                     }
                     None => {
-                        instrumentation::record_local_split_attempt(
-                            u64::try_from(local_split_start.elapsed().as_nanos())
-                                .unwrap_or(u64::MAX),
-                            false,
-                        );
-                        let nonroot_start = std::time::Instant::now();
+                        instrumentation::record_local_split_attempt(local_split_start, false);
+                        let nonroot_start = instrumentation::profile_start();
                         let outcome = balance::balance_nonroot(
                             cx,
                             &mut self.pager,
@@ -4533,14 +4511,12 @@ impl<P: PageWriter> BtCursor<P> {
                             self.page_size,
                             parent_is_root,
                         )?;
-                        instrumentation::record_nonroot_balance(
-                            u64::try_from(nonroot_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        );
+                        instrumentation::record_nonroot_balance(nonroot_start);
                         outcome
                     }
                 }
             } else {
-                let nonroot_start = std::time::Instant::now();
+                let nonroot_start = instrumentation::profile_start();
                 let outcome = balance::balance_nonroot(
                     cx,
                     &mut self.pager,
@@ -4552,9 +4528,7 @@ impl<P: PageWriter> BtCursor<P> {
                     self.page_size,
                     parent_is_root,
                 )?;
-                instrumentation::record_nonroot_balance(
-                    u64::try_from(nonroot_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                );
+                instrumentation::record_nonroot_balance(nonroot_start);
                 outcome
             };
 
@@ -6368,7 +6342,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
 
-        let quick_balance_start = std::time::Instant::now();
+        let quick_balance_start = instrumentation::profile_start();
         match balance::balance_quick_known_divider_rowid(
             cx,
             &mut self.pager,
@@ -6380,10 +6354,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.page_size,
         ) {
             Ok(Some(result)) => {
-                instrumentation::record_quick_balance_attempt(
-                    u64::try_from(quick_balance_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    true,
-                );
+                instrumentation::record_quick_balance_attempt(quick_balance_start, true);
                 self.note_split_event();
                 self.stack.clear();
                 self.at_eof = true;
@@ -6406,10 +6377,7 @@ impl<P: PageWriter> BtCursor<P> {
                 Ok(true)
             }
             Ok(None) => {
-                instrumentation::record_quick_balance_attempt(
-                    u64::try_from(quick_balance_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    false,
-                );
+                instrumentation::record_quick_balance_attempt(quick_balance_start, false);
                 Ok(false)
             }
             Err(error) => Err(error),

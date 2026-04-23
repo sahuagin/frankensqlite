@@ -207,6 +207,29 @@ fn copy_profile_enabled() -> bool {
     BTREE_COPY_PROFILE_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Start a profiling timer for a hot-path segment.
+///
+/// Returns `Some(Instant::now())` only when the copy profile gate is enabled;
+/// otherwise returns `None`. Call sites capture this once at segment start,
+/// run their work unconditionally, then pass the sentinel to the paired
+/// `record_*` recorder — which is a no-op when the sentinel is `None`.
+///
+/// Purpose: avoid paying `clock_gettime` on every invocation when profiling
+/// is off. Previously the pattern `let t = Instant::now(); /* work */;
+/// record_x(t.elapsed())` captured the clock unconditionally and the gate
+/// was checked only inside the recorder — wasting two `clock_gettime`
+/// syscalls per hot-path op.
+#[inline]
+pub(crate) fn profile_start() -> Option<std::time::Instant> {
+    copy_profile_enabled().then(std::time::Instant::now)
+}
+
+#[inline]
+fn profile_elapsed_ns(start: Option<std::time::Instant>) -> Option<u64> {
+    let s = start?;
+    Some(u64::try_from(s.elapsed().as_nanos()).unwrap_or(u64::MAX))
+}
+
 #[inline]
 fn saturating_add_bytes(counter: &AtomicU64, bytes: usize) {
     counter.fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
@@ -291,40 +314,40 @@ pub(crate) fn record_page_header_rebuild() {
     BTREE_PAGE_HEADER_REBUILD_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_payload_append_mutate(duration_ns: u64) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_fast_table_leaf_payload_append_mutate(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_FAST_TABLE_LEAF_PAYLOAD_APPEND_CALLS.fetch_add(1, Ordering::Relaxed);
     BTREE_FAST_TABLE_LEAF_PAYLOAD_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_payload_append_stage(duration_ns: u64) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_fast_table_leaf_payload_append_stage(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_FAST_TABLE_LEAF_PAYLOAD_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(duration_ns: u64) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_fast_table_leaf_full_cell_append_mutate(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_FAST_TABLE_LEAF_FULL_CELL_APPEND_CALLS.fetch_add(1, Ordering::Relaxed);
     BTREE_FAST_TABLE_LEAF_FULL_CELL_MUTATE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_fast_table_leaf_full_cell_append_stage(duration_ns: u64) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_fast_table_leaf_full_cell_append_stage(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_FAST_TABLE_LEAF_FULL_CELL_STAGE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_quick_balance_attempt(duration_ns: u64, hit: bool) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_quick_balance_attempt(start: Option<std::time::Instant>, hit: bool) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_QUICK_BALANCE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     if hit {
         BTREE_QUICK_BALANCE_HITS.fetch_add(1, Ordering::Relaxed);
@@ -332,10 +355,10 @@ pub(crate) fn record_quick_balance_attempt(duration_ns: u64, hit: bool) {
     BTREE_QUICK_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_local_split_attempt(duration_ns: u64, hit: bool) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_local_split_attempt(start: Option<std::time::Instant>, hit: bool) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_LOCAL_SPLIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     if hit {
         BTREE_LOCAL_SPLIT_HITS.fetch_add(1, Ordering::Relaxed);
@@ -343,10 +366,10 @@ pub(crate) fn record_local_split_attempt(duration_ns: u64, hit: bool) {
     BTREE_LOCAL_SPLIT_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
 
-pub(crate) fn record_nonroot_balance(duration_ns: u64) {
-    if !copy_profile_enabled() {
+pub(crate) fn record_nonroot_balance(start: Option<std::time::Instant>) {
+    let Some(duration_ns) = profile_elapsed_ns(start) else {
         return;
-    }
+    };
     BTREE_NONROOT_BALANCE_CALLS.fetch_add(1, Ordering::Relaxed);
     BTREE_NONROOT_BALANCE_TIME_NS.fetch_add(duration_ns, Ordering::Relaxed);
 }
