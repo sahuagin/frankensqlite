@@ -15,6 +15,7 @@
 //!   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick
 //!   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant, SystemTime};
@@ -35,14 +36,18 @@ const ROW_COUNTS_QUICK: &[usize] = &[100, 1_000, 10_000];
 const CONCURRENT_THREAD_COUNTS: &[usize] = &[2, 4, 8];
 const CONCURRENT_ROWS_PER_THREAD: usize = 1_000;
 const CONCURRENT_RANGE_SIZE: i64 = 1_000_000;
-const JSON_REPORT_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-report.v2";
-const CI_REGRESSION_GATE_SCHEMA_V1: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v1";
+const JSON_REPORT_SCHEMA_V3: &str = "fsqlite-e2e.comprehensive-bench-report.v3";
+const CI_REGRESSION_GATE_SCHEMA_V2: &str = "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2";
 const CI_REGRESSION_GATE_BEAD_ID: &str = "bd-m4tju";
 const CI_REGRESSION_BASELINE_BEAD_ID: &str = "bd-0winn";
 const CI_REGRESSION_BASELINE_AVG_RATIO: f64 = 2.74;
-const CI_REGRESSION_GATE_STATUS_PENDING_BASELINE: &str = "schema_draft_pending_w5_7_baseline";
+const CI_REGRESSION_GATE_STATUS_RICH_SCORECARD: &str = "rich_scorecard_schema_ready";
 const CI_REGRESSION_GATE_THRESHOLD_SOURCE: &str =
-    "thresholds pending bd-0winn comprehensive-bench refresh";
+    "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score";
+const CI_PRIMARY_SCORE_MAX_REGRESSION_PCT: f64 = 0.03;
+const CI_GEOMEAN_MAX_REGRESSION_PCT: f64 = 0.05;
+const CI_CATEGORY_GEOMEAN_MAX_REGRESSION_PCT: f64 = 0.10;
+const CI_P90_MAX_REGRESSION_PCT: f64 = 0.15;
 const CONCURRENT_WRITERS_SECTION_TITLE: &str =
     "Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC";
 
@@ -451,13 +456,63 @@ struct CliOptions {
     print_json_schema: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ScenarioCategory {
+    ReadSingle,
+    ReadAggregate,
+    WriteSingle,
+    WriteBulk,
+    ConcurrentWriters,
+    MixedOltp,
+}
+
+impl ScenarioCategory {
+    const ALL: [Self; 6] = [
+        Self::ReadSingle,
+        Self::ReadAggregate,
+        Self::WriteSingle,
+        Self::WriteBulk,
+        Self::ConcurrentWriters,
+        Self::MixedOltp,
+    ];
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::ReadSingle => "read_single",
+            Self::ReadAggregate => "read_aggregate",
+            Self::WriteSingle => "write_single",
+            Self::WriteBulk => "write_bulk",
+            Self::ConcurrentWriters => "concurrent_writers",
+            Self::MixedOltp => "mixed",
+        }
+    }
+
+    const fn default_weight(self) -> f64 {
+        match self {
+            Self::ReadSingle => 0.35,
+            Self::ReadAggregate => 0.15,
+            Self::WriteSingle => 0.30,
+            Self::WriteBulk => 0.10,
+            Self::ConcurrentWriters | Self::MixedOltp => 0.05,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
 struct ReportSummaryStats {
     total_scenarios: usize,
     franken_faster: usize,
     comparable: usize,
     csqlite_faster: usize,
+    avg_ratio: Option<f64>,
     average_ratio: Option<f64>,
+    geomean_ratio: Option<f64>,
+    median_ratio: Option<f64>,
+    p90_ratio: Option<f64>,
+    p99_ratio: Option<f64>,
+    primary_metric: String,
+    per_category: BTreeMap<String, JsonCategoryRatioStats>,
+    per_category_weighted: JsonWeightedCategoryScore,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -508,9 +563,29 @@ struct JsonMeasurement {
 struct JsonRow {
     scenario_id: String,
     scenario: String,
+    category: String,
     csqlite: Option<JsonMeasurement>,
     fsqlite: Option<JsonMeasurement>,
     ratio_fsqlite_over_csqlite: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonCategoryRatioStats {
+    n: usize,
+    avg_ratio: Option<f64>,
+    geomean_ratio: Option<f64>,
+    median_ratio: Option<f64>,
+    p90_ratio: Option<f64>,
+    p99_ratio: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct JsonWeightedCategoryScore {
+    primary: bool,
+    score: Option<f64>,
+    weights: BTreeMap<String, f64>,
+    observed_weight: f64,
+    missing_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -548,12 +623,20 @@ struct JsonCiRegressionThresholdsDraft {
     avg_ratio_baseline: f64,
     avg_ratio_max: Option<f64>,
     mt_p95_ratio_max: Option<f64>,
+    primary_score_max_regression_pct: f64,
+    geomean_max_regression_pct: f64,
+    per_category_geomean_max_regression_pct: f64,
+    p90_max_regression_pct: f64,
     threshold_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct JsonCiRegressionObservedMetrics {
     avg_ratio: Option<f64>,
+    primary_score: Option<f64>,
+    geomean_ratio: Option<f64>,
+    median_ratio: Option<f64>,
+    p90_ratio: Option<f64>,
     max_mt_p95_ratio: Option<f64>,
     max_mt_p95_scenario_id: Option<String>,
 }
@@ -562,14 +645,17 @@ fn compute_report_summary(report: &BenchReport) -> ReportSummaryStats {
     let mut franken_faster = 0_usize;
     let mut csqlite_faster = 0_usize;
     let mut comparable = 0_usize;
-    let mut total_ratio = 0.0_f64;
-    let mut total_scenarios = 0_usize;
+    let mut ratios = Vec::new();
+    let mut category_ratios: BTreeMap<ScenarioCategory, Vec<f64>> = BTreeMap::new();
 
     for section in &report.sections {
         for row in &section.rows {
             if let Some(ratio) = row_ratio(row) {
-                total_ratio += ratio;
-                total_scenarios += 1;
+                ratios.push(ratio);
+                category_ratios
+                    .entry(categorize_scenario(&section.title, &row.scenario))
+                    .or_default()
+                    .push(ratio);
                 if ratio < 0.95 {
                     franken_faster += 1;
                 } else if ratio > 1.05 {
@@ -581,12 +667,167 @@ fn compute_report_summary(report: &BenchReport) -> ReportSummaryStats {
         }
     }
 
+    let aggregate = ratio_stats(&ratios);
+    let mut per_category = BTreeMap::new();
+    for category in ScenarioCategory::ALL {
+        let stats = ratio_stats(
+            category_ratios
+                .get(&category)
+                .map_or(&[][..], Vec::as_slice),
+        );
+        per_category.insert(category.id().to_owned(), stats);
+    }
+    let per_category_weighted = weighted_category_score(&per_category);
+
     ReportSummaryStats {
-        total_scenarios,
+        total_scenarios: ratios.len(),
         franken_faster,
         comparable,
         csqlite_faster,
-        average_ratio: (total_scenarios > 0).then_some(total_ratio / total_scenarios as f64),
+        avg_ratio: aggregate.avg_ratio,
+        average_ratio: aggregate.avg_ratio,
+        geomean_ratio: aggregate.geomean_ratio,
+        median_ratio: aggregate.median_ratio,
+        p90_ratio: aggregate.p90_ratio,
+        p99_ratio: aggregate.p99_ratio,
+        primary_metric: "per_category_weighted.score".to_owned(),
+        per_category,
+        per_category_weighted,
+    }
+}
+
+fn categorize_scenario(section_title: &str, scenario: &str) -> ScenarioCategory {
+    let section = section_title.to_ascii_lowercase();
+    let scenario = scenario.to_ascii_lowercase();
+
+    if section.contains("concurrent writers") {
+        return ScenarioCategory::ConcurrentWriters;
+    }
+    if section.contains("mixed oltp") {
+        return ScenarioCategory::MixedOltp;
+    }
+    if section.contains("transaction strategy") {
+        return if scenario.contains("autocommit") {
+            ScenarioCategory::WriteSingle
+        } else {
+            ScenarioCategory::WriteBulk
+        };
+    }
+    if section.contains("insert") || section.contains("record size") {
+        return ScenarioCategory::WriteBulk;
+    }
+    if section.contains("update") || section.contains("delete") {
+        return ScenarioCategory::WriteSingle;
+    }
+    if section.contains("join") || section.contains("subquery") || section.contains("cte") {
+        return if scenario.contains("group")
+            || scenario.contains("having")
+            || scenario.contains("count")
+            || scenario.contains("sum")
+            || scenario.contains("exists")
+            || scenario.contains(" in subquery")
+            || scenario.contains("cte")
+        {
+            ScenarioCategory::ReadAggregate
+        } else {
+            ScenarioCategory::ReadSingle
+        };
+    }
+    if section.contains("string") {
+        return if scenario.contains("group_concat") {
+            ScenarioCategory::ReadAggregate
+        } else {
+            ScenarioCategory::ReadSingle
+        };
+    }
+    if section.contains("read") || section.contains("query") || section.contains("select") {
+        return if scenario.contains("count")
+            || scenario.contains("group")
+            || scenario.contains("sum")
+            || scenario.contains("aggregate")
+        {
+            ScenarioCategory::ReadAggregate
+        } else {
+            ScenarioCategory::ReadSingle
+        };
+    }
+
+    ScenarioCategory::ReadSingle
+}
+
+fn ratio_stats(ratios: &[f64]) -> JsonCategoryRatioStats {
+    let mut sorted: Vec<f64> = ratios
+        .iter()
+        .copied()
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .collect();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    if n == 0 {
+        return JsonCategoryRatioStats {
+            n: 0,
+            avg_ratio: None,
+            geomean_ratio: None,
+            median_ratio: None,
+            p90_ratio: None,
+            p99_ratio: None,
+        };
+    }
+
+    let sum = sorted.iter().sum::<f64>();
+    let log_sum = sorted.iter().map(|ratio| ratio.ln()).sum::<f64>();
+    JsonCategoryRatioStats {
+        n,
+        avg_ratio: Some(sum / n as f64),
+        geomean_ratio: Some((log_sum / n as f64).exp()),
+        median_ratio: percentile_ratio(&sorted, 50.0),
+        p90_ratio: percentile_ratio(&sorted, 90.0),
+        p99_ratio: percentile_ratio(&sorted, 99.0),
+    }
+}
+
+fn percentile_ratio(sorted: &[f64], pct: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let idx = ((pct / 100.0) * (sorted.len() - 1) as f64).ceil() as usize;
+    sorted.get(idx.min(sorted.len() - 1)).copied()
+}
+
+fn category_weights() -> BTreeMap<String, f64> {
+    ScenarioCategory::ALL
+        .into_iter()
+        .map(|category| (category.id().to_owned(), category.default_weight()))
+        .collect()
+}
+
+fn weighted_category_score(
+    per_category: &BTreeMap<String, JsonCategoryRatioStats>,
+) -> JsonWeightedCategoryScore {
+    let weights = category_weights();
+    let mut weighted_log_sum = 0.0_f64;
+    let mut observed_weight = 0.0_f64;
+    let mut missing_categories = Vec::new();
+
+    for (category, weight) in &weights {
+        match per_category
+            .get(category)
+            .and_then(|stats| stats.geomean_ratio)
+        {
+            Some(geomean) => {
+                weighted_log_sum += geomean.ln() * weight;
+                observed_weight += weight;
+            }
+            None => missing_categories.push(category.clone()),
+        }
+    }
+
+    JsonWeightedCategoryScore {
+        primary: true,
+        score: (observed_weight > 0.0).then_some((weighted_log_sum / observed_weight).exp()),
+        weights,
+        observed_weight,
+        missing_categories,
     }
 }
 
@@ -632,22 +873,30 @@ fn max_multithread_p95_ratio(report: &BenchReport) -> (Option<f64>, Option<Strin
 
 fn build_ci_regression_gate(
     report: &BenchReport,
-    summary: ReportSummaryStats,
+    summary: &ReportSummaryStats,
 ) -> JsonCiRegressionGateDraft {
     let (max_mt_p95_ratio, max_mt_p95_scenario_id) = max_multithread_p95_ratio(report);
     JsonCiRegressionGateDraft {
-        schema_version: CI_REGRESSION_GATE_SCHEMA_V1.to_owned(),
+        schema_version: CI_REGRESSION_GATE_SCHEMA_V2.to_owned(),
         bead_id: CI_REGRESSION_GATE_BEAD_ID.to_owned(),
         depends_on_bead_id: CI_REGRESSION_BASELINE_BEAD_ID.to_owned(),
-        status: CI_REGRESSION_GATE_STATUS_PENDING_BASELINE.to_owned(),
+        status: CI_REGRESSION_GATE_STATUS_RICH_SCORECARD.to_owned(),
         thresholds: JsonCiRegressionThresholdsDraft {
             avg_ratio_baseline: CI_REGRESSION_BASELINE_AVG_RATIO,
             avg_ratio_max: None,
             mt_p95_ratio_max: None,
+            primary_score_max_regression_pct: CI_PRIMARY_SCORE_MAX_REGRESSION_PCT,
+            geomean_max_regression_pct: CI_GEOMEAN_MAX_REGRESSION_PCT,
+            per_category_geomean_max_regression_pct: CI_CATEGORY_GEOMEAN_MAX_REGRESSION_PCT,
+            p90_max_regression_pct: CI_P90_MAX_REGRESSION_PCT,
             threshold_source: CI_REGRESSION_GATE_THRESHOLD_SOURCE.to_owned(),
         },
         observed: JsonCiRegressionObservedMetrics {
-            avg_ratio: summary.average_ratio,
+            avg_ratio: summary.avg_ratio,
+            primary_score: summary.per_category_weighted.score,
+            geomean_ratio: summary.geomean_ratio,
+            median_ratio: summary.median_ratio,
+            p90_ratio: summary.p90_ratio,
             max_mt_p95_ratio,
             max_mt_p95_scenario_id,
         },
@@ -840,6 +1089,9 @@ fn build_json_report(
                 .map(|row| JsonRow {
                     scenario_id: format!("{}__{}", section_id, stable_slug(&row.scenario)),
                     scenario: row.scenario.clone(),
+                    category: categorize_scenario(&section.title, &row.scenario)
+                        .id()
+                        .to_owned(),
                     csqlite: row.csqlite.as_ref().map(JsonMeasurement::from_measurement),
                     fsqlite: row.fsqlite.as_ref().map(JsonMeasurement::from_measurement),
                     ratio_fsqlite_over_csqlite: row_ratio(row),
@@ -855,13 +1107,13 @@ fn build_json_report(
         .collect();
 
     JsonBenchmarkReport {
-        schema_version: JSON_REPORT_SCHEMA_V2.to_owned(),
+        schema_version: JSON_REPORT_SCHEMA_V3.to_owned(),
         generated_at_utc: chrono_stamp(),
         total_elapsed_ms: u64::try_from(total_elapsed.as_millis()).unwrap_or(u64::MAX),
         config,
         environment,
+        ci_regression_gate: build_ci_regression_gate(report, &summary),
         summary,
-        ci_regression_gate: build_ci_regression_gate(report, summary),
         sections,
     }
 }
@@ -870,7 +1122,7 @@ fn build_json_report(
 fn benchmark_json_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v2.json",
+        "$id": "https://frankensqlite.dev/schemas/fsqlite-e2e/comprehensive-bench-report.v3.json",
         "title": "FrankenSQLite comprehensive benchmark JSON report",
         "type": "object",
         "additionalProperties": false,
@@ -886,7 +1138,7 @@ fn benchmark_json_schema() -> serde_json::Value {
         ],
         "properties": {
             "schema_version": {
-                "const": JSON_REPORT_SCHEMA_V2
+                "const": JSON_REPORT_SCHEMA_V3
             },
             "generated_at_utc": {
                 "type": "string"
@@ -908,16 +1160,53 @@ fn benchmark_json_schema() -> serde_json::Value {
             "summary": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["total_scenarios", "franken_faster", "comparable", "csqlite_faster", "average_ratio"],
+                "required": [
+                    "total_scenarios",
+                    "franken_faster",
+                    "comparable",
+                    "csqlite_faster",
+                    "avg_ratio",
+                    "average_ratio",
+                    "geomean_ratio",
+                    "median_ratio",
+                    "p90_ratio",
+                    "p99_ratio",
+                    "primary_metric",
+                    "per_category",
+                    "per_category_weighted"
+                ],
                 "properties": {
                     "total_scenarios": {"type": "integer", "minimum": 0},
                     "franken_faster": {"type": "integer", "minimum": 0},
                     "comparable": {"type": "integer", "minimum": 0},
                     "csqlite_faster": {"type": "integer", "minimum": 0},
+                    "avg_ratio": {
+                        "type": ["number", "null"],
+                        "description": "Continuity metric only; not the primary score."
+                    },
                     "average_ratio": {
                         "type": ["number", "null"],
-                        "description": "Primary avg_ratio CI metric: FrankenSQLite median time divided by C SQLite median time across comparable rows."
-                    }
+                        "description": "Backward-compatible alias for avg_ratio; not the primary score."
+                    },
+                    "geomean_ratio": {"type": ["number", "null"]},
+                    "median_ratio": {"type": ["number", "null"]},
+                    "p90_ratio": {"type": ["number", "null"]},
+                    "p99_ratio": {"type": ["number", "null"]},
+                    "primary_metric": {"const": "per_category_weighted.score"},
+                    "per_category": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["read_single", "read_aggregate", "write_single", "write_bulk", "concurrent_writers", "mixed"],
+                        "properties": {
+                            "read_single": {"$ref": "#/$defs/category_stats"},
+                            "read_aggregate": {"$ref": "#/$defs/category_stats"},
+                            "write_single": {"$ref": "#/$defs/category_stats"},
+                            "write_bulk": {"$ref": "#/$defs/category_stats"},
+                            "concurrent_writers": {"$ref": "#/$defs/category_stats"},
+                            "mixed": {"$ref": "#/$defs/category_stats"}
+                        }
+                    },
+                    "per_category_weighted": {"$ref": "#/$defs/weighted_category_score"}
                 }
             },
             "ci_regression_gate": {
@@ -925,27 +1214,52 @@ fn benchmark_json_schema() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": ["schema_version", "bead_id", "depends_on_bead_id", "status", "thresholds", "observed"],
                 "properties": {
-                    "schema_version": {"const": CI_REGRESSION_GATE_SCHEMA_V1},
+                    "schema_version": {"const": CI_REGRESSION_GATE_SCHEMA_V2},
                     "bead_id": {"const": CI_REGRESSION_GATE_BEAD_ID},
                     "depends_on_bead_id": {"const": CI_REGRESSION_BASELINE_BEAD_ID},
-                    "status": {"const": CI_REGRESSION_GATE_STATUS_PENDING_BASELINE},
+                    "status": {"const": CI_REGRESSION_GATE_STATUS_RICH_SCORECARD},
                     "thresholds": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["avg_ratio_baseline", "avg_ratio_max", "mt_p95_ratio_max", "threshold_source"],
+                        "required": [
+                            "avg_ratio_baseline",
+                            "avg_ratio_max",
+                            "mt_p95_ratio_max",
+                            "primary_score_max_regression_pct",
+                            "geomean_max_regression_pct",
+                            "per_category_geomean_max_regression_pct",
+                            "p90_max_regression_pct",
+                            "threshold_source"
+                        ],
                         "properties": {
                             "avg_ratio_baseline": {"type": "number"},
                             "avg_ratio_max": {"type": ["number", "null"]},
                             "mt_p95_ratio_max": {"type": ["number", "null"]},
+                            "primary_score_max_regression_pct": {"type": "number"},
+                            "geomean_max_regression_pct": {"type": "number"},
+                            "per_category_geomean_max_regression_pct": {"type": "number"},
+                            "p90_max_regression_pct": {"type": "number"},
                             "threshold_source": {"type": "string"}
                         }
                     },
                     "observed": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["avg_ratio", "max_mt_p95_ratio", "max_mt_p95_scenario_id"],
+                        "required": [
+                            "avg_ratio",
+                            "primary_score",
+                            "geomean_ratio",
+                            "median_ratio",
+                            "p90_ratio",
+                            "max_mt_p95_ratio",
+                            "max_mt_p95_scenario_id"
+                        ],
                         "properties": {
                             "avg_ratio": {"type": ["number", "null"]},
+                            "primary_score": {"type": ["number", "null"]},
+                            "geomean_ratio": {"type": ["number", "null"]},
+                            "median_ratio": {"type": ["number", "null"]},
+                            "p90_ratio": {"type": ["number", "null"]},
                             "max_mt_p95_ratio": {
                                 "type": ["number", "null"],
                                 "description": "Worst fsqlite/csqlite p95 latency ratio among multithreaded concurrent-writer rows."
@@ -970,10 +1284,11 @@ fn benchmark_json_schema() -> serde_json::Value {
                             "items": {
                                 "type": "object",
                                 "additionalProperties": false,
-                                "required": ["scenario_id", "scenario", "csqlite", "fsqlite", "ratio_fsqlite_over_csqlite"],
+                                "required": ["scenario_id", "scenario", "category", "csqlite", "fsqlite", "ratio_fsqlite_over_csqlite"],
                                 "properties": {
                                     "scenario_id": {"type": "string"},
                                     "scenario": {"type": "string"},
+                                    "category": {"$ref": "#/$defs/scenario_category"},
                                     "csqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
                                     "fsqlite": {"anyOf": [{"$ref": "#/$defs/measurement"}, {"type": "null"}]},
                                     "ratio_fsqlite_over_csqlite": {"type": ["number", "null"]}
@@ -985,6 +1300,50 @@ fn benchmark_json_schema() -> serde_json::Value {
             }
         },
         "$defs": {
+            "scenario_category": {
+                "type": "string",
+                "enum": ["read_single", "read_aggregate", "write_single", "write_bulk", "concurrent_writers", "mixed"]
+            },
+            "category_stats": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["n", "avg_ratio", "geomean_ratio", "median_ratio", "p90_ratio", "p99_ratio"],
+                "properties": {
+                    "n": {"type": "integer", "minimum": 0},
+                    "avg_ratio": {"type": ["number", "null"]},
+                    "geomean_ratio": {"type": ["number", "null"]},
+                    "median_ratio": {"type": ["number", "null"]},
+                    "p90_ratio": {"type": ["number", "null"]},
+                    "p99_ratio": {"type": ["number", "null"]}
+                }
+            },
+            "weighted_category_score": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["primary", "score", "weights", "observed_weight", "missing_categories"],
+                "properties": {
+                    "primary": {"const": true},
+                    "score": {"type": ["number", "null"]},
+                    "weights": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["read_single", "read_aggregate", "write_single", "write_bulk", "concurrent_writers", "mixed"],
+                        "properties": {
+                            "read_single": {"type": "number"},
+                            "read_aggregate": {"type": "number"},
+                            "write_single": {"type": "number"},
+                            "write_bulk": {"type": "number"},
+                            "concurrent_writers": {"type": "number"},
+                            "mixed": {"type": "number"}
+                        }
+                    },
+                    "observed_weight": {"type": "number", "minimum": 0},
+                    "missing_categories": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/scenario_category"}
+                    }
+                }
+            },
             "measurement": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2411,6 +2770,99 @@ mod tests {
     }
 
     #[test]
+    fn scenario_categories_use_canonical_ids() {
+        assert_eq!(ScenarioCategory::MixedOltp.id(), "mixed");
+        assert_eq!(
+            categorize_scenario("Mixed OLTP Workload at Scale", "5K ops (80r/20w)").id(),
+            "mixed"
+        );
+        assert_eq!(
+            categorize_scenario(
+                "INSERTThroughput — Transaction Strategy Comparison (small_3col)",
+                "100 rows / autocommit",
+            )
+            .id(),
+            "write_single"
+        );
+        assert_eq!(
+            categorize_scenario(
+                "INSERTThroughput — Transaction Strategy Comparison (small_3col)",
+                "1000 rows / batched (1000/txn)",
+            )
+            .id(),
+            "write_bulk"
+        );
+        assert_eq!(
+            categorize_scenario("Read-After-Write Query Performance", "100 rows / COUNT(*)").id(),
+            "read_aggregate"
+        );
+        assert_eq!(
+            categorize_scenario(
+                "Read-After-Write Query Performance",
+                "100 rows / point lookup (PK)",
+            )
+            .id(),
+            "read_single"
+        );
+        assert_eq!(
+            categorize_scenario(
+                "JOIN Performance — Multi-Table Queries",
+                "100 orders / INNER JOIN"
+            )
+            .id(),
+            "read_single"
+        );
+        assert_eq!(
+            categorize_scenario(
+                "JOIN Performance — Multi-Table Queries",
+                "100 orders / JOIN + GROUP BY",
+            )
+            .id(),
+            "read_aggregate"
+        );
+    }
+
+    #[test]
+    fn weighted_category_score_uses_ratio_geomean_rollup() {
+        let mut per_category = BTreeMap::new();
+        for category in ScenarioCategory::ALL {
+            per_category.insert(category.id().to_owned(), ratio_stats(&[]));
+        }
+        per_category.insert(
+            "read_single".to_owned(),
+            JsonCategoryRatioStats {
+                n: 1,
+                avg_ratio: Some(4.0),
+                geomean_ratio: Some(4.0),
+                median_ratio: Some(4.0),
+                p90_ratio: Some(4.0),
+                p99_ratio: Some(4.0),
+            },
+        );
+        per_category.insert(
+            "write_single".to_owned(),
+            JsonCategoryRatioStats {
+                n: 1,
+                avg_ratio: Some(1.0),
+                geomean_ratio: Some(1.0),
+                median_ratio: Some(1.0),
+                p90_ratio: Some(1.0),
+                p99_ratio: Some(1.0),
+            },
+        );
+
+        let score = weighted_category_score(&per_category);
+        let expected = ((4.0_f64.ln() * 0.35) / 0.65).exp();
+
+        assert!(
+            (score.score.expect("score should exist") - expected).abs() < 1.0e-12,
+            "weighted score should be a weighted geometric ratio rollup",
+        );
+        assert!((score.observed_weight - 0.65).abs() < 1.0e-12);
+        assert!(score.missing_categories.contains(&"mixed".to_owned()));
+    }
+
+    #[test]
     fn build_json_report_uses_stable_ids_and_summary() {
         let report = sample_report();
         let json = build_json_report(
@@ -2444,11 +2896,26 @@ mod tests {
             },
         );
 
-        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V2);
+        assert_eq!(json.schema_version, JSON_REPORT_SCHEMA_V3);
         assert_eq!(json.summary.total_scenarios, 1);
+        assert_eq!(json.summary.primary_metric, "per_category_weighted.score");
+        assert_eq!(json.summary.per_category["write_bulk"].n, 1);
+        assert!(
+            (json
+                .summary
+                .per_category_weighted
+                .score
+                .expect("primary score should exist")
+                - json
+                    .summary
+                    .geomean_ratio
+                    .expect("geomean ratio should exist"))
+            .abs()
+                < 1.0e-12
+        );
         assert_eq!(
             json.ci_regression_gate.schema_version,
-            CI_REGRESSION_GATE_SCHEMA_V1
+            CI_REGRESSION_GATE_SCHEMA_V2
         );
         assert_eq!(json.ci_regression_gate.bead_id, CI_REGRESSION_GATE_BEAD_ID);
         assert_eq!(
@@ -2465,6 +2932,7 @@ mod tests {
             json.sections[0].rows[0].scenario_id,
             "insert-throughput__100-rows-small-record",
         );
+        assert_eq!(json.sections[0].rows[0].category, "write_bulk");
         assert!(
             json.summary
                 .average_ratio
@@ -2527,6 +2995,11 @@ mod tests {
             )
         );
         assert_eq!(json.ci_regression_gate.observed.max_mt_p95_ratio, Some(3.0));
+        assert_eq!(
+            json.ci_regression_gate.observed.primary_score,
+            json.summary.per_category_weighted.score
+        );
+        assert_eq!(json.sections[0].rows[0].category, "concurrent_writers");
     }
 
     #[test]
@@ -2535,19 +3008,33 @@ mod tests {
 
         assert_eq!(
             schema["properties"]["schema_version"]["const"],
-            JSON_REPORT_SCHEMA_V2
+            JSON_REPORT_SCHEMA_V3
         );
         assert_eq!(
             schema["properties"]["ci_regression_gate"]["properties"]["bead_id"]["const"],
             CI_REGRESSION_GATE_BEAD_ID
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]["avg_ratio_baseline"]
+            schema["properties"]["summary"]["properties"]["primary_metric"]["const"],
+            "per_category_weighted.score"
+        );
+        assert_eq!(
+            schema["properties"]["ci_regression_gate"]["properties"]["thresholds"]["properties"]["primary_score_max_regression_pct"]
                 ["type"],
             "number"
         );
         assert_eq!(
-            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["max_mt_p95_ratio"]
+            schema["properties"]["sections"]["items"]["properties"]["rows"]["items"]["properties"]
+                ["category"]["$ref"],
+            "#/$defs/scenario_category"
+        );
+        assert_eq!(schema["$defs"]["scenario_category"]["enum"][5], "mixed");
+        assert_eq!(
+            schema["properties"]["summary"]["properties"]["per_category"]["required"][5],
+            "mixed"
+        );
+        assert_eq!(
+            schema["properties"]["ci_regression_gate"]["properties"]["observed"]["properties"]["primary_score"]
                 ["type"][0],
             "number"
         );
