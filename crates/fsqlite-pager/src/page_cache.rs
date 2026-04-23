@@ -1602,8 +1602,28 @@ impl FlatPageSlots {
 
     /// Clear all pages. Returns the number of pages evicted.
     fn clear(&self) -> usize {
+        // Short-circuit the common "already-empty" case so we don't walk
+        // every slot on each clear call. Under MT-writer contention this
+        // accounted for 3.02% self-time at 8t on the 2026-04-23 post-T1
+        // capture (`fsqlite-mt-post-t1t2t7-184420`).
+        if self.count.load(Ordering::Acquire) == 0 {
+            // Even when no pages are resident, tombstones can accumulate; we
+            // still want to reset the cursor to probe from the front.
+            self.eviction_cursor.store(0, Ordering::Relaxed);
+            return 0;
+        }
         let mut removed = 0_usize;
         for slot in self.slots.iter() {
+            // Pre-filter with Relaxed load: the AcqRel RMW is expensive on
+            // every slot even when the slot is already empty, which is the
+            // dominant shape for a mostly-drained flat table.
+            let observed = slot.pgno.load(Ordering::Relaxed);
+            if observed == SLOT_EMPTY || observed == SLOT_TOMBSTONE {
+                // Still record the state with a non-contending store in case
+                // another thread raced the load — the `!= SLOT_EMPTY` branch
+                // below handles genuine transitions.
+                continue;
+            }
             let pgno = slot.pgno.swap(SLOT_EMPTY, Ordering::AcqRel);
             if pgno != SLOT_EMPTY && pgno != SLOT_TOMBSTONE {
                 let _ = slot.data.lock().take();

@@ -2751,7 +2751,21 @@ impl AtomicPublishedPages {
     }
 
     fn clear(&self) {
+        // Short-circuit: if nothing is published we can skip scanning all
+        // `ATOMIC_PUBLISHED_SLOT_COUNT` slots. Under MT-writer contention the
+        // publication plane is cleared on every transaction rollback/retry,
+        // and the clear was a measurable 14.61% self-time at 8 threads on the
+        // 2026-04-23 post-T1 capture (`fsqlite-mt-post-t1t2t7-184420`).
+        if self.page_count.load(AtomicOrdering::Acquire) == 0 {
+            return;
+        }
         for slot in self.slots.iter() {
+            // Pre-filter with a Relaxed load to avoid the AcqRel RMW on
+            // already-empty slots — the common case when only a handful of
+            // the 65,535 slots are actually live.
+            if !slot.present.load(AtomicOrdering::Relaxed) {
+                continue;
+            }
             if slot.present.swap(false, AtomicOrdering::AcqRel) {
                 let _ = slot
                     .page
