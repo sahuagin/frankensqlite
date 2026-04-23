@@ -4689,6 +4689,17 @@ where
         Ok(self.cache.metrics_snapshot())
     }
 
+    /// Capture cheap cache counters for hot-path statistical sampling.
+    ///
+    /// Skips per-slot iteration and the eviction-policy mutex. Suitable for
+    /// callers that only need hit/miss/admit/evict counts and resident-page
+    /// totals (e.g. the e-process oracle refresh loop).
+    pub fn cache_metrics_lightweight_snapshot(
+        &self,
+    ) -> Result<crate::page_cache::PageCacheLightweightSnapshot> {
+        Ok(self.cache.metrics_lightweight_snapshot())
+    }
+
     /// Capture a read-only snapshot of the resident page-cache entries.
     pub fn cache_page_snapshots(&self) -> Result<Vec<PageCachePageSnapshot>> {
         Ok(self.cache.page_snapshots())

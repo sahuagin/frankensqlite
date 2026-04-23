@@ -93,6 +93,39 @@ pub fn resolve_page_buffer_max(explicit: Option<usize>) -> usize {
 // PageCache
 // ---------------------------------------------------------------------------
 
+/// Cheap cache counters (no per-slot iteration, no eviction-policy lock).
+///
+/// Paired with [`ShardedPageCache::metrics_lightweight_snapshot`] for
+/// hot-path callers (e.g. the e-process oracle) that only need the
+/// aggregate hit/miss counters. The fields carry the same meaning as the
+/// first six fields of [`PageCacheMetricsSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCacheLightweightSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub admits: u64,
+    pub evictions: u64,
+    pub cached_pages: usize,
+    pub pool_capacity: usize,
+}
+
+impl PageCacheLightweightSnapshot {
+    #[must_use]
+    pub fn total_accesses(self) -> u64 {
+        self.hits.saturating_add(self.misses)
+    }
+
+    #[must_use]
+    pub fn hit_rate_percent(self) -> f64 {
+        let total = self.total_accesses();
+        if total == 0 {
+            0.0
+        } else {
+            (self.hits as f64 * 100.0) / total as f64
+        }
+    }
+}
+
 /// Point-in-time page-cache counters and gauges.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PageCacheMetricsSnapshot {
@@ -2691,6 +2724,57 @@ impl ShardedPageCache {
             shard.lock().clear();
         }
         self.clear_eviction_history();
+    }
+
+    /// Capture cheap-to-compute cache counters, skipping per-slot iteration.
+    ///
+    /// This is a hot-path-safe alternative to `metrics_snapshot()` for callers
+    /// that only need `{hits, misses, admits, evictions, cached_pages,
+    /// pool_capacity}` — notably `Connection::refresh_eprocess_oracle`, which
+    /// samples a cache miss-ratio at ~1-of-64 statements.
+    ///
+    /// Full `metrics_snapshot()` walks every resident `PageSlot` via
+    /// `stable_snapshot`, collects a `Vec<PageCachePageSnapshot>`, iterates
+    /// again for `dirty_ratio_pct`, and locks the eviction policy to sample
+    /// queue sizes. None of that data is needed for the e-process oracle,
+    /// yet the iteration cost amortized to ~5% self-time at MT 8t on the
+    /// 2026-04-23 hotspot capture (bd-m4s2c).
+    #[must_use]
+    pub fn metrics_lightweight_snapshot(&self) -> PageCacheLightweightSnapshot {
+        if self.use_fast_path.load(Ordering::Relaxed) {
+            if let Some(ref fast) = self.fast_array {
+                let arr = fast.lock();
+                return PageCacheLightweightSnapshot {
+                    hits: arr.hits,
+                    misses: arr.misses,
+                    admits: arr.admits,
+                    evictions: arr.evictions,
+                    cached_pages: arr.len(),
+                    pool_capacity: self.pool.capacity(),
+                };
+            }
+        }
+        let mut total_hits = self.flat_slots.hits.load(Ordering::Relaxed);
+        let mut total_misses = self.flat_slots.misses.load(Ordering::Relaxed);
+        let mut total_admits = self.flat_slots.admits.load(Ordering::Relaxed);
+        let mut total_evictions = self.flat_slots.evictions.load(Ordering::Relaxed);
+        let mut total_pages = self.flat_slots.len();
+        for shard in self.shards.iter() {
+            let s = shard.lock();
+            total_hits = total_hits.saturating_add(s.hits);
+            total_misses = total_misses.saturating_add(s.misses);
+            total_admits = total_admits.saturating_add(s.admits);
+            total_evictions = total_evictions.saturating_add(s.evictions);
+            total_pages = total_pages.saturating_add(s.len());
+        }
+        PageCacheLightweightSnapshot {
+            hits: total_hits,
+            misses: total_misses,
+            admits: total_admits,
+            evictions: total_evictions,
+            cached_pages: total_pages,
+            pool_capacity: self.pool.capacity(),
+        }
     }
 
     /// Capture current cache metrics aggregated across all shards.

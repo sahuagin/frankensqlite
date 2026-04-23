@@ -36,8 +36,9 @@ pub use page_buf::{
     reset_page_buffer_pool_metrics,
 };
 pub use page_cache::{
-    DEFAULT_PAGE_BUFFER_MAX, PageCache, PageCacheEvictionPolicy, PageCacheMetricsSnapshot,
-    PageCachePageSnapshot, PageCacheQueueKind, ShardedPageCache, resolve_page_buffer_max,
+    DEFAULT_PAGE_BUFFER_MAX, PageCache, PageCacheEvictionPolicy, PageCacheLightweightSnapshot,
+    PageCacheMetricsSnapshot, PageCachePageSnapshot, PageCacheQueueKind, ShardedPageCache,
+    resolve_page_buffer_max,
 };
 pub use pager::{
     PAGER_METADATA_PUBLICATION_CONTRACTS, PagerMetadataPublicationClass,
