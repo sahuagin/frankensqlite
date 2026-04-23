@@ -1,0 +1,1 @@
+for i in $(seq 1 40); do '/tmp/rch_target_fsqlite_cod3/release-perf/deps/fast_path_separation-752d3a6dadfbb964' manual_profile_bench_shape_prepared_direct_insert_1000 --ignored --nocapture --test-threads=1 >/dev/null; done

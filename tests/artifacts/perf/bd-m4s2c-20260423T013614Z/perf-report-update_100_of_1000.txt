@@ -1,0 +1,454 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 34  of event 'cpu-clock:u'
+# Event count (approx.): 68410448
+#
+# Overhead  Symbol                                                                                                                                                                                                       Shared Object       IPC   [IPC Coverage]
+# ........  ...........................................................................................................................................................................................................  ..................  ....................
+#
+    11.76%  [.] 0x0000000000000986                                                                                                                                                                                       [vdso]              -      -
+            |
+            ---0x737db6b8c986
+               clock_gettime
+               <std::sys::pal::unix::time::Timespec>::now
+               |
+               |--8.82%--<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+               |          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               |          perf_update_delete::main
+               |          std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               |          main
+               |          0x737db662a575
+               |          __libc_start_main
+               |          _start
+               |
+                --2.94%--<fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+                          perf_update_delete::main
+                          std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+                          main
+                          0x737db662a575
+                          __libc_start_main
+                          _start
+
+     5.88%  [.] <alloc::sync::Arc<fsqlite_pager::pager::PublishedPagerState>>::drop_slow                                                                                                                                 perf-update-delete  -      -
+            |
+            ---<alloc::sync::Arc<fsqlite_pager::pager::PublishedPagerState>>::drop_slow
+               <alloc::sync::Arc<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>>::drop_slow
+               <alloc::sync::Arc<dyn core::ops::function::Fn<(fsqlite_core::connection::TraceEvent,), Output = ()> + core::marker::Send + core::marker::Sync>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <alloc::sync::Arc<fsqlite_pager::page_cache::ShardedPageCache>>::drop_slow                                                                                                                               perf-update-delete  -      -
+            |
+            ---<alloc::sync::Arc<fsqlite_pager::page_cache::ShardedPageCache>>::drop_slow
+               <alloc::sync::Arc<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>>::drop_slow
+               <alloc::sync::Arc<dyn core::ops::function::Fn<(fsqlite_core::connection::TraceEvent,), Output = ()> + core::marker::Send + core::marker::Sync>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cell::CellRef>::parse                                                                                                                                                                    perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cell::CellRef>::parse
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::rowid                                perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::rowid
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at                                                                 perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert                                                                                                          perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid                                                                          perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_btree::cursor::CellSlotCache>::get                                                                                                                                                              perf-update-delete  -      -
+            |
+            ---<fsqlite_btree::cursor::CellSlotCache>::get
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_expr                                                                                                                          perf-update-delete  -      -
+            |
+            ---<fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_expr
+               <fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_expr
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert                                                                                                                            perf-update-delete  -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_core::connection::Connection>::store_prepared_direct_insert_append_hint                                                                                                                         perf-update-delete  -      -
+            |
+            ---<fsqlite_core::connection::Connection>::store_prepared_direct_insert_append_hint
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_core::connection::SharedMvccState>::new                                                                                                                                                         perf-update-delete  -      -
+            |
+            ---<fsqlite_core::connection::SharedMvccState>::new
+               <fsqlite_core::connection::Connection>::open_with_env_and_pager
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_pager::page_cache::FlatPageSlots>::clear                                                                                                                                                        perf-update-delete  -      -
+            |
+            ---<fsqlite_pager::page_cache::FlatPageSlots>::clear
+               <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_parser::parser::Parser>::parse_column_def                                                                                                                                                       perf-update-delete  -      -
+            |
+            ---<fsqlite_parser::parser::Parser>::parse_column_def
+               <fsqlite_parser::parser::Parser>::parse_create_table
+               <fsqlite_parser::parser::Parser>::parse_statement_inner::{closure#0}
+               <fsqlite_parser::parser::Parser>::parse_all
+               fsqlite_core::compat_persist::parse_single_statement
+               fsqlite_core::compat_persist::is_without_rowid_table_sql
+               <fsqlite_core::connection::Connection>::table_declares_without_rowid
+               <fsqlite_core::connection::Connection>::prepared_update_delete_static_fallback_reason
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <fsqlite_wal::checksum::WalChecksumTransform>::for_wal_frame                                                                                                                                             perf-update-delete  -      -
+            |
+            ---<fsqlite_wal::checksum::WalChecksumTransform>::for_wal_frame
+               <fsqlite_core::wal_adapter::WalBackendAdapter<fsqlite_vfs::memory::MemoryFile> as fsqlite_pager::traits::WalBackend>::prepare_append_frames
+               fsqlite_pager::pager::prepare_group_commit_batch_for_lane
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] <std::sys::pal::unix::time::Timespec>::now                                                                                                                                                               perf-update-delete  -      -
+            |
+            ---<std::sys::pal::unix::time::Timespec>::now
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemTable>                                                                                                                                               perf-update-delete  -      -
+            |
+            ---core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemTable>
+               core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemDatabase>
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] core::slice::sort::shared::smallsort::small_sort_general::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>  perf-update-delete  -      -
+            |
+            ---core::slice::sort::shared::smallsort::small_sort_general::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::delete
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] fsqlite_btree::cell::cell_on_page_size_fast                                                                                                                                                              perf-update-delete  -      -
+            |
+            ---fsqlite_btree::cell::cell_on_page_size_fast
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::delete
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update
+               <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] fsqlite_types::record::parse_record_into                                                                                                                                                                 perf-update-delete  -      -
+            |
+            ---fsqlite_types::record::parse_record_into
+               fsqlite_types::record::parse_record
+               <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] std::sys::fs::unix::try_statx                                                                                                                                                                            perf-update-delete  -      -
+            |
+            ---std::sys::fs::unix::try_statx
+               std::sys::fs::metadata
+               std::thread::functions::available_parallelism
+               fsqlite_wal::parallel_wal::default_parallel_wal_lane_count
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] xxhash_rust::xxh3::xxh3_64_long_default                                                                                                                                                                  perf-update-delete  -      -
+            |
+            ---xxhash_rust::xxh3::xxh3_64_long_default
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::page_mutation_counter
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x000000000022efea                                                                                                                                                                                       cat                 -      -
+            |
+            ---0x609e3ed7bfea
+               0x609e3ed78ffd
+               0x609e3f0f58c5
+               0x609e3f0dcc74
+               0x609e3f0dcd89
+               0x609e3f0dc9ef
+               0x609e3f10429b
+               0x609e3f0f81b1
+               0x609e3f0f8142
+               0x609e3eee7337
+               0x609e3ecfbbcb
+               0x609e3ecf6f8f
+               0x609e3ed2aab4
+               0x609e3ed326f7
+               0x609e3eebf9f7
+               0x609e3ed326e5
+               0x79860fa2a575
+               __libc_start_main
+               0x609e3ec51b15
+
+     2.94%  [.] 0x00000000000b1383                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db66b1383
+               0x737db66b3881
+               0x737db66b462f
+               std::thread::functions::available_parallelism
+               once_cell::imp::initialize_or_wait
+               <once_cell::imp::OnceCell<usize>>::initialize::<<once_cell::sync::OnceCell<usize>>::get_or_init<dashmap::default_shard_amount::{closure#0}>::{closure#0}, <once_cell::sync::OnceCell<_>>::get_or_init::Void>
+               <fsqlite_pager::pager::PublishedPagerState>::new
+               <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x00000000000b269d                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db66b269d
+               0x737db66b299d
+               core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemTable>
+               core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemDatabase>
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x00000000000b334e                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db66b334e
+               0x737db66b462f
+               <alloc::sync::Arc<[u8]>>::make_mut
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x0000000000198b76                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db6798b76
+               <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x0000000000198cca                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db6798cca
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+     2.94%  [.] 0x0000000000199593                                                                                                                                                                                       libc.so.6           -      -
+            |
+            ---0x737db6799593
+               <fsqlite_core::connection::Connection>::open_with_env_and_pager
+               perf_update_delete::main
+               std::sys::backtrace::__rust_begin_short_backtrace::<fn() -> std::process::ExitCode, std::process::ExitCode>
+               main
+               0x737db662a575
+               __libc_start_main
+               _start
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

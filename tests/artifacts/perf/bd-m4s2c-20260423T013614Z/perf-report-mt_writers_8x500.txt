@@ -1,0 +1,699 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 59  of event 'cpu-clock:u'
+# Event count (approx.): 118712248
+#
+# Overhead  Symbol                                                                                                                                                                                                                                   Shared Object     IPC   [IPC Coverage]
+# ........  .......................................................................................................................................................................................................................................  ................  ....................
+#
+    13.56%  [.] <fsqlite_pager::pager::PublishedPages>::clear                                                                                                                                                                                        mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_pager::pager::PublishedPages>::clear
+               <fsqlite_pager::pager::PublishedPagerState>::publish_clear_if
+               |
+               |--8.47%--<fsqlite_core::connection::PagerBackend>::refresh_published_snapshot
+               |          <fsqlite_core::connection::Connection>::bind_pager_publication
+               |          <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               |          |
+               |          |--6.78%--<fsqlite_core::connection::Connection>::execute_rollback_with_cx
+               |          |          <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               |          |          <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               |          |          <fsqlite_core::connection::Connection>::execute
+               |          |          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               |          |          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |          |          <std::sys::thread::unix::Thread>::new::thread_start
+               |          |          0x788276ea3d64
+               |          |          0x788276f373fc
+               |          |
+               |           --1.69%--<fsqlite_core::connection::Connection>::open_with_env_and_pager
+               |                     <fsqlite_core::connection::Connection>::open_with_page_size_and_env::<alloc::string::String>
+               |                     std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               |                     <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |                     <std::sys::thread::unix::Thread>::new::thread_start
+               |                     0x788276ea3d64
+               |                     0x788276f373fc
+               |
+                --5.08%--<fsqlite_core::connection::PagerBackend>::begin
+                          <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+                          <fsqlite_core::connection::Connection>::execute_rollback_with_cx
+                          <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+                          <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+                          <fsqlite_core::connection::Connection>::execute
+                          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+                          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                          <std::sys::thread::unix::Thread>::new::thread_start
+                          0x788276ea3d64
+                          0x788276f373fc
+
+     5.08%  [.] <alloc::sync::Arc<fsqlite_pager::pager::PublishedPagerState>>::drop_slow                                                                                                                                                             mt-mvcc-bench     -      -
+            |
+            ---<alloc::sync::Arc<fsqlite_pager::pager::PublishedPagerState>>::drop_slow
+               <alloc::sync::Arc<fsqlite_pager::pager::SimplePager<fsqlite_vfs::uring::IoUringVfs>>>::drop_slow
+               <alloc::sync::Arc<dyn core::ops::function::Fn<(fsqlite_core::connection::TraceEvent,), Output = ()> + core::marker::Send + core::marker::Sync>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     5.08%  [.] <core::slice::iter::Iter<fsqlite_pager::page_cache::PageSlot> as core::iter::traits::iterator::Iterator>::find_map::<fsqlite_pager::page_cache::PageCachePageSnapshot, &mut <fsqlite_pager::page_cache::PageSlot>::stable_snapshot>  mt-mvcc-bench     -      -
+            |
+            ---<core::slice::iter::Iter<fsqlite_pager::page_cache::PageSlot> as core::iter::traits::iterator::Iterator>::find_map::<fsqlite_pager::page_cache::PageCachePageSnapshot, &mut <fsqlite_pager::page_cache::PageSlot>::stable_snapshot>
+               <fsqlite_pager::page_cache::ShardedPageCache>::metrics_snapshot
+               <fsqlite_core::connection::Connection>::refresh_eprocess_oracle
+               |
+               |--3.39%--<fsqlite_core::connection::Connection>::pragma_database_header
+               |          <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               |          <fsqlite_core::connection::Connection>::compile_and_wrap
+               |          <fsqlite_core::connection::Connection>::prepare_after_background_status
+               |          <fsqlite_core::connection::Connection>::execute
+               |          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               |          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |          <std::sys::thread::unix::Thread>::new::thread_start
+               |          0x788276ea3d64
+               |          0x788276f373fc
+               |
+                --1.69%--<fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+                          <fsqlite_core::connection::Connection>::execute
+                          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+                          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                          <std::sys::thread::unix::Thread>::new::thread_start
+                          0x788276ea3d64
+                          0x788276f373fc
+
+     5.08%  [.] cfree                                                                                                                                                                                                                                libc.so.6         -      -
+            |
+            ---cfree
+               |
+               |--1.69%--<fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               |          <fsqlite_core::connection::Connection>::compile_and_wrap
+               |          <fsqlite_core::connection::Connection>::prepare_after_background_status
+               |          <fsqlite_core::connection::Connection>::execute
+               |          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               |          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |          <std::sys::thread::unix::Thread>::new::thread_start
+               |          0x788276ea3d64
+               |          0x788276f373fc
+               |
+               |--1.69%--<fsqlite_core::connection::Connection>::insert_parse_cache
+               |          <fsqlite_core::connection::Connection>::cached_parse_multi
+               |          <fsqlite_core::connection::Connection>::execute
+               |          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               |          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |          <std::sys::thread::unix::Thread>::new::thread_start
+               |          0x788276ea3d64
+               |          0x788276f373fc
+               |
+                --1.69%--<fsqlite_core::connection::Connection>::execute
+                          std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+                          <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                          <std::sys::thread::unix::Thread>::new::thread_start
+                          0x788276ea3d64
+                          0x788276f373fc
+
+     3.39%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert                                                                                                                                                        mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <alloc::raw_vec::RawVecInner>::finish_grow                                                                                                                                                                                           mt-mvcc-bench     -      -
+            |
+            ---<alloc::raw_vec::RawVecInner>::finish_grow
+               <alloc::raw_vec::RawVec<fsqlite_ast::Expr>>::grow_one
+               <fsqlite_parser::parser::Parser>::parse_comma_sep::<fsqlite_ast::Expr>
+               <fsqlite_parser::parser::Parser>::parse_values_core
+               <fsqlite_parser::parser::Parser>::parse_insert_stmt
+               <fsqlite_parser::parser::Parser>::parse_statement_inner::{closure#0}
+               <fsqlite_parser::parser::Parser>::parse_all
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <alloc::string::String as core::fmt::Write>::write_str.1098                                                                                                                                                                          mt-mvcc-bench     -      -
+            |
+            ---<alloc::string::String as core::fmt::Write>::write_str.1098
+               <&fsqlite_ast::InsertStatement as core::fmt::Display>::fmt
+               core::fmt::write
+               <fsqlite_ast::Statement as core::fmt::Display>::fmt
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_ast::InsertStatement as core::clone::Clone>::clone                                                                                                                                                                          mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_ast::InsertStatement as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_btree::cell::CellRef>::parse                                                                                                                                                                                                mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_btree::cell::CellRef>::parse
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at                                                                                             mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::table_leaf_rowid_at                                                                                       mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::table_leaf_rowid_at
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::search_integer_key_table_leaf
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page                                                                                                                                                  mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_core::connection::Connection>::clear_compilation_reuse_caches                                                                                                                                                               mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_core::connection::Connection>::clear_compilation_reuse_caches
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_core::connection::Connection>::execute                                                                                                                                                                                      mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status                                                                                                                                         mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_core::connection::TableExecutionRuntimeInputs as core::clone::Clone>::clone                                                                                                                                                 mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_core::connection::TableExecutionRuntimeInputs as core::clone::Clone>::clone
+               <fsqlite_core::connection::PreparedDmlDispatch as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_mvcc::core_types::InProcessPageLockTable>::unregister_waiter                                                                                                                                                                mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_mvcc::core_types::InProcessPageLockTable>::unregister_waiter
+               fsqlite_vdbe::engine::wait_for_page_lock_holder_change
+               <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal
+               <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_pager::page_cache::FlatPageSlots>::clear                                                                                                                                                                                    mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_pager::page_cache::FlatPageSlots>::clear
+               <fsqlite_pager::page_cache::ShardedPageCache>::clear
+               <fsqlite_pager::pager::PagerInner<fsqlite_vfs::uring::IoUringFile>>::refresh_committed_state
+               <fsqlite_core::connection::PagerBackend>::refresh_published_snapshot
+               <fsqlite_core::connection::Connection>::bind_pager_publication
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::open_with_env_and_pager
+               <fsqlite_core::connection::Connection>::open_with_page_size_and_env::<alloc::string::String>
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_pager::page_cache::ShardedPageCache>::metrics_snapshot                                                                                                                                                                      mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_pager::page_cache::ShardedPageCache>::metrics_snapshot
+               <fsqlite_core::connection::Connection>::refresh_eprocess_oracle
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_pager::pager::PublishedPagerState>::new                                                                                                                                                                                     mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_pager::pager::PublishedPagerState>::new
+               <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+               <fsqlite_core::connection::Connection>::open_with_page_size_and_env::<alloc::string::String>
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::uring::IoUringVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>::{closure#4}                                                   mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::uring::IoUringVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>::{closure#4}
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::uring::IoUringVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_parser::lexer::Lexer>::tokenize_into                                                                                                                                                                                        mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_parser::lexer::Lexer>::tokenize_into
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_parser::parser::Parser>::parse_comma_sep::<alloc::string::String>                                                                                                                                                           mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_parser::parser::Parser>::parse_comma_sep::<alloc::string::String>
+               <fsqlite_parser::parser::Parser>::parse_insert_stmt
+               <fsqlite_parser::parser::Parser>::parse_statement_inner::{closure#0}
+               <fsqlite_parser::parser::Parser>::parse_all
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_parser::token::TokenKind as core::clone::Clone>::clone                                                                                                                                                                      mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_parser::token::TokenKind as core::clone::Clone>::clone
+               <fsqlite_parser::parser::Parser>::parse_identifier
+               <fsqlite_parser::parser::Parser>::parse_comma_sep::<alloc::string::String>
+               <fsqlite_parser::parser::Parser>::parse_insert_stmt
+               <fsqlite_parser::parser::Parser>::parse_statement_inner::{closure#0}
+               <fsqlite_parser::parser::Parser>::parse_all
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_types::cx::Cx>::checkpoint                                                                                                                                                                                                  mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_types::cx::Cx>::checkpoint
+               fsqlite_vdbe::engine::wait_for_page_lock_holder_change
+               <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal
+               <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_types::value::SqliteValue>::apply_affinity                                                                                                                                                                                  mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_types::value::SqliteValue>::apply_affinity
+               <fsqlite_core::connection::Connection>::try_build_prepared_direct_simple_insert_constant_record
+               <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read_page_data                                                                                                                                         mt-mvcc-bench     -      -
+            |
+            ---<fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read_page_data
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] <hashbrown::map::HashMap<fsqlite_types::PageNumber, fsqlite_pager::pager::StagedPage, core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>>::insert                                                                      mt-mvcc-bench     -      -
+            |
+            ---<hashbrown::map::HashMap<fsqlite_types::PageNumber, fsqlite_pager::pager::StagedPage, core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>>::insert
+               fsqlite_pager::pager::insert_staged_page::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+               <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::write_page_data
+               <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal
+               <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] core::ptr::drop_in_place::<alloc::vec::Vec<fsqlite_ast::ResultColumn>>                                                                                                                                                               mt-mvcc-bench     -      -
+            |
+            ---core::ptr::drop_in_place::<alloc::vec::Vec<fsqlite_ast::ResultColumn>>
+               <alloc::sync::Arc<fsqlite_ast::Statement>>::drop_slow
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] core::ptr::drop_in_place::<fsqlite_ast::Expr>                                                                                                                                                                                        mt-mvcc-bench     -      -
+            |
+            ---core::ptr::drop_in_place::<fsqlite_ast::Expr>
+               core::ptr::drop_in_place::<core::option::Option<fsqlite_core::connection::PreparedDirectSimpleInsert>>
+               <alloc::sync::Arc<fsqlite_core::connection::PreparedCacheEntry>>::drop_slow
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] fsqlite_core::connection::statement_contains_rewritable_subquery                                                                                                                                                                     mt-mvcc-bench     -      -
+            |
+            ---fsqlite_core::connection::statement_contains_rewritable_subquery
+               <fsqlite_core::connection::Connection>::rewrite_subquery_statement
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] fsqlite_vdbe::engine::wait_for_page_lock_holder_change                                                                                                                                                                               mt-mvcc-bench     -      -
+            |
+            ---fsqlite_vdbe::engine::wait_for_page_lock_holder_change
+               <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal
+               <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data
+               fsqlite_btree::balance::write_page_if_changed::<fsqlite_vdbe::engine::SharedTxnPageIo>
+               fsqlite_btree::balance::apply_child_replacement::<fsqlite_vdbe::engine::SharedTxnPageIo>
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::balance_for_insert
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] xxhash_rust::xxh3::xxh3_64_long_default                                                                                                                                                                                              mt-mvcc-bench     -      -
+            |
+            ---xxhash_rust::xxh3::xxh3_64_long_default
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::page_mutation_counter
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::move_to_rightmost_leaf
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000229c56                                                                                                                                                                                                                   cat               -      -
+            |
+            ---0x5ee7532ccc56
+               0x5ee7532cede4
+               0x5ee7532cbf79
+               0x5ee7532ca88e
+               0x5ee7532cc497
+               0x5ee7532cc262
+               0x5ee7532ce9f1
+               0x5ee7532ce7a2
+               0x5ee753659600
+               0x5ee75365984c
+               0x5ee753659eef
+               0x5ee75324c951
+               0x5ee75324cf4a
+               0x5ee753280ab4
+               0x5ee7532886f7
+               0x5ee7534159f7
+               0x5ee7532886e5
+               0x7011c5e2a575
+               __libc_start_main
+               0x5ee7531a7b15
+
+     1.69%  [.] 0x00000000000b1558                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276eb1558
+               0x788276eb24ad
+               0x788276eb2a71
+               0x788276eb614a
+               0x788276ea3c0e
+               0x788276f373fc
+
+     1.69%  [.] 0x00000000000b1565                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276eb1565
+               0x788276eb3244
+               0x788276eb4569
+               <alloc::raw_vec::RawVecInner>::finish_grow
+               <alloc::raw_vec::RawVec<fsqlite_ast::Statement>>::grow_one
+               <fsqlite_parser::parser::Parser>::parse_all
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x00000000000b2a5c                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276eb2a5c
+               core::ptr::drop_in_place::<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x00000000000b3354                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276eb3354
+               0x788276eb4569
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x00000000000b36bb                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x7f92a60b36bb
+               0x7f92a60b462f
+               0x560803c8326d
+               0x560803c9a537
+               0x560803ed0322
+               0x560803ecf30c
+               0x560803ecfec7
+               0x560803ac2951
+               0x560803ac2f4a
+               0x560803af6ab4
+               0x560803afe6f7
+               0x560803c8b9f7
+               0x560803afe6e5
+               0x7f92a602a575
+               __libc_start_main
+               0x560803a1db15
+
+     1.69%  [.] 0x00000000000b3dec                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276eb3dec
+               0x788276eb4569
+               <alloc::sync::Arc<[u8]>>::make_mut
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000198b00                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276f98b00
+               <fsqlite_ast::Expr as core::clone::Clone>::clone
+               <fsqlite_ast::InsertStatement as core::clone::Clone>::clone
+               <fsqlite_ast::Statement as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000198b11                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276f98b11
+               <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000198b46                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276f98b46
+               <fsqlite_ast::InsertSource as core::fmt::Display>::fmt
+               core::fmt::write
+               <&fsqlite_ast::InsertStatement as core::fmt::Display>::fmt
+               core::fmt::write
+               <fsqlite_ast::Statement as core::fmt::Display>::fmt
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000198ca4                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276f98ca4
+               fsqlite_parser::parser::parse_statements_with_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+     1.69%  [.] 0x0000000000198cdd                                                                                                                                                                                                                   libc.so.6         -      -
+            |
+            ---0x788276f98cdd
+               std::sys::backtrace::__rust_begin_short_backtrace::<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>
+               <std::thread::lifecycle::spawn_unchecked<mt_mvcc_bench::run_fsqlite::{closure#0}, (core::time::Duration, usize)>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x788276ea3d64
+               0x788276f373fc
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

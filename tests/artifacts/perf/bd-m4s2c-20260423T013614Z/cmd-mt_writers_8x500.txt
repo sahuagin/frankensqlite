@@ -1,0 +1,1 @@
+'/tmp/rch_target_fsqlite_cod3/release-perf/mt-mvcc-bench' --threads=8 --rows-per-thread=500 --iters=1

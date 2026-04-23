@@ -1,0 +1,842 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 64  of event 'cpu-clock:u'
+# Event count (approx.): 128772608
+#
+# Overhead  Symbol                                                                                                                                        Shared Object                          IPC   [IPC Coverage]
+# ........  ............................................................................................................................................  .....................................  ....................
+#
+    10.94%  [.] <fsqlite_pager::pager::PublishedPagerState>::new                                                                                          fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_pager::pager::PublishedPagerState>::new
+               <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+               <fsqlite_core::connection::Connection>::open::<&str>
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x7a6f67ca3d64
+               |          0x7a6f67d373fc
+               |
+               |--1.56%--0x7953bd6a3d64
+               |          0x7953bd7373fc
+               |
+               |--1.56%--0x78867c2a3d64
+               |          0x78867c3373fc
+               |
+               |--1.56%--0x780a54ea3d64
+               |          0x780a54f373fc
+               |
+               |--1.56%--0x75aa13aa3d64
+               |          0x75aa13b373fc
+               |
+               |--1.56%--0x7550dbea3d64
+               |          0x7550dbf373fc
+               |
+                --1.56%--0x7090fcca3d64
+                          0x7090fcd373fc
+
+    10.94%  [.] 0x0000000000000986                                                                                                                        [vdso]                                 -      -
+            |
+            |--1.56%--0x7f137ac4c986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+            |          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+            |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+            |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x7f137a8a3d64
+            |          0x7f137a9373fc
+            |
+            |--1.56%--0x7b3a4ee55986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          <std::time::Instant>::elapsed
+            |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+            |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x7b3a4eaa3d64
+            |          0x7b3a4eb373fc
+            |
+            |--1.56%--0x7953bd9f1986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+            |          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+            |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+            |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x7953bd6a3d64
+            |          0x7953bd7373fc
+            |
+            |--1.56%--0x780a55206986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x780a54ea3d64
+            |          0x780a54f373fc
+            |
+            |--1.56%--0x778a79325986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          fsqlite_types::record::parse_record_into
+            |          fsqlite_types::record::parse_record
+            |          <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+            |          <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+            |          <fsqlite_core::connection::Connection>::execute_commit_with_cx
+            |          <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+            |          <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+            |          <fsqlite_core::connection::Connection>::execute
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x778a78ea3d64
+            |          0x778a78f373fc
+            |
+            |--1.56%--0x76699b6ed986
+            |          clock_gettime
+            |          <std::sys::pal::unix::time::Timespec>::now
+            |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+            |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x76699b2a3d64
+            |          0x76699b3373fc
+            |
+             --1.56%--0x7550dc335986
+                       clock_gettime
+                       <std::sys::pal::unix::time::Timespec>::now
+                       fsqlite_types::record::parse_record_into
+                       fsqlite_types::record::parse_record
+                       <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+                       <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+                       <fsqlite_core::connection::Connection>::execute_commit_with_cx
+                       <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+                       <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+                       <fsqlite_core::connection::Connection>::execute
+                       <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+                       test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+                       test::run_test::{closure#0}
+                       std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+                       <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                       <std::sys::thread::unix::Thread>::new::thread_start
+                       0x7550dbea3d64
+                       0x7550dbf373fc
+
+     7.81%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert                                                             fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x7f128d2a3d64
+               |          0x7f128d3373fc
+               |
+               |--1.56%--0x7caf0eaa3d64
+               |          0x7caf0eb373fc
+               |
+               |--1.56%--0x7bf8a34a3d64
+               |          0x7bf8a35373fc
+               |
+               |--1.56%--0x75dfc22a3d64
+               |          0x75dfc23373fc
+               |
+                --1.56%--0x72eef64a3d64
+                          0x72eef65373fc
+
+     6.25%  [.] core::ptr::drop_in_place::<[fsqlite_pager::pager::AtomicPublishedPageSlot]>                                                               fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---core::ptr::drop_in_place::<[fsqlite_pager::pager::AtomicPublishedPageSlot]>
+               <alloc::sync::Arc<fsqlite_pager::pager::PublishedPagerState>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>
+               <alloc::sync::Arc<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>>::drop_slow
+               <alloc::sync::Arc<dyn fsqlite_observability::ConflictObserver>>::drop_slow
+               core::ptr::drop_in_place::<core::cell::RefCell<std::collections::hash::map::HashMap<alloc::string::String, alloc::sync::Arc<dyn fsqlite_func::vtab::VtabModuleFactory>>>>
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x7f137a8a3d64
+               |          0x7f137a9373fc
+               |
+               |--1.56%--0x7caf0eaa3d64
+               |          0x7caf0eb373fc
+               |
+               |--1.56%--0x7a87626a3d64
+               |          0x7a87627373fc
+               |
+                --1.56%--0x7a2db34a3d64
+                          0x7a2db35373fc
+
+     4.69%  [.] xxhash_rust::xxh3::xxh3_64_long_default                                                                                                   fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---xxhash_rust::xxh3::xxh3_64_long_default
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::page_mutation_counter
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x75aa13aa3d64
+               |          0x75aa13b373fc
+               |
+               |--1.56%--0x71099eaa3d64
+               |          0x71099eb373fc
+               |
+                --1.56%--0x7090fcca3d64
+                          0x7090fcd373fc
+
+     3.12%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at  fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at
+               <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::rowid
+               <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x7f31dd6a3d64
+               |          0x7f31dd7373fc
+               |
+                --1.56%--0x73d58e8a3d64
+                          0x73d58e9373fc
+
+     3.12%  [.] fsqlite_btree::cell::read_cell_pointers_into                                                                                              fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---fsqlite_btree::cell::read_cell_pointers_into
+               |
+               |--1.56%--<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               |          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               |          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               |          test::run_test::{closure#0}
+               |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               |          <std::sys::thread::unix::Thread>::new::thread_start
+               |          0x7caf0eaa3d64
+               |          0x7caf0eb373fc
+               |
+                --1.56%--fsqlite_btree::cell::read_cell_pointers
+                          <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+                          <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+                          <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+                          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+                          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+                          test::run_test::{closure#0}
+                          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+                          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                          <std::sys::thread::unix::Thread>::new::thread_start
+                          0x7a3096ca3d64
+                          0x7a3096d373fc
+
+     3.12%  [.] malloc                                                                                                                                    libc.so.6                              -      -
+            |
+            ---malloc
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               |
+               |--1.56%--0x7fe5422a3d64
+               |          0x7fe5423373fc
+               |
+                --1.56%--0x7b11012a3d64
+                          0x7b11013373fc
+
+     3.12%  [.] 0x00000000000ac772                                                                                                                        libc.so.6                              -      -
+            |
+            |--1.56%--0x79fdeb4ac772
+            |          read
+            |          std::io::default_read_to_end::small_probe_read::<&std::fs::File>
+            |          std::io::default_read_to_end::<&std::fs::File>
+            |          <&std::fs::File as std::io::Read>::read_to_string
+            |          std::thread::functions::available_parallelism
+            |          once_cell::imp::initialize_or_wait
+            |          <once_cell::imp::OnceCell<usize>>::initialize::<<once_cell::sync::OnceCell<usize>>::get_or_init<dashmap::default_shard_amount::{closure#0}>::{closure#0}, <once_cell::sync::OnceCell<_>>::get_or_init::Void>
+            |          <fsqlite_pager::pager::PublishedPagerState>::new
+            |          <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+            |          <fsqlite_core::connection::Connection>::open::<&str>
+            |          <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+            |          test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+            |          test::run_test::{closure#0}
+            |          std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+            |          <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+            |          <std::sys::thread::unix::Thread>::new::thread_start
+            |          0x79fdeb4a3d64
+            |          0x79fdeb5373fc
+            |
+             --1.56%--0x70ccceaac772
+                       read
+                       std::io::default_read_to_end::small_probe_read::<&std::fs::File>
+                       std::io::default_read_to_end::<&std::fs::File>
+                       <&std::fs::File as std::io::Read>::read_to_string
+                       std::thread::functions::available_parallelism
+                       fsqlite_wal::parallel_wal::default_parallel_wal_lane_count
+                       <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+                       <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+                       <fsqlite_core::connection::Connection>::execute_commit_with_cx
+                       <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+                       <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+                       <fsqlite_core::connection::Connection>::execute
+                       <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+                       test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+                       test::run_test::{closure#0}
+                       std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+                       <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+                       <std::sys::thread::unix::Thread>::new::thread_start
+                       0x70ccceaa3d64
+                       0x70ccceb373fc
+
+     1.56%  [.] <alloc::sync::Arc<fsqlite_mvcc::core_types::CommitIndex>>::drop_slow                                                                      fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<alloc::sync::Arc<fsqlite_mvcc::core_types::CommitIndex>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7953bd6a3d64
+               0x7953bd7373fc
+
+     1.56%  [.] <alloc::sync::Arc<fsqlite_pager::page_cache::ShardedPageCache>>::drop_slow                                                                fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<alloc::sync::Arc<fsqlite_pager::page_cache::ShardedPageCache>>::drop_slow
+               core::ptr::drop_in_place::<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>
+               <alloc::sync::Arc<fsqlite_pager::pager::SimplePager<fsqlite_vfs::memory::MemoryVfs>>>::drop_slow
+               <alloc::sync::Arc<dyn fsqlite_observability::ConflictObserver>>::drop_slow
+               core::ptr::drop_in_place::<core::cell::RefCell<std::collections::hash::map::HashMap<alloc::string::String, alloc::sync::Arc<dyn fsqlite_func::vtab::VtabModuleFactory>>>>
+               core::ptr::drop_in_place::<fsqlite_core::connection::Connection>
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x78867c2a3d64
+               0x78867c3373fc
+
+     1.56%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid           fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7a2db34a3d64
+               0x7a2db35373fc
+
+     1.56%  [.] <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl                                                                   fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7763a56a3d64
+               0x7763a57373fc
+
+     1.56%  [.] <fsqlite_pager::page_cache::FlatPageSlots>::clear                                                                                         fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_pager::page_cache::FlatPageSlots>::clear
+               <fsqlite_core::connection::PagerBackend>::open_with_requested_page_size_and_page_buffer_max
+               <fsqlite_core::connection::Connection>::open::<&str>
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7a3096ca3d64
+               0x7a3096d373fc
+
+     1.56%  [.] <fsqlite_pager::page_cache::ShardedPageCache>::metrics_snapshot                                                                           fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_pager::page_cache::ShardedPageCache>::metrics_snapshot
+               <fsqlite_core::connection::Connection>::refresh_eprocess_oracle
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7e308c8a3d64
+               0x7e308c9373fc
+
+     1.56%  [.] <fsqlite_parser::parser::Parser>::parse_all                                                                                               fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_parser::parser::Parser>::parse_all
+               <fsqlite_core::connection::Connection>::parse_statements_with_statement_scratch
+               <fsqlite_core::connection::Connection>::parse_single_statement_with_statement_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_single
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x75dfc22a3d64
+               0x75dfc23373fc
+
+     1.56%  [.] <fsqlite_parser::parser::Parser>::parse_column_def                                                                                        fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_parser::parser::Parser>::parse_column_def
+               <fsqlite_parser::parser::Parser>::parse_create_table
+               <fsqlite_parser::parser::Parser>::parse_statement_inner::{closure#0}
+               <fsqlite_parser::parser::Parser>::parse_all
+               <fsqlite_core::connection::Connection>::parse_statements_with_statement_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7f137a8a3d64
+               0x7f137a9373fc
+
+     1.56%  [.] <fsqlite_parser::parser::Parser>::parse_create_table                                                                                      fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_parser::parser::Parser>::parse_create_table
+               <fsqlite_parser::parser::Parser>::parse_all
+               <fsqlite_core::connection::Connection>::parse_statements_with_statement_scratch
+               <fsqlite_core::connection::Connection>::cached_parse_multi
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x71099eaa3d64
+               0x71099eb373fc
+
+     1.56%  [.] <fsqlite_types::cx::Cx>::checkpoint                                                                                                       fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_types::cx::Cx>::checkpoint
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_try_append_cached_rightmost_leaf_hint::{closure#0}
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7b11012a3d64
+               0x7b11013373fc
+
+     1.56%  [.] <fsqlite_types::cx::Cx>::checkpoint                                                                                                       fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_types::cx::Cx>::checkpoint
+               <fsqlite_vfs::memory::MemoryFile as fsqlite_vfs::traits::VfsFile>::read
+               <fsqlite_wal::wal::WalFile<fsqlite_vfs::memory::MemoryFile>>::refresh
+               <fsqlite_core::wal_adapter::WalBackendAdapter<fsqlite_vfs::memory::MemoryFile> as fsqlite_pager::traits::WalBackend>::begin_transaction
+               <fsqlite_pager::pager::PagerInner<fsqlite_vfs::memory::MemoryFile>>::refresh_committed_state
+               <fsqlite_core::connection::PagerBackend>::begin
+               <fsqlite_core::connection::Connection>::begin_pager_txn_with_busy_timeout
+               <fsqlite_core::connection::Connection>::ensure_autocommit_txn_mode_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7f128d2a3d64
+               0x7f128d3373fc
+
+     1.56%  [.] <fsqlite_types::value::SqliteValue as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>                                       fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_types::value::SqliteValue as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+               <fsqlite_vdbe::engine::MemTable as core::clone::Clone>::clone
+               <fsqlite_vdbe::engine::MemDatabase as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::capture_time_travel_snapshot
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x79fdeb4a3d64
+               0x79fdeb5373fc
+
+     1.56%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::from_parts                                                                                       fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<fsqlite_vdbe::engine::SharedTxnPageIo>::from_parts
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x758e2a4a3d64
+               0x758e2a5373fc
+
+     1.56%  [.] <std::sys::fs::unix::File>::open_c                                                                                                        fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<std::sys::fs::unix::File>::open_c
+               std::thread::functions::available_parallelism
+               fsqlite_wal::parallel_wal::default_parallel_wal_lane_count
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7737c90a3d64
+               0x7737c91373fc
+
+     1.56%  [.] <std::sys::pal::unix::time::Timespec>::now                                                                                                fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<std::sys::pal::unix::time::Timespec>::now
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x79fdeb4a3d64
+               0x79fdeb5373fc
+
+     1.56%  [.] <u8 as core::fmt::Display>::fmt                                                                                                           fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---<u8 as core::fmt::Display>::fmt
+               core::fmt::write
+               alloc::fmt::format::format_inner
+               <fsqlite_core::connection::Connection>::compile_table_select
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7090fcca3d64
+               0x7090fcd373fc
+
+     1.56%  [.] __rustc::__rust_alloc                                                                                                                     fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---__rustc::__rust_alloc
+               <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+               <fsqlite_core::connection::Connection>::reload_memdb_from_pager_with_mode
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x71dd0cea3d64
+               0x71dd0cf373fc
+
+     1.56%  [.] clock_gettime                                                                                                                             libc.so.6                              -      -
+            |
+            ---clock_gettime
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7550dbea3d64
+               0x7550dbf373fc
+
+     1.56%  [.] fsqlite_types::serial_type::write_varint                                                                                                  fast_path_separation-752d3a6dadfbb964  -      -
+            |
+            ---fsqlite_types::serial_type::write_varint
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7d5ae80a3d64
+               0x7d5ae81373fc
+
+     1.56%  [.] 0x00000000000009c2                                                                                                                        [vdso]                                 -      -
+            |
+            ---0x7519c8d8e9c2
+               clock_gettime
+               <std::sys::pal::unix::time::Timespec>::now
+               <std::time::Instant>::elapsed
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7519c88a3d64
+               0x7519c89373fc
+
+     1.56%  [.] 0x0000000000228830                                                                                                                        cat                                    -      -
+            |
+            ---0x617801ed9830
+               0x617801edc9f1
+               0x617801edc7a2
+               0x617802267600
+               0x61780226784c
+               0x617802267eef
+               0x617801e5a951
+               0x617801e5af4a
+               0x617801e8eab4
+               0x617801e966f7
+               0x6178020239f7
+               0x617801e966e5
+               0x7fcc24a2a575
+               __libc_start_main
+               0x617801db5b15
+
+     1.56%  [.] 0x00000000000b26c9                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x73d58e8b26c9
+               0x73d58e8b2a71
+               0x73d58e8b614a
+               0x73d58e8a3c0e
+               0x73d58e9373fc
+
+     1.56%  [.] 0x00000000000b3354                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x73901d2b3354
+               0x73901d2b4569
+               <alloc::raw_vec::RawVecInner>::finish_grow
+               <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+               fsqlite_btree::cell::read_cell_pointers_into
+               fsqlite_btree::cell::read_cell_pointers
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x73901d2a3d64
+               0x73901d3373fc
+
+     1.56%  [.] 0x00000000000b34b1                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x76699b2b34b1
+               0x76699b2b4569
+               <fsqlite_types::value::SqliteValue as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+               <fsqlite_vdbe::engine::MemTable as core::clone::Clone>::clone
+               <fsqlite_vdbe::engine::MemDatabase as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::capture_time_travel_snapshot
+               <fsqlite_core::connection::Connection>::execute_commit_with_cx
+               <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x76699b2a3d64
+               0x76699b3373fc
+
+     1.56%  [.] 0x00000000000b4574                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x78fd282b4574
+               <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<alloc::sync::Arc<[u8]>>>::initialize<<std::sync::once_lock::OnceLock<alloc::sync::Arc<[u8]>>>::get_or_init<<fsqlite_types::PageData as core::clone::Clone>::clone::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+               <std::sys::sync::once::futex::Once>::call
+               <std::sync::once_lock::OnceLock<alloc::sync::Arc<[u8]>>>::initialize::<<std::sync::once_lock::OnceLock<alloc::sync::Arc<[u8]>>>::get_or_init<<fsqlite_types::PageData as core::clone::Clone>::clone::{closure#0}>::{closure#0}, !>
+               <fsqlite_types::PageData as core::clone::Clone>::clone
+               <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::get_page
+               <fsqlite_core::connection::Connection>::pragma_database_header
+               <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x78fd282a3d64
+               0x78fd283373fc
+
+     1.56%  [.] 0x0000000000198b00                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x7b5af2598b00
+               <fsqlite_ast::InsertStatement as core::clone::Clone>::clone
+               <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_plan
+               <fsqlite_core::connection::Connection>::compile_and_wrap
+               <fsqlite_core::connection::Connection>::prepare_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7b5af24a3d64
+               0x7b5af25373fc
+
+     1.56%  [.] 0x0000000000198b11                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x7dd9a0598b11
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7dd9a04a3d64
+               0x7dd9a05373fc
+
+     1.56%  [.] 0x0000000000198c98                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x7ddf9e798c98
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7ddf9e6a3d64
+               0x7ddf9e7373fc
+
+     1.56%  [.] 0x0000000000198d41                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x78867c398d41
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+               <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+               <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+               <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x78867c2a3d64
+               0x78867c3373fc
+
+     1.56%  [.] 0x00000000001995ae                                                                                                                        libc.so.6                              -      -
+            |
+            ---0x7d5ae81995ae
+               <std::sync::once::Once>::call_once_force::<<std::sync::lazy_lock::LazyLock<fsqlite_wal::group_commit::ConsolidationMetrics>>::force::{closure#0}>::{closure#0}
+               <std::sys::sync::once::futex::Once>::call
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>::{closure#4}
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+               <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+               <fsqlite_core::connection::Connection>::resolve_autocommit_txn_with_dirty_table_and_capture_and_cx
+               <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status
+               <fsqlite_core::connection::Connection>::execute
+               <fast_path_separation::manual_profile_bench_shape_prepared_direct_insert_1000::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+               test::__rust_begin_short_backtrace::<core::result::Result<(), alloc::string::String>, fn() -> core::result::Result<(), alloc::string::String>>
+               test::run_test::{closure#0}
+               std::sys::backtrace::__rust_begin_short_backtrace::<test::run_test::{closure#1}, ()>
+               <std::thread::lifecycle::spawn_unchecked<test::run_test::{closure#1}, ()>::{closure#1} as core::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+               <std::sys::thread::unix::Thread>::new::thread_start
+               0x7d5ae80a3d64
+               0x7d5ae81373fc
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

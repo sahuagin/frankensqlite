@@ -1,0 +1,5 @@
+perf-update-delete: rows=1000 iters=20 which=update (do_update=true do_delete=false update_count=100 delete_count=50)
+  (first iter complete)
+total=81ms populate=33ms update=23ms delete=0ms  |  per-row-update=11667ns  per-row-delete=0ns
+[ perf record: Woken up 2 times to write data ]
+[ perf record: Captured and wrote 0.021 MB tests/artifacts/perf/bd-m4s2c-20260423T013614Z/perf-cpu-update_100_of_1000.data (34 samples) ]

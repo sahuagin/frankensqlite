@@ -1,0 +1,1 @@
+Single-thread INSERT 1000 small_3col; 40 repeated test invocations for sampling
