@@ -148,7 +148,6 @@ impl RecoveryFence {
         );
         Err(FrankenError::BusyRecovery)
     }
-
 }
 
 /// Scoped guard that releases the fence on drop.
@@ -288,10 +287,7 @@ impl PidOwnedLockRegistry {
     /// Deregister a specific `(page, pid)` pair, if present.
     pub fn deregister(&self, page: PageNumber, pid: u32) -> bool {
         let mut inner = self.inner.lock();
-        if let Some(pos) = inner
-            .iter()
-            .position(|e| e.page == page && e.pid == pid)
-        {
+        if let Some(pos) = inner.iter().position(|e| e.page == page && e.pid == pid) {
             inner.swap_remove(pos);
             true
         } else {
@@ -802,8 +798,7 @@ mod tests {
             }
         }
         let mut target = NoopTarget;
-        let barrier =
-            execute_recovery_barrier(&cx, &mut target, &file, page_size, &lied_expected);
+        let barrier = execute_recovery_barrier(&cx, &mut target, &file, page_size, &lied_expected);
         assert!(
             matches!(barrier, Err(FrankenError::DatabaseCorrupt { .. })),
             "barrier must surface unrecoverable error on mismatch",

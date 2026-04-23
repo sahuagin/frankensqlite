@@ -23,6 +23,7 @@ use crate::checkpoint::{
     plan_checkpoint,
 };
 use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalSalts};
+use crate::recovery_fence::{CheckpointChecksumVerdict, ExpectedPageChecksum};
 use crate::wal::WalFile;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,23 @@ pub trait CheckpointTarget {
 
     /// Sync the database file to stable storage.
     fn sync_db(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Read back a page's current on-disk content, if the target supports
+    /// it.  Used by the post-checkpoint checksum verification path
+    /// (bd-yfdb6) to confirm that the DB file matches the expected state
+    /// before the WAL is truncated.
+    ///
+    /// The default implementation returns `None`, which skips verification.
+    /// Concrete `CheckpointTarget`s that back a real VFS file should
+    /// override this with the equivalent of `vfs.read(db_fd, buf, offset)`.
+    fn read_page_if_supported(
+        &self,
+        _cx: &Cx,
+        _page_no: PageNumber,
+        _buf: &mut [u8],
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +119,9 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
+    // bd-yfdb6: accumulate expected post-checkpoint page checksums so the
+    // truncate path can verify the DB state before discarding WAL frames.
+    let mut expected_checksums: Vec<ExpectedPageChecksum> = Vec::new();
     if plan.frames_to_backfill > 0 {
         // Backfill frames [backfilled_frames .. backfilled_frames + frames_to_backfill).
         let start = usize::try_from(normalized.backfilled_frames).unwrap_or(usize::MAX);
@@ -138,6 +159,21 @@ pub fn execute_checkpoint<F: VfsFile>(
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
             target.write_page(cx, page_no, page_data)?;
 
+            // bd-yfdb6: capture the expected post-checkpoint checksum so the
+            // truncate path can verify disk state before discarding WAL
+            // frames. Page checksums live in the trailer; if the trailer
+            // length is too small (tests with tiny pages), we skip the
+            // capture silently — this is additive insurance, not a hard
+            // invariant.
+            if page_data.len() >= crate::checksum::PAGE_CHECKSUM_RESERVED_BYTES {
+                if let Ok(checksum) = crate::checksum::read_page_checksum(page_data) {
+                    expected_checksums.push(ExpectedPageChecksum {
+                        page: page_no,
+                        checksum,
+                    });
+                }
+            }
+
             debug!(
                 frame_idx,
                 page_number = page_no.get(),
@@ -160,8 +196,11 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     // Post-action: reset or truncate WAL. Passes `target` so the
     // truncate path can issue an explicit fsync(db, FULL) before the
-    // WAL is truncated (bd-yfdb6).
-    let wal_was_reset = apply_checkpoint_post_action(cx, wal, plan.post_action, target)?;
+    // WAL is truncated, and the expected-checksums prefix so the same
+    // path can verify on-disk DB state matches the post-checkpoint
+    // state before truncating (both bd-yfdb6).
+    let wal_was_reset =
+        apply_checkpoint_post_action(cx, wal, plan.post_action, target, &expected_checksums)?;
 
     let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
 
@@ -189,6 +228,7 @@ fn apply_checkpoint_post_action<F: VfsFile>(
     wal: &mut WalFile<F>,
     post_action: CheckpointPostAction,
     target: &mut impl CheckpointTarget,
+    expected_checksums: &[ExpectedPageChecksum],
 ) -> Result<bool> {
     match post_action {
         CheckpointPostAction::ResetWal | CheckpointPostAction::TruncateWal => {
@@ -207,6 +247,34 @@ fn apply_checkpoint_post_action<F: VfsFile>(
                 // backfill path. A failure here MUST prevent the truncate;
                 // `?` accomplishes that.
                 crate::recovery_fence::ensure_db_fsync_before_wal_truncate(cx, target)?;
+
+                // bd-yfdb6: if the target supports read-back, verify that
+                // every page we just checkpointed still matches its
+                // expected post-checkpoint checksum on disk. On mismatch,
+                // refuse the truncate — the WAL must stay intact so a retry
+                // can complete the backfill.
+                if !expected_checksums.is_empty() {
+                    let verdict = verify_checkpoint_checksums_via_target(
+                        cx,
+                        target,
+                        wal.page_size(),
+                        expected_checksums,
+                    )?;
+                    if let CheckpointChecksumVerdict::Mismatch { first_bad_page } = verdict {
+                        tracing::error!(
+                            target: "fsqlite.wal.recovery_fence",
+                            first_bad_page = first_bad_page.get(),
+                            "UNRECOVERABLE: post-checkpoint DB/WAL disagreed; refusing truncate"
+                        );
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "post-checkpoint DB/WAL state disagreed at page {}; WAL truncate refused \
+                                 to preserve committed frames (bd-yfdb6)",
+                                first_bad_page.get()
+                            ),
+                        });
+                    }
+                }
             }
             wal.reset(cx, new_seq, new_salts, truncate)?;
             info!(
@@ -219,6 +287,39 @@ fn apply_checkpoint_post_action<F: VfsFile>(
         }
         CheckpointPostAction::None => Ok(false),
     }
+}
+
+/// Walk each expected page through the target's optional read-back hook
+/// and compare on-disk trailers. When the target opts out
+/// (`read_page_if_supported` returns `None`), verification is silently
+/// skipped — which matches the audit-requested behaviour of "additive
+/// insurance, not a hard invariant" for targets without a read path.
+fn verify_checkpoint_checksums_via_target(
+    cx: &Cx,
+    target: &impl CheckpointTarget,
+    page_size: usize,
+    expected: &[ExpectedPageChecksum],
+) -> Result<CheckpointChecksumVerdict> {
+    let mut buf = vec![0u8; page_size];
+    for exp in expected {
+        let maybe_read = target.read_page_if_supported(cx, exp.page, &mut buf)?;
+        let Some(n) = maybe_read else {
+            // Target does not support read-back; abort further checks.
+            return Ok(CheckpointChecksumVerdict::Match);
+        };
+        if n < page_size {
+            return Ok(CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: exp.page,
+            });
+        }
+        let observed = crate::checksum::read_page_checksum(&buf)?;
+        if observed != exp.checksum {
+            return Ok(CheckpointChecksumVerdict::Mismatch {
+                first_bad_page: exp.page,
+            });
+        }
+    }
+    Ok(CheckpointChecksumVerdict::Match)
 }
 
 // ===========================================================================

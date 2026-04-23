@@ -46,8 +46,8 @@ use fsqlite_wal::{
     GroupCommitConsolidator, PARALLEL_WAL_COMPATIBILITY_SELECTOR, PARALLEL_WAL_FLUSH_SCENARIO_ID,
     PARALLEL_WAL_LANE_POLICY_VERSION, PARALLEL_WAL_STAGE_SCENARIO_ID, ParallelWalControlSurface,
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
-    ParallelWalOperatingMode, ParallelWalShadowVerdict, SubmitOutcome, TransactionConflictSnapshot,
-    TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
+    ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
+    TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
     parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
     parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
@@ -1304,6 +1304,39 @@ fn has_wal_backend(wal_backend: &SharedWalBackend) -> Result<bool> {
 
 static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>>> =
     OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// bd-yfdb6: Recovery fence registry
+// ---------------------------------------------------------------------------
+//
+// Keyed by canonical DB path so every `SimplePager::open_with_cx*` call for
+// the same file contends on the same `RecoveryFence`. Connection-open
+// acquires the fence while running the hot-journal / WAL recovery probe,
+// with bounded backoff (100 ms × 10 = 1 s) before surfacing a soft
+// `BusyRecovery` to the caller.
+static RECOVERY_FENCES: OnceLock<Mutex<HashMap<PathBuf, Arc<RecoveryFence>>>> = OnceLock::new();
+
+fn recovery_fence_for_path(db_path: &Path) -> Arc<RecoveryFence> {
+    let fences = RECOVERY_FENCES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut fences = fences
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(
+        fences
+            .entry(db_path.to_path_buf())
+            .or_insert_with(|| Arc::new(RecoveryFence::new())),
+    )
+}
+
+fn recovery_fence_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<RecoveryFence> {
+    if vfs.is_memory() {
+        // In-memory databases are connection-local; a fresh fence per open
+        // keeps isolation intact.
+        Arc::new(RecoveryFence::new())
+    } else {
+        recovery_fence_for_path(db_path)
+    }
+}
 
 fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
     let queues = GROUP_COMMIT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -4952,6 +4985,15 @@ where
         };
 
         let journal_path = Self::journal_path(path);
+        // bd-yfdb6: acquire the per-path recovery fence before running the
+        // hot-journal probe. If another connection is already running
+        // recovery on this path, we block with bounded backoff
+        // (RECOVERY_FENCE_BACKOFF * RECOVERY_FENCE_MAX_RETRIES) and then
+        // surface BusyRecovery if the fence is still held — letting the
+        // caller retry cleanly.
+        let recovery_fence = recovery_fence_for_backend(&*vfs, path);
+        let _recovery_guard = recovery_fence.acquire_for_recovery()?;
+
         // Hot journal recovery writes the database image back to its durable
         // pre-commit state, so acquire EXCLUSIVE before replay even during
         // initial open.

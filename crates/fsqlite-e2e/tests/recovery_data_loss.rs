@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-yfdb6";
@@ -133,8 +133,7 @@ fn wait_for_committed_batches(commit_log: &Path, min_batches: u32) -> bool {
 }
 
 fn yfdb6_producer_child(db_path: &Path, commit_log: &Path, stop_after: u32) -> ! {
-    let conn = Connection::open(db_path.to_string_lossy().as_ref())
-        .expect("producer: open db");
+    let conn = Connection::open(db_path.to_string_lossy().as_ref()).expect("producer: open db");
     setup_table(&conn);
 
     let mut commit_log_file = std::fs::OpenOptions::new()
@@ -177,7 +176,8 @@ fn yfdb6_producer_child(db_path: &Path, commit_log: &Path, stop_after: u32) -> !
             // of landing the SIGKILL mid-write (which is the whole point of
             // this test).
             loop {
-                conn.execute("BEGIN IMMEDIATE;").expect("producer: begin tail txn");
+                conn.execute("BEGIN IMMEDIATE;")
+                    .expect("producer: begin tail txn");
                 for id in next_id..(next_id + BATCH_SIZE) {
                     conn.execute_with_params(
                         "INSERT INTO t(id, payload) VALUES (?1, ?2);",
@@ -197,11 +197,7 @@ fn yfdb6_producer_child(db_path: &Path, commit_log: &Path, stop_after: u32) -> !
     }
 }
 
-fn spawn_producer(
-    db_path: &Path,
-    commit_log: &Path,
-    stop_after: u32,
-) -> std::process::Child {
+fn spawn_producer(db_path: &Path, commit_log: &Path, stop_after: u32) -> std::process::Child {
     Command::new(env::current_exe().expect("current_exe"))
         .arg("--exact")
         .arg(HELPER_TEST_NAME)
@@ -221,8 +217,7 @@ fn run_one_iteration(seed: u64, iteration: u32) {
     let commit_log: PathBuf = dir.path().join(format!("yfdb6_iter_{iteration}.commits"));
 
     let mut rng = StdRng::seed_from_u64(seed);
-    let stop_after: u32 =
-        rng.gen_range(KILL_AFTER_MIN_COMMITS..=KILL_AFTER_MAX_COMMITS);
+    let stop_after: u32 = rng.gen_range(KILL_AFTER_MIN_COMMITS..=KILL_AFTER_MAX_COMMITS);
 
     let mut child = spawn_producer(&db_path, &commit_log, stop_after);
 
@@ -254,8 +249,7 @@ fn run_one_iteration(seed: u64, iteration: u32) {
     let expected_rows = expected_rows_from_commit_log(&commit_entries);
 
     // Open a fresh connection: this runs the WAL recovery path.
-    let verifier =
-        Connection::open(db_path.to_string_lossy().as_ref()).expect("verifier: open db");
+    let verifier = Connection::open(db_path.to_string_lossy().as_ref()).expect("verifier: open db");
     assert!(
         verifier.is_concurrent_mode_default(),
         "[{BEAD_ID}] recovered connection must keep concurrent mode enabled",
@@ -305,7 +299,9 @@ fn two_process_sigkill_recovery_loses_no_committed_writes() {
     let base_seed: u64 = 0x0000_0000_0000_BD6_Fu64;
     let iterations: u32 = 20;
     for i in 0..iterations {
-        let seed = base_seed.wrapping_mul(1 + u64::from(i)).wrapping_add(u64::from(i) * 7919);
+        let seed = base_seed
+            .wrapping_mul(1 + u64::from(i))
+            .wrapping_add(u64::from(i) * 7919);
         run_one_iteration(seed, i);
     }
     eprintln!(
