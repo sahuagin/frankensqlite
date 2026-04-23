@@ -178,8 +178,8 @@ use crate::{
     TableIndexMetaMap, VdbeProgram, enter_vdbe_decode_profile_stage,
     enter_vdbe_execute_profile_stage,
     jit::{
-        CompiledProgram, ConstantResultRowTemplate, InsertValueSource, RowidLookupSelectTemplate,
-        SimpleInsertTemplate, try_compile_program,
+        CompiledProgram, ConstantResultRowTemplate, FullScanSelectTemplate, InsertValueSource,
+        RowidLookupSelectTemplate, SimpleInsertTemplate, try_compile_program,
     },
     opcode_register_spans,
 };
@@ -4955,6 +4955,10 @@ fn estimate_compiled_program_size(compiled_program: &CompiledProgram) -> u64 {
         CompiledProgram::RowidLookupSelect(template) => {
             let col_count = u64::try_from(template.column_indices.len()).unwrap_or(u64::MAX);
             col_count.saturating_mul(24).saturating_add(80)
+        }
+        CompiledProgram::FullScanSelect(template) => {
+            let col_count = u64::try_from(template.column_indices.len()).unwrap_or(u64::MAX);
+            col_count.saturating_mul(24).saturating_add(64)
         }
     }
 }
@@ -12173,6 +12177,57 @@ impl VdbeEngine {
         Ok(ExecOutcome::Done)
     }
 
+    fn execute_compiled_full_scan_select(
+        &mut self,
+        template: &FullScanSelectTemplate,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<ExecOutcome> {
+        if !self.open_storage_cursor(template.cursor_id, template.root_page, false) {
+            return Err(FrankenError::internal(format!(
+                "compiled full-scan SELECT could not open cursor {} on root {}",
+                template.cursor_id, template.root_page
+            )));
+        }
+
+        let has_rows = {
+            let sc = self
+                .storage_cursors
+                .get_mut(&template.cursor_id)
+                .ok_or_else(|| {
+                    FrankenError::internal("compiled full-scan SELECT lost its cursor")
+                })?;
+            sc.cursor.first(&sc.cx)?
+        };
+
+        if has_rows {
+            loop {
+                let mut values = Vec::with_capacity(template.column_indices.len());
+                for &col_idx in &template.column_indices {
+                    let val = self.cursor_column(template.cursor_id, col_idx as usize)?;
+                    values.push(val);
+                }
+                self.emit_compiled_result_row(&values, collect_vdbe_metrics, row_handler)?;
+
+                let more = {
+                    let sc = self
+                        .storage_cursors
+                        .get_mut(&template.cursor_id)
+                        .ok_or_else(|| {
+                            FrankenError::internal("compiled full-scan SELECT lost cursor mid-scan")
+                        })?;
+                    sc.cursor.next(&sc.cx)?
+                };
+                if !more {
+                    break;
+                }
+            }
+        }
+
+        self.storage_cursors.remove(&template.cursor_id);
+        Ok(ExecOutcome::Done)
+    }
+
     fn execute_compiled_program(
         &mut self,
         compiled_program: &CompiledProgram,
@@ -12195,6 +12250,9 @@ impl VdbeEngine {
                     collect_vdbe_metrics,
                     row_handler,
                 ),
+            CompiledProgram::FullScanSelect(template) => {
+                self.execute_compiled_full_scan_select(template, collect_vdbe_metrics, row_handler)
+            }
         }
     }
 

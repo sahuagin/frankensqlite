@@ -25,6 +25,8 @@ pub enum CompiledProgram {
     SimpleInsert(SimpleInsertTemplate),
     /// Compiled rowid-equality SELECT: `SELECT cols FROM t WHERE rowid = ?`.
     RowidLookupSelect(RowidLookupSelectTemplate),
+    /// Compiled full table scan SELECT: `SELECT cols FROM t`.
+    FullScanSelect(FullScanSelectTemplate),
 }
 
 /// Template for a compiled rowid-equality SELECT.
@@ -41,6 +43,17 @@ pub struct RowidLookupSelectTemplate {
     pub column_indices: Vec<i32>,
     /// Source of the rowid lookup key.
     pub rowid_source: InsertValueSource,
+}
+
+/// Template for a compiled full table scan SELECT.
+///
+/// Captures: cursor, root page, column extraction indices. Emits one
+/// result row per table row (Rewind → Column... → ResultRow → Next loop).
+#[derive(Debug, Clone)]
+pub struct FullScanSelectTemplate {
+    pub cursor_id: i32,
+    pub root_page: i32,
+    pub column_indices: Vec<i32>,
 }
 
 /// One compiled column source for a simple INSERT record.
@@ -85,6 +98,7 @@ pub fn try_compile_program(ops: &[VdbeOp]) -> Option<CompiledProgram> {
         .map(CompiledProgram::ConstantResultRow)
         .or_else(|| try_compile_insert(ops).map(CompiledProgram::SimpleInsert))
         .or_else(|| try_compile_rowid_lookup_select(ops).map(CompiledProgram::RowidLookupSelect))
+        .or_else(|| try_compile_full_scan_select(ops).map(CompiledProgram::FullScanSelect))
 }
 
 fn ensure_const_register(registers: &mut Vec<Option<SqliteValue>>, reg: i32, value: SqliteValue) {
@@ -512,6 +526,56 @@ fn resolve_register_source(ops: &[VdbeOp], reg: i32) -> Option<InsertValueSource
     None
 }
 
+fn try_compile_full_scan_select(ops: &[VdbeOp]) -> Option<FullScanSelectTemplate> {
+    for op in ops {
+        match op.opcode {
+            Opcode::Init
+            | Opcode::Transaction
+            | Opcode::Goto
+            | Opcode::Noop
+            | Opcode::OpenRead
+            | Opcode::Close
+            | Opcode::Halt
+            | Opcode::Rewind
+            | Opcode::Next
+            | Opcode::Column
+            | Opcode::ResultRow
+            | Opcode::Affinity
+            | Opcode::ReadCookie
+            | Opcode::TableLock
+            | Opcode::RealAffinity
+            | Opcode::Integer
+            | Opcode::Null => {}
+            _ => return None,
+        }
+    }
+
+    let rewind = ops.iter().find(|op| op.opcode == Opcode::Rewind)?;
+    let cursor_id = rewind.p1;
+    let root_page = find_read_root_page(ops, cursor_id)?;
+
+    ops.iter().find(|op| op.opcode == Opcode::Next && op.p1 == cursor_id)?;
+
+    let result_row = ops.iter().find(|op| op.opcode == Opcode::ResultRow)?;
+    let first_result_reg = result_row.p1;
+    let result_count = usize::try_from(result_row.p2).ok()?;
+
+    let mut column_indices = Vec::with_capacity(result_count);
+    for offset in 0..i32::try_from(result_count).ok()? {
+        let dest_reg = first_result_reg + offset;
+        let col_op = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Column && op.p1 == cursor_id && op.p3 == dest_reg)?;
+        column_indices.push(col_op.p2);
+    }
+
+    Some(FullScanSelectTemplate {
+        cursor_id,
+        root_page,
+        column_indices,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,5 +795,30 @@ mod tests {
         assert_eq!(template.root_page, 5);
         assert_eq!(template.column_indices, vec![0, 1]);
         assert_eq!(template.rowid_source, InsertValueSource::Binding(0));
+    }
+
+    #[test]
+    fn try_compile_full_scan_select_from_rewind_next_pattern() {
+        let ops = vec![
+            VdbeOp { opcode: Opcode::Init, p1: 0, p2: 9, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Transaction, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::OpenRead, p1: 0, p2: 3, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Rewind, p1: 0, p2: 8, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Column, p1: 0, p2: 0, p3: 1, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Column, p1: 0, p2: 1, p3: 2, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::ResultRow, p1: 1, p2: 2, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Next, p1: 0, p2: 4, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Close, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp { opcode: Opcode::Halt, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
+        ];
+
+        let compiled = try_compile_program(&ops);
+        let template = match compiled {
+            Some(CompiledProgram::FullScanSelect(t)) => t,
+            other => panic!("expected FullScanSelect, got {other:?}"),
+        };
+        assert_eq!(template.cursor_id, 0);
+        assert_eq!(template.root_page, 3);
+        assert_eq!(template.column_indices, vec![0, 1]);
     }
 }
