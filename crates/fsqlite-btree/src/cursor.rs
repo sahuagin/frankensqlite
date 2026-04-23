@@ -570,7 +570,7 @@ struct StackEntry {
 const TABLE_SEEK_CACHE_SLOTS: usize = 4;
 const CELL_SLOT_CACHE_ENTRIES: usize = 64;
 
-type CachedCellSlots = SmallVec<[Option<CachedCellSlot>; 32]>;
+type CachedCellSlots = SmallVec<[(u16, CachedCellSlot); 8]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedCellSlot {
@@ -634,8 +634,8 @@ impl CellSlotCache {
         })?;
         let slot = self.entries[entry_idx]
             .slots
-            .get(usize::from(cell_idx))
-            .and_then(|cached| *cached)?;
+            .iter()
+            .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot))?;
         if entry_idx != 0 {
             let entry = self.entries.remove(entry_idx);
             self.entries.insert(0, entry);
@@ -647,7 +647,6 @@ impl CellSlotCache {
         &mut self,
         page_no: PageNumber,
         mutation_counter: u32,
-        cell_count: u16,
         cell_idx: u16,
         slot: CachedCellSlot,
     ) {
@@ -663,12 +662,11 @@ impl CellSlotCache {
             }
         };
 
-        let slot_idx = usize::from(cell_idx);
-        let required_len = usize::from(cell_count).max(slot_idx.saturating_add(1));
-        if entry.slots.len() < required_len {
-            entry.slots.resize(required_len, None);
+        if let Some((_, existing)) = entry.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
+            *existing = slot;
+        } else {
+            entry.slots.push((cell_idx, slot));
         }
-        entry.slots[slot_idx] = Some(slot);
 
         self.entries.insert(0, entry);
         self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
@@ -1942,13 +1940,9 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let slot = self.parse_cell_slot_at(entry, idx)?;
-        self.cell_slot_cache.borrow_mut().insert(
-            entry.page_no,
-            entry.mutation_counter,
-            entry.header.cell_count,
-            idx,
-            slot,
-        );
+        self.cell_slot_cache
+            .borrow_mut()
+            .insert(entry.page_no, entry.mutation_counter, idx, slot);
         Ok(slot.into_cell_ref())
     }
 
@@ -8334,10 +8328,12 @@ mod tests {
         assert_eq!(first_cell.rowid, Some(1));
         let first_counter = first_entry.mutation_counter;
         assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+        assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 1);
 
         let second_cell = cursor.parse_cell_at(&first_entry, 1).unwrap();
         assert_eq!(second_cell.rowid, Some(2));
         assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 1);
+        assert_eq!(cursor.cell_slot_cache.borrow().entries[0].slots.len(), 2);
 
         cursor
             .pager
