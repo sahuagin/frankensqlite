@@ -2247,6 +2247,12 @@ pub struct GcHorizonResult {
     pub active_slots: usize,
     /// Number of sentinel-tagged slots that blocked advancement.
     pub sentinel_blockers: usize,
+    /// Number of pinned readers whose snapshot `CommitSeq` clamped the
+    /// proposed horizon below the slot-based floor (bd-wt4uu).
+    pub stale_reader_clamps: usize,
+    /// Reader snapshot `CommitSeq` that clamped the horizon, if any. Only
+    /// meaningful when `stale_reader_clamps > 0`.
+    pub clamped_by_reader_seq: Option<CommitSeq>,
 }
 
 /// Compute the new GC horizon from a set of `SharedTxnSlot`s (§5.6.5).
@@ -2326,7 +2332,90 @@ pub fn raise_gc_horizon(
         new_horizon,
         active_slots,
         sentinel_blockers,
+        stale_reader_clamps: 0,
+        clamped_by_reader_seq: None,
     }
+}
+
+/// Snapshot of a pinned reader consulted during GC horizon advance (bd-wt4uu).
+///
+/// This is a slot-free view that matches
+/// [`crate::ebr::ReaderPinSnapshot`] but keeps [`core_types`] decoupled from
+/// the EBR registry type so callers (e.g. the pager) can supply synthetic
+/// reader lists in tests without constructing a full registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderPinCommitSeq {
+    /// Stable guard id (for logging).
+    pub guard_id: u64,
+    /// Reader snapshot `CommitSeq`. `None` means the reader has not declared
+    /// its snapshot seq and is NOT considered for horizon clamping.
+    pub pinned_commit_seq: Option<CommitSeq>,
+    /// Elapsed pin duration for observability.
+    pub pinned_for: Duration,
+}
+
+/// Compute the new GC horizon with synchronous stale-reader clamping (bd-wt4uu).
+///
+/// Wraps [`raise_gc_horizon`] and additionally clamps the proposed horizon to
+/// `min_pinned_commit_seq - 1` if any reader's declared snapshot `CommitSeq`
+/// is below the slot-based floor.
+///
+/// **Correctness**: readers may hold an EBR pin with a snapshot seq that is
+/// older than any `SharedTxnSlot` the writer scans (e.g. the reader's slot
+/// was freed or the reader registered via a ticket without a slot). Clamping
+/// here preserves reader visibility: versions with `commit_seq < horizon`
+/// are reclaimable; any reader pinned at `seq` still needs versions whose
+/// commit_seq is in `[seq, current]`, so the horizon must stay `<= seq - 1`.
+///
+/// **Observability**: emits `tracing::warn!(target = "fsqlite_mvcc::stale_reader_pressure", ...)`
+/// when a commit is clamped. Fields: `guard_id`, `pinned_for_ms`,
+/// `commit_seq_delta`, `affected_pages`.
+#[must_use]
+pub fn raise_gc_horizon_with_reader_clamp(
+    slots: &[SharedTxnSlot],
+    old_horizon: CommitSeq,
+    commit_seq: CommitSeq,
+    reader_pins: &[ReaderPinCommitSeq],
+    affected_pages: usize,
+) -> GcHorizonResult {
+    let mut result = raise_gc_horizon(slots, old_horizon, commit_seq);
+
+    // Find the minimum pinned_commit_seq across all readers (if any).
+    let clamp = reader_pins
+        .iter()
+        .filter_map(|pin| pin.pinned_commit_seq.map(|seq| (pin, seq)))
+        .min_by_key(|(_, seq)| *seq);
+
+    if let Some((pin, clamp_seq)) = clamp {
+        if clamp_seq <= result.new_horizon {
+            // Clamp the horizon to clamp_seq - 1 (or old_horizon if that is
+            // larger — monotonicity must be preserved).
+            let clamped = CommitSeq::new(clamp_seq.get().saturating_sub(1));
+            let clamped = if clamped >= old_horizon {
+                clamped
+            } else {
+                old_horizon
+            };
+            if clamped < result.new_horizon {
+                let commit_seq_delta = commit_seq.get().saturating_sub(clamp_seq.get());
+                tracing::warn!(
+                    target: "fsqlite_mvcc::stale_reader_pressure",
+                    guard_id = pin.guard_id,
+                    pinned_for_ms = pin.pinned_for.as_millis() as u64,
+                    commit_seq_delta,
+                    affected_pages,
+                    clamped_horizon = clamped.get(),
+                    proposed_horizon = result.new_horizon.get(),
+                    "commit GC horizon clamped by stale reader pin (bd-wt4uu)"
+                );
+                result.new_horizon = clamped;
+                result.stale_reader_clamps = 1;
+                result.clamped_by_reader_seq = Some(clamp_seq);
+            }
+        }
+    }
+
+    result
 }
 
 /// Result of a single slot cleanup attempt.
@@ -2513,6 +2602,49 @@ pub fn cleanup_and_raise_gc_horizon(
     }
 
     let horizon_result = raise_gc_horizon(slots, old_horizon, commit_seq);
+    (horizon_result, cleaned)
+}
+
+/// Cleanup stale sentinel slots and raise the GC horizon, additionally
+/// clamping the horizon against stale reader pins (bd-wt4uu).
+///
+/// This is the production entry point for commit finalization: it invokes
+/// the stale-reader check BEFORE advancing the horizon. If any reader pins a
+/// snapshot `CommitSeq` below the slot-based floor, the horizon is clamped
+/// to `min_pinned_commit_seq - 1` and a
+/// `tracing::warn!(target = "fsqlite_mvcc::stale_reader_pressure", ...)`
+/// is emitted for each clamped commit.
+///
+/// Callers that already know `reader_pins` (e.g. obtained via
+/// `VersionGuardRegistry::all_reader_pins`) should prefer this function over
+/// [`cleanup_and_raise_gc_horizon`].
+pub fn cleanup_and_raise_gc_horizon_with_reader_clamp(
+    slots: &[SharedTxnSlot],
+    old_horizon: CommitSeq,
+    commit_seq: CommitSeq,
+    now_epoch_secs: u64,
+    process_alive: impl Fn(u32, u64) -> bool,
+    reader_pins: &[ReaderPinCommitSeq],
+    affected_pages: usize,
+) -> (GcHorizonResult, usize) {
+    let mut cleaned = 0_usize;
+
+    for (idx, slot) in slots.iter().enumerate() {
+        let slot_pid = slot.pid.load(Ordering::Acquire);
+        let result = try_cleanup_sentinel_slot(slot, now_epoch_secs, &process_alive);
+        if let SlotCleanupResult::Reclaimed { orphan_txn_id, .. } = result {
+            cleaned += 1;
+            GLOBAL_TXN_SLOT_METRICS.record_crash_detected(Some(idx), slot_pid, orphan_txn_id);
+        }
+    }
+
+    let horizon_result = raise_gc_horizon_with_reader_clamp(
+        slots,
+        old_horizon,
+        commit_seq,
+        reader_pins,
+        affected_pages,
+    );
     (horizon_result, cleaned)
 }
 

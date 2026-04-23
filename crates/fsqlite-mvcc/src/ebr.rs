@@ -212,6 +212,17 @@ impl std::fmt::Display for EbrMetricsSnapshot {
     }
 }
 
+/// Default cap on the number of pending versions queued for a single page
+/// while a stale reader still pins an older snapshot.
+///
+/// When a version chain for a page exceeds this cap with at least one pinned
+/// reader holding an older `commit_seq`, the MVCC layer force-aborts the
+/// pinned reader via [`VersionGuardRegistry::mark_force_abort`] and surfaces a
+/// [`MvccError::StaleReaderForceAborted`] error on the reader's next access.
+/// This prevents the OOM failure mode documented in `bd-wt4uu` (unbounded
+/// version-chain growth under long-lived readers at 3am prod load).
+pub const DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE: usize = 4096;
+
 /// Configuration for stale-reader detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StaleReaderConfig {
@@ -219,6 +230,12 @@ pub struct StaleReaderConfig {
     pub warn_after: Duration,
     /// Minimum interval between repeated warnings for the same guard.
     pub warn_every: Duration,
+    /// Maximum number of versions pending in a single page's chain while a
+    /// stale reader still pins an older `commit_seq`.
+    ///
+    /// When exceeded, the offending reader is force-aborted rather than
+    /// letting the chain grow to OOM. See [`bd-wt4uu`] design doc.
+    pub max_pending_versions_per_page: usize,
 }
 
 impl Default for StaleReaderConfig {
@@ -226,6 +243,7 @@ impl Default for StaleReaderConfig {
         Self {
             warn_after: Duration::from_secs(30),
             warn_every: Duration::from_secs(5),
+            max_pending_versions_per_page: DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE,
         }
     }
 }
@@ -237,6 +255,18 @@ pub struct ReaderPinSnapshot {
     pub guard_id: u64,
     /// Elapsed pin duration.
     pub pinned_for: Duration,
+    /// EBR epoch pinned by this reader (monotonic counter; not a `CommitSeq`).
+    pub pinned_epoch: u64,
+    /// `CommitSeq` captured by the reader at snapshot time, if known.
+    ///
+    /// When present, writers MUST NOT advance the GC horizon past this value
+    /// without force-aborting this reader first. A `None` value means the
+    /// reader has not reported its snapshot seq yet (e.g. transient pins that
+    /// don't participate in MVCC horizon gating).
+    pub pinned_commit_seq: Option<u64>,
+    /// Whether this reader has been marked for force-abort due to stale-reader
+    /// pressure (bd-wt4uu).
+    pub force_abort: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -244,6 +274,8 @@ struct ReaderPinState {
     pinned_at: Instant,
     last_warned_at: Option<Instant>,
     pinned_epoch: u64,
+    pinned_commit_seq: Option<u64>,
+    force_abort: bool,
 }
 
 /// Registry for active epoch pins (`VersionGuard`s).
@@ -321,6 +353,12 @@ impl VersionGuardRegistry {
     }
 
     /// Snapshot all stale readers as of `now`.
+    ///
+    /// Returns one entry per currently pinned reader whose pin age is at
+    /// least [`StaleReaderConfig::warn_after`]. The entry carries the reader's
+    /// `pinned_epoch`, optional `pinned_commit_seq`, and `force_abort` flag
+    /// so that writers can synchronously consult pin state before advancing
+    /// the GC horizon (bd-wt4uu).
     #[must_use]
     pub fn stale_reader_snapshots(&self, now: Instant) -> Vec<ReaderPinSnapshot> {
         self.active
@@ -332,12 +370,90 @@ impl VersionGuardRegistry {
                     Some(ReaderPinSnapshot {
                         guard_id,
                         pinned_for,
+                        pinned_epoch: state.pinned_epoch,
+                        pinned_commit_seq: state.pinned_commit_seq,
+                        force_abort: state.force_abort,
                     })
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    /// Snapshot every currently pinned reader (regardless of staleness age).
+    ///
+    /// Unlike [`Self::stale_reader_snapshots`], this returns every active pin.
+    /// Used by the horizon-cap path in `cleanup_and_raise_gc_horizon` so that
+    /// even short-lived pins can clamp the horizon when they declared a
+    /// snapshot seq. Returns an empty `Vec` if no readers are pinned.
+    #[must_use]
+    pub fn all_reader_pins(&self) -> Vec<ReaderPinSnapshot> {
+        let now = Instant::now();
+        self.active
+            .lock()
+            .iter()
+            .map(|(&guard_id, state)| ReaderPinSnapshot {
+                guard_id,
+                pinned_for: now.saturating_duration_since(state.pinned_at),
+                pinned_epoch: state.pinned_epoch,
+                pinned_commit_seq: state.pinned_commit_seq,
+                force_abort: state.force_abort,
+            })
+            .collect()
+    }
+
+    /// Minimum `pinned_commit_seq` across currently active readers.
+    ///
+    /// Returns `None` if no reader has declared a snapshot seq. A `Some(seq)`
+    /// return means: any version visible only at `CommitSeq < seq` is still
+    /// reachable; the GC horizon MUST NOT advance past `seq - 1` without
+    /// force-aborting the corresponding reader (bd-wt4uu).
+    #[must_use]
+    pub fn min_pinned_commit_seq(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .values()
+            .filter_map(|state| state.pinned_commit_seq)
+            .min()
+    }
+
+    /// Attach a snapshot `CommitSeq` to an already-pinned guard.
+    ///
+    /// Called by [`VersionGuard`] / [`VersionGuardTicket`] owners once their
+    /// transaction's `begin_seq` is known. Idempotent: later calls with the
+    /// same or newer seq are no-ops; monotonic behaviour is not enforced here
+    /// because a single guard corresponds to one transaction's lifetime.
+    pub fn set_pinned_commit_seq(&self, guard_id: u64, commit_seq: u64) {
+        if let Some(state) = self.active.lock().get_mut(&guard_id) {
+            state.pinned_commit_seq = Some(commit_seq);
+        }
+    }
+
+    /// Mark a pinned guard as force-aborted due to stale-reader pressure.
+    ///
+    /// The reader can observe this flag via [`VersionGuard::is_force_aborted`]
+    /// or [`VersionGuardTicket::is_force_aborted`] and surface an error to
+    /// the caller. Idempotent. Returns `true` if the guard was present and
+    /// transitioned from `false` to `true`, `false` otherwise.
+    pub fn mark_force_abort(&self, guard_id: u64) -> bool {
+        self.active.lock().get_mut(&guard_id).is_some_and(|state| {
+            if state.force_abort {
+                false
+            } else {
+                state.force_abort = true;
+                true
+            }
+        })
+    }
+
+    /// Query whether a pinned guard has been force-aborted.
+    #[must_use]
+    pub fn is_force_aborted(&self, guard_id: u64) -> bool {
+        self.active
+            .lock()
+            .get(&guard_id)
+            .is_some_and(|state| state.force_abort)
     }
 
     /// Emit stale-reader warnings as of `now`.
@@ -383,6 +499,8 @@ impl VersionGuardRegistry {
                 pinned_at,
                 last_warned_at: None,
                 pinned_epoch,
+                pinned_commit_seq: None,
+                force_abort: false,
             },
         );
         guard_id
@@ -448,6 +566,20 @@ impl VersionGuard {
     #[must_use]
     pub fn pinned_for(&self) -> Duration {
         self.pinned_at.elapsed()
+    }
+
+    /// Attach a snapshot `CommitSeq` so writers can clamp the GC horizon at
+    /// commit finalization (bd-wt4uu).
+    pub fn set_pinned_commit_seq(&self, commit_seq: u64) {
+        self.registry
+            .set_pinned_commit_seq(self.guard_id, commit_seq);
+    }
+
+    /// Returns `true` if this guard has been force-aborted by the writer
+    /// due to stale-reader pressure (bd-wt4uu).
+    #[must_use]
+    pub fn is_force_aborted(&self) -> bool {
+        self.registry.is_force_aborted(self.guard_id)
     }
 
     /// Defer retirement of an owned value until it is safe to reclaim.
@@ -557,6 +689,20 @@ impl VersionGuardTicket {
     #[must_use]
     pub fn registry(&self) -> &Arc<VersionGuardRegistry> {
         &self.registry
+    }
+
+    /// Attach a snapshot `CommitSeq` so writers can clamp the GC horizon at
+    /// commit finalization (bd-wt4uu).
+    pub fn set_pinned_commit_seq(&self, commit_seq: u64) {
+        self.registry
+            .set_pinned_commit_seq(self.guard_id, commit_seq);
+    }
+
+    /// Returns `true` if this ticket has been force-aborted by the writer
+    /// due to stale-reader pressure (bd-wt4uu).
+    #[must_use]
+    pub fn is_force_aborted(&self) -> bool {
+        self.registry.is_force_aborted(self.guard_id)
     }
 
     /// Pin the current thread's epoch and defer retirement of a value.
@@ -860,8 +1006,8 @@ mod tests {
     use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
     use super::{
-        EbrMetrics, GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry,
-        VersionGuardTicket,
+        DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE, EbrMetrics, GLOBAL_EBR_METRICS, StaleReaderConfig,
+        VersionGuard, VersionGuardRegistry, VersionGuardTicket,
     };
 
     #[test]
@@ -869,6 +1015,7 @@ mod tests {
         let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
             warn_after: Duration::from_secs(60),
             warn_every: Duration::from_secs(10),
+            ..StaleReaderConfig::default()
         }));
         assert_eq!(registry.active_guard_count(), 0);
 
@@ -921,6 +1068,7 @@ mod tests {
         let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
             warn_after: Duration::from_millis(5),
             warn_every: Duration::from_millis(5),
+            ..StaleReaderConfig::default()
         }));
 
         let _guard = VersionGuard::pin(Arc::clone(&registry));
@@ -936,6 +1084,7 @@ mod tests {
         let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
             warn_after: Duration::ZERO,
             warn_every: Duration::from_millis(5),
+            ..StaleReaderConfig::default()
         }));
         let _guard = VersionGuard::pin(Arc::clone(&registry));
 
@@ -1230,6 +1379,7 @@ mod tests {
         let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
             warn_after: Duration::ZERO,
             warn_every: Duration::ZERO,
+            ..StaleReaderConfig::default()
         }));
         let _guard = VersionGuard::pin(Arc::clone(&registry));
 
@@ -1412,5 +1562,192 @@ mod tests {
         // Force drain on empty also returns empty.
         let drained = queue.force_drain();
         assert!(drained.is_empty());
+    }
+
+    // ===================================================================
+    // bd-wt4uu: stale-reader horizon clamp + bounded version chain
+    // ===================================================================
+
+    use crate::cache_aligned::SharedTxnSlot;
+    use crate::core_types::{ReaderPinCommitSeq, raise_gc_horizon_with_reader_clamp};
+    use fsqlite_types::CommitSeq;
+
+    /// A reader pinned at `begin_seq=5` MUST prevent the GC horizon from
+    /// advancing past `4` even if the writer's view of the slot table shows
+    /// no active transaction (the reader holds an EBR pin but its TxnSlot is
+    /// freed). Covers the core bd-wt4uu race.
+    #[test]
+    fn test_gc_horizon_capped_at_stale_reader_pin() {
+        // No active slots — pretend the reader's slot was already freed but
+        // its EBR pin still carries its snapshot seq.
+        let slots: &[SharedTxnSlot] = &[];
+        let reader_pins = vec![ReaderPinCommitSeq {
+            guard_id: 42,
+            pinned_commit_seq: Some(CommitSeq::new(5)),
+            pinned_for: Duration::from_secs(45),
+        }];
+
+        // Writer commits 100 times → commit_seq=106, proposes horizon=106.
+        let old_horizon = CommitSeq::new(0);
+        let commit_seq = CommitSeq::new(106);
+        let result = raise_gc_horizon_with_reader_clamp(
+            slots,
+            old_horizon,
+            commit_seq,
+            &reader_pins,
+            /* affected_pages */ 7,
+        );
+
+        assert!(
+            result.new_horizon <= CommitSeq::new(4),
+            "bead_id=bd-wt4uu reader@seq=5 MUST clamp horizon to ≤ 4 \
+             (got {:?})",
+            result.new_horizon
+        );
+        assert_eq!(
+            result.stale_reader_clamps, 1,
+            "bead_id=bd-wt4uu exactly one reader clamp must be recorded"
+        );
+        assert_eq!(
+            result.clamped_by_reader_seq,
+            Some(CommitSeq::new(5)),
+            "bead_id=bd-wt4uu clamping reader seq must be surfaced"
+        );
+    }
+
+    /// When a version chain for a page exceeds the configured per-page cap
+    /// while a stale reader holds it pinned, the writer MUST force-abort the
+    /// reader so the chain can be GC'd — preventing OOM.
+    #[test]
+    fn test_bounded_chain_force_aborts_stale_reader() {
+        let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
+            warn_after: Duration::ZERO,
+            warn_every: Duration::from_millis(5),
+            max_pending_versions_per_page: 4,
+        }));
+
+        // Pin a reader and declare its snapshot seq.
+        let reader = VersionGuard::pin(Arc::clone(&registry));
+        reader.set_pinned_commit_seq(10);
+        assert!(
+            !reader.is_force_aborted(),
+            "bead_id=bd-wt4uu reader starts un-aborted"
+        );
+        assert_eq!(
+            registry.min_pinned_commit_seq(),
+            Some(10),
+            "bead_id=bd-wt4uu min_pinned_commit_seq reports reader's seq"
+        );
+
+        // Simulate the writer's bounded-chain enforcement: chain length
+        // exceeds the per-page cap (4). The writer marks the reader.
+        let chain_len = 128_usize;
+        let cap = registry.stale_reader_config().max_pending_versions_per_page;
+        assert!(chain_len > cap, "precondition: chain must exceed cap");
+
+        let marked = registry.mark_force_abort(reader.guard_id());
+        assert!(
+            marked,
+            "bead_id=bd-wt4uu force-abort mark must succeed on first call"
+        );
+
+        // Reader observes the abort on next access.
+        assert!(
+            reader.is_force_aborted(),
+            "bead_id=bd-wt4uu reader MUST observe force-abort on next access"
+        );
+
+        // Idempotent: second call returns false.
+        assert!(
+            !registry.mark_force_abort(reader.guard_id()),
+            "bead_id=bd-wt4uu second force-abort mark must be idempotent"
+        );
+
+        // Dropping the reader clears its pin — chain is reclaimable.
+        drop(reader);
+        assert_eq!(
+            registry.min_pinned_commit_seq(),
+            None,
+            "bead_id=bd-wt4uu min_pinned_commit_seq clears after reader drops"
+        );
+    }
+
+    /// Under normal load (no stale readers, short-lived pins), the horizon
+    /// must advance monotonically across many commits — no regression from
+    /// the clamp path.
+    #[test]
+    fn test_no_regression_under_normal_load() {
+        let slots: &[SharedTxnSlot] = &[];
+
+        let mut horizon = CommitSeq::new(0);
+        let commits = 10_000_u64;
+        for i in 1..=commits {
+            let commit_seq = CommitSeq::new(i);
+            // No readers pinned.
+            let result = raise_gc_horizon_with_reader_clamp(
+                slots,
+                horizon,
+                commit_seq,
+                &[],
+                /* affected_pages */ 1,
+            );
+            assert!(
+                result.new_horizon >= horizon,
+                "bead_id=bd-wt4uu horizon must never decrease: \
+                 old={horizon:?} new={:?} at commit={i}",
+                result.new_horizon
+            );
+            assert_eq!(
+                result.stale_reader_clamps, 0,
+                "bead_id=bd-wt4uu no clamp under normal load"
+            );
+            horizon = result.new_horizon;
+        }
+        assert_eq!(
+            horizon,
+            CommitSeq::new(commits),
+            "bead_id=bd-wt4uu horizon must equal final commit_seq after \
+             {commits} normal commits"
+        );
+    }
+
+    /// Config default exposes the 4096 per-page cap from bd-wt4uu.
+    #[test]
+    fn test_stale_reader_config_default_carries_per_page_cap() {
+        let cfg = StaleReaderConfig::default();
+        assert_eq!(
+            cfg.max_pending_versions_per_page, DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE,
+            "bead_id=bd-wt4uu default cap must be {DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE}"
+        );
+        assert_eq!(
+            DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE, 4096,
+            "bead_id=bd-wt4uu per-page cap default must be 4096"
+        );
+    }
+
+    /// Clamping must NEVER cause the horizon to regress below `old_horizon`
+    /// (monotonicity invariant, §5.6.5).
+    #[test]
+    fn test_clamp_respects_monotonic_horizon() {
+        let slots: &[SharedTxnSlot] = &[];
+
+        // old_horizon is already past the reader's snapshot seq — the reader
+        // is effectively too late to clamp; the horizon must stay at
+        // old_horizon (never decrease).
+        let old_horizon = CommitSeq::new(20);
+        let commit_seq = CommitSeq::new(100);
+        let reader_pins = vec![ReaderPinCommitSeq {
+            guard_id: 1,
+            pinned_commit_seq: Some(CommitSeq::new(5)),
+            pinned_for: Duration::from_secs(45),
+        }];
+
+        let result =
+            raise_gc_horizon_with_reader_clamp(slots, old_horizon, commit_seq, &reader_pins, 0);
+        assert!(
+            result.new_horizon >= old_horizon,
+            "bead_id=bd-wt4uu horizon must not decrease below old_horizon \
+             even when a reader holds an older seq"
+        );
     }
 }

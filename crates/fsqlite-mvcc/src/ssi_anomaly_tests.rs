@@ -733,6 +733,7 @@ fn ebr_stale_reader_detection() {
     let config = StaleReaderConfig {
         warn_after: Duration::from_millis(1),
         warn_every: Duration::from_millis(1),
+        ..StaleReaderConfig::default()
     };
     let registry = Arc::new(VersionGuardRegistry::new(config));
     let _guard = VersionGuard::pin(Arc::clone(&registry));

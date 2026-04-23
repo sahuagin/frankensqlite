@@ -240,10 +240,11 @@ pub use conflict_model::{
 pub use conformal_martingale::{ConformalMartingaleConfig, ConformalMartingaleMonitor};
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
-    InProcessPageLockTable, LOCK_TABLE_SHARDS, OrphanedSlotCleanupStats, RebuildError,
-    RebuildResult, SlotCleanupResult, Transaction, TransactionMode, TransactionState, VersionArena,
-    VersionIdx, cleanup_and_raise_gc_horizon, cleanup_orphaned_slots, raise_gc_horizon,
-    try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
+    InProcessPageLockTable, LOCK_TABLE_SHARDS, OrphanedSlotCleanupStats, ReaderPinCommitSeq,
+    RebuildError, RebuildResult, SlotCleanupResult, Transaction, TransactionMode, TransactionState,
+    VersionArena, VersionIdx, cleanup_and_raise_gc_horizon,
+    cleanup_and_raise_gc_horizon_with_reader_clamp, cleanup_orphaned_slots, raise_gc_horizon,
+    raise_gc_horizon_with_reader_clamp, try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
 };
 pub use deterministic_rebase::{
     BaseRowReader, RebaseEligibility, RebaseError, RebaseResult, RebaseSchemaLookup, ReplayResult,
@@ -255,8 +256,9 @@ pub use differential_privacy::{
     reset_dp_metrics, sensitivity,
 };
 pub use ebr::{
-    EbrMetrics, EbrMetricsSnapshot, EbrRetireQueue, GLOBAL_EBR_METRICS, ReaderPinSnapshot,
-    StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
+    DEFAULT_MAX_PENDING_VERSIONS_PER_PAGE, EbrMetrics, EbrMetricsSnapshot, EbrRetireQueue,
+    GLOBAL_EBR_METRICS, ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry,
+    VersionGuardTicket,
 };
 pub use flat_combining::{
     FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_SHARDS, MAX_FC_THREADS, OP_ADD, OP_READ,

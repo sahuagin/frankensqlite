@@ -144,6 +144,7 @@ fn test_ebr_guard_lifecycle_latency() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_secs(30),
         warn_every: Duration::from_secs(5),
+        ..StaleReaderConfig::default()
     }));
 
     let before = GLOBAL_EBR_METRICS.snapshot();
@@ -402,6 +403,7 @@ fn test_stale_reader_detection() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_millis(10),
         warn_every: Duration::from_millis(5),
+        ..StaleReaderConfig::default()
     }));
 
     // Pin a guard and let it become "stale".
@@ -470,6 +472,7 @@ fn test_conformance_summary() {
     let reg2 = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_millis(1),
         warn_every: Duration::from_millis(1),
+        ..StaleReaderConfig::default()
     }));
     let g2 = VersionGuard::pin(Arc::clone(&reg2));
     std::thread::sleep(Duration::from_millis(5));

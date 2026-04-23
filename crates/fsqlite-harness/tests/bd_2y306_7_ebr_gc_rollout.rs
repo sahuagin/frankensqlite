@@ -217,6 +217,7 @@ fn test_stale_reader_warning_budget() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_millis(10),
         warn_every: Duration::from_millis(50),
+        ..StaleReaderConfig::default()
     }));
 
     // Pin a guard and let it become stale.
@@ -505,6 +506,7 @@ fn test_multithreaded_gc_reader_contention() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_secs(30),
         warn_every: Duration::from_secs(5),
+        ..StaleReaderConfig::default()
     }));
 
     // Spawn reader threads that pin/unpin rapidly.
@@ -621,6 +623,7 @@ fn test_conformance_summary() {
     let registry = Arc::new(VersionGuardRegistry::new(StaleReaderConfig {
         warn_after: Duration::from_millis(5),
         warn_every: Duration::from_millis(1),
+        ..StaleReaderConfig::default()
     }));
     let scheduler = GcScheduler::new();
 
