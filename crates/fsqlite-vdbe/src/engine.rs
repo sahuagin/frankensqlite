@@ -2469,6 +2469,8 @@ fn wait_for_page_lock_holder_change(
     page_no: PageNumber,
     remaining: Duration,
 ) -> Result<bool> {
+    // Outer check runs the full `Cx::checkpoint` (observes e-process oracle +
+    // native cx plane) before entering the wait loop.
     observe_execution_cancellation(cx)?;
 
     let Some(holder) = ctx.lock_table.holder(page_no) else {
@@ -2481,7 +2483,16 @@ fn wait_for_page_lock_holder_change(
     let metrics_enabled = vdbe_metrics_enabled();
     let started = Instant::now();
     loop {
-        observe_execution_cancellation(cx)?;
+        // Per-iteration cancellation check: only probe the local
+        // `cancel_requested` atomic. The wait slice is bounded by
+        // `PAGE_LOCK_WAIT_CANCELLATION_POLL` (5 ms), so even if the e-process
+        // oracle fires during a slice, we'll observe it on the next iteration
+        // via the outer checkpoint at the top of the caller's loop. Running
+        // the full `Cx::checkpoint()` here was 1.58% self-time on the
+        // 2026-04-23 MT 8t DWARF capture (`fsqlite-memmove-dwarf-213322`).
+        if cx.is_cancel_requested() {
+            return Err(FrankenError::Abort);
+        }
 
         let wait_budget = remaining.saturating_sub(started.elapsed());
         if wait_budget.is_zero() {
