@@ -358,6 +358,30 @@ mod tests {
         assert!(matches!(err, FrankenError::Internal(_)));
     }
 
+    #[test]
+    fn public_api_writable_schema_allows_filebacked_sqlite_master_insert() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db_path = dir.path().join("writable-schema.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute("CREATE TABLE real_table (id INTEGER);")
+            .unwrap();
+        let before = conn.query_row("PRAGMA writable_schema;").unwrap();
+        assert_eq!(row_values(&before), vec![SqliteValue::Integer(0)]);
+
+        conn.execute("PRAGMA writable_schema = ON;").unwrap();
+        let after = conn.query_row("PRAGMA writable_schema;").unwrap();
+        assert_eq!(row_values(&after), vec![SqliteValue::Integer(1)]);
+
+        let inserted = conn
+            .execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) \
+                 VALUES('table', 'fake_tbl', 'fake_tbl', 0, 'CREATE TABLE fake_tbl(x)');",
+            )
+            .unwrap();
+        assert_eq!(inserted, 1);
+    }
+
     // ── DML affected-row counts (bd-118o) ─────────────────────────────────
 
     #[test]

@@ -1460,6 +1460,9 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("recursive_triggers") {
             return apply_recursive_triggers(state, stmt);
         }
+        if name.eq_ignore_ascii_case("writable_schema") {
+            return apply_writable_schema(state, stmt);
+        }
         if is_fsqlite_mvcc_max_chain_length(&stmt.name) {
             return apply_mvcc_max_chain_length(state, stmt);
         }
@@ -1741,6 +1744,20 @@ pub mod pragma {
             Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
                 let enabled = parse_bool(expr)?;
                 state.recursive_triggers = enabled;
+                Ok(PragmaOutput::Int(i64::from(enabled)))
+            }
+        }
+    }
+
+    fn apply_writable_schema(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.writable_schema))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.writable_schema = enabled;
                 Ok(PragmaOutput::Int(i64::from(enabled)))
             }
         }
