@@ -554,7 +554,8 @@ fn try_compile_full_scan_select(ops: &[VdbeOp]) -> Option<FullScanSelectTemplate
     let cursor_id = rewind.p1;
     let root_page = find_read_root_page(ops, cursor_id)?;
 
-    ops.iter().find(|op| op.opcode == Opcode::Next && op.p1 == cursor_id)?;
+    ops.iter()
+        .find(|op| op.opcode == Opcode::Next && op.p1 == cursor_id)?;
 
     let result_row = ops.iter().find(|op| op.opcode == Opcode::ResultRow)?;
     let first_result_reg = result_row.p1;
@@ -800,16 +801,86 @@ mod tests {
     #[test]
     fn try_compile_full_scan_select_from_rewind_next_pattern() {
         let ops = vec![
-            VdbeOp { opcode: Opcode::Init, p1: 0, p2: 9, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Transaction, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::OpenRead, p1: 0, p2: 3, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Rewind, p1: 0, p2: 8, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Column, p1: 0, p2: 0, p3: 1, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Column, p1: 0, p2: 1, p3: 2, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::ResultRow, p1: 1, p2: 2, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Next, p1: 0, p2: 4, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Close, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Halt, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
+            VdbeOp {
+                opcode: Opcode::Init,
+                p1: 0,
+                p2: 9,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Transaction,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::OpenRead,
+                p1: 0,
+                p2: 3,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Rewind,
+                p1: 0,
+                p2: 8,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 0,
+                p3: 1,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Column,
+                p1: 0,
+                p2: 1,
+                p3: 2,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::ResultRow,
+                p1: 1,
+                p2: 2,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Next,
+                p1: 0,
+                p2: 4,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Close,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
+            VdbeOp {
+                opcode: Opcode::Halt,
+                p1: 0,
+                p2: 0,
+                p3: 0,
+                p4: P4::None,
+                p5: 0,
+            },
         ];
 
         let compiled = try_compile_program(&ops);
