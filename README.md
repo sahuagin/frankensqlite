@@ -183,6 +183,16 @@ All threshold PRAGMAs clamp invalid low values to safe minimums.
 
 ## MVCC: How Concurrent Writers Work
 
+> **Using FrankenSQLite from multiple processes or a many-agent swarm?**
+> Read [`docs/concurrency-contract.md`](docs/concurrency-contract.md) before
+> your caller library writes any workaround. It states, unambiguously, which
+> concurrency shapes are supported (`single-process / multi-Connection / MVCC WAL`),
+> which are not (`single-Connection shared across threads`), and which are
+> under active hardening (`multi-process swarm-write`, tracked in
+> [#70](https://github.com/Dicklesworthstone/frankensqlite/issues/70) — the
+> harness under `crates/fsqlite-e2e/src/bin/swarm_multiprocess.rs` is the
+> canonical source of truth for what currently holds).
+
 ### The Write Path
 
 ```
