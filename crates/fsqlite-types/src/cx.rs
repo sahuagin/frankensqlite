@@ -1002,25 +1002,43 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Returns `Ok(())` when not cancelled **or when inside a masked section**.
     /// When cancellation is observed, transitions state from `CancelRequested`
     /// to `Cancelling`.
+    ///
+    /// Hot-path note: the cheap `cancel_requested` atomic load is consulted
+    /// first, then `mask_depth`. Only if neither cheap signal proves we're
+    /// clear do we consult the e-process oracle and the native asupersync
+    /// `Cx::checkpoint()`. Previously `maybe_cancel_via_native_cx` was
+    /// evaluated **unconditionally** before the fast-path test — every
+    /// checkpoint paid for the nested asupersync cancel machinery even when
+    /// the cheap atomic said "not cancelled". That showed up as 5.87%
+    /// self-time on the 2026-04-23 post-bench-fix MT 8t capture
+    /// (`fsqlite-bench-fix-validation-194151`).
     pub fn checkpoint(&self) -> Result<()> {
-        let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
-
-        // Fast path: not cancelled and no oracle-based shedding signal.
-        #[cfg(feature = "native")]
-        let native_cancel = self.maybe_cancel_via_native_cx(masked);
-        #[cfg(not(feature = "native"))]
-        let native_cancel = false;
-
-        if !self.inner.cancel_requested.load(Ordering::Acquire)
-            && !self.maybe_cancel_via_eprocess()
-            && !native_cancel
-        {
-            return Ok(());
+        let cancel_requested = self.inner.cancel_requested.load(Ordering::Acquire);
+        if !cancel_requested {
+            // Cheap path already proved we're not locally cancelled. Only
+            // the oracle + native cx can still observe a cancel signal.
+            if !self.maybe_cancel_via_eprocess() {
+                #[cfg(feature = "native")]
+                {
+                    let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
+                    if !self.maybe_cancel_via_native_cx(masked) {
+                        return Ok(());
+                    }
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    return Ok(());
+                }
+            }
         }
-        // Masked: defer cancellation observation.
+
+        // Either cancel_requested is set locally, or one of the async plane
+        // checks fired. Masked sections defer observation unconditionally.
+        let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
         if masked {
             return Ok(());
         }
+
         // Slow path: transition CancelRequested → Cancelling.
         {
             let mut state = self
