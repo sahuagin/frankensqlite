@@ -285,6 +285,17 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
             let base = tid as i64 * ROWID_BASE_STRIDE;
             let mut failed = 0usize;
 
+            // Prepare the INSERT once per transaction attempt; bind params per
+            // iteration. This matches the rusqlite reference loop (L412-446
+            // below) so both sides parse+plan the insert a single time and
+            // the per-row cost is just bind + execute.
+            //
+            // Using `format!` per-iter on the fsqlite side was an
+            // apples-to-oranges artifact that pinned `Lexer::tokenize_into`
+            // at 2.53% self-time and drove 12%+ allocator churn on MT 8t
+            // (2026-04-23 capture `fsqlite-t3b-validation-185110`).
+            let insert_sql = "INSERT INTO bench (id, payload) VALUES (?1, ?2)";
+
             // Single transaction spanning all rows; retry on transient
             // conflicts by rolling back and reopening the transaction.
             let mut retry_count = 0usize;
@@ -304,12 +315,24 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
                     return (start.elapsed(), rows_per_thread);
                 }
 
+                let stmt = match conn.prepare(insert_sql) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[fsqlite t{tid}] prepare failed: {e}");
+                        let _ = conn.execute("ROLLBACK");
+                        return (start.elapsed(), rows_per_thread);
+                    }
+                };
+
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..rows_per_thread as i64 {
                     let id = base + i;
-                    let sql =
-                        format!("INSERT INTO bench (id, payload) VALUES ({id}, 'tid{tid}_i{i}')");
-                    match conn.execute(&sql) {
+                    let payload = format!("tid{tid}_i{i}");
+                    let params = [
+                        fsqlite::SqliteValue::Integer(id),
+                        fsqlite::SqliteValue::Text(payload.into()),
+                    ];
+                    match stmt.execute_with_params(&params) {
                         Ok(_) => {}
                         Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
                             let _ = conn.execute("ROLLBACK");
