@@ -186,7 +186,7 @@ debug = true
 inherits = "release"
 opt-level = 3
 debug = false
-strip = true
+strip = false
 
 [profile.dev]
 opt-level = 1
