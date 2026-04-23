@@ -221,9 +221,18 @@ if [[ "${RUN_BOLT}" -eq 1 ]]; then
         echo "[BOLT] Post-link optimization..."
         BOLT_PROFILE="${RUN_DIR}/bolt.fdata"
         BOLT_BIN="${PGO_BIN}.bolt"
-        perf record -e cycles:u -j any,u -o "${RUN_DIR}/perf.data" -- \
-            "${PGO_BIN}" "${BENCH_ARGV[@]}" > "${RUN_DIR}/bolt_training.log" 2>&1
-        perf2bolt -p "${RUN_DIR}/perf.data" -o "${BOLT_PROFILE}" "${PGO_BIN}"
+        if perf record -e cycles:u -j any,u -o /dev/null -- /bin/true 2>/dev/null; then
+            echo "      using LBR branch sampling"
+            perf record -e cycles:u -j any,u -o "${RUN_DIR}/perf.data" -- \
+                "${PGO_BIN}" "${BENCH_ARGV[@]}" > "${RUN_DIR}/bolt_training.log" 2>&1
+            PERF2BOLT_FLAGS=()
+        else
+            echo "      LBR unavailable; falling back to basic sampling (no-LBR mode)"
+            perf record -o "${RUN_DIR}/perf.data" -- \
+                "${PGO_BIN}" "${BENCH_ARGV[@]}" > "${RUN_DIR}/bolt_training.log" 2>&1
+            PERF2BOLT_FLAGS=(-nl)
+        fi
+        perf2bolt "${PERF2BOLT_FLAGS[@]}" -p "${RUN_DIR}/perf.data" -o "${BOLT_PROFILE}" "${PGO_BIN}"
         llvm-bolt "${PGO_BIN}" -o "${BOLT_BIN}" -data="${BOLT_PROFILE}" \
             -reorder-blocks=ext-tsp -reorder-functions=hfsort+ -split-functions -icf=1
         echo "      BOLT output: ${BOLT_BIN}"
