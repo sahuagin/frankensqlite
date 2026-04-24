@@ -51,7 +51,7 @@ const JSONB_OBJECT_TYPE: u8 = 0xC;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PathSegment {
-    Key(String),
+    Key(SmallText),
     Index(usize),
     Append,
     FromEnd(usize),
@@ -161,8 +161,7 @@ fn json_extract_value(root: &Value, paths: &[&str]) -> Result<SqliteValue> {
     }
 
     if paths.len() == 1 {
-        let selected = resolve_path(root, paths[0])?;
-        return Ok(selected.map_or(SqliteValue::Null, json_to_sqlite_scalar));
+        return json_extract_single_path(root, paths[0]);
     }
 
     let mut out = Vec::with_capacity(paths.len());
@@ -183,9 +182,7 @@ fn jsonb_extract_value(root: &Value, paths: &[&str]) -> Result<Vec<u8>> {
     }
 
     let output = if paths.len() == 1 {
-        resolve_path(root, paths[0])?
-            .cloned()
-            .unwrap_or(Value::Null)
+        jsonb_extract_single_path_value(root, paths[0])?
     } else {
         let mut values = Vec::with_capacity(paths.len());
         for path_expr in paths {
@@ -208,6 +205,15 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
     };
     let encoded = encode_json_text("json_arrow encode failed", value)?;
     Ok(SqliteValue::Text(encoded.into()))
+}
+
+fn json_extract_single_path(root: &Value, path: &str) -> Result<SqliteValue> {
+    let selected = resolve_path(root, path)?;
+    Ok(selected.map_or(SqliteValue::Null, json_to_sqlite_scalar))
+}
+
+fn jsonb_extract_single_path_value(root: &Value, path: &str) -> Result<Value> {
+    Ok(resolve_path(root, path)?.cloned().unwrap_or(Value::Null))
 }
 
 fn json_array_length_value(root: &Value, path: Option<&str>) -> Result<Option<usize>> {
@@ -1143,7 +1149,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                         ))
                     })?;
                     idx += 1; // closing quote
-                    segments.push(PathSegment::Key(key));
+                    segments.push(PathSegment::Key(SmallText::from_string(key)));
                 } else {
                     let start = idx;
                     while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
@@ -1154,7 +1160,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                             "invalid json path `{path}`: empty key segment"
                         )));
                     }
-                    segments.push(PathSegment::Key(path[start..idx].to_owned()));
+                    segments.push(PathSegment::Key(SmallText::new(&path[start..idx])));
                 }
             }
             b'[' => {
@@ -1220,19 +1226,148 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     Ok(segments)
 }
 
+fn parse_quoted_path_key<'a>(path: &'a str, bytes: &[u8], idx: &mut usize) -> Result<Cow<'a, str>> {
+    let quoted_start = *idx;
+    *idx += 1;
+    let mut escaped = false;
+    let mut saw_escape = false;
+
+    while *idx < bytes.len() {
+        let byte = bytes[*idx];
+        if escaped {
+            escaped = false;
+            *idx += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            saw_escape = true;
+            *idx += 1;
+            continue;
+        }
+        if byte == b'"' {
+            let raw = &path[(quoted_start + 1)..*idx];
+            let key = if saw_escape {
+                let quoted_key = &path[quoted_start..=*idx];
+                Cow::Owned(serde_json::from_str::<String>(quoted_key).map_err(|error| {
+                    FrankenError::function_error(format!(
+                        "invalid json path `{path}` quoted key `{quoted_key}`: {error}"
+                    ))
+                })?)
+            } else {
+                Cow::Borrowed(raw)
+            };
+            *idx += 1;
+            return Ok(key);
+        }
+        *idx += 1;
+    }
+
+    Err(FrankenError::function_error(format!(
+        "invalid json path `{path}`: missing closing quote in key segment"
+    )))
+}
+
 fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
-    let segments = parse_path(path)?;
+    let bytes = path.as_bytes();
+    if bytes.first().copied() != Some(b'$') {
+        return Err(FrankenError::function_error(format!(
+            "invalid json path `{path}`: must start with `$`"
+        )));
+    }
+
+    let mut idx = 1;
     let mut cursor = root;
 
-    for segment in segments {
-        match segment {
-            PathSegment::Key(key) => {
-                let Some(next) = cursor.get(&key) else {
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'.' => {
+                idx += 1;
+                if idx >= bytes.len() {
+                    return Err(FrankenError::function_error(format!(
+                        "invalid json path `{path}`: empty key segment"
+                    )));
+                }
+
+                let next = if bytes[idx] == b'"' {
+                    let key = parse_quoted_path_key(path, bytes, &mut idx)?;
+                    cursor.get(key.as_ref())
+                } else {
+                    let start = idx;
+                    while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
+                        idx += 1;
+                    }
+                    if start == idx {
+                        return Err(FrankenError::function_error(format!(
+                            "invalid json path `{path}`: empty key segment"
+                        )));
+                    }
+                    cursor.get(&path[start..idx])
+                };
+
+                let Some(resolved) = next else {
                     return Ok(None);
                 };
-                cursor = next;
+                cursor = resolved;
             }
-            PathSegment::Index(index) => {
+            b'[' => {
+                idx += 1;
+                let start = idx;
+                let mut escaped = false;
+                while idx < bytes.len() {
+                    let byte = bytes[idx];
+                    if escaped {
+                        escaped = false;
+                        idx += 1;
+                        continue;
+                    }
+                    if byte == b'\\' {
+                        escaped = true;
+                        idx += 1;
+                        continue;
+                    }
+                    if byte == b']' {
+                        break;
+                    }
+                    idx += 1;
+                }
+                if idx >= bytes.len() {
+                    return Err(FrankenError::function_error(format!(
+                        "invalid json path `{path}`: missing closing `]`"
+                    )));
+                }
+                let segment_text = &path[start..idx];
+                idx += 1;
+
+                if segment_text == "#" {
+                    return Ok(None);
+                }
+                if let Some(rest) = segment_text.strip_prefix("#-") {
+                    let from_end = rest.parse::<usize>().map_err(|error| {
+                        FrankenError::function_error(format!(
+                            "invalid json path `{path}` from-end index `{segment_text}`: {error}"
+                        ))
+                    })?;
+                    if from_end == 0 {
+                        return Err(FrankenError::function_error(format!(
+                            "invalid json path `{path}`: from-end index must be >= 1"
+                        )));
+                    }
+                    let Some(array) = cursor.as_array() else {
+                        return Ok(None);
+                    };
+                    if from_end > array.len() {
+                        return Ok(None);
+                    }
+                    cursor = &array[array.len() - from_end];
+                    continue;
+                }
+
+                let index = segment_text.parse::<usize>().map_err(|error| {
+                    FrankenError::function_error(format!(
+                        "invalid json path `{path}` array index `{segment_text}`: {error}"
+                    ))
+                })?;
                 let Some(array) = cursor.as_array() else {
                     return Ok(None);
                 };
@@ -1241,17 +1376,11 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                 };
                 cursor = next;
             }
-            PathSegment::FromEnd(from_end) => {
-                let Some(array) = cursor.as_array() else {
-                    return Ok(None);
-                };
-                if from_end > array.len() {
-                    return Ok(None);
-                }
-                let index = array.len() - from_end;
-                cursor = &array[index];
+            _ => {
+                return Err(FrankenError::function_error(format!(
+                    "invalid json path `{path}` at byte offset {idx}"
+                )));
             }
-            PathSegment::Append => return Ok(None),
         }
     }
 
@@ -1543,23 +1672,23 @@ fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode
 
     let applied = match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
-            let exists = object.contains_key(key);
+            let exists = object.contains_key(key.as_ref());
             match mode {
                 EditMode::Set => {
-                    object.insert(key.clone(), new_value);
+                    object.insert(key.to_string(), new_value);
                     true
                 }
                 EditMode::Insert => {
                     if exists {
                         false
                     } else {
-                        object.insert(key.clone(), new_value);
+                        object.insert(key.to_string(), new_value);
                         true
                     }
                 }
                 EditMode::Replace => {
                     if exists {
-                        object.insert(key.clone(), new_value);
+                        object.insert(key.to_string(), new_value);
                         true
                     } else {
                         false
@@ -1637,7 +1766,7 @@ fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
 
     match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
-            object.remove(key);
+            object.remove(key.as_ref());
         }
         (Value::Array(array), PathSegment::Index(index)) if *index < array.len() => {
             array.remove(*index);
@@ -1659,7 +1788,7 @@ fn resolve_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) -> Option
     for segment in segments {
         match segment {
             PathSegment::Key(key) => {
-                let next = cursor.as_object_mut()?.get_mut(key)?;
+                let next = cursor.as_object_mut()?.get_mut(key.as_ref())?;
                 cursor = next;
             }
             PathSegment::Index(index) => {
@@ -1722,13 +1851,15 @@ fn resolve_parent_for_edit<'a>(
                     _ => return None,
                 };
 
-                if !object.contains_key(key) {
+                if !object.contains_key(key.as_ref()) {
                     if !matches!(mode, EditMode::Set | EditMode::Insert) {
                         return None;
                     }
-                    object.insert(key.clone(), scaffold_for_next_segment(next_segment));
+                    object.insert(key.to_string(), scaffold_for_next_segment(next_segment));
                 }
-                cursor = object.get_mut(key).expect("just inserted or checked");
+                cursor = object
+                    .get_mut(key.as_ref())
+                    .expect("just inserted or checked");
             }
             PathSegment::Index(index) => {
                 if cursor.is_null() {
@@ -2088,6 +2219,10 @@ impl ScalarFunction for JsonExtractFunc {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
+        if args.len() == 2 {
+            let path = text_arg(self.name(), args, 1)?;
+            return json_extract_single_path(&input, path);
+        }
         let paths = collect_path_args(self.name(), args, 1)?;
         json_extract_value(&input, &paths)
     }
@@ -2122,8 +2257,13 @@ impl ScalarFunction for JsonbExtractFunc {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
-        let paths = collect_path_args(self.name(), args, 1)?;
-        let blob = jsonb_extract_value(&input, &paths)?;
+        let blob = if args.len() == 2 {
+            let path = text_arg(self.name(), args, 1)?;
+            encode_jsonb_root(&jsonb_extract_single_path_value(&input, path)?)
+        } else {
+            let paths = collect_path_args(self.name(), args, 1)?;
+            jsonb_extract_value(&input, &paths)
+        }?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
@@ -3104,6 +3244,44 @@ mod tests {
     fn test_json_extract_from_end() {
         let result = json_extract("[10,20,30]", &["$[#-1]"]).unwrap();
         assert_eq!(result, SqliteValue::Integer(30));
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_json_extract_deep_single_path() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: usize = 200_000;
+        const REPEATS: usize = 5;
+        const JSON: &str = r#"{"a":{"b":{"c":{"d":[{"e":123},{"e":456}]}}}}"#;
+        const PATH: &str = "$.a.b.c.d[1].e";
+
+        let func = JsonExtractFunc;
+        let args = [
+            SqliteValue::Text(SmallText::from_string(JSON)),
+            SqliteValue::Text(SmallText::from_string(PATH)),
+        ];
+        let mut best_ns = u128::MAX;
+        let mut last_result = SqliteValue::Null;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..ROWS {
+                last_result = black_box(
+                    func.invoke(black_box(&args))
+                        .expect("json_extract benchmark invocation must succeed"),
+                );
+            }
+            let elapsed_ns = started.elapsed().as_nanos();
+            if elapsed_ns < best_ns {
+                best_ns = elapsed_ns;
+            }
+        }
+
+        println!(
+            "json_extract_deep_single_path rows={ROWS} repeats={REPEATS} best_ns={best_ns} last_result={last_result:?}"
+        );
     }
 
     #[test]
