@@ -927,9 +927,10 @@ const SLOT_TOMBSTONE: u32 = u32::MAX;
 /// length at 50–70% load is 1–3; 32 handles worst-case clustering.
 const MAX_PROBE_LENGTH: usize = 32;
 
-/// Minimum flat-table capacity (power of 2). Covers ~2 800 pages at 70%
-/// load (≈ 11 MiB at 4 KiB pages).
-const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
+/// Minimum flat-table capacity (power of 2). Covers ~350 pages at 70%
+/// load (≈ 1.4 MiB at 4 KiB pages), which is enough for tiny databases while
+/// keeping connection-open allocation proportional to observed size.
+const FLAT_SLOTS_MIN_CAPACITY: usize = 512;
 /// Maximum eagerly allocated flat-table capacity.
 ///
 /// The page-buffer pool ceiling is a lazy upper bound used to avoid spurious
@@ -938,6 +939,24 @@ const FLAT_SLOTS_MIN_CAPACITY: usize = 4096;
 /// configured maximum buffer count while overflow shards still absorb the cold
 /// tail.
 const FLAT_SLOTS_TARGET_CAPACITY: usize = 16_384;
+
+fn round_flat_slot_capacity(requested: usize) -> usize {
+    requested
+        .max(1)
+        .checked_next_power_of_two()
+        .unwrap_or(FLAT_SLOTS_TARGET_CAPACITY)
+        .clamp(FLAT_SLOTS_MIN_CAPACITY, FLAT_SLOTS_TARGET_CAPACITY)
+}
+
+fn flat_slot_capacity_for_pool(max_buffers: usize) -> usize {
+    round_flat_slot_capacity(max_buffers.saturating_mul(2))
+}
+
+fn flat_slot_capacity_for_initial_pages(max_buffers: usize, initial_pages: u32) -> usize {
+    let page_hint = usize::try_from(initial_pages).unwrap_or(usize::MAX).max(1);
+    let hot_page_bound = page_hint.min(max_buffers.max(1));
+    round_flat_slot_capacity(hot_page_bound.saturating_mul(2))
+}
 
 fn normalize_page_cache_shard_count(requested: usize) -> usize {
     requested
@@ -1928,6 +1947,26 @@ impl ShardedPageCache {
         Self::with_max_buffers_and_shards(page_size, max_buffers, DEFAULT_PAGE_CACHE_SHARDS)
     }
 
+    /// Create a new sharded page cache with a front-cache sized from the
+    /// currently observed database page count.
+    ///
+    /// The buffer-pool ceiling is a high-water safety bound, not a hot-set
+    /// measurement. Empty and tiny databases should not pay to initialize the
+    /// full 16K-slot lock-free front-cache on every connection open; existing
+    /// larger databases still scale up to the same cap.
+    pub fn with_max_buffers_for_initial_pages(
+        page_size: PageSize,
+        max_buffers: usize,
+        initial_pages: u32,
+    ) -> Self {
+        Self::with_max_buffers_for_initial_pages_and_shards(
+            page_size,
+            max_buffers,
+            initial_pages,
+            DEFAULT_PAGE_CACHE_SHARDS,
+        )
+    }
+
     /// Create a sharded cache with an explicit partition count.
     ///
     /// `shard_count` is normalized to a power of two within a bounded range so
@@ -1941,6 +1980,20 @@ impl ShardedPageCache {
             PageBufPool::new(page_size, max_buffers),
             page_size,
             shard_count,
+        )
+    }
+
+    fn with_max_buffers_for_initial_pages_and_shards(
+        page_size: PageSize,
+        max_buffers: usize,
+        initial_pages: u32,
+        shard_count: usize,
+    ) -> Self {
+        Self::with_pool_and_shards_and_flat_capacity(
+            PageBufPool::new(page_size, max_buffers),
+            page_size,
+            shard_count,
+            flat_slot_capacity_for_initial_pages(max_buffers, initial_pages),
         )
     }
 
@@ -1965,6 +2018,16 @@ impl ShardedPageCache {
     }
 
     fn with_pool_and_shards(pool: PageBufPool, page_size: PageSize, shard_count: usize) -> Self {
+        let flat_capacity = flat_slot_capacity_for_pool(pool.capacity());
+        Self::with_pool_and_shards_and_flat_capacity(pool, page_size, shard_count, flat_capacity)
+    }
+
+    fn with_pool_and_shards_and_flat_capacity(
+        pool: PageBufPool,
+        page_size: PageSize,
+        shard_count: usize,
+        flat_capacity: usize,
+    ) -> Self {
         let shard_count = normalize_page_cache_shard_count(shard_count);
         let shard_shift = 32 - shard_count.trailing_zeros();
         let shard_mask = shard_count - 1;
@@ -1972,15 +2035,6 @@ impl ShardedPageCache {
             .map(|_| Mutex::new(PageCacheShard::new()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-
-        // Bound the lock-free front-cache to a reasonable hot set. The pool
-        // ceiling is a lazy upper bound; eagerly allocating one flat slot per
-        // potential page buffer makes connection open scale with configured
-        // capacity instead of actual working set.
-        let flat_capacity = pool
-            .capacity()
-            .saturating_mul(2)
-            .clamp(FLAT_SLOTS_MIN_CAPACITY, FLAT_SLOTS_TARGET_CAPACITY);
 
         Self {
             flat_slots: FlatPageSlots::new(flat_capacity),
@@ -5870,6 +5924,36 @@ mod tests {
             cache.flat_slots.slots.len(),
             FLAT_SLOTS_TARGET_CAPACITY,
             "flat-slot front-cache should stay bounded even when the buffer pool ceiling is large"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_initial_page_hint_keeps_tiny_db_open_small() {
+        let cache = ShardedPageCache::with_max_buffers_for_initial_pages(
+            PageSize::DEFAULT,
+            DEFAULT_PAGE_BUFFER_MAX,
+            1,
+        );
+
+        assert_eq!(
+            cache.flat_slots.slots.len(),
+            FLAT_SLOTS_MIN_CAPACITY,
+            "tiny databases should not allocate the full flat-slot target on open"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_initial_page_hint_scales_large_db_to_target() {
+        let cache = ShardedPageCache::with_max_buffers_for_initial_pages(
+            PageSize::DEFAULT,
+            DEFAULT_PAGE_BUFFER_MAX,
+            u32::try_from(FLAT_SLOTS_TARGET_CAPACITY).unwrap(),
+        );
+
+        assert_eq!(
+            cache.flat_slots.slots.len(),
+            FLAT_SLOTS_TARGET_CAPACITY,
+            "large databases should still get the full lock-free front-cache cap"
         );
     }
 
