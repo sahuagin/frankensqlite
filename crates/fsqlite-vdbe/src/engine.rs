@@ -11787,6 +11787,21 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // AddImm is the canonical counter/accumulator increment, emitted
+            // in row counters, aggregate folding, recursive-CTE step counters,
+            // and conformance-test hot loops. Nearly every execution finds an
+            // Integer already in the target register, so the work is a read +
+            // `wrapping_add` + integer write — promoting it out of the 190-arm
+            // main match shortens the per-op instruction window meaningfully.
+            Opcode::AddImm => {
+                let val = self
+                    .get_reg(op.p1)
+                    .to_integer()
+                    .wrapping_add(i64::from(op.p2));
+                self.set_reg_int(op.p1, val);
+                *pc += 1;
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
