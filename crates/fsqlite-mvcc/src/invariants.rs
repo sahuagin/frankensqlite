@@ -672,27 +672,31 @@ impl VersionStore {
         let new_raw = ChainHeadTable::pack_idx(idx);
         let mut cas_attempts = 0_u32;
 
-        let previous_head = loop {
+        // `publish` is the only production path that installs a new chain
+        // head (`ChainHeadTable::{install,install_with_retry,remove}` are
+        // test-only), and it holds `arena.write()` exclusively across
+        // the load + link + swap sequence. No other thread can mutate
+        // this slot in that window, so `compare_exchange` (strong) must
+        // succeed on the first attempt — the prior `compare_exchange_weak`
+        // loop existed only to recover from spurious weak-CAS failures
+        // that this path never needed to tolerate.
+        let previous_head = {
             cas_attempts += 1;
             let slots = shard.slots.read();
             let current_raw = slots[slot_idx].load(Ordering::Acquire);
             let prev = ChainHeadTable::unpack_idx(current_raw);
 
-            // Link the new version to the current head BEFORE trying to swap.
+            // Link the new version to the current head BEFORE the swap.
             let v = arena.get_mut(idx).expect("just allocated");
             v.prev = prev.map(idx_to_version_pointer);
 
-            match slots[slot_idx].compare_exchange_weak(
-                current_raw,
-                new_raw,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break prev,
-                Err(_) => {
-                    std::hint::spin_loop();
-                }
-            }
+            slots[slot_idx]
+                .compare_exchange(current_raw, new_raw, Ordering::AcqRel, Ordering::Acquire)
+                .expect(
+                    "chain-head CAS must succeed under arena.write() exclusive hold: \
+                     no other writer can mutate this slot in the window",
+                );
+            prev
         };
         drop(arena);
 
