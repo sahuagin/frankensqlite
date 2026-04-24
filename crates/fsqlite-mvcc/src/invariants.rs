@@ -199,13 +199,20 @@ impl std::fmt::Debug for TxnManager {
 
 /// The core MVCC visibility predicate.
 ///
-/// A page version `V` is visible to snapshot `S` if and only if:
-/// 1. `V.commit_seq != 0` (the version is committed, not a private write-set entry)
-/// 2. `V.commit_seq <= S.high` (the commit happened before the snapshot)
+/// A page version `V` is visible to snapshot `S` iff
+/// `V.commit_seq ∈ [1, S.high]`. Collapsed into one unsigned
+/// comparison so the hot resolve loop does not branch on the
+/// committed/uncommitted check:
+///
+/// `commit_seq.wrapping_sub(1) < snapshot.high`
+///
+/// - commit_seq = 0 → `0u64.wrapping_sub(1) = u64::MAX`, never `< snapshot.high` → `false`.
+/// - commit_seq ∈ [1, snapshot.high] → `commit_seq - 1 < snapshot.high` → `true`.
+/// - commit_seq  > snapshot.high → `commit_seq - 1 >= snapshot.high` → `false`.
 #[inline]
 #[must_use]
 pub fn visible(version: &PageVersion, snapshot: &Snapshot) -> bool {
-    version.commit_seq.get() != 0 && version.commit_seq <= snapshot.high
+    version.commit_seq.get().wrapping_sub(1) < snapshot.high.get()
 }
 
 /// Visibility interval for a committed page version on a chain.

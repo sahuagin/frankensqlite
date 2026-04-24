@@ -219,9 +219,14 @@ impl CellDelta {
     }
 
     /// Whether this delta is visible to the given snapshot.
+    ///
+    /// Branchless: `commit_seq.wrapping_sub(1) < snapshot_high` folds the
+    /// `committed && <= high` check into one unsigned comparison. See
+    /// `invariants::visible` for the full derivation.
+    #[inline]
     #[must_use]
     pub fn is_visible_to(&self, snapshot_high: CommitSeq) -> bool {
-        self.commit_seq.get() != 0 && self.commit_seq <= snapshot_high
+        self.commit_seq.get().wrapping_sub(1) < snapshot_high.get()
     }
 }
 
