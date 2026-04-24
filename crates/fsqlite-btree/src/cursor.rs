@@ -5683,13 +5683,15 @@ impl<P: PageWriter> BtCursor<P> {
             )));
         }
 
-        let separator_cell = self.parse_cell_at(&entry, separator_idx)?;
-        let left_child =
-            separator_cell
-                .left_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior table separator missing left child".to_owned(),
-                })?;
+        // bd-k7zd7.3: extract the left-child pointer directly from the cell's
+        // first 4 bytes instead of routing through `parse_cell_at` →
+        // `CellRef::parse`. The separator cell is on an interior-table page
+        // (verified above) and the caller only needs `left_child`; decoding
+        // the rowid varint, computing local payload size, and checking
+        // overflow bounds are all dead work on this path. Same principle as
+        // commit 4b061dcc (`child_page_at` rewired to
+        // `read_interior_child_inline`).
+        let left_child = Self::read_interior_child_inline(&entry, separator_idx)?;
 
         let mut new_cell = [0_u8; 13];
         new_cell[0..4].copy_from_slice(&left_child.get().to_be_bytes());
@@ -14493,5 +14495,81 @@ mod tests {
             }
             run_and_report("index_random_insert", cell_slot_cache_counter_snapshot());
         }
+    }
+
+    /// bd-k7zd7.3 microbench: `replace_table_interior_separator_rowid`'s
+    /// separator-left-child extraction, comparing the direct
+    /// `read_interior_child_inline` path against the old
+    /// `parse_cell_at + cell.left_child.ok_or(..)` path.
+    ///
+    /// Ignored by default. Same pattern as `bench_child_page_at_interior_table`
+    /// but targets the DELETE-rebalance separator lookup (≈1 call per leaf
+    /// collapse; 99 % cache miss per the bd-k7zd7 audit).
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_replace_separator_inline_vs_parse_cell_at() {
+        const CHILDREN: usize = 128;
+        const WARMUP: u32 = 200_000;
+        const ITERS: u32 = 5_000_000;
+
+        let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
+            .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
+            .collect();
+        let right = pn((CHILDREN as u32) + 200);
+        let page_bytes = build_interior_table(&children, right);
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, page_bytes);
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+
+        // Warm cell-slot cache so the legacy path hits it.
+        for idx in 0..entry.header.cell_count {
+            let _ = cursor.parse_cell_at(&entry, idx).unwrap();
+        }
+
+        // Fast path — production code after bd-k7zd7.3.
+        for i in 0..WARMUP {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(
+                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
+            );
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(
+                BtCursor::<MemPageStore>::read_interior_child_inline(&entry, idx).unwrap(),
+            );
+        }
+        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        // Legacy path — parse_cell_at + separator_cell.left_child.ok_or(...).
+        let legacy = |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
+            let separator_cell = cursor.parse_cell_at(&entry, idx)?;
+            separator_cell
+                .left_child
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior table separator missing left child".to_owned(),
+                })
+        };
+        for i in 0..WARMUP {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(legacy(&cursor, idx).unwrap());
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(legacy(&cursor, idx).unwrap());
+        }
+        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        println!(
+            "[replace_separator_inline] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
+             speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
+            slow_ns / fast_ns.max(f64::EPSILON)
+        );
     }
 }
