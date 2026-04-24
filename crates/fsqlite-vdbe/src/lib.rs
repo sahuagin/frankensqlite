@@ -1817,7 +1817,7 @@ pub mod pragma {
     fn parse_text_expr(expr: &Expr) -> Result<String> {
         match expr {
             Expr::Literal(Literal::String(s), _) => Ok(s.clone()),
-            Expr::Column(col, _) => Ok(col.column.clone()),
+            Expr::Column(col, _) => Ok(col.column.to_string()),
             Expr::Literal(Literal::Integer(n), _) => Ok(n.to_string()),
             other => Err(FrankenError::TypeMismatch {
                 expected: "text or identifier".to_owned(),
@@ -2023,7 +2023,7 @@ pub mod pragma {
                     .parse::<i64>()
                     .map_err(|_| FrankenError::TypeMismatch {
                         expected: "integer (0..255)".to_owned(),
-                        actual: col.column.clone(),
+                        actual: col.column.to_string(),
                     })
             }
             other => Err(FrankenError::TypeMismatch {
@@ -2039,7 +2039,7 @@ pub mod pragma {
             Expr::Literal(Literal::String(s), _) => (s.clone(), parse_str_bool(s)),
             Expr::Literal(Literal::True, _) => ("TRUE".to_owned(), Some(true)),
             Expr::Literal(Literal::False, _) => ("FALSE".to_owned(), Some(false)),
-            Expr::Column(col, _) => (col.column.clone(), parse_str_bool(&col.column)),
+            Expr::Column(col, _) => (col.column.to_string(), parse_str_bool(&col.column)),
             other => {
                 return Err(FrankenError::TypeMismatch {
                     expected: "ON|OFF|TRUE|FALSE|1|0".to_owned(),

@@ -1,0 +1,34 @@
+{
+  "schema_version": "fsqlite-e2e.mt_mvcc_bench_report.v2",
+  "rows_per_thread": 500,
+  "iterations": 20,
+  "thread_results": [
+    {
+      "threads": 2,
+      "fsqlite_wps_p50": 168411.49223720908,
+      "fsqlite_wps_p95": 214779.92111427351,
+      "fsqlite_wps_p99": 222989.90711477562,
+      "sqlite_wps_p50": 386462.37935823074,
+      "sqlite_wps_p95": 432701.28846837074,
+      "sqlite_wps_p99": 496981.4717377411,
+      "throughput_ratio": 0.4357771965200791,
+      "fsqlite_ms_p50": 5.9379919999999995,
+      "fsqlite_ms_p95": 107.8561514,
+      "fsqlite_ms_p99": 108.19602948,
+      "sqlite_ms_p50": 2.587624,
+      "sqlite_ms_p95": 3.5978088,
+      "sqlite_ms_p99": 3.85543056,
+      "time_ratio": 2.294766163863065,
+      "fsqlite_failed_rows": 0,
+      "sqlite_failed_rows": 0
+    }
+  ],
+  "pass_over_pass_gate": {
+    "schema_version": "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1",
+    "history_json_path": "/data/projects/frankensqlite/tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/profile_mt2_history_current.json",
+    "threshold_ratio_drop_pct": 5.0,
+    "status": "no_prior_report",
+    "previous_report_found": false,
+    "regressions": []
+  }
+}

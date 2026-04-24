@@ -1,0 +1,34 @@
+{
+  "schema_version": "fsqlite-e2e.mt_mvcc_bench_report.v2",
+  "rows_per_thread": 500,
+  "iterations": 20,
+  "thread_results": [
+    {
+      "threads": 2,
+      "fsqlite_wps_p50": 9499.618994435259,
+      "fsqlite_wps_p95": 229598.84962625883,
+      "fsqlite_wps_p99": 230650.9952289961,
+      "sqlite_wps_p50": 445008.1710648067,
+      "sqlite_wps_p95": 481079.89779531973,
+      "sqlite_wps_p99": 484192.5845697818,
+      "throughput_ratio": 0.021347066440835817,
+      "fsqlite_ms_p50": 105.267559,
+      "fsqlite_ms_p95": 107.032367,
+      "fsqlite_ms_p99": 107.482971,
+      "sqlite_ms_p50": 2.2474475,
+      "sqlite_ms_p95": 2.6020101500000004,
+      "sqlite_ms_p99": 2.9810396299999993,
+      "time_ratio": 46.838717700858425,
+      "fsqlite_failed_rows": 0,
+      "sqlite_failed_rows": 0
+    }
+  ],
+  "pass_over_pass_gate": {
+    "schema_version": "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1",
+    "history_json_path": "tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/profile_mt2_history.json",
+    "threshold_ratio_drop_pct": 5.0,
+    "status": "no_prior_report",
+    "previous_report_found": false,
+    "regressions": []
+  }
+}

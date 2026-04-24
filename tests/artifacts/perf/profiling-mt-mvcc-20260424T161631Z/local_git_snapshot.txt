@@ -1,0 +1,41 @@
+## local git status
+## main...origin/main [ahead 6]
+ M crates/fsqlite-btree/src/cell.rs
+ M crates/fsqlite-btree/src/cursor.rs
+ M crates/fsqlite-core/src/connection.rs
+ M crates/fsqlite-core/src/connection/pragma_maintenance.rs
+ M crates/fsqlite-pager/src/pager.rs
+ M crates/fsqlite-vdbe/src/codegen.rs
+ M crates/fsqlite-vdbe/src/lib.rs
+
+## recent commits
+6bd060fb perf(btree): key cell cache by page image token
+9a409ddb perf(planner): fast-path repeated plan-cache hits
+973c9c9e fix(fts5): implement prefix option indexes
+55936908 planner: promote IPK equality before access path
+4c71d3b6 perf(pager): wal_frame_count takes RwLock read-lock instead of write-lock
+4ddd874d perf(parser): keep column refs interned
+17d2cb4f fix(fts5): implement columnsize option
+2776f51b perf(planner): swap Arc<QueryPlan> for Rc<QueryPlan> in the plan cache
+e917e178 perf(pager): short-circuit freelist dirty check on clean append growth
+6438b35c perf(core): arm projected rowid prepared reads on Track W (bd-c0bsc)
+2c48d026 chore(beads): sync post projected-rowid-lookup batch
+1348b5ac test(mvcc): microbench branching vs branchless visible() predicate
+615c6b37 chore(beads,perf-artifacts): sync beads + include staged bd-cnk5d 2T cliff verify artifacts
+233db488 fix(core): deref root_page in RetainedAutocommitOverlayFastPath::root_page
+b86cd4e6 perf(core): SimpleProjectedRowidLookup fast path for PK equality SELECT <cols>
+daf81b39 perf(pager): cap PageBufPool free-list initial capacity at 64
+ec87700b perf(mvcc): branchless visibility predicate via wrapping_sub
+b5710e55 perf(e2e): ship apples-to-apples mt rerun artifact
+4d251536 style(mvcc): rustfmt core types
+7dc9ed35 bench(vdbe): register IfPos pipeline stage
+
+## measured tree overlay
+base_head 6bd060fb4eb7dccef4cd49a6dc3b8f7583249a8c
+overlay crates/fsqlite-core/src/connection.rs
+overlay crates/fsqlite-core/src/connection/pragma_maintenance.rs
+overlay crates/fsqlite-vdbe/src/codegen.rs
+overlay crates/fsqlite-vdbe/src/lib.rs
+
+## reserved artifact path
+tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z

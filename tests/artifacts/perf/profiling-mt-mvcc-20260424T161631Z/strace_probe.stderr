@@ -1,0 +1,49 @@
+mt-mvcc-bench: rows_per_thread=100 threads=[8] iters=2 apples_to_apples=false
+mt-mvcc-bench: wrote json report tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/strace_probe.json
+mt-mvcc-bench: wrote markdown summary tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/strace_probe.md
+mt-mvcc-bench: updated pass-over-pass history tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/strace_probe_history.json
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ------------------
+ 52.07    0.308355         303      1016       149 futex
+ 20.98    0.124256         913       136           clock_nanosleep
+  7.64    0.045260          22      1991           pread64
+  5.78    0.034221          24      1395       319 statx
+  2.54    0.015027          26       561           mprotect
+  1.66    0.009839          23       424       424 readlink
+  1.15    0.006838          10       674           fcntl
+  0.88    0.005220          31       167        31 newfstatat
+  0.78    0.004607          19       235        23 openat
+  0.73    0.004310         107        40           madvise
+  0.71    0.004229         132        32           clone3
+  0.67    0.003981          25       158           fstat
+  0.67    0.003945          24       163           rt_sigprocmask
+  0.57    0.003397          34        99           sigaltstack
+  0.43    0.002543           9       263           pwrite64
+  0.37    0.002212          29        75           mmap
+  0.28    0.001665           5       284           read
+  0.28    0.001663          41        40           getpid
+  0.25    0.001486          30        49           munmap
+  0.24    0.001440          25        56           sched_getaffinity
+  0.24    0.001406          42        33           gettid
+  0.23    0.001362           6       212           close
+  0.19    0.001112          33        33           set_robust_list
+  0.18    0.001085          32        33           rseq
+  0.13    0.000775           5       140           lseek
+  0.10    0.000596          24        24           geteuid
+  0.06    0.000356          14        25           write
+  0.04    0.000223           5        42           fsync
+  0.04    0.000209          16        13           brk
+  0.03    0.000198          11        17           ftruncate
+  0.03    0.000181          10        17         3 unlink
+  0.01    0.000066           5        12           sched_yield
+  0.01    0.000053           5        10           getrandom
+  0.01    0.000031          10         3         3 mkdir
+  0.00    0.000027           4         6           rt_sigaction
+  0.00    0.000000           0         1           poll
+  0.00    0.000000           0         1         1 access
+  0.00    0.000000           0         1           execve
+  0.00    0.000000           0         1           arch_prctl
+  0.00    0.000000           0         1           set_tid_address
+  0.00    0.000000           0         2           prlimit64
+------ ----------- ----------- --------- --------- ------------------
+100.00    0.592174          69      8485       953 total

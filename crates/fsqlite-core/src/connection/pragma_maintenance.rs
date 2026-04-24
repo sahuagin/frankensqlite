@@ -72,7 +72,7 @@ fn parse_checkpoint_mode(value: &fsqlite_ast::PragmaValue) -> Result<CheckpointM
     };
     let text = match expr {
         Expr::Literal(Literal::String(s), _) => s.clone(),
-        Expr::Column(col_ref, _) if col_ref.table.is_none() => col_ref.column.clone(),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => col_ref.column.to_string(),
         _ => {
             return Err(FrankenError::Internal(
                 "PRAGMA wal_checkpoint mode must be PASSIVE/FULL/RESTART/TRUNCATE".to_owned(),

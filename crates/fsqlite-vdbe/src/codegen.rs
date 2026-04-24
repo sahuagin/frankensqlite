@@ -506,7 +506,7 @@ fn find_upsert_target_index<'a>(
         .columns
         .iter()
         .filter_map(|ic| match &ic.expr {
-            Expr::Column(col_ref, _) => Some(col_ref.column.as_str()),
+            Expr::Column(col_ref, _) => Some(col_ref.column.as_ref()),
             _ => None,
         })
         .collect();
@@ -8879,7 +8879,10 @@ fn rewrite_aggregates_recursive(
             };
             agg_cols.push(agg_col);
             let placeholder_name = format!("__agg_{idx}__");
-            return Expr::Column(ColumnRef::bare(&placeholder_name), fsqlite_ast::Span::ZERO);
+            return Expr::Column(
+                ColumnRef::bare(placeholder_name.as_str()),
+                fsqlite_ast::Span::ZERO,
+            );
         }
     }
 
@@ -12891,7 +12894,7 @@ fn emit_column_reads(
                 if let Expr::Column(col_ref, _) = expr {
                     if let Some(qualifier) = &col_ref.table {
                         if !matches_table_or_alias(qualifier, table, table_alias) {
-                            return Err(CodegenError::TableNotFound(qualifier.clone()));
+                            return Err(CodegenError::TableNotFound(qualifier.to_string()));
                         }
                     }
                     if let Some(col_idx) = table.column_index(&col_ref.column) {
@@ -12905,7 +12908,7 @@ fn emit_column_reads(
                     } else {
                         return Err(CodegenError::ColumnNotFound {
                             table: table.name.clone(),
-                            column: col_ref.column.clone(),
+                            column: col_ref.column.to_string(),
                         });
                     }
                 } else {
@@ -13082,7 +13085,11 @@ fn emit_having_expr(
         // Column reference — resolve to the corresponding group-key output register.
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
-            if let Some(col_idx) = table.columns.iter().position(|c| c.name == *col_name) {
+            if let Some(col_idx) = table
+                .columns
+                .iter()
+                .position(|c| c.name == col_name.as_ref())
+            {
                 // Find the output column whose group key maps to this table column.
                 for (i, oc) in output_cols.iter().enumerate() {
                     if let GroupByOutputCol::GroupKey { key_index, .. } = oc {
@@ -13939,7 +13946,7 @@ fn resolve_result_column_indices(
                     let idx = table.column_index(&col_ref.column).ok_or_else(|| {
                         CodegenError::ColumnNotFound {
                             table: table.name.clone(),
-                            column: col_ref.column.clone(),
+                            column: col_ref.column.to_string(),
                         }
                     })?;
                     indices.push(idx);
@@ -14899,7 +14906,7 @@ fn column_name(expr: &Expr, table: &TableSchema, table_alias: Option<&str>) -> O
             return None;
         }
         if !is_rowid_ref(col_ref, Some(table), table_alias) {
-            return Some(col_ref.column.clone());
+            return Some(col_ref.column.to_string());
         }
     }
     None
