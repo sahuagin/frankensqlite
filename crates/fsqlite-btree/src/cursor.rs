@@ -36,7 +36,7 @@ use fsqlite_types::serial_type::{
 use fsqlite_types::{PageData, PageNumber, SqliteValue, WitnessKey};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(target_arch = "x86_64")]
 use std::intrinsics::prefetch_read_data;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1030,6 +1030,7 @@ impl<P> BtCursor<P> {
         self.last_known_depth = None;
         self.seek_cache.fill(None);
         self.cell_slot_cache.get_mut().clear();
+        self.mutation_counter_memo.get_mut().clear();
         self.bump_row_image_epoch();
     }
 
@@ -1088,6 +1089,7 @@ impl<P> BtCursor<P> {
         );
         self.page_size = page_size;
         self.cell_slot_cache.get_mut().clear();
+        self.mutation_counter_memo.get_mut().clear();
     }
 
     fn clear_seek_cache(&mut self) {
@@ -3494,7 +3496,7 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
-                let mutation_counter = self.page_mutation_counter(&cached.page_data);
+                let mutation_counter = self.page_mutation_counter(cached.page_no, &cached.page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
@@ -5888,7 +5890,7 @@ impl<P: PageWriter> BtCursor<P> {
             cached.cell_pointers.push(new_cell_offset);
             let stack_page_data = cached.page_data.clone();
             let stack_cell_pointers = cached.cell_pointers.clone();
-            let mutation_counter = self.page_mutation_counter(&stack_page_data);
+            let mutation_counter = self.page_mutation_counter(cached.page_no, &stack_page_data);
             self.stack.clear();
             self.stack.push(StackEntry {
                 page_no: cached.page_no,
@@ -5929,7 +5931,7 @@ impl<P: PageWriter> BtCursor<P> {
                 cached.cell_pointers.push(new_cell_offset);
                 let stack_page_data = cached.page_data.clone();
                 let stack_cell_pointers = cached.cell_pointers.clone();
-                let mutation_counter = self.page_mutation_counter(&stack_page_data);
+                let mutation_counter = self.page_mutation_counter(cached.page_no, &stack_page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
@@ -6139,7 +6141,7 @@ impl<P: PageWriter> BtCursor<P> {
         )? {
             let cell_pointers =
                 cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-            let mutation_counter = self.page_mutation_counter(&page_data);
+            let mutation_counter = self.page_mutation_counter(hinted_leaf_page, &page_data);
             self.last_insert_rowid = Some(rowid);
             self.stack.clear();
             self.stack.push(StackEntry {
@@ -6183,7 +6185,7 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(Some((insert_idx, _))) => {
                 let cell_pointers =
                     cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
-                let mutation_counter = self.page_mutation_counter(&page_data);
+                let mutation_counter = self.page_mutation_counter(hinted_leaf_page, &page_data);
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
                 self.stack.clear();

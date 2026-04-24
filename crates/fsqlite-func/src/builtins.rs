@@ -980,10 +980,14 @@ pub struct RandomblobFunc;
 impl ScalarFunction for RandomblobFunc {
     #[allow(clippy::cast_sign_loss)]
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() {
-            return Ok(SqliteValue::Null);
-        }
-        let n_i64 = args[0].to_integer().max(0);
+        // C SQLite returns a one-byte blob for NULL and for all lengths below
+        // one. `zeroblob()` uses different empty-blob semantics, so keep this
+        // rule local to randomblob().
+        let n_i64 = if args[0].is_null() {
+            1
+        } else {
+            args[0].to_integer().max(1)
+        };
         if n_i64 > 1_000_000_000 {
             return Err(FrankenError::TooBig);
         }
@@ -3292,6 +3296,21 @@ mod tests {
         match result {
             SqliteValue::Blob(b) => assert_eq!(b.len(), 16),
             other => unreachable!("expected blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_randomblob_null_zero_and_negative_lengths_are_one_byte() {
+        for arg in [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(-5),
+        ] {
+            let result = invoke1(&RandomblobFunc, arg).unwrap();
+            match result {
+                SqliteValue::Blob(b) => assert_eq!(b.len(), 1),
+                other => unreachable!("expected one-byte blob, got {other:?}"),
+            }
         }
     }
 
