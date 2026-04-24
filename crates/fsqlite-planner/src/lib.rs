@@ -7161,7 +7161,10 @@ mod tests {
         let range = best_access_path(
             &table,
             &[],
-            &[classify_where_term(lower_expr), classify_where_term(upper_expr)],
+            &[
+                classify_where_term(lower_expr),
+                classify_where_term(upper_expr),
+            ],
             None,
         );
         assert!(matches!(range.kind, AccessPathKind::FullTableScan));
