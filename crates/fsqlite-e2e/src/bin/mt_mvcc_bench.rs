@@ -84,6 +84,7 @@ struct Options {
     json_output: Option<PathBuf>,
     summary_md: Option<PathBuf>,
     history_json: PathBuf,
+    apples_to_apples: bool,
 }
 
 impl Default for Options {
@@ -95,6 +96,7 @@ impl Default for Options {
             json_output: None,
             summary_md: None,
             history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
+            apples_to_apples: false,
         }
     }
 }
@@ -102,10 +104,12 @@ impl Default for Options {
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
-         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH]\n\
+         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH] [--apples-to-apples]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
          --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}\n\
+         note: --apples-to-apples is a compatibility flag; this benchmark already\n\
+         uses the prepared-statement/file-backed/shared-db path on both engines.\n\
          note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
          which is the minimal repro for the 13+ thread startup-open failure."
     );
@@ -116,6 +120,10 @@ fn parse_args() -> Options {
     let mut opts = Options::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--apples-to-apples" {
+            opts.apples_to_apples = true;
+            continue;
+        }
         let (key, val) = if let Some(eq) = arg.find('=') {
             (arg[..eq].to_owned(), arg[eq + 1..].to_owned())
         } else if arg == "--help" || arg == "-h" {
@@ -909,8 +917,8 @@ fn run() -> Result<(), String> {
     let opts = parse_args();
 
     eprintln!(
-        "mt-mvcc-bench: rows_per_thread={} threads={:?} iters={}",
-        opts.rows_per_thread, opts.threads, opts.iters,
+        "mt-mvcc-bench: rows_per_thread={} threads={:?} iters={} apples_to_apples={}",
+        opts.rows_per_thread, opts.threads, opts.iters, opts.apples_to_apples,
     );
 
     println!(
