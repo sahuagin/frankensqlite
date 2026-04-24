@@ -2211,23 +2211,20 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Get the child page for an interior page at the given cell index.
     ///
-    /// If `cell_idx == cell_count`, returns the right child.
-    /// Otherwise, returns the left child of the cell at `cell_idx`.
+    /// If `cell_idx == cell_count`, returns the right child. Otherwise,
+    /// returns the left child of the cell at `cell_idx`.
+    ///
+    /// bd-4i4vh.3: this used to route through `parse_cell_at`, paying for a
+    /// full `CellRef::parse` (varint decodes for payload size / rowid, local
+    /// and overflow bounds checks) on every interior-page descent probe just
+    /// to extract the 4-byte left-child pointer. Interior cells start with
+    /// that pointer as their first field, so `read_interior_child_inline`
+    /// reads it directly from the page image — no varint work, no cell-slot
+    /// cache traffic — and covers the `>= cell_count` case with `right_child`
+    /// already.
+    #[inline]
     fn child_page_at(&self, entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
-        if cell_idx >= entry.header.cell_count {
-            entry
-                .header
-                .right_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior page has no right child".to_owned(),
-                })
-        } else {
-            let cell = self.parse_cell_at(entry, cell_idx)?;
-            cell.left_child
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior cell has no left child".to_owned(),
-                })
-        }
+        Self::read_interior_child_inline(entry, cell_idx)
     }
 
     /// Recompute which child slot in an ancestor page points at `child_page_no`.
@@ -14208,6 +14205,88 @@ mod tests {
         println!(
             "[page_mutation_counter memo] memoized={fast_ns:.3}ns  raw_xxh3={slow_ns:.3}ns  \
              speedup={:.2}x  (usable={USABLE}, iters={ITERS})",
+            slow_ns / fast_ns.max(f64::EPSILON)
+        );
+    }
+
+    /// Micro-benchmark for bd-4i4vh.3: `child_page_at` direct-read vs the old
+    /// `parse_cell_at + cell.left_child` path on interior table pages.
+    ///
+    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Simulates root-to-leaf descent where every interior-page probe only
+    /// needs the left-child pointer; the legacy path paid for two varint
+    /// decodes + cell-slot cache traffic + a full `CellRef` struct build just
+    /// to throw away everything except `left_child`.
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_child_page_at_interior_table() {
+        const CHILDREN: usize = 128;
+        const WARMUP: u32 = 200_000;
+        const ITERS: u32 = 5_000_000;
+
+        // Build a realistic interior-table page: 128 (left_child, rowid)
+        // divider cells + a right_child pointer.
+        let children: Vec<(PageNumber, i64)> = (0..CHILDREN)
+            .map(|i| (pn((i as u32) + 10), (i as i64) * 100 + 1))
+            .collect();
+        let right = pn((CHILDREN as u32) + 200);
+        let page_bytes = build_interior_table(&children, right);
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, page_bytes);
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let entry = cursor.load_page(&cx, pn(2)).unwrap();
+
+        // Warm-up the cell-slot cache so the legacy path hits its cache.
+        for idx in 0..entry.header.cell_count {
+            let _ = cursor.parse_cell_at(&entry, idx).unwrap();
+        }
+
+        // Fast path — production code.
+        for i in 0..WARMUP {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(cursor.child_page_at(&entry, idx).unwrap());
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(cursor.child_page_at(&entry, idx).unwrap());
+        }
+        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        // Legacy path — parse_cell_at + cell.left_child.ok_or(...)
+        let legacy_child_page = |cursor: &BtCursor<MemPageStore>, idx: u16| -> Result<PageNumber> {
+            if idx >= entry.header.cell_count {
+                entry
+                    .header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child".to_owned(),
+                    })
+            } else {
+                let cell = cursor.parse_cell_at(&entry, idx)?;
+                cell.left_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior cell has no left child".to_owned(),
+                    })
+            }
+        };
+        for i in 0..WARMUP {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let idx = (i as u16) % entry.header.cell_count;
+            std::hint::black_box(legacy_child_page(&cursor, idx).unwrap());
+        }
+        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        println!(
+            "[child_page_at interior-table] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
+             speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
             slow_ns / fast_ns.max(f64::EPSILON)
         );
     }
