@@ -643,7 +643,37 @@ impl CellSlotCache {
         Some(slot)
     }
 
+    #[inline]
     fn insert(
+        &mut self,
+        page_no: PageNumber,
+        mutation_counter: u32,
+        cell_idx: u16,
+        slot: CachedCellSlot,
+    ) {
+        // Binary-search on a single page repeatedly hits the same MRU entry —
+        // previously we `remove(0)` + `insert(0, entry)` on every slot insert,
+        // paying O(CELL_SLOT_CACHE_ENTRIES) memmoves just to shuffle the front
+        // entry back to the front. Mutate in place when the target is already
+        // MRU to keep this path allocation-free and bounded by the SmallVec
+        // slot scan.
+        if let Some(front) = self.entries.first_mut() {
+            if front.page_no == page_no && front.mutation_counter == mutation_counter {
+                if let Some((_, existing)) =
+                    front.slots.iter_mut().find(|(idx, _)| *idx == cell_idx)
+                {
+                    *existing = slot;
+                } else {
+                    front.slots.push((cell_idx, slot));
+                }
+                return;
+            }
+        }
+        self.insert_slow(page_no, mutation_counter, cell_idx, slot);
+    }
+
+    #[cold]
+    fn insert_slow(
         &mut self,
         page_no: PageNumber,
         mutation_counter: u32,
@@ -13827,5 +13857,79 @@ mod tests {
                 std_ns as f64 / dispatched_ns.max(1) as f64
             );
         }
+    }
+
+    /// Micro-benchmark for bd-4i4vh: hot-front-entry CellSlotCache insert.
+    ///
+    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Simulates the binary-search-on-a-single-page hot path where every
+    /// `parse_cell_at` miss calls `insert()` on the same MRU entry.
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_cell_slot_cache_insert_front_entry() {
+        const PREFILL: u32 = 32;
+        const WARMUP: u32 = 200_000;
+        const ITERS: u32 = 5_000_000;
+
+        fn sample_slot(payload_size: u32) -> CachedCellSlot {
+            CachedCellSlot {
+                left_child: None,
+                rowid: Some(1),
+                payload_size,
+                local_size: payload_size,
+                payload_offset: 128,
+                overflow_page: None,
+            }
+        }
+
+        let hot_page = pn(999);
+        let hot_counter = 0x1234_5678_u32;
+        let slot = sample_slot(32);
+
+        let prime_cache = |cache: &mut CellSlotCache| {
+            for i in 0..PREFILL {
+                let page = pn(i + 2);
+                cache.insert_slow(page, i.wrapping_add(0xAB00), 0, sample_slot(16));
+            }
+            // Promote hot entry to the front so subsequent inserts exercise
+            // the front-entry path.
+            cache.insert_slow(hot_page, hot_counter, 0, slot);
+            assert_eq!(cache.entries.first().unwrap().page_no, hot_page);
+            assert_eq!(cache.entries.first().unwrap().mutation_counter, hot_counter);
+        };
+
+        // Fast path — production code.
+        let mut cache_fast = CellSlotCache::default();
+        prime_cache(&mut cache_fast);
+        for i in 0..WARMUP {
+            cache_fast.insert(hot_page, hot_counter, (i % 10) as u16, slot);
+            std::hint::black_box(&cache_fast);
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            cache_fast.insert(hot_page, hot_counter, (i % 10) as u16, slot);
+            std::hint::black_box(&cache_fast);
+        }
+        let fast_ns = t0.elapsed().as_nanos() as u64 / u64::from(ITERS);
+
+        // Slow path — legacy remove(0) + insert(0) + truncate.
+        let mut cache_slow = CellSlotCache::default();
+        prime_cache(&mut cache_slow);
+        for i in 0..WARMUP {
+            cache_slow.insert_slow(hot_page, hot_counter, (i % 10) as u16, slot);
+            std::hint::black_box(&cache_slow);
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            cache_slow.insert_slow(hot_page, hot_counter, (i % 10) as u16, slot);
+            std::hint::black_box(&cache_slow);
+        }
+        let slow_ns = t0.elapsed().as_nanos() as u64 / u64::from(ITERS);
+
+        println!(
+            "[cell_slot_cache insert front-entry] fast={fast_ns}ns  slow={slow_ns}ns  \
+             speedup={:.2}x  (prefill={PREFILL}, iters={ITERS})",
+            slow_ns as f64 / fast_ns.max(1) as f64
+        );
     }
 }
