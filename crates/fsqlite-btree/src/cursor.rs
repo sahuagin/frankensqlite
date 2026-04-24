@@ -6197,24 +6197,34 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(None);
         }
 
-        if let Some((insert_idx, _)) = self.try_append_table_leaf_payload_in_place_no_overflow(
-            cx,
-            hinted_leaf_page,
-            &mut page_data,
-            &mut header,
-            rowid,
-            data,
-        )? {
-            let cell_pointers =
-                cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        // Snapshot the pre-append header so the cached pointer vector can be
+        // rebuilt from the old pointer array plus the returned new-cell
+        // offset. The append helpers already proved the extra pointer slot is
+        // valid and wrote it to the page; rereading it from the page would just
+        // decode the byte pair we already have.
+        let pre_append_header = header;
+        if let Some((insert_idx, new_cell_offset)) = self
+            .try_append_table_leaf_payload_in_place_no_overflow(
+                cx,
+                hinted_leaf_page,
+                &mut page_data,
+                &mut header,
+                rowid,
+                data,
+            )?
+        {
+            let mut cell_pointers =
+                cell::read_cell_pointers(page_data.as_bytes(), &pre_append_header, header_offset)?;
+            cell_pointers.push(new_cell_offset);
             let mutation_counter = Self::page_mutation_counter(&page_data);
+            let stack_cell_pointers = cell_pointers.clone();
             self.last_insert_rowid = Some(rowid);
             self.stack.clear();
             self.stack.push(StackEntry {
                 page_no: hinted_leaf_page,
                 page_data: page_data.clone(),
                 header,
-                cell_pointers: cell_pointers.clone(),
+                cell_pointers: stack_cell_pointers,
                 mutation_counter,
                 cell_idx: insert_idx,
             });
@@ -6226,7 +6236,7 @@ impl<P: PageWriter> BtCursor<P> {
                 parent_page: self.current_parent_page_hint_from_stack(),
                 page_data: page_data.clone(),
                 header,
-                cell_pointers: cell_pointers.clone(),
+                cell_pointers,
             });
             return Ok(Some(TableAppendHint {
                 leaf_page: hinted_leaf_page,
@@ -6248,9 +6258,13 @@ impl<P: PageWriter> BtCursor<P> {
             &cell_data,
         );
         match append_result {
-            Ok(Some((insert_idx, _))) => {
-                let cell_pointers =
-                    cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+            Ok(Some((insert_idx, new_cell_offset))) => {
+                let mut cell_pointers = cell::read_cell_pointers(
+                    page_data.as_bytes(),
+                    &pre_append_header,
+                    header_offset,
+                )?;
+                cell_pointers.push(new_cell_offset);
                 let mutation_counter = Self::page_mutation_counter(&page_data);
                 self.cell_buf = cell_data;
                 self.last_insert_rowid = Some(rowid);
