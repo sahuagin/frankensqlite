@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 use crate::decode_proofs::{DecodeAuditEntry, EcsDecodeProof};
 use crate::replication_sender::{
     CHANGESET_HEADER_SIZE, ChangesetHeader, ChangesetId, DEFAULT_RPC_MESSAGE_CAP_BYTES, PageEntry,
-    ReplicationPacket, ReplicationWireVersion,
+    ReplicationPacket, ReplicationWireVersion, compute_changeset_id,
 };
 use crate::source_block_partition::K_MAX;
 
@@ -741,6 +741,14 @@ impl ReplicationReceiver {
             });
         }
         let changeset_bytes = &padded_bytes[..total_len];
+        let computed_id = compute_changeset_id(changeset_bytes);
+        if computed_id != changeset_id {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "changeset id mismatch: expected {changeset_id:?}, computed {computed_id:?}"
+                ),
+            });
+        }
 
         // Parse page entries.
         let page_size =
@@ -748,6 +756,12 @@ impl ReplicationReceiver {
                 what: "page_size".to_owned(),
                 value: header.page_size.to_string(),
             })?;
+        if page_size == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "page_size".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
         let entry_size = 4_usize
             .checked_add(8)
             .and_then(|value| value.checked_add(page_size))
@@ -769,10 +783,10 @@ impl ReplicationReceiver {
                     value: format!("entry_size={entry_size}, n_pages={}", header.n_pages),
                 })?;
 
-        if data_bytes.len() < required_bytes {
+        if data_bytes.len() != required_bytes {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "insufficient data for {} pages: {} < {}",
+                    "changeset payload length mismatch for {} pages: {} != {}",
                     header.n_pages,
                     data_bytes.len(),
                     required_bytes,
@@ -1003,6 +1017,12 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
         what: "page_size".to_owned(),
         value: header.page_size.to_string(),
     })?;
+    if page_size == 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "page_size".to_owned(),
+            value: "0".to_owned(),
+        });
+    }
     let entry_size = 4_usize
         .checked_add(8)
         .and_then(|value| value.checked_add(page_size))
@@ -1023,10 +1043,10 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
                 what: "changeset payload size".to_owned(),
                 value: format!("entry_size={entry_size}, n_pages={}", header.n_pages),
             })?;
-    if data_bytes.len() < required_bytes {
+    if data_bytes.len() != required_bytes {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
-                "insufficient data for {} pages: {} < {}",
+                "changeset payload length mismatch for {} pages: {} != {}",
                 header.n_pages,
                 data_bytes.len(),
                 required_bytes
@@ -1549,15 +1569,15 @@ mod tests {
     #[test]
     fn test_receiver_treats_payload_hash_mismatch_as_erasure() {
         let mut receiver = ReplicationReceiver::new();
-        let mut packet = make_packet(
+        let packet = make_packet(
             ChangesetId::from_bytes([0x44; 16]),
             0,
             0,
             100,
             vec![0x42; 512],
         );
-        packet.payload_xxh3 ^= 0xDEAD_BEEF;
-        let wire = packet.to_bytes().expect("encode tampered packet");
+        let mut wire = packet.to_bytes().expect("encode packet");
+        wire[48] ^= 0xFF;
         let result = receiver.process_packet(&wire).expect("process packet");
         assert_eq!(result, PacketResult::Erasure);
     }
@@ -1776,6 +1796,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_and_validate_rejects_changeset_id_mismatch() {
+        let page_size = 128_u32;
+        let mut pages = make_pages(page_size, &[1]);
+        let changeset_bytes = encode_changeset(page_size, &mut pages).expect("encode");
+        let wrong_changeset_id = ChangesetId::from_bytes([0x42; 16]);
+
+        let receiver = ReplicationReceiver::new();
+        let result = receiver.parse_and_validate_changeset(wrong_changeset_id, &changeset_bytes);
+        assert!(
+            matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+            "bead_id={TEST_BEAD_ID} case=changeset_id_mismatch_rejected"
+        );
+    }
+
+    #[test]
     fn test_parse_and_validate_rejects_total_len_smaller_than_header() {
         let receiver = ReplicationReceiver::new();
         let changeset_id = ChangesetId::from_bytes([0xA5; 16]);
@@ -1789,6 +1824,24 @@ mod tests {
 
         let result = receiver.parse_and_validate_changeset(changeset_id, &malformed);
         assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+    }
+
+    #[test]
+    fn test_parse_and_validate_rejects_trailing_payload_bytes() {
+        let page_size = 128_u32;
+        let mut pages = make_pages(page_size, &[1]);
+        let mut malformed = encode_changeset(page_size, &mut pages).expect("encode");
+        malformed.push(0x99);
+        let total_len = u64::try_from(malformed.len()).expect("test total_len fits u64");
+        malformed[14..22].copy_from_slice(&total_len.to_le_bytes());
+        let changeset_id = compute_changeset_id(&malformed);
+
+        let receiver = ReplicationReceiver::new();
+        let result = receiver.parse_and_validate_changeset(changeset_id, &malformed);
+        assert!(
+            matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+            "bead_id={TEST_BEAD_ID} case=parse_rejects_trailing_payload"
+        );
     }
 
     #[test]
@@ -1807,6 +1860,22 @@ mod tests {
 
         let result = parse_changeset_pages(&malformed);
         assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+    }
+
+    #[test]
+    fn test_parse_changeset_pages_rejects_trailing_payload() {
+        let page_size = 128_u32;
+        let mut pages = make_pages(page_size, &[1]);
+        let mut malformed = encode_changeset(page_size, &mut pages).expect("encode");
+        malformed.push(0xA5);
+        let total_len = u64::try_from(malformed.len()).expect("test total_len fits u64");
+        malformed[14..22].copy_from_slice(&total_len.to_le_bytes());
+
+        let result = parse_changeset_pages(&malformed);
+        assert!(
+            matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+            "bead_id={TEST_BEAD_ID} case=parse_pages_rejects_trailing_payload"
+        );
     }
 
     #[test]

@@ -498,6 +498,13 @@ impl PageEntry {
     }
 }
 
+fn auth_tags_equal(lhs: &[u8; 16], rhs: &[u8; 16]) -> bool {
+    lhs.iter()
+        .zip(rhs.iter())
+        .fold(0_u8, |acc, (&left, &right)| acc | (left ^ right))
+        == 0
+}
+
 /// 128-bit changeset identifier (truncated BLAKE3).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChangesetId([u8; 16]);
@@ -621,6 +628,27 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
             value: "0".to_owned(),
         });
     }
+    let page_size_usize = usize::try_from(page_size).map_err(|_| FrankenError::OutOfRange {
+        what: "page_size".to_owned(),
+        value: page_size.to_string(),
+    })?;
+
+    for (index, page) in pages.iter().enumerate() {
+        if page.page_bytes.len() != page_size_usize {
+            return Err(FrankenError::OutOfRange {
+                what: format!("pages[{index}].page_bytes.len"),
+                value: format!("{} (expected {page_size_usize})", page.page_bytes.len()),
+            });
+        }
+        if !page.validate_xxh3() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} xxh3 mismatch before changeset encoding",
+                    page.page_number
+                ),
+            });
+        }
+    }
 
     canonicalize_changeset_pages(pages);
 
@@ -630,8 +658,26 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
     })?;
 
     // Per-page entry size: 4 (page_number) + 8 (xxh3) + page_size
-    let entry_size = 4_u64 + 8 + u64::from(page_size);
-    let total_len = CHANGESET_HEADER_SIZE as u64 + entry_size * u64::from(n_pages);
+    let entry_size = 4_u64
+        .checked_add(8)
+        .and_then(|value| value.checked_add(u64::from(page_size)))
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: "entry_size".to_owned(),
+            value: format!("page_size={page_size}"),
+        })?;
+    let payload_len =
+        entry_size
+            .checked_mul(u64::from(n_pages))
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "changeset payload size".to_owned(),
+                value: format!("entry_size={entry_size}, n_pages={n_pages}"),
+            })?;
+    let total_len = (CHANGESET_HEADER_SIZE as u64)
+        .checked_add(payload_len)
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: "changeset total_len".to_owned(),
+            value: format!("payload_len={payload_len}"),
+        })?;
 
     let header = ChangesetHeader {
         magic: CHANGESET_MAGIC,
@@ -848,7 +894,7 @@ impl ReplicationPacket {
     }
 
     fn auth_material(&self) -> Vec<u8> {
-        let mut material = Vec::with_capacity(16 + 1 + 4 + 4 + 2 + 8 + 8);
+        let mut material = Vec::with_capacity(16 + 1 + 4 + 4 + 4 + 2 + 8 + 8);
         material.extend_from_slice(self.changeset_id.as_bytes());
         material.push(self.sbn);
         material.extend_from_slice(&self.esi.to_be_bytes());
@@ -864,6 +910,10 @@ impl ReplicationPacket {
         let mut hasher = blake3::Hasher::new_keyed(auth_key);
         hasher.update(REPLICATION_PACKET_AUTH_DOMAIN.as_bytes());
         hasher.update(&self.auth_material());
+        // Authentication must cover the bytes themselves, not only the
+        // non-cryptographic XXH3 transport checksum. Otherwise an XXH3
+        // collision would preserve the keyed tag.
+        hasher.update(&self.symbol_data);
         let digest = hasher.finalize();
         let mut out = [0_u8; 16];
         out.copy_from_slice(&digest.as_bytes()[..16]);
@@ -882,7 +932,7 @@ impl ReplicationPacket {
             return false;
         }
         match (self.auth_tag, auth_key) {
-            (Some(tag), Some(key)) => tag == self.compute_auth_tag(key),
+            (Some(tag), Some(key)) => auth_tags_equal(&tag, &self.compute_auth_tag(key)),
             (Some(_), None) | (None, Some(_)) => false,
             (None, None) => true,
         }
@@ -927,6 +977,15 @@ impl ReplicationPacket {
                     "symbol_size_t mismatch: header={}, payload={}",
                     self.symbol_size_t,
                     self.symbol_data.len()
+                ),
+            });
+        }
+        let computed_xxh3 = Self::compute_payload_xxh3(&self.symbol_data);
+        if computed_xxh3 != self.payload_xxh3 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "payload_xxh3 mismatch before encoding: header={:#x}, payload={:#x}",
+                    self.payload_xxh3, computed_xxh3
                 ),
             });
         }
@@ -995,6 +1054,14 @@ impl ReplicationPacket {
             && buf[4] == REPLICATION_PROTOCOL_VERSION_V2;
         if is_v2 {
             let flags = buf[5];
+            let unsupported_flags = flags & !REPLICATION_FLAG_AUTH_PRESENT;
+            if unsupported_flags != 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "unsupported replication packet flags: {unsupported_flags:#04x}"
+                    ),
+                });
+            }
             let header_len = usize::from(u16::from_be_bytes([buf[6], buf[7]]));
             if header_len != REPLICATION_HEADER_SIZE {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -1017,6 +1084,11 @@ impl ReplicationPacket {
             let k_source = u32::from_be_bytes(buf[28..32].try_into().expect("4 bytes"));
             let r_repair = u32::from_be_bytes(buf[32..36].try_into().expect("4 bytes"));
             let symbol_size_t = u16::from_be_bytes(buf[36..38].try_into().expect("2 bytes"));
+            if buf[38] != 0 || buf[39] != 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "replication packet reserved bytes must be zero".to_owned(),
+                });
+            }
             let seed = u64::from_be_bytes(buf[40..48].try_into().expect("8 bytes"));
             let payload_xxh3 = u64::from_be_bytes(buf[48..56].try_into().expect("8 bytes"));
             let mut auth_tag_bytes = [0_u8; 16];
@@ -1667,6 +1739,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_encode_changeset_rejects_page_size_mismatch() {
+        let mut pages = vec![PageEntry::new(1, vec![0xAA; 127])];
+        let result = encode_changeset(128, &mut pages);
+        assert!(
+            matches!(result, Err(FrankenError::OutOfRange { .. })),
+            "bead_id={TEST_BEAD_ID} case=page_size_mismatch_rejected"
+        );
+    }
+
+    #[test]
+    fn test_encode_changeset_rejects_stale_page_checksum() {
+        let page_size = 128_u32;
+        let mut pages = make_pages(page_size, &[1]);
+        pages[0].page_bytes[0] ^= 0xFF;
+
+        let result = encode_changeset(page_size, &mut pages);
+        assert!(
+            matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+            "bead_id={TEST_BEAD_ID} case=stale_page_checksum_rejected"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // UDP Packet format tests
     // -----------------------------------------------------------------------
@@ -1710,6 +1805,70 @@ mod tests {
         assert_eq!(
             packet, decoded,
             "bead_id={TEST_BEAD_ID} case=packet_roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_v2_packet_rejects_unknown_flags_and_reserved_bytes() {
+        let id = ChangesetId::from_bytes([0xAB; 16]);
+        let packet = ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id: id,
+                sbn: 0,
+                esi: 7,
+                k_source: 9,
+                r_repair: 1,
+                symbol_size_t: 16,
+                seed: derive_seed_from_changeset_id(&id),
+            },
+            vec![0x11; 16],
+        );
+
+        let mut unknown_flags = packet.to_bytes().expect("encode");
+        unknown_flags[5] |= 0b1000_0000;
+        assert!(
+            matches!(
+                ReplicationPacket::from_bytes(&unknown_flags),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "bead_id={TEST_BEAD_ID} case=unknown_flags_rejected"
+        );
+
+        let mut nonzero_reserved = packet.to_bytes().expect("encode");
+        nonzero_reserved[38] = 1;
+        assert!(
+            matches!(
+                ReplicationPacket::from_bytes(&nonzero_reserved),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ),
+            "bead_id={TEST_BEAD_ID} case=reserved_bytes_rejected"
+        );
+    }
+
+    #[test]
+    fn test_auth_tag_covers_symbol_bytes_not_only_xxh3() {
+        let key = [0x42; 32];
+        let id = ChangesetId::from_bytes([0xCD; 16]);
+        let packet = ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id: id,
+                sbn: 0,
+                esi: 1,
+                k_source: 2,
+                r_repair: 0,
+                symbol_size_t: 8,
+                seed: derive_seed_from_changeset_id(&id),
+            },
+            vec![0x55; 8],
+        );
+        let mut altered = packet.clone();
+        altered.symbol_data[0] ^= 0xFF;
+        altered.payload_xxh3 = packet.payload_xxh3;
+
+        assert_ne!(
+            packet.compute_auth_tag(&key),
+            altered.compute_auth_tag(&key),
+            "bead_id={TEST_BEAD_ID} case=auth_tag_covers_payload_bytes"
         );
     }
 
