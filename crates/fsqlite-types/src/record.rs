@@ -1993,9 +1993,58 @@ pub fn encode_batch_auto(rows: &[&[SqliteValue]]) -> fsqlite_error::Result<Vec<u
 /// per-column decoding without re-parsing the header.
 #[allow(clippy::cast_possible_truncation)]
 pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {
+    match classify_serial_type(serial_type) {
+        SerialTypeClass::Null => {
+            return Some(profile_decoded_value(SqliteValue::Null, profile_enabled));
+        }
+        SerialTypeClass::Zero => {
+            return Some(profile_decoded_value(
+                SqliteValue::Integer(0),
+                profile_enabled,
+            ));
+        }
+        SerialTypeClass::One => {
+            return Some(profile_decoded_value(
+                SqliteValue::Integer(1),
+                profile_enabled,
+            ));
+        }
+        SerialTypeClass::Integer => {
+            return Some(profile_decoded_value(
+                SqliteValue::Integer(decode_big_endian_signed(bytes)),
+                profile_enabled,
+            ));
+        }
+        SerialTypeClass::Float => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let bits = u64::from_be_bytes(bytes.try_into().ok()?);
+            let value = f64::from_bits(bits);
+            return Some(profile_decoded_value(
+                if value.is_nan() {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::Float(value)
+                },
+                profile_enabled,
+            ));
+        }
+        SerialTypeClass::Reserved => return None,
+        SerialTypeClass::Text | SerialTypeClass::Blob => {}
+    }
+
     let mut slot = pool_acquire().unwrap_or(SqliteValue::Null);
     decode_value_into(serial_type, bytes, &mut slot, profile_enabled)?;
     Some(slot)
+}
+
+#[inline]
+fn profile_decoded_value(value: SqliteValue, profile_enabled: bool) -> SqliteValue {
+    if profile_enabled {
+        note_decoded_value(&value);
+    }
+    value
 }
 
 #[inline]
