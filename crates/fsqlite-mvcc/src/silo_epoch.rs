@@ -22,6 +22,16 @@
 //! will invoke [`EpochGroupCommit::submit`] from the commit routine and
 //! replace the dummy flush callback with the real WAL fsync.
 //!
+//! **Wiring decision is deferred**: a separate same-process group-commit
+//! controller, `fsqlite_pager::GroupCommitQueue`, is already wired into
+//! `SimpleTransaction::commit` via `GroupCommitConsolidator`. Stacking
+//! Silo on top of it would duplicate batching. See `bd-rh3sr` for the
+//! investigation, the 2026-04-23 8-thread profile evidence that the
+//! 1→2-thread cliff is dominated by off-CPU page-lock waits (not
+//! WAL-append fsync), and the decision tree — tune GroupCommitQueue,
+//! replace it with Silo, or delete this scaffold — that a follow-up
+//! must resolve *before* wiring.
+//!
 //! # Shape
 //!
 //! - [`EpochGroupCommit::new`] spawns a background advancer task.
