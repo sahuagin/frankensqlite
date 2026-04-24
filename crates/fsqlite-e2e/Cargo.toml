@@ -78,6 +78,10 @@ path = "src/bin/corruption_demo.rs"
 name = "perf-update-delete"
 path = "src/bin/perf_update_delete.rs"
 
+[[bin]]
+name = "mt-read-bench"
+path = "src/bin/mt_read_bench.rs"
+
 [[bench]]
 name = "e2e_bench"
 harness = false
