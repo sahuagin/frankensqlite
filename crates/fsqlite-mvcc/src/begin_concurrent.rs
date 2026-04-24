@@ -642,20 +642,20 @@ pub struct ConcurrentRegistry {
     gc_horizon_counts: BTreeMap<CommitSeq, usize>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
     committed_readers: Vec<CommittedReaderInfo>,
-    /// Page-local index into committed reader history.
-    committed_readers_by_page: HashMap<PageNumber, Vec<usize>>,
-    /// Page witness-local index into committed reader history.
-    committed_readers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    /// Page-local index into committed reader history (identity-hashed).
+    committed_readers_by_page: PageMap<Vec<usize>>,
+    /// Page witness-local index into committed reader history (identity-hashed).
+    committed_readers_by_page_witness: PageMap<Vec<usize>>,
     /// Exact cell-local index into committed reader history.
     committed_readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
     /// Committed reader entries that include at least one global witness.
     committed_readers_with_global_keys: Vec<usize>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
     committed_writers: Vec<CommittedWriterInfo>,
-    /// Page-local index into committed writer history.
-    committed_writers_by_page: HashMap<PageNumber, Vec<usize>>,
-    /// Page witness-local index into committed writer history.
-    committed_writers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    /// Page-local index into committed writer history (identity-hashed).
+    committed_writers_by_page: PageMap<Vec<usize>>,
+    /// Page witness-local index into committed writer history (identity-hashed).
+    committed_writers_by_page_witness: PageMap<Vec<usize>>,
     /// Exact cell-local index into committed writer history.
     committed_writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
     /// Committed writer entries that include at least one global witness.
@@ -678,13 +678,13 @@ impl ConcurrentRegistry {
             active_snapshot_highs: HashMap::new(),
             gc_horizon_counts: BTreeMap::new(),
             committed_readers: Vec::new(),
-            committed_readers_by_page: HashMap::new(),
-            committed_readers_by_page_witness: HashMap::new(),
+            committed_readers_by_page: PageMap::default(),
+            committed_readers_by_page_witness: PageMap::default(),
             committed_readers_by_exact_cell: HashMap::new(),
             committed_readers_with_global_keys: Vec::new(),
             committed_writers: Vec::new(),
-            committed_writers_by_page: HashMap::new(),
-            committed_writers_by_page_witness: HashMap::new(),
+            committed_writers_by_page: PageMap::default(),
+            committed_writers_by_page_witness: PageMap::default(),
             committed_writers_by_exact_cell: HashMap::new(),
             committed_writers_with_global_keys: Vec::new(),
             recycled_handles: Vec::new(),
@@ -2003,11 +2003,22 @@ fn hydrate_finalize_witness_state(
 
 fn collect_precise_candidates(
     global_indexes: &[usize],
-    indexes_by_page: &HashMap<PageNumber, Vec<usize>>,
-    indexes_by_page_witness: &HashMap<PageNumber, Vec<usize>>,
+    indexes_by_page: &PageMap<Vec<usize>>,
+    indexes_by_page_witness: &PageMap<Vec<usize>>,
     indexes_by_exact_cell: &HashMap<(PageNumber, u64), Vec<usize>>,
     summary: &WitnessKeySummary,
 ) -> Vec<usize> {
+    // Short-circuit: when every committed-history index is empty there is
+    // nothing to probe per summary page/cell. This is the hot shape when
+    // no committed SSI history exists yet — every commit otherwise walks
+    // `summary.page_witness_pages` doing wasted HashMap probes.
+    if global_indexes.is_empty()
+        && indexes_by_page.is_empty()
+        && indexes_by_page_witness.is_empty()
+        && indexes_by_exact_cell.is_empty()
+    {
+        return Vec::new();
+    }
     let mut candidate_indexes = global_indexes.to_vec();
     for &page in &summary.page_witness_pages {
         if let Some(indexes) = indexes_by_page.get(&page) {
@@ -2134,6 +2145,15 @@ impl ActiveEdgeDiscoveryIndex {
         committing_commit_seq: CommitSeq,
         write_key_summary: &WitnessKeySummary,
     ) -> Vec<&'a dyn ActiveTxnView> {
+        // Short-circuit: if no active view has any read witnesses, the
+        // SireadTable-equivalent indexes are all empty and there can be no
+        // incoming rw-antidependency edges regardless of how many pages the
+        // committer writes. Skip the per-page probe loop + sort/dedup. This
+        // is a very common case on write-heavy workloads where the active
+        // set is dominated by writers that have not yet read anything.
+        if self.all_readers.is_empty() {
+            return Vec::new();
+        }
         let mut candidate_indexes = if write_key_summary.has_global_keys {
             self.all_readers.clone()
         } else {
@@ -2177,6 +2197,14 @@ impl ActiveEdgeDiscoveryIndex {
         committing_commit_seq: CommitSeq,
         read_key_summary: &WitnessKeySummary,
     ) -> Vec<&'a dyn ActiveTxnView> {
+        // Symmetric short-circuit to `incoming_candidate_refs`: when no
+        // active view holds any write witnesses, no outgoing
+        // rw-antidependency edge can exist no matter what the reader read.
+        // This is the expected shape on read-heavy MT workloads where
+        // only a handful of the active sessions are writers.
+        if self.all_writers.is_empty() {
+            return Vec::new();
+        }
         let mut candidate_indexes = if read_key_summary.has_global_keys {
             self.all_writers.clone()
         } else {
@@ -6443,6 +6471,106 @@ mod tests {
             "bench_read_path_page_state_lookup: baseline median={b_med:.1} ns/probe; \
              optimised median={o_med:.1} ns/probe; delta={delta_pct:+.1}% \
              (n={TRIALS} trials, {READS_PER_TRIAL} reads/trial, staged={STAGED_PAGES})"
+        );
+    }
+
+    /// Microbench for the new `all_readers.is_empty()` short-circuit in
+    /// `ActiveEdgeDiscoveryIndex::incoming_candidate_refs`. Builds an index
+    /// from write-only views (readers vec empty) and a committer's write
+    /// summary that covers N pages, then times repeated
+    /// `incoming_candidate_refs` calls. Without the short-circuit each
+    /// call clones `self.readers_with_global_keys`, probes
+    /// `readers_by_page` / `readers_by_page_witness` N times each, and
+    /// runs sort+dedup; with the short-circuit each call is a single
+    /// atomic-length check.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_incoming_candidate_refs_empty_readers() {
+        use std::cell::Cell;
+        use std::collections::HashSet;
+        use std::time::Instant;
+
+        use super::{
+            ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags, summarize_witness_keys,
+        };
+
+        fn make_writer_view(token_id: u64, pages: &[u32]) -> HandleView {
+            let write_pages: HashSet<PageNumber> = pages.iter().copied().map(test_page).collect();
+            HandleView {
+                token: test_token(token_id),
+                begin_seq: CommitSeq::new(1),
+                flags: HandleViewFlags(HandleViewFlags::ACTIVE),
+                // Read side intentionally empty — all_readers stays empty
+                // so the short-circuit fires.
+                read_pages: HashSet::new(),
+                read_page_witness_pages: HashSet::new(),
+                read_exact_cells: HashSet::new(),
+                write_pages: write_pages.clone(),
+                write_page_witness_pages: write_pages,
+                write_exact_cells: HashSet::new(),
+                has_in_rw: Cell::new(false),
+                has_out_rw: Cell::new(false),
+            }
+        }
+
+        // MT 16t shape again: 16 writer-only views, 10 pages each. A
+        // committing txn writes 10 pages and asks for incoming edges.
+        const VIEWS: usize = 16;
+        const PAGES_PER_VIEW: u32 = 10;
+        const CALLS_PER_TRIAL: u32 = 500_000;
+        const TRIALS: usize = 7;
+
+        let views: Vec<HandleView> = (0..VIEWS)
+            .map(|i| {
+                let base = (i as u32) * PAGES_PER_VIEW + 1;
+                let pages: Vec<u32> = (base..base + PAGES_PER_VIEW).collect();
+                make_writer_view((i as u64) + 1, &pages)
+            })
+            .collect();
+
+        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let committer_token = test_token(999);
+        let committer_begin = CommitSeq::new(1);
+        let committer_end = CommitSeq::new(2);
+        let committer_write_keys: Vec<WitnessKey> = (1..=PAGES_PER_VIEW)
+            .map(|i| WitnessKey::Page(test_page(i)))
+            .collect();
+        let write_summary = summarize_witness_keys(&committer_write_keys);
+
+        // Warm-up.
+        for _ in 0..CALLS_PER_TRIAL {
+            std::hint::black_box(index.incoming_candidate_refs(
+                &views,
+                committer_token,
+                committer_begin,
+                committer_end,
+                &write_summary,
+            ));
+        }
+
+        let mut samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..CALLS_PER_TRIAL {
+                std::hint::black_box(index.incoming_candidate_refs(
+                    &views,
+                    committer_token,
+                    committer_begin,
+                    committer_end,
+                    &write_summary,
+                ));
+            }
+            let elapsed = start.elapsed();
+            let ns_per_call = elapsed.as_nanos() as f64 / f64::from(CALLS_PER_TRIAL);
+            eprintln!("  trial: {ns_per_call:.1} ns/call ({elapsed:?} total)");
+            samples.push(ns_per_call);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = samples[TRIALS / 2];
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "bench_incoming_candidate_refs_empty_readers: median={median:.1} ns/call, \
+             mean={mean:.1} ns/call (n={TRIALS}, views={VIEWS}, write_pages={PAGES_PER_VIEW})"
         );
     }
 }
