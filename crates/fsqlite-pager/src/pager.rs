@@ -8230,6 +8230,18 @@ where
         // =====================================================================
         // D1-CRITICAL: Split inner lock into prepare/IO/publish phases (bd-3wop3.8)
         //
+        // REMAINING CLIFF (bd-wee9a, 2026-04-24): even with Phase A shrunk to
+        // ~20 µs, the per-pager `self.inner.lock()` taken below still
+        // serializes all writers of this pager. At MT 2t,
+        // `FSQLITE_TRACE_GROUP_COMMIT=1` shows every flush with
+        // `members=[N]` (size-1 batches) — writers never arrive in the
+        // GroupCommitQueue simultaneously because peer N+1 is blocked on
+        // this mutex while peer N completes Phases A+B+C. Raising
+        // `GROUP_COMMIT_SPARSE_ARRIVAL_WAIT` to 2 ms did not change the
+        // batching pattern. See bd-wee9a for the full analysis and
+        // candidate fixes (shrink Phase A further / per-txn prep buffers /
+        // optimistic BEGIN CONCURRENT fast path).
+        //
         // BEFORE: inner.lock() held for entire commit (~100us) serializing all threads
         // AFTER:
         //   Phase A (prepare, ~20us): Hold inner.lock() briefly to snapshot state
