@@ -1102,6 +1102,12 @@ impl<P> BtCursor<P> {
 
     fn bump_row_image_epoch(&mut self) {
         self.row_image_epoch = self.row_image_epoch.wrapping_add(1);
+        // Any cursor-driven write can hand the allocator back a freshly-freed
+        // page buffer whose memory address gets recycled by the next
+        // `read_page_data` with different bytes. Drop the whole 4-slot memo
+        // so the next `page_mutation_counter` re-hashes rather than trusting
+        // a possibly-recycled pointer.
+        self.mutation_counter_memo.get_mut().clear();
     }
 
     fn page_mutation_counter(&self, page_no: PageNumber, page_data: &PageData) -> u32 {
@@ -3496,7 +3502,8 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
-                let mutation_counter = self.page_mutation_counter(cached.page_no, &cached.page_data);
+                let mutation_counter =
+                    self.page_mutation_counter(cached.page_no, &cached.page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
                     page_no: cached.page_no,
@@ -14142,6 +14149,66 @@ mod tests {
             "[cell_slot_cache get front-entry] fast={fast_ns}ns  slow={slow_ns}ns  \
              speedup={:.2}x  (prefill={PREFILL}, iters={ITERS})",
             slow_ns as f64 / fast_ns.max(1) as f64
+        );
+    }
+
+    /// Micro-benchmark for bd-4i4vh.2: mutation-counter memo vs raw xxh3 hash.
+    ///
+    /// Ignored by default (run with `--release --ignored --nocapture`).
+    /// Simulates repeated `page_mutation_counter` invocations for the same
+    /// (page_no, bytes_ptr) — the common case during a root-to-leaf descent
+    /// and subsequent stack reuse within a single insert burst.
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_page_mutation_counter_memo() {
+        const USABLE: u32 = 4096;
+        const WARMUP: u32 = 100_000;
+        const ITERS: u32 = 5_000_000;
+
+        // Realistic-ish page image: fill with a mix so xxh3 can't short-circuit
+        // on zero runs.
+        let mut page = vec![0u8; USABLE as usize];
+        for (i, byte) in page.iter_mut().enumerate() {
+            *byte = (i ^ (i >> 3) ^ 0x5a) as u8;
+        }
+        // Embed a plausible btree header prefix so nothing panics downstream.
+        page[3..5].copy_from_slice(&120u16.to_be_bytes()); // cell_count
+        page[5..7].copy_from_slice(&3800u16.to_be_bytes()); // cell_content_offset
+        let page_data = PageData::from_vec(page);
+
+        let store = MemPageStore::new(USABLE);
+        let cursor = BtCursor::new(store, pn(7), USABLE, true);
+        let page_no = pn(7);
+
+        // Warm-up (fast path — memoized lookup).
+        for _ in 0..WARMUP {
+            let c = cursor.page_mutation_counter(page_no, &page_data);
+            std::hint::black_box(c);
+        }
+
+        // Fast path: the second-and-later calls hit the 4-slot memo.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let c = cursor.page_mutation_counter(page_no, &page_data);
+            std::hint::black_box(c);
+        }
+        let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        // Slow path: direct xxh3 hash, re-hashed every iteration.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let c = BtCursor::<MemPageStore>::compute_page_mutation_counter_from_bytes(
+                page_data.as_bytes(),
+                USABLE,
+            );
+            std::hint::black_box(c);
+        }
+        let slow_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        println!(
+            "[page_mutation_counter memo] memoized={fast_ns:.3}ns  raw_xxh3={slow_ns:.3}ns  \
+             speedup={:.2}x  (usable={USABLE}, iters={ITERS})",
+            slow_ns / fast_ns.max(f64::EPSILON)
         );
     }
 }
