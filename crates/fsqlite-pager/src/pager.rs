@@ -2698,6 +2698,13 @@ const ATOMIC_PUBLISHED_MAX_SLOT_COUNT: usize = ATOMIC_PUBLISHED_PAGE_LIMIT as us
 struct AtomicPublishedPageSlot {
     present: AtomicBool,
     page: Mutex<Option<PageData>>,
+    /// Position of this slot within
+    /// [`AtomicPublishedPages::active_indices`]. Protected by the
+    /// `active_indices` mutex; only valid when `present` is `true`. Kept
+    /// as an `AtomicUsize` to avoid an `UnsafeCell`/`Cell` non-`Sync`
+    /// wrapper — every read/write happens while the `active_indices`
+    /// lock is held, so `Relaxed` is sufficient.
+    active_pos: AtomicUsize,
 }
 
 /// Lock-free-on-miss publication plane for the low page-number hot set.
@@ -2723,6 +2730,7 @@ impl AtomicPublishedPages {
             .map(|_| AtomicPublishedPageSlot {
                 present: AtomicBool::new(false),
                 page: Mutex::new(None),
+                active_pos: AtomicUsize::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -2789,6 +2797,8 @@ impl AtomicPublishedPages {
         let inserted = guard.is_none();
         *guard = Some(page);
         if inserted {
+            slot.active_pos
+                .store(active_indices.len(), AtomicOrdering::Relaxed);
             active_indices.push(idx);
         }
         drop(guard);
@@ -2818,11 +2828,31 @@ impl AtomicPublishedPages {
             .take()
             .is_some();
         if removed {
-            if let Some(pos) = active_indices
+            let pos = slot.active_pos.load(AtomicOrdering::Relaxed);
+            if pos < active_indices.len() && active_indices[pos] == idx {
+                // O(1) swap_remove using the stored back-pointer. If the
+                // swapped-in element (formerly the tail) lands at `pos`,
+                // refresh its own back-pointer so its next `remove`
+                // stays O(1) as well.
+                active_indices.swap_remove(pos);
+                if let Some(&moved_idx) = active_indices.get(pos) {
+                    self.slots[moved_idx]
+                        .active_pos
+                        .store(pos, AtomicOrdering::Relaxed);
+                }
+            } else if let Some(fallback_pos) = active_indices
                 .iter()
                 .position(|&active_idx| active_idx == idx)
             {
-                active_indices.swap_remove(pos);
+                // Defensive fallback: back-pointer was stale (should not
+                // happen, but keep the structure consistent if it ever
+                // does rather than leaving a dangling active-index).
+                active_indices.swap_remove(fallback_pos);
+                if let Some(&moved_idx) = active_indices.get(fallback_pos) {
+                    self.slots[moved_idx]
+                        .active_pos
+                        .store(fallback_pos, AtomicOrdering::Relaxed);
+                }
             }
             self.page_count.fetch_sub(1, AtomicOrdering::Relaxed);
         }
@@ -2870,6 +2900,10 @@ impl AtomicPublishedPages {
             let page_no = PageNumber::new(u32::try_from(idx + 1).unwrap_or(u32::MAX))
                 .expect("atomic publication slot index must map to a valid page number");
             if f(&page_no) {
+                // Refresh the back-pointer to match the rebuilt position
+                // so subsequent remove() stays O(1).
+                slot.active_pos
+                    .store(retained_indices.len(), AtomicOrdering::Relaxed);
                 retained_indices.push(idx);
                 continue;
             }
@@ -2908,6 +2942,8 @@ impl AtomicPublishedPages {
             let inserted = guard.is_none();
             *guard = Some(page);
             if inserted {
+                slot.active_pos
+                    .store(active_indices.len(), AtomicOrdering::Relaxed);
                 active_indices.push(idx);
                 total_added = total_added.saturating_add(1);
             }
@@ -21925,6 +21961,128 @@ mod tests {
         assert_eq!(published_pages.atomic_active_slot_count(), 0);
         assert_eq!(published_pages.len(), 0);
         assert!(published_pages.get(page_two).is_none());
+    }
+
+    #[test]
+    fn test_atomic_published_pages_remove_middle_and_tail_are_consistent() {
+        // Exercise the back-pointer: remove from head, middle, and tail
+        // positions and assert the structure stays consistent afterwards.
+        let published_pages = PublishedPages::new(16);
+        let page = |n: u32| PageNumber::new(n).unwrap();
+        for n in 1..=5 {
+            assert!(
+                published_pages.insert(page(n), PageData::from_vec(sample_page(n as u8))),
+                "fresh insert should succeed for page {n}"
+            );
+        }
+        assert_eq!(published_pages.atomic_active_slot_count(), 5);
+        // Middle
+        assert!(published_pages.remove(page(3)));
+        assert_eq!(published_pages.atomic_active_slot_count(), 4);
+        assert!(published_pages.get(page(3)).is_none());
+        assert!(published_pages.get(page(5)).is_some());
+        // Head (post-middle-removal the head is still page 1)
+        assert!(published_pages.remove(page(1)));
+        assert_eq!(published_pages.atomic_active_slot_count(), 3);
+        assert!(published_pages.get(page(1)).is_none());
+        assert!(published_pages.get(page(4)).is_some());
+        // Tail (before the above two removes, 5 was the tail — after the
+        // two swap_removes its back-pointer must still resolve)
+        assert!(published_pages.remove(page(5)));
+        assert_eq!(published_pages.atomic_active_slot_count(), 2);
+        assert!(published_pages.get(page(5)).is_none());
+        // Remaining two pages still reachable
+        assert!(published_pages.get(page(2)).is_some());
+        assert!(published_pages.get(page(4)).is_some());
+        // Removing the remaining pages also works
+        assert!(published_pages.remove(page(2)));
+        assert!(published_pages.remove(page(4)));
+        assert_eq!(published_pages.atomic_active_slot_count(), 0);
+        assert_eq!(published_pages.len(), 0);
+    }
+
+    #[test]
+    fn test_atomic_published_pages_remove_is_o1_vs_linear_scan() {
+        // Micro-benchmark gate: compares the new O(1) slot.active_pos
+        // back-pointer path in AtomicPublishedPages::remove against a
+        // reference O(n) implementation that simulates the prior
+        // `iter().position()` scan. Both implementations run the same
+        // insert/remove workload over the same input.
+        //
+        // The gate only fails if the O(1) path regresses below the O(n)
+        // reference. On CI the delta is hardware-dependent, so we print
+        // both timings with tracing and use a generous lower bound. The
+        // interesting number — the ratio — is captured in the commit
+        // body.
+        use std::time::Instant;
+
+        const N: u32 = 4_000;
+        let slot_cap = u32::try_from(ATOMIC_PUBLISHED_MIN_SLOT_COUNT)
+            .expect("ATOMIC_PUBLISHED_MIN_SLOT_COUNT fits in u32");
+        assert!(
+            N <= slot_cap,
+            "N must stay within the direct-slot plane for apples-to-apples timing"
+        );
+        let pages: Vec<PageNumber> = (1..=N).map(|n| PageNumber::new(n).unwrap()).collect();
+        let payload = PageData::from_vec(sample_page(0xE4));
+
+        // Warm caches / allocator before timing (alloc churn otherwise
+        // biases the first run).
+        {
+            let warm = PublishedPages::new(N);
+            for &p in &pages {
+                let _ = warm.insert(p, payload.clone());
+            }
+            for &p in &pages {
+                let _ = warm.remove(p);
+            }
+        }
+
+        // Timed run: O(1) back-pointer path (the actual production
+        // implementation after this commit).
+        let published = PublishedPages::new(N);
+        for &p in &pages {
+            assert!(published.insert(p, payload.clone()));
+        }
+        let t0 = Instant::now();
+        for &p in &pages {
+            assert!(published.remove(p));
+        }
+        let o1_elapsed = t0.elapsed();
+        assert_eq!(published.atomic_active_slot_count(), 0);
+
+        // Reference run: simulate the old O(n) path with a local
+        // Vec<usize> and iter().position(). This is a pure
+        // data-structure microbenchmark (no slot I/O), so it only
+        // reflects the search cost we removed — it is strictly
+        // conservative toward the O(1) path (which also pays the
+        // per-slot lock cost the reference skips).
+        let mut active_indices: Vec<usize> = (0..N as usize).collect();
+        let t0 = Instant::now();
+        for &p in &pages {
+            let idx = (p.get() - 1) as usize;
+            let pos = active_indices
+                .iter()
+                .position(|&i| i == idx)
+                .expect("active index must be present");
+            active_indices.swap_remove(pos);
+        }
+        let linear_elapsed = t0.elapsed();
+        assert!(active_indices.is_empty());
+
+        eprintln!(
+            "atomic_published_pages_remove: O(1) back-pointer = {o1_elapsed:?}, \
+             reference O(n) linear scan = {linear_elapsed:?} for N={N}"
+        );
+        // Sanity gate: the O(1) remove must not regress beyond the O(n)
+        // scan on this micro-workload. The scan has zero slot overhead
+        // (just Vec ops), so `linear_elapsed * 4` is still a very loose
+        // upper bound — we mainly care about catching accidental
+        // super-linear regressions.
+        assert!(
+            o1_elapsed <= linear_elapsed.saturating_mul(4),
+            "O(1) remove regressed vs pure O(n) reference: o1={o1_elapsed:?} scan={linear_elapsed:?}"
+        );
     }
 
     #[test]
