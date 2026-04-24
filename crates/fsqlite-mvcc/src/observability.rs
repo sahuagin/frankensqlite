@@ -10,7 +10,7 @@
 
 use fsqlite_types::sync_primitives::Instant;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};
@@ -52,6 +52,28 @@ static MVCC_VERSIONS_TRAVERSED_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static MVCC_VERSIONS_TRAVERSED_SUM: AtomicU64 = AtomicU64::new(0);
 static MVCC_ACTIVE_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Gate for the snapshot-read observability histogram. When `false` (the
+/// default) every `record_snapshot_read_versions_traversed` call returns
+/// immediately after a single relaxed atomic-bool load — skipping the three
+/// `fetch_add`s the histogram otherwise performs on every MVCC resolve. The
+/// runtime metrics probe (PRAGMA / admin tooling) flips this on when it
+/// wants to observe the histogram. Matches the `FSQLITE_VDBE_METRICS_ENABLED`
+/// pattern in the VDBE engine.
+static MVCC_SNAPSHOT_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable the MVCC snapshot-read histogram collection.
+/// Defaults to disabled so hot-path resolves do not pay three relaxed
+/// atomic increments per call.
+pub fn set_mvcc_snapshot_metrics_enabled(enabled: bool) {
+    MVCC_SNAPSHOT_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current MVCC snapshot-read metrics collection flag.
+#[must_use]
+pub fn mvcc_snapshot_metrics_enabled() -> bool {
+    MVCC_SNAPSHOT_METRICS_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Monotonic nanosecond timestamp relative to process start.
 fn now_ns() -> u64 {
     // Use a single, consistent epoch for all events in this process.
@@ -73,7 +95,23 @@ fn emit(observer: &SharedObserver, event: &ConflictEvent) {
 
 /// Record one snapshot-read traversal into the
 /// `fsqlite_mvcc_versions_traversed` histogram.
+///
+/// No-op when `mvcc_snapshot_metrics_enabled()` is false (the default).
+/// This is called from every `VersionStore::resolve_visible_version` /
+/// `with_visible_version` / `resolve_visible_commit_seq` exit path, so
+/// the gate is an important hot-path saver — see
+/// `bench_resolve_visible_version_metric_gate`.
+#[inline]
 pub fn record_snapshot_read_versions_traversed(versions_traversed: u64) {
+    if !MVCC_SNAPSHOT_METRICS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    record_snapshot_read_versions_traversed_slow(versions_traversed);
+}
+
+#[cold]
+#[inline(never)]
+fn record_snapshot_read_versions_traversed_slow(versions_traversed: u64) {
     MVCC_VERSIONS_TRAVERSED_SAMPLES.fetch_add(1, Ordering::Relaxed);
     MVCC_VERSIONS_TRAVERSED_SUM.fetch_add(versions_traversed, Ordering::Relaxed);
 
@@ -537,6 +575,9 @@ mod tests {
 
     #[test]
     fn snapshot_metrics_record_histogram_and_gauge() {
+        // The histogram defaults to disabled in production; enable it here
+        // so the record_* calls below actually mutate the counters.
+        set_mvcc_snapshot_metrics_enabled(true);
         let before = mvcc_snapshot_metrics_snapshot();
 
         mvcc_snapshot_established();

@@ -2999,4 +2999,68 @@ mod tests {
             }
         }
     }
+
+    /// Microbench: cost of `resolve_visible_version` on a one-page,
+    /// one-committed-version chain (the MVCC read fast path). The per-call
+    /// cost of the `record_snapshot_read_versions_traversed` histogram
+    /// (three relaxed atomic `fetch_add` operations) dominates this path
+    /// when metrics are disabled and that call is pure waste.
+    ///
+    /// Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_resolve_visible_version_metric_gate --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_resolve_visible_version_metric_gate() {
+        use crate::observability::set_mvcc_snapshot_metrics_enabled;
+        use std::time::Instant;
+
+        const PAGES: u32 = 256;
+        const RESOLVES_PER_TRIAL: u32 = 200_000;
+        const TRIALS: usize = 7;
+
+        // Build a store with PAGES pages, one committed version each.
+        let store = VersionStore::new(PageSize::DEFAULT);
+        for i in 1..=PAGES {
+            store.publish(make_version(i, 1, None));
+        }
+        let snapshot = make_snapshot(5);
+
+        fn run_trial(store: &VersionStore, snapshot: &Snapshot, resolves: u32, pages: u32) -> f64 {
+            let start = Instant::now();
+            for i in 0..resolves {
+                let pgno = PageNumber::new((i % pages) + 1).unwrap();
+                std::hint::black_box(store.resolve_visible_version(pgno, snapshot));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(resolves)
+        }
+
+        // Warm up in both configurations before timing.
+        set_mvcc_snapshot_metrics_enabled(true);
+        run_trial(&store, &snapshot, RESOLVES_PER_TRIAL, PAGES);
+        set_mvcc_snapshot_metrics_enabled(false);
+        run_trial(&store, &snapshot, RESOLVES_PER_TRIAL, PAGES);
+
+        let mut metrics_on_samples = Vec::with_capacity(TRIALS);
+        let mut metrics_off_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            set_mvcc_snapshot_metrics_enabled(true);
+            let on = run_trial(&store, &snapshot, RESOLVES_PER_TRIAL, PAGES);
+            set_mvcc_snapshot_metrics_enabled(false);
+            let off = run_trial(&store, &snapshot, RESOLVES_PER_TRIAL, PAGES);
+            eprintln!("  metrics=on: {on:.1} ns/resolve   metrics=off: {off:.1} ns/resolve");
+            metrics_on_samples.push(on);
+            metrics_off_samples.push(off);
+        }
+        metrics_on_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        metrics_off_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let on_med = metrics_on_samples[TRIALS / 2];
+        let off_med = metrics_off_samples[TRIALS / 2];
+        let delta_pct = (off_med - on_med) / on_med * 100.0;
+        eprintln!(
+            "bench_resolve_visible_version_metric_gate: metrics_on median={on_med:.1} \
+             ns/resolve; metrics_off median={off_med:.1} ns/resolve; delta={delta_pct:+.1}% \
+             (n={TRIALS} trials, {RESOLVES_PER_TRIAL} resolves/trial, pages={PAGES})"
+        );
+    }
 }
