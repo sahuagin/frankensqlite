@@ -152,6 +152,18 @@ fn parse_columnsize_option(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_prefix_option(value: &str) -> Option<Vec<usize>> {
+    let mut prefix_lengths = Vec::new();
+    for segment in value.split_ascii_whitespace() {
+        let prefix_length = segment.parse::<usize>().ok()?;
+        if prefix_length == 0 {
+            return None;
+        }
+        prefix_lengths.push(prefix_length);
+    }
+    (!prefix_lengths.is_empty()).then_some(prefix_lengths)
+}
+
 fn parse_option_assignment(input: &str) -> Option<(&str, &str)> {
     let (key, value) = input.split_once('=')?;
     Some((key.trim(), value.trim()))
@@ -1054,6 +1066,8 @@ pub struct Posting {
 pub struct InvertedIndex {
     /// term -> list of postings
     index: HashMap<SmallText, PostingList>,
+    /// prefix length -> (prefix term -> list of postings)
+    prefix_indexes: HashMap<usize, HashMap<SmallText, PostingList>>,
     /// Set of rowids currently present in the index.
     doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
@@ -1069,13 +1083,23 @@ impl Default for InvertedIndex {
 impl InvertedIndex {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_column_sizes(true)
+        Self::with_options(true, &[])
     }
 
     #[must_use]
     pub fn with_column_sizes(track_column_sizes: bool) -> Self {
+        Self::with_options(track_column_sizes, &[])
+    }
+
+    #[must_use]
+    pub fn with_options(track_column_sizes: bool, prefix_lengths: &[usize]) -> Self {
         Self {
             index: HashMap::new(),
+            prefix_indexes: prefix_lengths
+                .iter()
+                .copied()
+                .map(|prefix_length| (prefix_length, HashMap::new()))
+                .collect(),
             doc_ids: HashSet::new(),
             doc_lengths: track_column_sizes.then(HashMap::new),
         }
@@ -1084,6 +1108,31 @@ impl InvertedIndex {
     #[must_use]
     pub const fn tracks_column_sizes(&self) -> bool {
         self.doc_lengths.is_some()
+    }
+
+    #[must_use]
+    pub fn tracks_prefix_length(&self, prefix_length: usize) -> bool {
+        self.prefix_indexes.contains_key(&prefix_length)
+    }
+
+    fn append_position(&mut self, term: &str, docid: i64, column: u32, position: u32) {
+        append_position_to_postings(
+            self.index.entry(SmallText::from(term)).or_default(),
+            docid,
+            column,
+            position,
+        );
+
+        for (prefix_length, prefix_index) in &mut self.prefix_indexes {
+            if let Some(prefix) = prefix_slice(term, *prefix_length) {
+                append_position_to_postings(
+                    prefix_index.entry(SmallText::from(prefix)).or_default(),
+                    docid,
+                    column,
+                    position,
+                );
+            }
+        }
     }
 
     /// Index a document's tokens for a given column.
@@ -1100,14 +1149,9 @@ impl InvertedIndex {
         }
 
         for (term, positions) in term_positions {
-            self.index
-                .entry(SmallText::from(term))
-                .or_default()
-                .push(Posting {
-                    docid,
-                    column,
-                    positions,
-                });
+            for position in positions {
+                self.append_position(term, docid, column, position);
+            }
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -1125,33 +1169,7 @@ impl InvertedIndex {
         tokenizer.visit_tokens(text, &mut |term, _start, _end, _| {
             let position = token_count;
             token_count = token_count.saturating_add(1);
-            if let Some(postings) = self.index.get_mut(term) {
-                if let Some(last_posting) = postings.last_mut()
-                    && last_posting.docid == docid
-                    && last_posting.column == column
-                {
-                    last_posting.positions.push(position);
-                } else {
-                    let mut positions = Positions::new();
-                    positions.push(position);
-                    postings.push(Posting {
-                        docid,
-                        column,
-                        positions,
-                    });
-                }
-            } else {
-                let mut positions = Positions::new();
-                positions.push(position);
-                self.index.insert(
-                    SmallText::from(term),
-                    SmallVec::from_buf([Posting {
-                        docid,
-                        column,
-                        positions,
-                    }]),
-                );
-            }
+            self.append_position(term, docid, column, position);
         });
 
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -1163,6 +1181,11 @@ impl InvertedIndex {
     pub fn remove_document(&mut self, docid: i64) {
         for postings in self.index.values_mut() {
             postings.retain(|p| p.docid != docid);
+        }
+        for prefix_index in self.prefix_indexes.values_mut() {
+            for postings in prefix_index.values_mut() {
+                postings.retain(|p| p.docid != docid);
+            }
         }
         self.doc_ids.remove(&docid);
         if let Some(doc_lengths) = self.doc_lengths.as_mut() {
@@ -1179,6 +1202,12 @@ impl InvertedIndex {
     /// Look up postings for terms matching a prefix.
     #[must_use]
     pub fn get_prefix_postings(&self, prefix: &str) -> Vec<&Posting> {
+        if let Some(prefix_index) = self.prefix_indexes.get(&prefix.chars().count()) {
+            return prefix_index
+                .get(prefix)
+                .map_or_else(Vec::new, |postings| postings.iter().collect());
+        }
+
         let mut result = Vec::new();
         for (term, postings) in &self.index {
             if term.starts_with(prefix) {
@@ -1250,6 +1279,38 @@ impl InvertedIndex {
             .map(|posting| u32::try_from(posting.positions.len()).unwrap_or(u32::MAX))
             .sum()
     }
+}
+
+fn append_position_to_postings(postings: &mut PostingList, docid: i64, column: u32, position: u32) {
+    if let Some(last_posting) = postings.last_mut()
+        && last_posting.docid == docid
+        && last_posting.column == column
+    {
+        last_posting.positions.push(position);
+    } else {
+        let mut positions = Positions::new();
+        positions.push(position);
+        postings.push(Posting {
+            docid,
+            column,
+            positions,
+        });
+    }
+}
+
+fn prefix_slice(term: &str, prefix_length: usize) -> Option<&str> {
+    if prefix_length == 0 {
+        return None;
+    }
+
+    let mut chars = term.char_indices();
+    for idx in 0..prefix_length {
+        let (offset, ch) = chars.next()?;
+        if idx + 1 == prefix_length {
+            return Some(&term[..offset + ch.len_utf8()]);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,6 +1827,8 @@ pub struct Fts5Table {
     config: Fts5Config,
     /// Tokenizer.
     tokenizer_name: String,
+    /// Configured prefix index lengths.
+    prefix_lengths: Vec<usize>,
     /// Inverted index.
     index: InvertedIndex,
     /// Stored document content: docid -> (col0, col1, ...).
@@ -1780,6 +1843,7 @@ pub struct Fts5Table {
 struct Fts5TableSnapshot {
     config: Fts5Config,
     tokenizer_name: String,
+    prefix_lengths: Vec<usize>,
     index: InvertedIndex,
     documents: HashMap<i64, Vec<String>>,
     next_rowid: i64,
@@ -1793,7 +1857,8 @@ impl Fts5Table {
             columns,
             config: Fts5Config::default(),
             tokenizer_name: "unicode61".to_owned(),
-            index: InvertedIndex::with_column_sizes(true),
+            prefix_lengths: Vec::new(),
+            index: InvertedIndex::with_options(true, &[]),
             documents: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
@@ -1804,6 +1869,7 @@ impl Fts5Table {
         Fts5TableSnapshot {
             config: self.config,
             tokenizer_name: self.tokenizer_name.clone(),
+            prefix_lengths: self.prefix_lengths.clone(),
             index: self.index.clone(),
             documents: self.documents.clone(),
             next_rowid: self.next_rowid,
@@ -1813,6 +1879,7 @@ impl Fts5Table {
     fn restore_state(&mut self, snapshot: Fts5TableSnapshot) {
         self.config = snapshot.config;
         self.tokenizer_name = snapshot.tokenizer_name;
+        self.prefix_lengths = snapshot.prefix_lengths;
         self.index = snapshot.index;
         self.documents = snapshot.documents;
         self.next_rowid = snapshot.next_rowid;
@@ -1886,7 +1953,8 @@ impl Fts5Table {
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
-        self.index = InvertedIndex::with_column_sizes(self.config.columnsize_enabled());
+        self.index =
+            InvertedIndex::with_options(self.config.columnsize_enabled(), &self.prefix_lengths);
         self.documents = HashMap::with_capacity(rows.len());
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
@@ -2019,6 +2087,7 @@ impl VirtualTable for Fts5Table {
         let mut columns: Vec<String> = Vec::new();
         let mut config = Fts5Config::default();
         let mut tokenizer_name = "unicode61".to_owned();
+        let mut prefix_lengths = Vec::new();
 
         if args.len() > 3 {
             for raw in &args[3..] {
@@ -2054,8 +2123,17 @@ impl VirtualTable for Fts5Table {
                                     FrankenError::function_error("fts5: columnsize must be 0 or 1")
                                 })?;
                         }
+                        "prefix" => {
+                            prefix_lengths.extend(
+                                parse_prefix_option(value_unquoted.as_str()).ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: prefix must be a whitespace separated list of positive integers",
+                                    )
+                                })?,
+                            );
+                        }
                         // Parsed for compatibility but not used in this in-memory path yet.
-                        "prefix" | "detail" | "insttoken" => {}
+                        "detail" | "insttoken" => {}
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2081,6 +2159,8 @@ impl VirtualTable for Fts5Table {
         if columns.is_empty() {
             columns.push("content".to_owned());
         }
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
 
         debug!(
             columns = ?columns,
@@ -2088,13 +2168,16 @@ impl VirtualTable for Fts5Table {
             content_mode = ?config.content_mode,
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
+            prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
         );
 
         let mut table = Self::with_columns(columns);
         table.config = config;
         table.tokenizer_name = tokenizer_name;
-        table.index = InvertedIndex::with_column_sizes(table.config.columnsize_enabled());
+        table.prefix_lengths = prefix_lengths;
+        table.index =
+            InvertedIndex::with_options(table.config.columnsize_enabled(), &table.prefix_lengths);
         Ok(table)
     }
 
@@ -2930,6 +3013,24 @@ mod tests {
         assert!(!docs.contains(&2));
     }
 
+    #[test]
+    fn test_prefix_index_population_and_cleanup() {
+        let mut index = InvertedIndex::with_options(true, &[3]);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("hello help"));
+        index.add_document(2, 0, &tok.tokenize("world"));
+
+        let results = index.get_prefix_postings("hel");
+        let docs: Vec<i64> = results.iter().map(|posting| posting.docid).collect();
+        assert!(index.tracks_prefix_length(3));
+        assert!(docs.contains(&1));
+        assert!(!docs.contains(&2));
+
+        index.remove_document(1);
+        assert!(index.get_prefix_postings("hel").is_empty());
+    }
+
     // -- BM25 tests --
 
     #[test]
@@ -3222,6 +3323,7 @@ mod tests {
                 "content=''",
                 "contentless_delete=1",
                 "columnsize=0",
+                "prefix='2 3'",
             ],
         )
         .unwrap();
@@ -3230,7 +3332,10 @@ mod tests {
         assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
         assert!(vtab.config.contentless_delete_enabled());
         assert!(!vtab.config.columnsize_enabled());
+        assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
+        assert!(vtab.index().tracks_prefix_length(2));
+        assert!(vtab.index().tracks_prefix_length(3));
     }
 
     #[test]
@@ -3247,6 +3352,39 @@ mod tests {
         let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "columnsize=2"])
             .expect_err("invalid columnsize should fail");
         assert!(err.to_string().contains("columnsize must be 0 or 1"));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_accumulates_prefix_options() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "prefix='3 2'",
+                "prefix='4 3'",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(vtab.prefix_lengths, vec![2, 3, 4]);
+        assert!(vtab.index().tracks_prefix_length(2));
+        assert!(vtab.index().tracks_prefix_length(3));
+        assert!(vtab.index().tracks_prefix_length(4));
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_prefix_option() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "prefix='2 0'"])
+            .expect_err("invalid prefix should fail");
+        assert!(
+            err.to_string()
+                .contains("prefix must be a whitespace separated list of positive integers")
+        );
     }
 
     #[test]
