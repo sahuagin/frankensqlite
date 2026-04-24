@@ -2547,6 +2547,129 @@ pub fn prepare_concurrent_commit_with_ssi(
         return Err((MvccError::InvalidState, FcwResult::Clean));
     };
 
+    let read_key_summary = summarize_witness_keys(&sorted_read_keys);
+    let write_key_summary = summarize_witness_keys(&sorted_write_keys);
+    if sorted_read_keys.is_empty() && sorted_write_keys.is_empty() {
+        return Ok(PreparedConcurrentCommit {
+            session_id,
+            planned_commit_seq,
+            txn_token: txn,
+            begin_seq,
+            read_keys: sorted_read_keys,
+            read_key_summary,
+            write_keys: sorted_write_keys,
+            write_key_summary,
+            write_set_pages,
+            held_lock_pages,
+            has_in_rw: false,
+            has_out_rw: false,
+            incoming_edges: Vec::new(),
+            outgoing_edges: Vec::new(),
+            dro_t3_decision: None,
+            used_uncontended_prepare_fast_path: false,
+            used_candidate_free_prepare_fast_path: true,
+        });
+    }
+
+    if sorted_read_keys.is_empty() {
+        let views = registry
+            .iter_active()
+            .filter_map(|(_, handle)| {
+                let guard = handle.lock();
+                guard.is_active().then_some(HandleView::new(&guard))
+            })
+            .collect::<Vec<_>>();
+        let active_index = ActiveEdgeDiscoveryIndex::build(&views);
+        let active_reader_candidates = active_index.incoming_candidate_refs(
+            &views,
+            txn,
+            begin_seq,
+            planned_commit_seq,
+            &write_key_summary,
+        );
+        let committed_reader_candidates = registry.committed_reader_candidates(
+            txn,
+            begin_seq,
+            planned_commit_seq,
+            &write_key_summary,
+        );
+        if active_reader_candidates.is_empty() && committed_reader_candidates.is_empty() {
+            return Ok(PreparedConcurrentCommit {
+                session_id,
+                planned_commit_seq,
+                txn_token: txn,
+                begin_seq,
+                read_keys: sorted_read_keys,
+                read_key_summary,
+                write_keys: sorted_write_keys,
+                write_key_summary,
+                write_set_pages,
+                held_lock_pages,
+                has_in_rw: false,
+                has_out_rw: false,
+                incoming_edges: Vec::new(),
+                outgoing_edges: Vec::new(),
+                dro_t3_decision: None,
+                used_uncontended_prepare_fast_path: false,
+                used_candidate_free_prepare_fast_path: true,
+            });
+        }
+
+        let incoming_edges = discover_incoming_edges(
+            txn,
+            begin_seq,
+            planned_commit_seq,
+            &sorted_write_keys,
+            &active_reader_candidates,
+            &committed_reader_candidates,
+        );
+        let dro_t3_decision = evaluate_prepare_t3_dro(
+            txn,
+            &incoming_edges,
+            &[],
+            registry.active.len(),
+            registry.committed_readers.len(),
+            registry.committed_writers.len(),
+        );
+        if incoming_edges
+            .iter()
+            .any(|edge| !edge.source_is_active && edge.source_has_in_rw)
+        {
+            tracing::warn!(
+                ?txn,
+                dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                "SSI validation aborted"
+            );
+            return Err((
+                MvccError::BusySnapshot,
+                FcwResult::Abort {
+                    reason: SsiAbortReason::CommittedPivot,
+                },
+            ));
+        }
+
+        return Ok(PreparedConcurrentCommit {
+            session_id,
+            planned_commit_seq,
+            txn_token: txn,
+            begin_seq,
+            read_keys: sorted_read_keys,
+            read_key_summary,
+            write_keys: sorted_write_keys,
+            write_key_summary,
+            write_set_pages,
+            held_lock_pages,
+            has_in_rw: !incoming_edges.is_empty(),
+            has_out_rw: false,
+            incoming_edges,
+            outgoing_edges: Vec::new(),
+            dro_t3_decision,
+            used_uncontended_prepare_fast_path: false,
+            used_candidate_free_prepare_fast_path: false,
+        });
+    }
+
     // Step 2: Discover SSI edges without publishing side effects yet.
     let views = registry
         .iter_active()
@@ -2556,8 +2679,6 @@ pub fn prepare_concurrent_commit_with_ssi(
         })
         .collect::<Vec<_>>();
     let active_index = ActiveEdgeDiscoveryIndex::build(&views);
-    let read_key_summary = summarize_witness_keys(&sorted_read_keys);
-    let write_key_summary = summarize_witness_keys(&sorted_write_keys);
     let active_reader_candidates = active_index.incoming_candidate_refs(
         &views,
         txn,
@@ -2882,6 +3003,74 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             &prepared.write_key_summary,
         )
     };
+
+    if prepared.incoming_edges.is_empty()
+        && prepared.outgoing_edges.is_empty()
+        && read_keys.is_empty()
+        && write_keys.is_empty()
+    {
+        commit_index.batch_update(&prepared.write_set_pages, committed_seq);
+        lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
+        if let Some(mut handle) = registry.get_mut(prepared.session_id)
+            && handle.is_active()
+        {
+            handle.has_in_rw.set(false);
+            handle.has_out_rw.set(false);
+            handle.mark_committed();
+        }
+        registry.prune_committed_conflict_history();
+        return;
+    }
+
+    if prepared.incoming_edges.is_empty()
+        && prepared.outgoing_edges.is_empty()
+        && read_keys.is_empty()
+    {
+        let active_views: Vec<HandleView> = registry
+            .active
+            .values()
+            .map(|handle| {
+                let guard = handle.lock();
+                HandleView::new(&guard)
+            })
+            .collect();
+        let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
+        let active_reader_candidates = active_index.incoming_candidate_refs(
+            &active_views,
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            write_key_summary,
+        );
+        let committed_reader_candidates = registry.committed_reader_candidates(
+            prepared.txn_token,
+            prepared.begin_seq,
+            committed_seq,
+            write_key_summary,
+        );
+        if active_reader_candidates.is_empty() && committed_reader_candidates.is_empty() {
+            commit_index.batch_update(&prepared.write_set_pages, committed_seq);
+            lock_table.release_set(prepared.held_lock_pages.iter().copied(), txn_id);
+            if let Some(mut handle) = registry.get_mut(prepared.session_id)
+                && handle.is_active()
+            {
+                handle.has_in_rw.set(false);
+                handle.has_out_rw.set(false);
+                handle.mark_committed();
+            }
+            if !write_keys.is_empty() {
+                registry.committed_writers.push(CommittedWriterInfo {
+                    token: prepared.txn_token,
+                    commit_seq: committed_seq,
+                    had_out_rw: false,
+                    keys: write_keys.to_vec(),
+                });
+                registry.index_committed_writer(registry.committed_writers.len() - 1);
+            }
+            registry.prune_committed_conflict_history();
+            return;
+        }
+    }
 
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
@@ -5209,6 +5398,51 @@ mod tests {
             prepared.dro_t3_decision().is_none(),
             "edge-free prepare should not emit a DRO decision"
         );
+    }
+
+    #[test]
+    fn test_zero_witness_commit_stays_candidate_free_with_active_peer() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        }
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(6), test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("zero-witness write should not need SSI candidate scans");
+
+        assert!(prepared.used_candidate_free_prepare_fast_path());
+        assert!(prepared.read_keys().is_empty());
+        assert!(prepared.write_keys().is_empty());
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(11),
+        );
+
+        assert!(
+            registry.committed_readers.is_empty() && registry.committed_writers.is_empty(),
+            "zero-witness commits must not add empty SSI history rows"
+        );
+        assert!(registry.get(s2).is_some_and(|peer| peer.is_active()));
     }
 
     #[test]

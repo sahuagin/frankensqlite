@@ -26,7 +26,12 @@ use crate::commit_combiner::CommitSequenceCombiner;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::{EbrRetireQueue, VersionGuardRegistry};
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
-use crate::observability::record_cas_attempt;
+// `record_cas_attempt` is intentionally no longer called from `publish`
+// after 2f2aecb0 switched the chain-head install to strong `compare_exchange`
+// — the attempt count is provably 1, so the histogram sample is a
+// meaningless constant. The recorder itself stays in `observability` for the
+// existing test harness and for any future lock-free installer path that
+// legitimately retries.
 use crate::reclamation::{advance_epoch_and_reclaim, reclaim_at_epoch, retire_and_reclaim};
 
 // ---------------------------------------------------------------------------
@@ -670,7 +675,6 @@ impl VersionStore {
         let mut arena = self.arena.write();
         let idx = arena.alloc(version);
         let new_raw = ChainHeadTable::pack_idx(idx);
-        let mut cas_attempts = 0_u32;
 
         // `publish` is the only production path that installs a new chain
         // head (`ChainHeadTable::{install,install_with_retry,remove}` are
@@ -679,9 +683,11 @@ impl VersionStore {
         // this slot in that window, so `compare_exchange` (strong) must
         // succeed on the first attempt — the prior `compare_exchange_weak`
         // loop existed only to recover from spurious weak-CAS failures
-        // that this path never needed to tolerate.
+        // that this path never needed to tolerate. Consequently the CAS
+        // attempt histogram sample is always 1 and we no longer call
+        // `record_cas_attempt` here (see module-level comment above the
+        // removed import).
         let previous_head = {
-            cas_attempts += 1;
             let slots = shard.slots.read();
             let current_raw = slots[slot_idx].load(Ordering::Acquire);
             let prev = ChainHeadTable::unpack_idx(current_raw);
@@ -699,8 +705,6 @@ impl VersionStore {
             prev
         };
         drop(arena);
-
-        record_cas_attempt(cas_attempts);
 
         // Step 3: Visibility-ranges side-index update. Gated off by default
         // because the diagnostic `visibility_range()` getter and the Debug
