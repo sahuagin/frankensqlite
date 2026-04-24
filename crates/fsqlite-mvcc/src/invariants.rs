@@ -534,8 +534,10 @@ impl std::fmt::Debug for ChainHeadTable {
 static MVCC_VISIBILITY_RANGES_TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable recording of `VersionVisibilityRange` side-index entries
-/// on `publish()` and GC prune. Defaults to disabled; callers that actually
-/// consume `VersionStore::visibility_range()` must flip this on first.
+/// on `publish()` and GC prune.
+///
+/// Defaults to disabled; callers that actually consume
+/// `VersionStore::visibility_range()` must flip this on first.
 pub fn set_mvcc_visibility_ranges_tracking_enabled(enabled: bool) {
     MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.store(enabled, Ordering::Relaxed);
 }
