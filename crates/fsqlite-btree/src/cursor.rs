@@ -567,10 +567,22 @@ struct StackEntry {
 // BtCursor
 // ---------------------------------------------------------------------------
 
+const CURSOR_STACK_INLINE_DEPTH: usize = 4;
 const TABLE_SEEK_CACHE_SLOTS: usize = 4;
 const CELL_SLOT_CACHE_ENTRIES: usize = 64;
 
-type CachedCellSlots = SmallVec<[(u16, CachedCellSlot); 8]>;
+type CursorStack = SmallVec<[StackEntry; CURSOR_STACK_INLINE_DEPTH]>;
+
+// bd-9e3xf.2: inline slot capacity widened 8 → 16. The bd-9e3xf audit
+// showed MISS_SLOT at 71 % of all misses — 54 739 / 76 865 across the
+// workload suite — and nearly all of those come from index-btree binary
+// search on a just-invalidated leaf. A search on an ~N-cell leaf adds
+// log2(N)+1 slots to the fresh entry as each probe misses; with the old
+// inline capacity of 8, any leaf with more than ~256 cells spills to the
+// heap on the 9th probe, paying a `malloc` + copy per search. Widening to
+// 16 covers leaves up to ~65 k cells inline while only adding 8 slots ×
+// 56 bytes ≈ 450 bytes per entry (capped at 64 entries per cursor).
+type CachedCellSlots = SmallVec<[(u16, CachedCellSlot); 16]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CachedCellSlot {
@@ -1045,7 +1057,7 @@ pub struct BtCursor<P> {
     /// Shared collation registry used by text-key comparisons.
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Page stack from root to current leaf.
-    stack: Vec<StackEntry>,
+    stack: CursorStack,
     /// Whether the cursor is at EOF (past the last entry).
     at_eof: bool,
     /// Read witnesses collected for SSI evidence.
@@ -1615,11 +1627,11 @@ impl<P: PageReader> BtCursor<P> {
             // that need custom collations still override via
             // `set_index_collation_context`.
             collation_registry: Arc::clone(default_collation_registry()),
-            // Most cursor lifetimes never approach the theoretical max depth,
-            // and the prepared direct-insert append lane can complete without
-            // ever pushing a stack entry. Avoid paying a heap allocation up
-            // front for every fresh cursor.
-            stack: Vec::new(),
+            // Most cursor lifetimes stay within root/interior/leaf depth, and
+            // the prepared direct-insert append lane can complete without ever
+            // pushing a stack entry. Keep shallow descents inline so both paths
+            // avoid heap growth in the common case.
+            stack: CursorStack::new(),
             at_eof: true,
             read_witnesses: Vec::new(),
             active_op_stats: None,
