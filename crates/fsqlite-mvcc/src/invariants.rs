@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use smallvec::SmallVec;
 
@@ -524,6 +524,51 @@ impl std::fmt::Debug for ChainHeadTable {
 // VersionStore — version chain management
 // ---------------------------------------------------------------------------
 
+/// Runtime gate for the `VersionStore::visibility_ranges` side-index. The
+/// range map is only consulted by diagnostic paths (`visibility_range()` /
+/// `Debug`) and a handful of in-tree tests, but the old unconditional
+/// `RwLock<HashMap>` writes on every `publish()` and every GC prune sat on
+/// the version-chain append hot path. Defaults to off so MVCC writers stop
+/// paying for a side-index nobody reads; tests flip it on before the
+/// handful of calls that need the ranges.
+static MVCC_VISIBILITY_RANGES_TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable recording of `VersionVisibilityRange` side-index entries
+/// on `publish()` and GC prune. Defaults to disabled; callers that actually
+/// consume `VersionStore::visibility_range()` must flip this on first.
+pub fn set_mvcc_visibility_ranges_tracking_enabled(enabled: bool) {
+    MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current state of the visibility-ranges side-index gate.
+#[must_use]
+pub fn mvcc_visibility_ranges_tracking_enabled() -> bool {
+    MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cold]
+#[inline(never)]
+fn publish_record_visibility_range(
+    ranges_lock: &RwLock<HashMap<VersionIdx, VersionVisibilityRange>>,
+    idx: VersionIdx,
+    begin_ts: CommitSeq,
+    previous_head: Option<VersionIdx>,
+) {
+    let mut ranges = ranges_lock.write();
+    ranges.insert(
+        idx,
+        VersionVisibilityRange {
+            begin_ts,
+            end_ts: None,
+        },
+    );
+    if let Some(old_head) = previous_head {
+        if let Some(old_range) = ranges.get_mut(&old_head) {
+            old_range.end_ts = Some(begin_ts);
+        }
+    }
+}
+
 /// Version chain head table + arena, providing `resolve()` and `resolve_for_txn()`.
 ///
 /// The version store owns all committed page versions in the arena and
@@ -651,21 +696,16 @@ impl VersionStore {
 
         record_cas_attempt(cas_attempts);
 
-        // Step 3: Visibility ranges update (brief write lock).
-        let mut ranges = self.visibility_ranges.write();
-        ranges.insert(
-            idx,
-            VersionVisibilityRange {
-                begin_ts,
-                end_ts: None,
-            },
-        );
-        if let Some(old_head) = previous_head {
-            if let Some(old_range) = ranges.get_mut(&old_head) {
-                old_range.end_ts = Some(begin_ts);
-            }
+        // Step 3: Visibility-ranges side-index update. Gated off by default
+        // because the diagnostic `visibility_range()` getter and the Debug
+        // impl are the only consumers; the old unconditional
+        // `visibility_ranges.write()` cost one `RwLock<HashMap>` exclusive
+        // acquire + 1-2 HashMap mutations on every version publish, which
+        // is on the write hot path. The conditional is a single relaxed
+        // bool load in the common (disabled) case.
+        if MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            publish_record_visibility_range(&self.visibility_ranges, idx, begin_ts, previous_head);
         }
-        drop(ranges);
 
         tracing::debug!(pgno = pgno.get(), "version published to chain head");
         idx
@@ -1108,12 +1148,17 @@ impl VersionStore {
         );
         drop(arena);
 
-        // Phase 2: Clean up visibility ranges (separate lock).
-        let mut ranges = self.visibility_ranges.write();
-        for idx in &result.pruned_indices {
-            ranges.remove(idx);
+        // Phase 2: Clean up visibility ranges (gated — only populated when
+        // visibility-range tracking is on, so removes are a no-op otherwise).
+        if MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.load(Ordering::Relaxed)
+            && !result.pruned_indices.is_empty()
+        {
+            let mut ranges = self.visibility_ranges.write();
+            for idx in &result.pruned_indices {
+                ranges.remove(idx);
+            }
+            drop(ranges);
         }
-        drop(ranges);
 
         // Phase 3: Queue pruned slots for deferred recycling (EBR).
         if !result.pruned_indices.is_empty() {
@@ -1308,9 +1353,11 @@ impl VersionStore {
         drop(arena);
 
         if !result.pruned_indices.is_empty() {
-            let mut ranges = self.visibility_ranges.write();
-            for idx in &result.pruned_indices {
-                ranges.remove(idx);
+            if MVCC_VISIBILITY_RANGES_TRACKING_ENABLED.load(Ordering::Relaxed) {
+                let mut ranges = self.visibility_ranges.write();
+                for idx in &result.pruned_indices {
+                    ranges.remove(idx);
+                }
             }
 
             let current_epoch = self.current_epoch();
@@ -1968,6 +2015,9 @@ mod tests {
 
     #[test]
     fn test_version_visibility_ranges_track_begin_end_timestamps() {
+        // Production gates the ranges side-index off to keep `publish()`
+        // off the RwLock<HashMap>; flip it on for this diagnostic test.
+        set_mvcc_visibility_ranges_tracking_enabled(true);
         let store = VersionStore::new(PageSize::DEFAULT);
 
         let v1 = make_version(1, 1, None);
@@ -3096,8 +3146,8 @@ mod tests {
             .map(|i| {
                 let kind = i % 10;
                 let seq = match kind {
-                    0 => 0,                     // uncommitted
-                    1 => snapshot_high + 1,     // newer than snapshot
+                    0 => 0,                              // uncommitted
+                    1 => snapshot_high + 1,              // newer than snapshot
                     _ => (i as u64 % snapshot_high) + 1, // visible
                 };
                 make_version(1, seq, None)
@@ -3154,5 +3204,65 @@ mod tests {
              branchless median={nb_med:.2} ns/call; delta={delta_pct:+.1}% \
              (n={TRIALS} trials, {ITERS_PER_TRIAL} iters/trial, samples={SAMPLES})"
         );
+    }
+
+    /// Microbench for the publish / version-chain append path. Compares
+    /// `publish()` with the visibility-ranges side-index tracking ON (the
+    /// pre-gate production state — `RwLock<HashMap>` write on every append)
+    /// to OFF (the post-gate default — one relaxed bool load).
+    ///
+    /// Each trial runs a fresh `VersionStore` and appends PUBLISHES
+    /// versions chained onto a small set of pages; both configurations see
+    /// the same allocation / chain-head CAS cost, so the delta is purely
+    /// the side-index gate.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_publish_visibility_ranges_gate() {
+        use std::time::Instant;
+
+        const PUBLISHES_PER_TRIAL: u32 = 20_000;
+        const PAGES: u32 = 32;
+        const TRIALS: usize = 9;
+
+        fn run_trial(publishes: u32, pages: u32, tracking_enabled: bool) -> f64 {
+            set_mvcc_visibility_ranges_tracking_enabled(tracking_enabled);
+            let store = VersionStore::new(PageSize::DEFAULT);
+            let mut heads: Vec<Option<VersionPointer>> = vec![None; pages as usize];
+            let start = Instant::now();
+            for i in 0..publishes {
+                let page_ix = (i as usize) % (pages as usize);
+                let prev = heads[page_ix];
+                let v = make_version((page_ix as u32) + 1, u64::from(i) + 1, prev);
+                let idx = store.publish(v);
+                heads[page_ix] = Some(idx_to_version_pointer(idx));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(publishes)
+        }
+
+        // Warm-up both configurations.
+        run_trial(PUBLISHES_PER_TRIAL, PAGES, true);
+        run_trial(PUBLISHES_PER_TRIAL, PAGES, false);
+
+        let mut on_samples = Vec::with_capacity(TRIALS);
+        let mut off_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let on = run_trial(PUBLISHES_PER_TRIAL, PAGES, true);
+            let off = run_trial(PUBLISHES_PER_TRIAL, PAGES, false);
+            eprintln!("  tracking=on: {on:.0} ns/publish   tracking=off: {off:.0} ns/publish");
+            on_samples.push(on);
+            off_samples.push(off);
+        }
+        on_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        off_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let on_med = on_samples[TRIALS / 2];
+        let off_med = off_samples[TRIALS / 2];
+        let delta_pct = (off_med - on_med) / on_med * 100.0;
+        eprintln!(
+            "bench_publish_visibility_ranges_gate: tracking_on median={on_med:.0} ns/publish; \
+             tracking_off median={off_med:.0} ns/publish; delta={delta_pct:+.1}% \
+             (n={TRIALS} trials, {PUBLISHES_PER_TRIAL} publishes/trial, pages={PAGES})"
+        );
+        // Leave the gate off; it's the production default.
+        set_mvcc_visibility_ranges_tracking_enabled(false);
     }
 }
