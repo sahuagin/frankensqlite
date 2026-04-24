@@ -7403,6 +7403,35 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         self.read_cell_payload_into(cx, top, &cell, buf)
     }
 
+    fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+        if self.at_eof || self.stack.is_empty() {
+            return Err(FrankenError::internal("cursor at EOF"));
+        }
+        let top = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        self.read_cell_payload_into(cx, top, &cell, buf)?;
+        if let Some(rowid) = cell.rowid {
+            return Ok(rowid);
+        }
+
+        // Index cursor fallback: match rowid() semantics, but reuse the
+        // payload bytes already materialized above instead of reading them a
+        // second time.
+        let key_values = parse_record(buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "malformed index key record while extracting rowid".to_owned(),
+        })?;
+        key_values
+            .last()
+            .and_then(fsqlite_types::SqliteValue::as_integer)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "index key record missing trailing integer rowid".to_owned(),
+            })
+    }
+
     fn payload_prefix_into(
         &self,
         cx: &Cx,
@@ -8314,6 +8343,35 @@ mod tests {
                     .saturating_add(1)
         );
         assert!(after.fsqlite_btree_depth >= 1);
+    }
+
+    #[test]
+    fn test_rowid_and_payload_into_matches_separate_accessors() -> Result<()> {
+        let cx = Cx::new();
+
+        let table_root = pn(2);
+        let table_store = MemPageStore::with_empty_table(table_root, USABLE);
+        let mut table_cursor = BtCursor::new(table_store, table_root, USABLE, true);
+        table_cursor.table_insert(&cx, 42, b"table-payload")?;
+        assert!(table_cursor.table_move_to(&cx, 42)?.is_found());
+
+        let mut payload = Vec::new();
+        let rowid = table_cursor.rowid_and_payload_into(&cx, &mut payload)?;
+        assert_eq!(rowid, table_cursor.rowid(&cx)?);
+        assert_eq!(payload, table_cursor.payload(&cx)?);
+
+        let index_root = pn(3);
+        let index_store = MemPageStore::with_empty_index(index_root, USABLE);
+        let mut index_cursor = BtCursor::new(index_store, index_root, USABLE, false);
+        let key = serialize_record(&[SqliteValue::Text("k".into()), SqliteValue::Integer(99)]);
+        index_cursor.index_insert(&cx, &key)?;
+        assert!(index_cursor.index_move_to(&cx, &key)?.is_found());
+
+        payload.clear();
+        let rowid = index_cursor.rowid_and_payload_into(&cx, &mut payload)?;
+        assert_eq!(rowid, index_cursor.rowid(&cx)?);
+        assert_eq!(payload, index_cursor.payload(&cx)?);
+        Ok(())
     }
 
     #[test]

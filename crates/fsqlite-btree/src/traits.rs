@@ -154,6 +154,16 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// clearing it first. This avoids allocations when repeatedly reading payloads.
     fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()>;
 
+    /// Read the rowid and payload at the current cursor position.
+    ///
+    /// The default preserves the historical two-call behavior for mock cursors.
+    /// Real table cursors can override this to parse the current cell once.
+    fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
+        let rowid = self.rowid(cx)?;
+        self.payload_into(cx, buf)?;
+        Ok(rowid)
+    }
+
     /// Read only a prefix of the payload at the current cursor position into
     /// the provided buffer, clearing it first.
     fn payload_prefix_into(
@@ -409,7 +419,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_btree_cursor_ops_sealed_mock() {
+    fn test_btree_cursor_ops_sealed_mock() -> Result<()> {
         let entries = vec![
             (1, b"alice".to_vec()),
             (2, b"bob".to_vec()),
@@ -419,18 +429,22 @@ mod tests {
         let cx = Cx::new();
 
         // Navigate forward.
-        assert!(cursor.first(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
-        assert_eq!(cursor.payload(&cx).unwrap(), b"alice");
+        assert!(cursor.first(&cx)?);
+        assert_eq!(cursor.rowid(&cx)?, 1);
+        assert_eq!(cursor.payload(&cx)?, b"alice");
+        let mut payload = Vec::new();
+        assert_eq!(cursor.rowid_and_payload_into(&cx, &mut payload)?, 1);
+        assert_eq!(payload, b"alice");
 
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+        assert!(cursor.next(&cx)?);
+        assert_eq!(cursor.rowid(&cx)?, 2);
 
-        assert!(cursor.next(&cx).unwrap());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+        assert!(cursor.next(&cx)?);
+        assert_eq!(cursor.rowid(&cx)?, 3);
 
-        assert!(!cursor.next(&cx).unwrap());
+        assert!(!cursor.next(&cx)?);
         assert!(cursor.eof());
+        Ok(())
     }
 
     #[test]
