@@ -1477,6 +1477,34 @@ pub fn concurrent_page_is_freed(handle: &ConcurrentHandle, page: PageNumber) -> 
     handle.is_page_freed(page)
 }
 
+/// Compound lookup: returns `(is_freed, staged_data)` from a single
+/// `page_states` HashMap probe.
+///
+/// The VDBE hot read path calls `concurrent_page_is_freed` followed by
+/// `concurrent_read_page` on every page read, producing two independent
+/// lookups on the same key. This helper collapses them into one so read
+/// workloads stop paying the double-lookup cost per page.
+///
+/// `staged_data` is cloned (cheap after first clone because `PageData`
+/// lazily promotes to `Arc<[u8]>` on the first clone).
+#[must_use]
+pub fn concurrent_page_read_state(
+    handle: &ConcurrentHandle,
+    page: PageNumber,
+) -> (bool, Option<PageData>) {
+    match handle.page_state(page) {
+        Some(state) => (state.is_freed, state.staged_data.clone()),
+        None => (false, None),
+    }
+}
+
+/// Fast predicate used by read callers to skip compound page-state lookups
+/// on read-only transactions (where `page_states` is empty).
+#[must_use]
+pub fn concurrent_has_page_state(handle: &ConcurrentHandle) -> bool {
+    !handle.page_states.is_empty()
+}
+
 /// Mark a page as metadata-exempt for MVCC conflict tracking (E3 — bd-wwqen Track E).
 ///
 /// Metadata pages (e.g., page 1 with freelist metadata) are still written but
@@ -6324,6 +6352,97 @@ mod tests {
         eprintln!(
             "bench_active_edge_index_build: median={median:.0} ns/build, mean={mean:.0} \
              ns/build (n={TRIALS}, views={VIEWS}, pages_per_view={PAGES_PER_VIEW})"
+        );
+    }
+
+    /// Microbench comparing the VDBE read hot-path's current double
+    /// `page_states` HashMap lookup (`concurrent_page_is_freed` +
+    /// `concurrent_read_page`) to the compound `concurrent_page_read_state`
+    /// that does a single lookup.
+    ///
+    /// Not a correctness test; ignored by default. Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_read_path_page_state_lookup --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_read_path_page_state_lookup() {
+        use std::time::Instant;
+
+        use super::{concurrent_page_is_freed, concurrent_page_read_state, concurrent_read_page};
+
+        const STAGED_PAGES: u32 = 64;
+        const READS_PER_TRIAL: u32 = 200_000;
+        const TRIALS: usize = 7;
+
+        // Populate the handle with STAGED_PAGES staged writes so
+        // `page_states` is hot and realistic (mix of hits + misses when the
+        // read probes pages outside the staged set).
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            for i in 1..=STAGED_PAGES {
+                concurrent_write_page(
+                    &mut handle,
+                    &lock_table,
+                    session_id,
+                    test_page(i),
+                    test_data(),
+                )
+                .unwrap();
+            }
+        }
+
+        fn run_trial<F: Fn(PageNumber) -> (bool, bool)>(reads: u32, probe: F) -> f64 {
+            let start = Instant::now();
+            for i in 0..reads {
+                // Alternate hits (pages 1..=STAGED_PAGES) and misses
+                // (pages STAGED_PAGES+1..2*STAGED_PAGES) to exercise both
+                // the Some/None branches of `page_states.get`.
+                let page = test_page((i % (STAGED_PAGES * 2)) + 1);
+                std::hint::black_box(probe(page));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(reads)
+        }
+
+        let handle = registry.get(session_id).unwrap();
+
+        // Baseline: the current engine.rs pattern — two independent
+        // `page_states` probes per read.
+        let baseline = |page: PageNumber| -> (bool, bool) {
+            let is_freed = concurrent_page_is_freed(&handle, page);
+            let hit = concurrent_read_page(&handle, page).is_some();
+            (is_freed, hit)
+        };
+        // Optimised: single compound probe returning both flags.
+        let optimised = |page: PageNumber| -> (bool, bool) {
+            let (is_freed, staged) = concurrent_page_read_state(&handle, page);
+            (is_freed, staged.is_some())
+        };
+
+        // Warm-up.
+        run_trial(READS_PER_TRIAL, baseline);
+        run_trial(READS_PER_TRIAL, optimised);
+
+        let mut baseline_samples = Vec::with_capacity(TRIALS);
+        let mut optimised_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let b = run_trial(READS_PER_TRIAL, baseline);
+            let o = run_trial(READS_PER_TRIAL, optimised);
+            eprintln!("  baseline: {b:.1} ns/probe   optimised: {o:.1} ns/probe");
+            baseline_samples.push(b);
+            optimised_samples.push(o);
+        }
+        baseline_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        optimised_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let b_med = baseline_samples[TRIALS / 2];
+        let o_med = optimised_samples[TRIALS / 2];
+        let delta_pct = (o_med - b_med) / b_med * 100.0;
+        eprintln!(
+            "bench_read_path_page_state_lookup: baseline median={b_med:.1} ns/probe; \
+             optimised median={o_med:.1} ns/probe; delta={delta_pct:+.1}% \
+             (n={TRIALS} trials, {READS_PER_TRIAL} reads/trial, staged={STAGED_PAGES})"
         );
     }
 }
