@@ -31,6 +31,11 @@
     clippy::redundant_else
 )]
 
+use std::{
+    borrow::Cow,
+    fmt::{Arguments, Write as _},
+};
+
 use fsqlite_error::Result;
 use fsqlite_types::SqliteValue;
 
@@ -673,6 +678,11 @@ fn format_datetime(jdn: f64, subsec: bool) -> String {
     format!("{} {}", format_date(jdn), format_time(jdn, subsec))
 }
 
+#[inline]
+fn push_format(result: &mut String, args: Arguments<'_>) {
+    let _ = result.write_fmt(args);
+}
+
 /// strftime format engine.
 fn format_strftime(fmt: &str, jdn: f64) -> String {
     let (y, mo, d) = jdn_to_ymd(jdn);
@@ -682,103 +692,121 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
     let jdn_int = (jdn + 0.5).floor() as i64;
     let dow = (jdn_int + 1) % 7; // 0=Sunday, 6=Saturday
 
-    let mut result = String::new();
-    let chars: Vec<char> = fmt.chars().collect();
+    let mut result = String::with_capacity(fmt.len().saturating_add(8));
+    let bytes = fmt.as_bytes();
     let mut i = 0;
+    let mut literal_start = 0;
 
-    while i < chars.len() {
-        if chars[i] == '%' && i + 1 < chars.len() {
+    while i < bytes.len() {
+        if bytes[i] != b'%' || i + 1 >= bytes.len() {
             i += 1;
-            match chars[i] {
-                'd' => result.push_str(&format!("{d:02}")),
-                'e' => result.push_str(&format!("{d:>2}")), // space-padded day
-                'f' => {
-                    // Seconds with fractional part.
-                    let total = s as f64 + frac;
-                    result.push_str(&format!("{total:06.3}"));
+            continue;
+        }
+
+        result.push_str(&fmt[literal_start..i]);
+
+        let spec_suffix = &fmt[i + 1..];
+        let Some(spec) = spec_suffix.chars().next() else {
+            break;
+        };
+        i += 1 + spec.len_utf8();
+        literal_start = i;
+
+        match spec {
+            'd' => push_format(&mut result, format_args!("{d:02}")),
+            'e' => push_format(&mut result, format_args!("{d:>2}")),
+            'f' => {
+                // Seconds with fractional part.
+                let total = s as f64 + frac;
+                push_format(&mut result, format_args!("{total:06.3}"));
+            }
+            'H' => push_format(&mut result, format_args!("{h:02}")),
+            'I' => {
+                // 12-hour clock.
+                let h12 = if h == 0 {
+                    12
+                } else if h > 12 {
+                    h - 12
+                } else {
+                    h
+                };
+                push_format(&mut result, format_args!("{h12:02}"));
+            }
+            'j' => push_format(&mut result, format_args!("{doy:03}")),
+            'J' => {
+                // C SQLite uses %.15g which strips trailing zeros.
+                push_format(&mut result, format_args!("{jdn:.15}"));
+                while result.as_bytes().last() == Some(&b'0') {
+                    result.pop();
                 }
-                'H' => result.push_str(&format!("{h:02}")),
-                'I' => {
-                    // 12-hour clock.
-                    let h12 = if h == 0 {
-                        12
-                    } else if h > 12 {
-                        h - 12
-                    } else {
-                        h
-                    };
-                    result.push_str(&format!("{h12:02}"));
-                }
-                'j' => result.push_str(&format!("{doy:03}")),
-                'J' => {
-                    // C SQLite uses %.15g which strips trailing zeros.
-                    let s = format!("{jdn:.15}");
-                    let s = s.trim_end_matches('0');
-                    let s = s.strip_suffix('.').unwrap_or(s);
-                    result.push_str(s);
-                }
-                'k' => {
-                    // Space-padded 24-hour.
-                    result.push_str(&format!("{h:>2}"));
-                }
-                'l' => {
-                    // Space-padded 12-hour.
-                    let h12 = if h == 0 {
-                        12
-                    } else if h > 12 {
-                        h - 12
-                    } else {
-                        h
-                    };
-                    result.push_str(&format!("{h12:>2}"));
-                }
-                'm' => result.push_str(&format!("{mo:02}")),
-                'M' => result.push_str(&format!("{mi:02}")),
-                'p' => {
-                    result.push_str(if h < 12 { "AM" } else { "PM" });
-                }
-                'P' => {
-                    result.push_str(if h < 12 { "am" } else { "pm" });
-                }
-                'R' => result.push_str(&format!("{h:02}:{mi:02}")),
-                's' => {
-                    let unix = jdn_to_unix(jdn);
-                    result.push_str(&unix.to_string());
-                }
-                'S' => result.push_str(&format!("{s:02}")),
-                'T' => result.push_str(&format!("{h:02}:{mi:02}:{s:02}")),
-                'u' => {
-                    // ISO 8601 day of week: 1=Monday, 7=Sunday.
-                    let u = if dow == 0 { 7 } else { dow };
-                    result.push_str(&u.to_string());
-                }
-                'w' => result.push_str(&dow.to_string()),
-                'W' => {
-                    // Week of year (Monday as first day of week, 00-53).
-                    let w = (doy + 6 - ((dow + 6) % 7)) / 7;
-                    result.push_str(&format!("{w:02}"));
-                }
-                'Y' => result.push_str(&format!("{y:04}")),
-                'G' | 'g' | 'V' => {
-                    // ISO 8601 week-based year/week.
-                    let (iso_y, iso_w) = iso_week(y, mo, d);
-                    match chars[i] {
-                        'G' => result.push_str(&format!("{iso_y:04}")),
-                        'g' => result.push_str(&format!("{:02}", iso_y % 100)),
-                        'V' => result.push_str(&format!("{iso_w:02}")),
-                        _ => unreachable!(),
-                    }
-                }
-                '%' => result.push('%'),
-                other => {
-                    result.push('%');
-                    result.push(other);
+                if result.as_bytes().last() == Some(&b'.') {
+                    result.pop();
                 }
             }
-        } else {
-            result.push(chars[i]);
+            'k' => {
+                // Space-padded 24-hour.
+                push_format(&mut result, format_args!("{h:>2}"));
+            }
+            'l' => {
+                // Space-padded 12-hour.
+                let h12 = if h == 0 {
+                    12
+                } else if h > 12 {
+                    h - 12
+                } else {
+                    h
+                };
+                push_format(&mut result, format_args!("{h12:>2}"));
+            }
+            'm' => push_format(&mut result, format_args!("{mo:02}")),
+            'M' => push_format(&mut result, format_args!("{mi:02}")),
+            'p' => {
+                result.push_str(if h < 12 { "AM" } else { "PM" });
+            }
+            'P' => {
+                result.push_str(if h < 12 { "am" } else { "pm" });
+            }
+            'R' => push_format(&mut result, format_args!("{h:02}:{mi:02}")),
+            's' => {
+                let unix = jdn_to_unix(jdn);
+                push_format(&mut result, format_args!("{unix}"));
+            }
+            'S' => push_format(&mut result, format_args!("{s:02}")),
+            'T' => {
+                push_format(&mut result, format_args!("{h:02}:{mi:02}:{s:02}"));
+            }
+            'u' => {
+                // ISO 8601 day of week: 1=Monday, 7=Sunday.
+                let u = if dow == 0 { 7 } else { dow };
+                push_format(&mut result, format_args!("{u}"));
+            }
+            'w' => push_format(&mut result, format_args!("{dow}")),
+            'W' => {
+                // Week of year (Monday as first day of week, 00-53).
+                let w = (doy + 6 - ((dow + 6) % 7)) / 7;
+                push_format(&mut result, format_args!("{w:02}"));
+            }
+            'Y' => push_format(&mut result, format_args!("{y:04}")),
+            'G' | 'g' | 'V' => {
+                // ISO 8601 week-based year/week.
+                let (iso_y, iso_w) = iso_week(y, mo, d);
+                match spec {
+                    'G' => push_format(&mut result, format_args!("{iso_y:04}")),
+                    'g' => push_format(&mut result, format_args!("{:02}", iso_y % 100)),
+                    'V' => push_format(&mut result, format_args!("{iso_w:02}")),
+                    _ => unreachable!(),
+                }
+            }
+            '%' => result.push('%'),
+            other => {
+                result.push('%');
+                result.push(other);
+            }
         }
-        i += 1;
+    }
+
+    if literal_start < fmt.len() {
+        result.push_str(&fmt[literal_start..]);
     }
 
     result
@@ -1013,10 +1041,15 @@ impl ScalarFunction for StrftimeFunc {
         if args.len() < 2 || args[0].is_null() || args[1].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let fmt = args[0].to_text();
         let rest = &args[1..];
         match parse_args(rest) {
-            Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn).into())),
+            Some((jdn, _)) => {
+                let fmt = match args[0].as_text_str() {
+                    Some(text) => Cow::Borrowed(text),
+                    None => Cow::Owned(args[0].to_text()),
+                };
+                Ok(SqliteValue::Text(format_strftime(fmt.as_ref(), jdn).into()))
+            }
             None => Ok(SqliteValue::Null),
         }
     }
@@ -1680,6 +1713,49 @@ mod tests {
         assert_eq!(
             StrftimeFunc.invoke(&[text("%Y"), null()]).unwrap(),
             SqliteValue::Null
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_strftime_timestamp_rows() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ROWS: usize = 200_000;
+        const REPEATS: usize = 5;
+        const FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+        const INPUT: &str = "2024-03-15 14:30:45";
+
+        let func = StrftimeFunc;
+        let fmt = text(FORMAT);
+        let input = text(INPUT);
+        let mut best_ns = u128::MAX;
+        let mut output_len = 0usize;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..ROWS {
+                let result = black_box(
+                    func.invoke(black_box(&[fmt.clone(), input.clone()]))
+                        .expect("strftime benchmark invocation must succeed"),
+                );
+                output_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            let elapsed_ns = started.elapsed().as_nanos();
+            if elapsed_ns < best_ns {
+                best_ns = elapsed_ns;
+            }
+        }
+
+        println!(
+            "strftime_timestamp_rows rows={ROWS} repeats={REPEATS} best_ns={best_ns} output_len={output_len}"
         );
     }
 
