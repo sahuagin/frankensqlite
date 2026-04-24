@@ -116,6 +116,35 @@ fn build_execute_stage_decrjumpzero_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute decrjumpzero benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of
+/// `IfPos` ops (the canonical OFFSET counter opcode). Each op's p2 jump
+/// target is the instruction immediately after it, so a "jump" is
+/// semantically equivalent to a fall-through for execution sequencing
+/// but still exercises the opcode's taken-branch body (register read,
+/// subtract, write-back, pc reassignment). p3=1 makes each op decrement
+/// the counter by one; counter is seeded with `op_repeats + 1` so the
+/// val>0 branch is taken every iteration.
+fn build_execute_stage_ifpos_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let counter = builder.alloc_reg();
+    let seed = i32::try_from(op_repeats + 1).unwrap_or(i32::MAX);
+    builder.emit_op(Opcode::Integer, seed, counter, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        let next = builder.emit_label();
+        // p1=counter, p3=1 (decrement by one), p2=next (the very next
+        // instruction — so this is an always-taken, fall-through-style jump).
+        builder.emit_jump_to_label(Opcode::IfPos, counter, 1, next, P4::None, 0);
+        builder.resolve_label(next);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute ifpos benchmark program should build")
+}
+
 fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
     let cx = Cx::new();
     let pager = SimplePager::open_with_cx(
@@ -291,6 +320,39 @@ fn bench_vdbe_execute_decrjumpzero_stage(c: &mut Criterion) {
                     let outcome = engine
                         .execute(program)
                         .expect("pipeline execute decrjumpzero benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_vdbe_execute_ifpos_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_ifpos");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_ifpos_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute ifpos benchmark should execute");
                     black_box(outcome);
                 });
             },
