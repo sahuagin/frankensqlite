@@ -171,24 +171,101 @@ per-wake acquire.
 
 ## Recommended landing order
 
-1. Strong CAS in chain-head install (single commit, measurable).
-2. Registry `active_writers: AtomicUsize` fast-path counter, plumb
-   through `can_use_uncontended_prepare_fast_path` (single commit, no
-   new protocol).
-3. "Alone at commit" bypass for read-index / write-index rollup —
+1. ~~Strong CAS in chain-head install~~ — **LANDED 4904047e**
+   (`compare_exchange_weak` → `compare_exchange`); `record_cas_attempt`
+   call dropped from `publish` in **59250449** since `cas_attempts` is
+   now provably 1.
+2. ~~SSI candidate-free prepare fast-path~~ — **LANDED 59250449**.
+   `prepare_concurrent_commit_with_ssi` now short-circuits two shapes
+   ahead of the full `ActiveEdgeDiscoveryIndex` + edge-discovery
+   pipeline: (a) both read + write sets empty, (b) read set empty with
+   write set non-empty and zero candidates from the active + committed
+   scans. `finalize_prepared_concurrent_commit_with_ssi` has a
+   matching fast path.
+3. Registry `active_writers: AtomicUsize` fast-path counter exposed
+   independently of the registry outer lock (currently
+   `Arc<Mutex<ConcurrentRegistry>>`; `active_count()` requires locking
+   the mutex). Would give callers a lock-free "am I alone?" check.
+   No current consumer yet identified, so **held** until a concrete
+   hot-path wants it.
+4. "Alone at commit" bypass for read-index / write-index rollup —
    skip the hashmap walks when we know no peer could care. (Scope
    depends on audit.)
-4. Single-writer protocol with replay-buffer read-tracking and
+5. Single-writer protocol with replay-buffer read-tracking and
    page-lock fast path. (Large; multiple commits, requires careful
    test matrix.)
+
+## Direct answer: when is the commit_seq bump skippable?
+
+**Never under current MVCC visibility semantics.** The bump is
+architecturally load-bearing for three reasons, which apply
+independently:
+
+1. **Version ordering on chains.** Every committed `PageVersion`
+   carries its `commit_seq` as the discriminator against the reader's
+   snapshot (`invariants::visible` — `commit_seq.wrapping_sub(1) <
+   snapshot.high`, landed in ec87700b). Two versions of the same page
+   with the same `commit_seq` cannot be ordered; reads of that page
+   become nondeterministic. The bump is what makes two consecutive
+   writes to the same page distinguishable.
+
+2. **Snapshot capture by future txns.** Each new txn's
+   `Snapshot.high` is today's `next_commit_seq`. Without bumping, the
+   next reader observes the stale seq and misses our just-committed
+   state — effectively a phantom-read. The "future reader" is the
+   next statement on the same Connection in autocommit mode, not just
+   a distinct-connection reader, so "no active readers right now"
+   does not help.
+
+3. **Stable commit-seq / GC horizon accounting.** `finish_commit_clock`
+   removes our seq from `active_commit_seqs` and advances
+   `stable_commit_seq` to `min(active) - 1`. If our commit never
+   allocated a seq, the horizon can't advance past our in-flight
+   writes either.
+
+**But the bump itself is already efficient.** The main Connection-level
+`next_commit_seq.fetch_add(1, AcqRel)` (core/src/connection.rs:9468,
+9482) and the commit-combiner's batched `fetch_add(N, AcqRel)`
+(mvcc/src/commit_combiner.rs:322) are both `AcqRel`, not `SeqCst`.
+The *cost* of the bump is one uncontended atomic RMW (~5 ns on x86).
+The `write_coordinator::allocate_commit_seq` at
+write_coordinator.rs:297 uses `SeqCst`, but it's on a cold
+recovery/compatibility path, not the default MT write path.
+
+**What *could* be skipped**: on a pure read-only commit (empty write
+set + empty read-index after SSI prep fast-path), the
+`active_commit_seqs` push + `finish_commit_clock` remove pair
+(connection.rs:9466–9469 / 9542–9556) is nearly pure overhead — we
+won't be adding a version to any chain. Today both fire
+unconditionally. **Lever candidate for core, not mvcc** — noted for
+whoever owns fsqlite-core.
+
+## Landed this session (pointer)
+
+See also `docs/perf-mvcc-session-20260424.md` for the full cumulative
+mvcc summary (10 commits: waiter-shard mutex skip, waiter ThreadId
+cache, compound page-state, snapshot histogram gate, SSI empty
+short-circuit + registry hasher, branchless visible, visibility_ranges
+gate, CAS histogram gate, active-snapshots gauge, SSI candidate-free
+prepare + CAS call cleanup).
 
 ## References
 
 - `crates/fsqlite-mvcc/src/begin_concurrent.rs:818` — existing uncontended
   prepare fast path.
+- `crates/fsqlite-mvcc/src/begin_concurrent.rs:2547-2670` — the new
+  candidate-free prepare fast path (landed 59250449).
 - `crates/fsqlite-mvcc/src/invariants.rs:611` — `VersionStore::publish`.
-- `crates/fsqlite-mvcc/src/invariants.rs:638` — weak CAS loop targeted by
-  lever (1).
+- `crates/fsqlite-mvcc/src/invariants.rs:665-695` — strong-CAS
+  chain-head install (landed 4904047e + 59250449 cleanup).
+- `crates/fsqlite-mvcc/src/commit_combiner.rs:297-330` — batched
+  AcqRel commit-seq allocator (already optimal).
+- `crates/fsqlite-core/src/connection.rs:9464-9488` —
+  `advance_commit_clock` (core-owned; commit-seq bump + active_commit_seqs
+  push).
+- `crates/fsqlite-core/src/connection.rs:9542-9569` —
+  `finish_commit_clock` (core-owned; active_commit_seqs remove +
+  stable_commit_seq advance).
 - `crates/fsqlite-vdbe/src/engine.rs:2684` / `:2733` — per-read handle
   lock + `record_read` sites.
 - `crates/fsqlite-mvcc/src/begin_concurrent.rs:374` — `record_read`
