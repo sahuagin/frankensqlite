@@ -9619,6 +9619,45 @@ where
                 return Err(FrankenError::Busy);
             }
 
+            // Fast path — WAL has no frames, so there is nothing to
+            // checkpoint. We've already held `inner.lock()` long enough
+            // to confirm no reader/writer is active (preserving the
+            // existing Busy semantics exercised by
+            // `test_checkpoint_busy_with_active_{reader,writer}`), but
+            // we can skip the rest of the heavy machinery that would
+            // otherwise run on an empty WAL: marking
+            // `checkpoint_active = true`, taking `wal_backend.write()`
+            // to pull the backend out of the shared RwLock, publishing
+            // pre-checkpoint metadata, constructing the drop guard, and
+            // re-publishing + re-installing at drop time. Each of
+            // those blocks concurrent readers/writers on the
+            // SharedWalBackend RwLock for no actual work.
+            //
+            // Attribution: the post-commit auto-checkpoint advisor
+            // (`Connection::maybe_run_adaptive_autocheckpoint`) already
+            // early-exits when `wal_frames_estimate < adaptive_target`,
+            // so the bulk of "nothing to checkpoint" calls never reach
+            // here. But explicit `PRAGMA wal_checkpoint[(mode)]` calls
+            // and the right-after-truncate advisor re-entry do land
+            // here with an empty WAL, and previously each one took
+            // `wal_backend.write()` exclusively — a serialization
+            // bubble for every concurrent commit on this pager.
+            let wal_is_empty =
+                with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count()))
+                    .unwrap_or(0)
+                    == 0;
+            if wal_is_empty {
+                drop(inner);
+                return Ok(traits::CheckpointResult {
+                    total_frames: 0,
+                    frames_backfilled: 0,
+                    completed: true,
+                    wal_was_reset: false,
+                    requested_mode: mode,
+                    effective_mode: mode,
+                });
+            }
+
             inner.checkpoint_active = true;
             checkpoint_gate_state = (inner.active_transactions, inner.checkpoint_active);
             let mut wal_guard = self
@@ -13294,7 +13333,13 @@ mod tests {
         }
 
         fn frame_count(&self) -> usize {
-            0
+            // Report a non-empty WAL so `SimplePager::checkpoint` does
+            // not short-circuit via the zero-frame fast path: this
+            // fixture exists specifically to exercise how the pager
+            // propagates errors from the backend's `checkpoint()`
+            // implementation, and that code path is only reachable
+            // when there are frames to back-fill.
+            1
         }
 
         fn checkpoint(
@@ -14512,6 +14557,55 @@ mod tests {
         assert_eq!(
             result.total_frames, 0,
             "bead_id={CHECKPOINT_DECOUPLING_BEAD_ID} case=checkpoint_success_total_frames"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_empty_wal_fast_path_does_not_extract_backend() {
+        // The zero-frames checkpoint fast path must:
+        //   1. Return a zero-work `CheckpointResult` that preserves the
+        //      caller-requested mode (so PRAGMA wal_checkpoint(TRUNCATE)
+        //      does not surface as Passive in a no-op case).
+        //   2. NOT take the WAL backend out of the SharedWalBackend
+        //      RwLock — otherwise peer readers / commits serialize
+        //      behind a gratuitous `write()` lock for no real work.
+        //
+        // This test verifies both: we install a sentinel backend,
+        // invoke `pager.checkpoint` on a freshly-opened (empty) WAL,
+        // and assert that the sentinel is still reachable via the
+        // read-only helper immediately after. A concurrent
+        // `with_wal_backend_read` probe racing against the checkpoint
+        // would block if the fast path still extracted the backend.
+        init_publication_test_tracing();
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        for mode in [
+            crate::traits::CheckpointMode::Passive,
+            crate::traits::CheckpointMode::Full,
+            crate::traits::CheckpointMode::Restart,
+            crate::traits::CheckpointMode::Truncate,
+        ] {
+            let result = pager
+                .checkpoint(&cx, mode)
+                .expect("empty-WAL checkpoint should succeed as a no-op");
+            assert_eq!(result.total_frames, 0);
+            assert_eq!(result.frames_backfilled, 0);
+            assert!(result.completed);
+            assert!(!result.wal_was_reset);
+            assert_eq!(result.requested_mode, mode);
+            assert_eq!(result.effective_mode, mode);
+        }
+
+        // The fast path must leave the SharedWalBackend occupied — a
+        // `with_wal_backend_read` probe immediately after must still
+        // see the backend mounted.
+        let frame_count_after =
+            with_wal_backend_read(&pager.wal_backend, |wal| Ok(wal.frame_count()))
+                .expect("SharedWalBackend must still hold the installed backend after fast-path");
+        assert_eq!(
+            frame_count_after, 0,
+            "fast path must not disturb the installed WAL backend state"
         );
     }
 
