@@ -618,6 +618,55 @@ struct CellSlotCache {
     entries: Vec<CellSlotCacheEntry>,
 }
 
+/// bd-yafor.2: cell-slot cache hit/miss accounting.
+///
+/// Incremented by `CellSlotCache::get` under `Relaxed` ordering so the cost is
+/// a single uncontended `lock xadd` per lookup — small enough to leave live in
+/// release builds while giving us ground-truth hit-rate data from any
+/// workload. The counters are inert unless read by
+/// `cell_slot_cache_counter_snapshot`.
+static CELL_SLOT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CELL_SLOT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of cell-slot cache counters for audit/tests.
+#[derive(Debug, Clone, Copy)]
+pub struct CellSlotCacheCounters {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CellSlotCacheCounters {
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.hits.saturating_add(self.misses)
+    }
+
+    #[must_use]
+    pub fn hit_rate(self) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                self.hits as f64 / total as f64
+            }
+        }
+    }
+}
+
+pub fn cell_slot_cache_counter_snapshot() -> CellSlotCacheCounters {
+    CellSlotCacheCounters {
+        hits: CELL_SLOT_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        misses: CELL_SLOT_CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+pub fn reset_cell_slot_cache_counters() {
+    CELL_SLOT_CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    CELL_SLOT_CACHE_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl CellSlotCache {
     fn clear(&mut self) {
         self.entries.clear();
@@ -636,12 +685,24 @@ impl CellSlotCache {
             && front.page_no == page_no
             && front.mutation_counter == mutation_counter
         {
-            return front
+            let slot = front
                 .slots
                 .iter()
                 .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
+            if slot.is_some() {
+                CELL_SLOT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                CELL_SLOT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return slot;
         }
-        self.get_slow(page_no, mutation_counter, cell_idx)
+        let result = self.get_slow(page_no, mutation_counter, cell_idx);
+        if result.is_some() {
+            CELL_SLOT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            CELL_SLOT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     #[cold]
@@ -2223,7 +2284,7 @@ impl<P: PageReader> BtCursor<P> {
     /// cache traffic — and covers the `>= cell_count` case with `right_child`
     /// already.
     #[inline]
-    fn child_page_at(&self, entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
+    fn child_page_at(entry: &StackEntry, cell_idx: u16) -> Result<PageNumber> {
         Self::read_interior_child_inline(entry, cell_idx)
     }
 
@@ -2248,7 +2309,7 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         for child_idx in 0..=entry.header.cell_count {
-            if self.child_page_at(&entry, child_idx)? == child_page_no {
+            if Self::child_page_at(&entry, child_idx)? == child_page_no {
                 return Ok(child_idx);
             }
         }
@@ -3139,7 +3200,7 @@ impl<P: PageReader> BtCursor<P> {
                     }
 
                     let next_child_idx = parent.cell_idx + 1;
-                    let child = self.child_page_at(parent, next_child_idx)?;
+                    let child = Self::child_page_at(parent, next_child_idx)?;
 
                     self.stack[depth - 1].cell_idx = next_child_idx;
                     let resume_stack = self.stack.clone();
@@ -3176,7 +3237,7 @@ impl<P: PageReader> BtCursor<P> {
         let next_child_idx = cell_idx + 1;
         let child = {
             let top = &self.stack[depth - 1];
-            self.child_page_at(top, next_child_idx)?
+            Self::child_page_at(top, next_child_idx)?
         };
         self.stack
             .last_mut()
@@ -3261,7 +3322,7 @@ impl<P: PageReader> BtCursor<P> {
                     }
 
                     let prev_child_idx = parent.cell_idx - 1;
-                    let child = self.child_page_at(parent, prev_child_idx)?;
+                    let child = Self::child_page_at(parent, prev_child_idx)?;
 
                     self.stack[depth - 1].cell_idx = prev_child_idx;
                     self.issue_prefetch_hint(cx, child);
@@ -3285,7 +3346,7 @@ impl<P: PageReader> BtCursor<P> {
         // The previous logical entry is the rightmost descendant of the left subtree.
         let child = {
             let top = &self.stack[depth - 1];
-            self.child_page_at(top, cell_idx)?
+            Self::child_page_at(top, cell_idx)?
         };
         self.issue_prefetch_hint(cx, child);
         let found = self.move_to_rightmost_leaf(cx, child, false)?;
@@ -6869,7 +6930,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                             .stack
                             .last()
                             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                        cursor.child_page_at(top, cell_idx + 1)?
+                        Self::child_page_at(top, cell_idx + 1)?
                     };
                     cursor.move_to_leftmost_leaf(cx, right_child, false)?;
 
@@ -6881,7 +6942,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                             .stack
                             .last()
                             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                        cursor.child_page_at(top, cell_idx)?
+                        Self::child_page_at(top, cell_idx)?
                     };
                     cursor.move_to_rightmost_leaf(cx, left_child, false)?;
                     let top = cursor
@@ -8040,7 +8101,7 @@ mod tests {
         let mut entry_count = 0usize;
 
         for idx in 0..entry.header.cell_count {
-            let left_child = cursor.child_page_at(&entry, idx)?;
+            let left_child = BtCursor::<P>::child_page_at(&entry, idx)?;
             let left_bounds =
                 validate_index_subtree_invariants(cursor, cx, left_child, false, visited)?
                     .ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -10559,7 +10620,7 @@ mod tests {
         );
         let root_separator_before = cursor.parse_cell_at(&root_entry, 0).unwrap().rowid.unwrap();
 
-        let left_subtree_page = cursor.child_page_at(&root_entry, 0).unwrap();
+        let left_subtree_page = BtCursor::<MemPageStore>::child_page_at(&root_entry, 0).unwrap();
         let left_subtree_before = cursor.load_page(&cx, left_subtree_page).unwrap();
         assert_eq!(
             left_subtree_before.header.page_type,
@@ -13836,8 +13897,7 @@ mod tests {
         );
 
         for child_idx in 0..=root_entry.header.cell_count {
-            let child_page = cursor
-                .child_page_at(&root_entry, child_idx)
+            let child_page = BtCursor::<MemPageStore>::child_page_at(&root_entry, child_idx)
                 .expect("read child pointer");
             let found = cursor
                 .find_child_slot_by_page_no(&cx, root, child_page)
@@ -14247,12 +14307,12 @@ mod tests {
         // Fast path — production code.
         for i in 0..WARMUP {
             let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(cursor.child_page_at(&entry, idx).unwrap());
+            std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
         }
         let t0 = Instant::now();
         for i in 0..ITERS {
             let idx = (i as u16) % entry.header.cell_count;
-            std::hint::black_box(cursor.child_page_at(&entry, idx).unwrap());
+            std::hint::black_box(BtCursor::<MemPageStore>::child_page_at(&entry, idx).unwrap());
         }
         let fast_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
 
@@ -14289,5 +14349,149 @@ mod tests {
              speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
             slow_ns / fast_ns.max(f64::EPSILON)
         );
+    }
+
+    /// bd-yafor.2 cell-slot cache hit-rate audit on the write-append hot path.
+    ///
+    /// Ignored by default. Drives three realistic workloads and reports the
+    /// cache hit-rate observed by the production `CellSlotCache::get` path:
+    ///
+    /// 1. Monotonic append — table_insert with strictly-increasing rowids.
+    /// 2. Random inserts — table_insert with a pseudo-random rowid sequence.
+    /// 3. Read-heavy — monotonic insert then repeated `table_move_to` seeks.
+    ///
+    /// Use with `--release --ignored --nocapture`.
+    #[test]
+    #[ignore = "audit benchmark; run with `--release --ignored --nocapture`"]
+    fn audit_cell_slot_cache_hit_rate_write_vs_read() {
+        const ROWS: i64 = 10_000;
+        const PAYLOAD: &[u8] = b"cc_3_audit_payload_0123456789abcdef";
+
+        fn run_and_report(label: &str, counters: crate::cursor::CellSlotCacheCounters) {
+            let total = counters.total();
+            println!(
+                "[cell_slot_cache audit] {label}: hits={}  misses={}  total={total}  hit_rate={:.4}",
+                counters.hits,
+                counters.misses,
+                counters.hit_rate()
+            );
+        }
+
+        // --- Scenario 1: Monotonic append ---
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_table(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            reset_cell_slot_cache_counters();
+            for rowid in 1..=ROWS {
+                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+            }
+            run_and_report("monotonic_append", cell_slot_cache_counter_snapshot());
+        }
+
+        // --- Scenario 2: Random middle-of-tree inserts ---
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_table(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            reset_cell_slot_cache_counters();
+            let mut state = 0x1234_5678_9abc_def0_u64;
+            let mut inserted = std::collections::HashSet::new();
+            let mut count = 0;
+            while count < ROWS {
+                let raw = lcg_next(&mut state);
+                #[allow(clippy::cast_possible_wrap)]
+                let rowid = ((raw % 100_000) + 1) as i64;
+                if inserted.insert(rowid) {
+                    cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+                    count += 1;
+                }
+            }
+            run_and_report("random_insert", cell_slot_cache_counter_snapshot());
+        }
+
+        // --- Scenario 3: Read-heavy after append ---
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_table(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            for rowid in 1..=ROWS {
+                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+            }
+            reset_cell_slot_cache_counters();
+            let mut state = 0xdeadbeef_cafebabe_u64;
+            for _ in 0..(ROWS * 4) {
+                let raw = lcg_next(&mut state);
+                #[allow(clippy::cast_possible_wrap)]
+                let target = (raw % (ROWS as u64)) as i64 + 1;
+                let _ = cursor.table_move_to(&cx, target).unwrap();
+            }
+            run_and_report(
+                "read_heavy_after_append",
+                cell_slot_cache_counter_snapshot(),
+            );
+        }
+
+        // --- Scenario 4: Binary search probes within a single append ---
+        // (sanity check — within a single insert the binary search walks mid,
+        // mid/2, mid/4... so the same cell slots ARE re-probed; cache should
+        // hit inside this single search if the entry is fresh)
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_table(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            // Pre-populate with a full leaf + some interior breadth so binary
+            // search actually does multi-level probing.
+            for rowid in 1..=500_i64 {
+                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+            }
+            reset_cell_slot_cache_counters();
+            for target in (1..=500_i64).rev() {
+                let _ = cursor.table_move_to(&cx, target).unwrap();
+            }
+            run_and_report("reverse_seek_preloaded", cell_slot_cache_counter_snapshot());
+        }
+
+        // --- Scenario 5: Delete-heavy (exercises predecessor_idx / separator_idx) ---
+        // Each delete that empties a leaf rebalances and may call parse_cell_at
+        // for predecessor + separator lookup on an interior page.
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_table(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+            for rowid in 1..=ROWS {
+                cursor.table_insert(&cx, rowid, PAYLOAD).unwrap();
+            }
+            reset_cell_slot_cache_counters();
+            for rowid in 1..=ROWS {
+                if cursor.table_move_to(&cx, rowid).unwrap().is_found() {
+                    cursor.delete(&cx).unwrap();
+                }
+            }
+            run_and_report(
+                "delete_all_after_append",
+                cell_slot_cache_counter_snapshot(),
+            );
+        }
+
+        // --- Scenario 6: Index btree inserts (exercises binary_search_index_leaf) ---
+        {
+            let cx = Cx::new();
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
+            reset_cell_slot_cache_counters();
+            let mut state = 0x0102_0304_0506_0708_u64;
+            for _ in 0..ROWS {
+                let raw = lcg_next(&mut state);
+                let key = serialize_record(&[
+                    #[allow(clippy::cast_possible_wrap)]
+                    SqliteValue::Integer((raw % 100_000) as i64),
+                    #[allow(clippy::cast_possible_wrap)]
+                    SqliteValue::Integer(raw as i64),
+                ]);
+                let _ = cursor.index_insert(&cx, &key);
+            }
+            run_and_report("index_random_insert", cell_slot_cache_counter_snapshot());
+        }
     }
 }
