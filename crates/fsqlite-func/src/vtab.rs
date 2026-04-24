@@ -229,6 +229,149 @@ impl<S: Clone> TransactionalVtabState<S> {
 }
 
 // ---------------------------------------------------------------------------
+// Module metadata
+// ---------------------------------------------------------------------------
+
+/// Classification for a schema object named by a virtual-table module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShadowTableKind {
+    /// The name is not a module-owned shadow table.
+    #[default]
+    Ordinary,
+    /// The name is a module-owned shadow table.
+    Shadow,
+}
+
+/// Policy returned by a module when the core asks whether a table name is a
+/// shadow table of a virtual table instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowTablePolicy {
+    /// Whether the table is ordinary or shadow-owned.
+    pub kind: ShadowTableKind,
+}
+
+impl ShadowTablePolicy {
+    /// Policy for an ordinary, non-shadow table.
+    #[must_use]
+    pub const fn ordinary() -> Self {
+        Self {
+            kind: ShadowTableKind::Ordinary,
+        }
+    }
+
+    /// Policy for a module-owned shadow table.
+    #[must_use]
+    pub const fn owned_shadow() -> Self {
+        Self {
+            kind: ShadowTableKind::Shadow,
+        }
+    }
+
+    /// Whether the table is module-owned shadow state.
+    #[must_use]
+    pub const fn is_shadow(self) -> bool {
+        matches!(self.kind, ShadowTableKind::Shadow)
+    }
+}
+
+impl Default for ShadowTablePolicy {
+    fn default() -> Self {
+        Self::ordinary()
+    }
+}
+
+/// Lifecycle shape a module exposes to the connection/catalog layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VtabLifecyclePolicy {
+    /// `create` and `connect` are effectively the same operation.
+    #[default]
+    Simple,
+    /// The module distinguishes create-time and connect-time lifecycle.
+    SeparateCreateAndConnect,
+}
+
+/// Integrity surface advertised by a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VtabIntegrityPolicy {
+    /// No module-specific integrity entry point is exposed.
+    #[default]
+    None,
+    /// Integrity checks are module-defined and may inspect shadow state.
+    ShadowAware,
+}
+
+/// Defensive/risk metadata analogous to SQLite's vtab safety flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VtabRiskLevel {
+    /// Safe to invoke in defensive contexts.
+    pub innocuous: bool,
+    /// Must not be invoked from schema or trigger contexts.
+    pub direct_only: bool,
+    /// May consult objects outside the current schema.
+    pub uses_all_schemas: bool,
+}
+
+impl VtabRiskLevel {
+    /// Risk profile for an innocuous module.
+    #[must_use]
+    pub const fn innocuous() -> Self {
+        Self {
+            innocuous: true,
+            direct_only: false,
+            uses_all_schemas: false,
+        }
+    }
+}
+
+/// Module-level metadata that future catalog and defensive checks can consult
+/// without hard-coding FTS5-specific behavior in unrelated layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VtabModuleMetadata {
+    /// Whether the module owns any shadow tables.
+    pub owns_shadow_tables: bool,
+    /// Whether create/connect semantics differ.
+    pub lifecycle: VtabLifecyclePolicy,
+    /// Whether the module exposes integrity hooks.
+    pub integrity: VtabIntegrityPolicy,
+    /// Defensive-execution metadata.
+    pub risk: VtabRiskLevel,
+}
+
+impl VtabModuleMetadata {
+    /// Metadata for ordinary modules with no shadow-table contract.
+    #[must_use]
+    pub const fn ordinary() -> Self {
+        Self {
+            owns_shadow_tables: false,
+            lifecycle: VtabLifecyclePolicy::Simple,
+            integrity: VtabIntegrityPolicy::None,
+            risk: VtabRiskLevel::innocuous(),
+        }
+    }
+
+    /// Metadata for a shadow-owning module.
+    #[must_use]
+    pub const fn shadow_owning(
+        lifecycle: VtabLifecyclePolicy,
+        integrity: VtabIntegrityPolicy,
+        risk: VtabRiskLevel,
+    ) -> Self {
+        Self {
+            owns_shadow_tables: true,
+            lifecycle,
+            integrity,
+            risk,
+        }
+    }
+}
+
+impl Default for VtabModuleMetadata {
+    fn default() -> Self {
+        Self::ordinary()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VirtualTable trait
 // ---------------------------------------------------------------------------
 
@@ -250,6 +393,23 @@ impl<S: Clone> TransactionalVtabState<S> {
 pub trait VirtualTable: Send + Sync {
     /// The cursor type for scanning this virtual table.
     type Cursor: VirtualTableCursor;
+
+    /// Static metadata for the module as a whole.
+    fn module_metadata(_args: &[&str]) -> VtabModuleMetadata
+    where
+        Self: Sized,
+    {
+        VtabModuleMetadata::ordinary()
+    }
+
+    /// Determine whether `table_name` is a module-owned shadow table for the
+    /// virtual table instance named `vtab_name`.
+    fn shadow_table_policy(_vtab_name: &str, _table_name: &str) -> ShadowTablePolicy
+    where
+        Self: Sized,
+    {
+        ShadowTablePolicy::ordinary()
+    }
 
     /// Called for `CREATE VIRTUAL TABLE`.
     ///
@@ -401,6 +561,17 @@ pub trait VtabModuleFactory: Send + Sync {
     /// Column names and affinities for the virtual table schema.
     fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
         Vec::new()
+    }
+
+    /// Static metadata for the module as a whole.
+    fn module_metadata(&self, _args: &[&str]) -> VtabModuleMetadata {
+        VtabModuleMetadata::ordinary()
+    }
+
+    /// Determine whether `table_name` is a module-owned shadow table for the
+    /// virtual table instance named `vtab_name`.
+    fn shadow_table_policy(&self, _vtab_name: &str, _table_name: &str) -> ShadowTablePolicy {
+        ShadowTablePolicy::ordinary()
     }
 }
 
@@ -554,6 +725,14 @@ where
         fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
             let vtab = T::connect(cx, args)?;
             Ok(Box::new(vtab))
+        }
+
+        fn module_metadata(&self, args: &[&str]) -> VtabModuleMetadata {
+            T::module_metadata(args)
+        }
+
+        fn shadow_table_policy(&self, vtab_name: &str, table_name: &str) -> ShadowTablePolicy {
+            T::shadow_table_policy(vtab_name, table_name)
         }
     }
 
@@ -793,6 +972,50 @@ mod tests {
             self.rows
                 .get(self.pos)
                 .map_or(Ok(0), |(rowid, _)| Ok(*rowid))
+        }
+    }
+
+    struct ShadowOwningVtab;
+
+    impl VirtualTable for ShadowOwningVtab {
+        type Cursor = ReadOnlyCursor;
+
+        fn module_metadata(_args: &[&str]) -> VtabModuleMetadata {
+            VtabModuleMetadata::shadow_owning(
+                VtabLifecyclePolicy::SeparateCreateAndConnect,
+                VtabIntegrityPolicy::ShadowAware,
+                VtabRiskLevel {
+                    innocuous: false,
+                    direct_only: true,
+                    uses_all_schemas: false,
+                },
+            )
+        }
+
+        fn shadow_table_policy(vtab_name: &str, table_name: &str) -> ShadowTablePolicy {
+            let Some((owner, suffix)) = table_name.rsplit_once('_') else {
+                return ShadowTablePolicy::ordinary();
+            };
+
+            if owner == vtab_name
+                && matches!(suffix, "config" | "content" | "data" | "docsize" | "idx")
+            {
+                return ShadowTablePolicy::owned_shadow();
+            }
+
+            ShadowTablePolicy::ordinary()
+        }
+
+        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+            Ok(Self)
+        }
+
+        fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
+            Ok(())
+        }
+
+        fn open(&self) -> Result<Self::Cursor> {
+            Ok(ReadOnlyCursor)
         }
     }
 
@@ -1116,6 +1339,41 @@ mod tests {
 
         assert_eq!(state.rollback_to(1), Some(7));
         assert_eq!(state.rollback(), Some(7));
+    }
+
+    #[test]
+    fn test_shadow_table_policy_defaults_to_ordinary() {
+        let policy = ReadOnlyVtab::shadow_table_policy("docs", "docs_data");
+        assert_eq!(policy, ShadowTablePolicy::ordinary());
+        assert!(!policy.is_shadow());
+    }
+
+    #[test]
+    fn test_shadow_owning_module_metadata_is_forwarded_by_factory() {
+        let factory = module_factory_from::<ShadowOwningVtab>();
+        let metadata = factory.module_metadata(&[]);
+
+        assert!(metadata.owns_shadow_tables);
+        assert_eq!(
+            metadata.lifecycle,
+            VtabLifecyclePolicy::SeparateCreateAndConnect
+        );
+        assert_eq!(metadata.integrity, VtabIntegrityPolicy::ShadowAware);
+        assert!(metadata.risk.direct_only);
+        assert!(!metadata.risk.innocuous);
+    }
+
+    #[test]
+    fn test_shadow_owning_module_matches_owned_shadow_tables() {
+        let factory = module_factory_from::<ShadowOwningVtab>();
+
+        let owned = factory.shadow_table_policy("docs", "docs_data");
+        let other_owner = factory.shadow_table_policy("docs", "posts_data");
+        let unrelated = factory.shadow_table_policy("docs", "docs_segments");
+
+        assert_eq!(owned.kind, ShadowTableKind::Shadow);
+        assert!(!other_owner.is_shadow());
+        assert!(!unrelated.is_shadow());
     }
 
     #[test]
