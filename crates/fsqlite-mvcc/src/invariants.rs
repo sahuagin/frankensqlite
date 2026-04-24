@@ -3267,4 +3267,62 @@ mod tests {
         // Leave the gate off; it's the production default.
         set_mvcc_visibility_ranges_tracking_enabled(false);
     }
+
+    /// Microbench for the CAS-metrics gate: toggles
+    /// `MVCC_CAS_METRICS_ENABLED` within a single run so publish costs
+    /// with / without CAS-histogram recording are directly paired. Keeps
+    /// visibility-ranges tracking off on both sides so this isolates the
+    /// CAS gate's contribution on top of f2707d1a.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_publish_cas_metrics_gate() {
+        use crate::observability::set_mvcc_cas_metrics_enabled;
+        use std::time::Instant;
+
+        const PUBLISHES_PER_TRIAL: u32 = 20_000;
+        const PAGES: u32 = 32;
+        const TRIALS: usize = 9;
+
+        fn run_trial(publishes: u32, pages: u32, cas_metrics_enabled: bool) -> f64 {
+            set_mvcc_visibility_ranges_tracking_enabled(false);
+            set_mvcc_cas_metrics_enabled(cas_metrics_enabled);
+            let store = VersionStore::new(PageSize::DEFAULT);
+            let mut heads: Vec<Option<VersionPointer>> = vec![None; pages as usize];
+            let start = Instant::now();
+            for i in 0..publishes {
+                let page_ix = (i as usize) % (pages as usize);
+                let prev = heads[page_ix];
+                let v = make_version((page_ix as u32) + 1, u64::from(i) + 1, prev);
+                let idx = store.publish(v);
+                heads[page_ix] = Some(idx_to_version_pointer(idx));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(publishes)
+        }
+
+        run_trial(PUBLISHES_PER_TRIAL, PAGES, true);
+        run_trial(PUBLISHES_PER_TRIAL, PAGES, false);
+
+        let mut on_samples = Vec::with_capacity(TRIALS);
+        let mut off_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let on = run_trial(PUBLISHES_PER_TRIAL, PAGES, true);
+            let off = run_trial(PUBLISHES_PER_TRIAL, PAGES, false);
+            eprintln!(
+                "  cas_metrics=on: {on:.0} ns/publish   cas_metrics=off: {off:.0} ns/publish"
+            );
+            on_samples.push(on);
+            off_samples.push(off);
+        }
+        on_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        off_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let on_med = on_samples[TRIALS / 2];
+        let off_med = off_samples[TRIALS / 2];
+        let delta_pct = (off_med - on_med) / on_med * 100.0;
+        eprintln!(
+            "bench_publish_cas_metrics_gate: cas_on median={on_med:.0} ns/publish; \
+             cas_off median={off_med:.0} ns/publish; delta={delta_pct:+.1}% \
+             (n={TRIALS} trials, {PUBLISHES_PER_TRIAL} publishes/trial, pages={PAGES})"
+        );
+        set_mvcc_cas_metrics_enabled(false);
+    }
 }

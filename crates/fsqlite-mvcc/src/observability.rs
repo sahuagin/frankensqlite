@@ -61,6 +61,14 @@ static MVCC_ACTIVE_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 /// pattern in the VDBE engine.
 static MVCC_SNAPSHOT_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Gate for the CAS-attempts observability histogram. `record_cas_attempt`
+/// is called from `VersionStore::publish` on every version-chain append
+/// and was doing two unconditional relaxed `fetch_add`s regardless of
+/// whether anyone ever reads the histogram. Production consumers are
+/// diagnostic-only, so the default is off — same pattern as
+/// `MVCC_SNAPSHOT_METRICS_ENABLED`.
+static MVCC_CAS_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Enable or disable the MVCC snapshot-read histogram collection.
 /// Defaults to disabled so hot-path resolves do not pay three relaxed
 /// atomic increments per call.
@@ -72,6 +80,19 @@ pub fn set_mvcc_snapshot_metrics_enabled(enabled: bool) {
 #[must_use]
 pub fn mvcc_snapshot_metrics_enabled() -> bool {
     MVCC_SNAPSHOT_METRICS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Enable or disable the MVCC CAS-attempts histogram collection.
+/// Defaults to disabled so hot-path publishes do not pay two relaxed
+/// atomic increments per call.
+pub fn set_mvcc_cas_metrics_enabled(enabled: bool) {
+    MVCC_CAS_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Current MVCC CAS-attempts metrics collection flag.
+#[must_use]
+pub fn mvcc_cas_metrics_enabled() -> bool {
+    MVCC_CAS_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Monotonic nanosecond timestamp relative to process start.
@@ -227,7 +248,23 @@ impl CasMetricsSnapshot {
 }
 
 /// Record one CAS install operation with the given number of CAS attempts.
+///
+/// No-op when `mvcc_cas_metrics_enabled()` is false (the default). Called
+/// from `VersionStore::publish` on every version-chain append; the gate
+/// keeps the hot path down to one relaxed bool load instead of two
+/// `fetch_add`s. See `bench_publish_visibility_ranges_gate` / the gate
+/// pattern landed in bc4fa6b5.
+#[inline]
 pub fn record_cas_attempt(attempts: u32) {
+    if !MVCC_CAS_METRICS_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    record_cas_attempt_slow(attempts);
+}
+
+#[cold]
+#[inline(never)]
+fn record_cas_attempt_slow(attempts: u32) {
     FSQLITE_MVCC_CAS_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let bucket = match attempts {
         0 | 1 => &FSQLITE_MVCC_CAS_RETRIES_LE_1,
@@ -613,6 +650,10 @@ mod tests {
 
     #[test]
     fn cas_metrics_recording_buckets_progress() {
+        // The CAS histogram defaults to disabled in production; enable it
+        // here so the record_cas_attempt calls below actually mutate the
+        // counters.
+        set_mvcc_cas_metrics_enabled(true);
         let before = cas_metrics_snapshot();
         record_cas_attempt(1);
         record_cas_attempt(2);
