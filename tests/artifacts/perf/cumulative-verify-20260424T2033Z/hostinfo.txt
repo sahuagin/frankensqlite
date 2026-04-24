@@ -1,0 +1,3 @@
+6.17.0-19-generic
+kptr_restrict=1
+nproc=128
