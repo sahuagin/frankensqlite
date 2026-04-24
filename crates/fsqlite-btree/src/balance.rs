@@ -457,15 +457,13 @@ fn quick_balance_divider_rowid<W: PageWriter>(
     }
     let leaf_ptrs = read_cell_pointers(leaf_data.as_bytes(), &leaf_header, leaf_offset)?;
     let last_ptr = leaf_ptrs[leaf_header.cell_count as usize - 1] as usize;
-    let last_cell = CellRef::parse(
-        leaf_data.as_bytes(),
-        last_ptr,
-        BtreePageType::LeafTable,
-        usable_size,
-    )?;
-    last_cell
-        .rowid
-        .ok_or_else(|| FrankenError::internal("leaf table cell missing rowid"))
+    // bd-ah597.2: same "caller only needs the rowid" pattern as commit
+    // b35f091c (predecessor_idx). The divider computed by quick-balance is
+    // just the last LeafTable cell's rowid; decoding local_size /
+    // overflow_page / payload_offset via the full `CellRef::parse` is dead
+    // work on this hot split path.
+    let _ = usable_size;
+    CellRef::parse_leaf_table_rowid(leaf_data.as_bytes(), last_ptr)
 }
 
 // ---------------------------------------------------------------------------
