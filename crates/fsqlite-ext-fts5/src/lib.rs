@@ -44,12 +44,30 @@ pub enum DeleteAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailMode {
+    Full,
+    Column,
+    None,
+}
+
+impl std::fmt::Display for DetailMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "full"),
+            Self::Column => write!(f, "column"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_field_names)]
 pub struct Fts5Config {
     secure_delete: bool,
     content_mode: ContentMode,
     contentless_delete: bool,
     columnsize: bool,
+    detail: DetailMode,
 }
 
 impl Fts5Config {
@@ -60,6 +78,7 @@ impl Fts5Config {
             content_mode,
             contentless_delete: false,
             columnsize: true,
+            detail: DetailMode::Full,
         }
     }
 
@@ -76,6 +95,11 @@ impl Fts5Config {
     #[must_use]
     pub const fn columnsize_enabled(self) -> bool {
         self.columnsize
+    }
+
+    #[must_use]
+    pub const fn detail_mode(self) -> DetailMode {
+        self.detail
     }
 
     #[must_use]
@@ -148,6 +172,15 @@ fn parse_columnsize_option(value: &str) -> Option<bool> {
     match value.trim() {
         "0" => Some(false),
         "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn parse_detail_option(value: &str) -> Option<DetailMode> {
+    match value.trim() {
+        "full" => Some(DetailMode::Full),
+        "column" => Some(DetailMode::Column),
+        "none" => Some(DetailMode::None),
         _ => None,
     }
 }
@@ -599,6 +632,10 @@ pub enum Fts5QueryError {
     UnaryNotForbidden,
     InvalidColumnFilter(String),
     InvalidNearSyntax,
+    UnsupportedByDetailMode {
+        detail: DetailMode,
+        feature: &'static str,
+    },
 }
 
 impl std::fmt::Display for Fts5QueryError {
@@ -612,6 +649,9 @@ impl std::fmt::Display for Fts5QueryError {
             }
             Self::InvalidColumnFilter(col) => write!(f, "invalid column filter: {col}"),
             Self::InvalidNearSyntax => write!(f, "invalid NEAR syntax"),
+            Self::UnsupportedByDetailMode { detail, feature } => {
+                write!(f, "detail={detail} does not support {feature}")
+            }
         }
     }
 }
@@ -1068,6 +1108,8 @@ pub struct InvertedIndex {
     index: HashMap<SmallText, PostingList>,
     /// prefix length -> (prefix term -> list of postings)
     prefix_indexes: HashMap<usize, HashMap<SmallText, PostingList>>,
+    /// How much positional detail is retained for each posting.
+    detail: DetailMode,
     /// Set of rowids currently present in the index.
     doc_ids: HashSet<i64>,
     /// Total token count per document (for BM25 avgdl)
@@ -1083,16 +1125,20 @@ impl Default for InvertedIndex {
 impl InvertedIndex {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_options(true, &[])
+        Self::with_options(true, &[], DetailMode::Full)
     }
 
     #[must_use]
     pub fn with_column_sizes(track_column_sizes: bool) -> Self {
-        Self::with_options(track_column_sizes, &[])
+        Self::with_options(track_column_sizes, &[], DetailMode::Full)
     }
 
     #[must_use]
-    pub fn with_options(track_column_sizes: bool, prefix_lengths: &[usize]) -> Self {
+    pub fn with_options(
+        track_column_sizes: bool,
+        prefix_lengths: &[usize],
+        detail: DetailMode,
+    ) -> Self {
         Self {
             index: HashMap::new(),
             prefix_indexes: prefix_lengths
@@ -1100,6 +1146,7 @@ impl InvertedIndex {
                 .copied()
                 .map(|prefix_length| (prefix_length, HashMap::new()))
                 .collect(),
+            detail,
             doc_ids: HashSet::new(),
             doc_lengths: track_column_sizes.then(HashMap::new),
         }
@@ -1115,12 +1162,27 @@ impl InvertedIndex {
         self.prefix_indexes.contains_key(&prefix_length)
     }
 
+    #[must_use]
+    pub const fn detail_mode(&self) -> DetailMode {
+        self.detail
+    }
+
     fn append_position(&mut self, term: &str, docid: i64, column: u32, position: u32) {
+        let stored_column = if self.detail == DetailMode::None {
+            0
+        } else {
+            column
+        };
+        let stored_position = if self.detail == DetailMode::Full {
+            position
+        } else {
+            0
+        };
         append_position_to_postings(
             self.index.entry(SmallText::from(term)).or_default(),
             docid,
-            column,
-            position,
+            stored_column,
+            stored_position,
         );
 
         for (prefix_length, prefix_index) in &mut self.prefix_indexes {
@@ -1128,8 +1190,8 @@ impl InvertedIndex {
                 append_position_to_postings(
                     prefix_index.entry(SmallText::from(prefix)).or_default(),
                     docid,
-                    column,
-                    position,
+                    stored_column,
+                    stored_position,
                 );
             }
         }
@@ -1399,6 +1461,7 @@ fn evaluate_query_string(
 ) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
     let tokens = parse_fts5_query(query)?;
     let expr = build_expr(&tokens)?;
+    validate_detail_mode(&expr, index.detail_mode())?;
     validate_column_filters(&expr, columns)?;
     let matching_docs = evaluate_expr_for_columns(index, &expr, columns);
     let query_terms = extract_query_terms(&expr);
@@ -1650,6 +1713,59 @@ fn validate_column_filters(
     }
 }
 
+fn validate_detail_mode(
+    expr: &Fts5Expr,
+    detail: DetailMode,
+) -> std::result::Result<(), Fts5QueryError> {
+    match expr {
+        Fts5Expr::And(left, right) | Fts5Expr::Or(left, right) | Fts5Expr::Not(left, right) => {
+            validate_detail_mode(left, detail)?;
+            validate_detail_mode(right, detail)
+        }
+        Fts5Expr::Phrase(_) => {
+            if detail == DetailMode::Full {
+                Ok(())
+            } else {
+                Err(Fts5QueryError::UnsupportedByDetailMode {
+                    detail,
+                    feature: "phrase queries",
+                })
+            }
+        }
+        Fts5Expr::Near(_, _) => {
+            if detail == DetailMode::Full {
+                Ok(())
+            } else {
+                Err(Fts5QueryError::UnsupportedByDetailMode {
+                    detail,
+                    feature: "NEAR queries",
+                })
+            }
+        }
+        Fts5Expr::InitialToken(inner) => {
+            if detail == DetailMode::Full {
+                validate_detail_mode(inner, detail)
+            } else {
+                Err(Fts5QueryError::UnsupportedByDetailMode {
+                    detail,
+                    feature: "initial-token queries",
+                })
+            }
+        }
+        Fts5Expr::ColumnFilter(_, inner) => {
+            if detail == DetailMode::None {
+                Err(Fts5QueryError::UnsupportedByDetailMode {
+                    detail,
+                    feature: "column filters",
+                })
+            } else {
+                validate_detail_mode(inner, detail)
+            }
+        }
+        Fts5Expr::Term(_) | Fts5Expr::Prefix(_) => Ok(()),
+    }
+}
+
 fn evaluate_phrase(
     index: &InvertedIndex,
     words: &[String],
@@ -1858,7 +1974,7 @@ impl Fts5Table {
             config: Fts5Config::default(),
             tokenizer_name: "unicode61".to_owned(),
             prefix_lengths: Vec::new(),
-            index: InvertedIndex::with_options(true, &[]),
+            index: InvertedIndex::with_options(true, &[], DetailMode::Full),
             documents: HashMap::new(),
             next_rowid: 1,
             txn_state: TransactionalVtabState::default(),
@@ -1953,8 +2069,11 @@ impl Fts5Table {
 
     /// Rebuild the in-memory index and rowid allocator from persisted rows.
     pub fn rebuild_documents(&mut self, rows: Vec<(i64, Vec<String>)>) {
-        self.index =
-            InvertedIndex::with_options(self.config.columnsize_enabled(), &self.prefix_lengths);
+        self.index = InvertedIndex::with_options(
+            self.config.columnsize_enabled(),
+            &self.prefix_lengths,
+            self.config.detail_mode(),
+        );
         self.documents = HashMap::with_capacity(rows.len());
         self.next_rowid = 1;
         let tokenizer = create_tokenizer(&self.tokenizer_name)
@@ -2123,6 +2242,14 @@ impl VirtualTable for Fts5Table {
                                     FrankenError::function_error("fts5: columnsize must be 0 or 1")
                                 })?;
                         }
+                        "detail" => {
+                            config.detail = parse_detail_option(value_unquoted.as_str())
+                                .ok_or_else(|| {
+                                    FrankenError::function_error(
+                                        "fts5: detail must be full, column, or none",
+                                    )
+                                })?;
+                        }
                         "prefix" => {
                             prefix_lengths.extend(
                                 parse_prefix_option(value_unquoted.as_str()).ok_or_else(|| {
@@ -2133,7 +2260,7 @@ impl VirtualTable for Fts5Table {
                             );
                         }
                         // Parsed for compatibility but not used in this in-memory path yet.
-                        "detail" | "insttoken" => {}
+                        "insttoken" => {}
                         _ => {
                             return Err(FrankenError::function_error(format!(
                                 "fts5: unsupported option '{key}'"
@@ -2168,6 +2295,7 @@ impl VirtualTable for Fts5Table {
             content_mode = ?config.content_mode,
             secure_delete = config.secure_delete,
             contentless_delete = config.contentless_delete,
+            detail = ?config.detail_mode(),
             prefix_lengths = ?prefix_lengths,
             "fts5: connecting virtual table"
         );
@@ -2176,8 +2304,11 @@ impl VirtualTable for Fts5Table {
         table.config = config;
         table.tokenizer_name = tokenizer_name;
         table.prefix_lengths = prefix_lengths;
-        table.index =
-            InvertedIndex::with_options(table.config.columnsize_enabled(), &table.prefix_lengths);
+        table.index = InvertedIndex::with_options(
+            table.config.columnsize_enabled(),
+            &table.prefix_lengths,
+            table.config.detail_mode(),
+        );
         Ok(table)
     }
 
@@ -3015,7 +3146,7 @@ mod tests {
 
     #[test]
     fn test_prefix_index_population_and_cleanup() {
-        let mut index = InvertedIndex::with_options(true, &[3]);
+        let mut index = InvertedIndex::with_options(true, &[3], DetailMode::Full);
         let tok = Unicode61Tokenizer::new();
 
         index.add_document(1, 0, &tok.tokenize("hello help"));
@@ -3029,6 +3160,21 @@ mod tests {
 
         index.remove_document(1);
         assert!(index.get_prefix_postings("hel").is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_detail_none_collapses_columns() {
+        let mut index = InvertedIndex::with_options(true, &[], DetailMode::None);
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("hello"));
+        index.add_document(1, 1, &tok.tokenize("hello"));
+
+        let postings = index.get_postings("hello");
+        assert_eq!(index.detail_mode(), DetailMode::None);
+        assert_eq!(postings.len(), 1);
+        assert_eq!(postings[0].column, 0);
+        assert_eq!(postings[0].positions.len(), 2);
     }
 
     // -- BM25 tests --
@@ -3279,6 +3425,65 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_table_detail_column_rejects_offset_queries() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "detail=column"],
+        )
+        .unwrap();
+        table.insert_document(1, &["rust title".to_owned(), "rust body".to_owned()]);
+
+        let term_results = table.search("title:rust").unwrap();
+        assert_eq!(term_results.len(), 1);
+        assert_eq!(term_results[0].0, 1);
+
+        assert_eq!(
+            table.search(r#""rust title""#).unwrap_err(),
+            Fts5QueryError::UnsupportedByDetailMode {
+                detail: DetailMode::Column,
+                feature: "phrase queries",
+            }
+        );
+        assert_eq!(
+            table.search("NEAR(rust title, 5)").unwrap_err(),
+            Fts5QueryError::UnsupportedByDetailMode {
+                detail: DetailMode::Column,
+                feature: "NEAR queries",
+            }
+        );
+        assert_eq!(
+            table.search("^rust").unwrap_err(),
+            Fts5QueryError::UnsupportedByDetailMode {
+                detail: DetailMode::Column,
+                feature: "initial-token queries",
+            }
+        );
+    }
+
+    #[test]
+    fn test_fts5_table_detail_none_rejects_column_filters() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &["fts5", "main", "docs", "title", "body", "detail=none"],
+        )
+        .unwrap();
+        table.insert_document(1, &["rust title".to_owned(), "plain body".to_owned()]);
+        table.insert_document(2, &["plain title".to_owned(), "rust body".to_owned()]);
+
+        let results = table.search("rust").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            table.search("title:rust").unwrap_err(),
+            Fts5QueryError::UnsupportedByDetailMode {
+                detail: DetailMode::None,
+                feature: "column filters",
+            }
+        );
+    }
+
+    #[test]
     fn test_fts5_table_bm25_ranking_order() {
         let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
 
@@ -3323,6 +3528,7 @@ mod tests {
                 "content=''",
                 "contentless_delete=1",
                 "columnsize=0",
+                "detail='column'",
                 "prefix='2 3'",
             ],
         )
@@ -3332,8 +3538,10 @@ mod tests {
         assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
         assert!(vtab.config.contentless_delete_enabled());
         assert!(!vtab.config.columnsize_enabled());
+        assert_eq!(vtab.config.detail_mode(), DetailMode::Column);
         assert_eq!(vtab.prefix_lengths, vec![2, 3]);
         assert!(!vtab.index().tracks_column_sizes());
+        assert_eq!(vtab.index().detail_mode(), DetailMode::Column);
         assert!(vtab.index().tracks_prefix_length(2));
         assert!(vtab.index().tracks_prefix_length(3));
     }
@@ -3384,6 +3592,17 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("prefix must be a whitespace separated list of positive integers")
+        );
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_invalid_detail() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "detail='offsets'"])
+            .expect_err("invalid detail should fail");
+        assert!(
+            err.to_string()
+                .contains("detail must be full, column, or none")
         );
     }
 
@@ -3652,6 +3871,7 @@ mod tests {
         assert!(!config.secure_delete_enabled());
         assert!(!config.contentless_delete_enabled());
         assert!(config.columnsize_enabled());
+        assert_eq!(config.detail_mode(), DetailMode::Full);
     }
 
     #[test]
@@ -3685,6 +3905,16 @@ mod tests {
         assert_eq!(
             format!("{}", Fts5QueryError::InvalidNearSyntax),
             "invalid NEAR syntax"
+        );
+        assert_eq!(
+            format!(
+                "{}",
+                Fts5QueryError::UnsupportedByDetailMode {
+                    detail: DetailMode::Column,
+                    feature: "phrase queries",
+                }
+            ),
+            "detail=column does not support phrase queries"
         );
     }
 
@@ -4491,6 +4721,7 @@ mod tests {
     fn test_fts5_table_config_accessors() {
         let mut table = Fts5Table::with_columns(vec!["c".to_owned()]);
         assert_eq!(table.config().content_mode(), ContentMode::Stored);
+        assert_eq!(table.config().detail_mode(), DetailMode::Full);
         table.config_mut().apply_control_command("secure-delete=1");
         assert!(table.config().secure_delete_enabled());
     }
