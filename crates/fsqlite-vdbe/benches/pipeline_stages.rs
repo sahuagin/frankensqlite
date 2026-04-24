@@ -44,6 +44,29 @@ fn build_execute_stage_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of
+/// single-register `Copy` ops. The source register holds an `Integer`, so
+/// the body reduces to `clone + set_reg_fast` per dispatch — the work is
+/// small enough that the hot-path pre-filter vs main-match routing is the
+/// dominant cost, which is exactly the effect we want to measure.
+fn build_execute_stage_copy_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let src = builder.alloc_reg();
+    let dst = builder.alloc_reg();
+    builder.emit_op(Opcode::Integer, 42, src, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        // p1=src, p2=dst, p3=0 (copy a single register)
+        builder.emit_op(Opcode::Copy, src, dst, 0, P4::None, 0);
+    }
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute copy benchmark program should build")
+}
+
 fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
     let cx = Cx::new();
     let pager = SimplePager::open_with_cx(
@@ -129,6 +152,39 @@ fn bench_vdbe_execute_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_copy_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_copy");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_copy_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute copy benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_commit_stage(c: &mut Criterion) {
     let mut group = c.benchmark_group("vdbe_pipeline_commit");
 
@@ -161,6 +217,7 @@ criterion_group!(
     benches,
     bench_vdbe_decode_stage,
     bench_vdbe_execute_stage,
+    bench_vdbe_execute_copy_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);

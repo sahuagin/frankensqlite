@@ -11802,6 +11802,20 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // Copy is the most frequently emitted register-motion opcode in
+            // codegen (71 sites), driving SELECT projection, expression
+            // propagation, and materialization staging. p3 is almost always 0
+            // (single-register copy); the body is `clone + set_reg_fast`.
+            // Keeping the loop form preserves semantics for the rare range
+            // copies while leaving the single-reg case a straight line.
+            Opcode::Copy => {
+                for i in 0..=op.p3 {
+                    let val = self.get_reg(op.p1 + i).clone();
+                    self.set_reg_fast(op.p2 + i, val);
+                }
+                *pc += 1;
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
