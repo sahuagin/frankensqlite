@@ -1316,14 +1316,27 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
 // `BusyRecovery` to the caller.
 static RECOVERY_FENCES: OnceLock<Mutex<HashMap<PathBuf, Arc<RecoveryFence>>>> = OnceLock::new();
 
+fn shared_file_state_key(db_path: &Path) -> PathBuf {
+    std::fs::canonicalize(db_path).unwrap_or_else(|_| {
+        if db_path.is_absolute() {
+            db_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(db_path))
+                .unwrap_or_else(|_| db_path.to_path_buf())
+        }
+    })
+}
+
 fn recovery_fence_for_path(db_path: &Path) -> Arc<RecoveryFence> {
+    let key = shared_file_state_key(db_path);
     let fences = RECOVERY_FENCES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut fences = fences
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         fences
-            .entry(db_path.to_path_buf())
+            .entry(key)
             .or_insert_with(|| Arc::new(RecoveryFence::new())),
     )
 }
@@ -1339,13 +1352,14 @@ fn recovery_fence_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<RecoveryFe
 }
 
 fn group_commit_queue_for_path(db_path: &Path) -> GroupCommitQueueRef {
+    let key = shared_file_state_key(db_path);
     let queues = GROUP_COMMIT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut queues = queues
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::clone(
         queues
-            .entry(db_path.to_path_buf())
+            .entry(key)
             .or_insert_with(|| Arc::new(GroupCommitQueue::new(GroupCommitConfig::default()))),
     )
 }
@@ -1368,10 +1382,11 @@ fn group_commit_queue_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> GroupCommi
 /// that open a different file at the same path.
 pub fn remove_group_commit_queue(db_path: &Path) {
     if let Some(queues) = GROUP_COMMIT_QUEUES.get() {
+        let key = shared_file_state_key(db_path);
         let mut queues = queues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queues.remove(db_path);
+        queues.remove(&key);
     }
 }
 
@@ -9566,6 +9581,14 @@ mod tests {
             *byte = reduced ^ seed;
         }
         page
+    }
+
+    #[test]
+    fn shared_file_state_key_matches_relative_and_absolute_spellings() {
+        let rel = Path::new("__fsqlite_nonexistent_shared_state_key_probe__.db");
+        let abs = std::env::current_dir().unwrap().join(rel);
+
+        assert_eq!(shared_file_state_key(rel), shared_file_state_key(&abs));
     }
 
     fn default_commit_service_fairness_budget(max_wait: Duration) -> Duration {
