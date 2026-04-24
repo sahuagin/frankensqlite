@@ -252,13 +252,16 @@ fn edit_json_paths_value(
     Ok(edited)
 }
 
-fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Value> {
+fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Option<Value>> {
     let mut edited = root.clone();
     for path in paths {
         let segments = parse_path(path)?;
+        if segments.is_empty() {
+            return Ok(None);
+        }
         remove_at_path(&mut edited, &segments);
     }
-    Ok(edited)
+    Ok(Some(edited))
 }
 
 fn json_patch_value(root: &Value, patch: &Value) -> Value {
@@ -502,14 +505,18 @@ pub fn jsonb_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u
 /// Remove JSON values at path(s). Array removals compact the array.
 pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
     let root = parse_json_text(input)?;
-    let edited = json_remove_value(&root, paths)?;
+    let Some(edited) = json_remove_value(&root, paths)? else {
+        return Ok("null".to_owned());
+    };
     encode_json_text("json_remove encode failed", &edited)
 }
 
 /// JSONB variant of `json_remove`.
 pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
     let root = parse_json_text(input)?;
-    let edited = json_remove_value(&root, paths)?;
+    let Some(edited) = json_remove_value(&root, paths)? else {
+        return encode_jsonb_root(&Value::Null);
+    };
     encode_jsonb_root(&edited)
 }
 
@@ -1855,6 +1862,11 @@ fn optional_flags_arg(name: &str, args: &[SqliteValue], index: usize) -> Result<
     let flags = u8::try_from(raw).map_err(|_| {
         FrankenError::function_error(format!("{name} flags out of range for u8: {raw}"))
     })?;
+    if !(1..=15).contains(&flags) {
+        return Err(FrankenError::function_error(format!(
+            "{name} FLAGS parameter must be between 1 and 15"
+        )));
+    }
     Ok(Some(flags))
 }
 
@@ -2518,7 +2530,9 @@ impl ScalarFunction for JsonRemoveFunc {
             return Ok(SqliteValue::Null);
         }
         let paths = collect_path_args(self.name(), args, 1)?;
-        let edited = json_remove_value(&input, &paths)?;
+        let Some(edited) = json_remove_value(&input, &paths)? else {
+            return Ok(SqliteValue::Null);
+        };
         let encoded = encode_json_text("json_remove encode failed", &edited)?;
         Ok(SqliteValue::Text(encoded.into()))
     }
@@ -2555,7 +2569,9 @@ impl ScalarFunction for JsonbRemoveFunc {
             return Ok(SqliteValue::Null);
         }
         let paths = collect_path_args(self.name(), args, 1)?;
-        let edited = json_remove_value(&input, &paths)?;
+        let Some(edited) = json_remove_value(&input, &paths)? else {
+            return Ok(SqliteValue::Null);
+        };
         let blob = encode_jsonb_root(&edited)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
@@ -3740,6 +3756,24 @@ mod tests {
     }
 
     #[test]
+    fn test_registered_json_valid_rejects_out_of_range_flags() {
+        let func = JsonValidFunc;
+        for flags in [0, 16, -1] {
+            let err = func
+                .invoke(&[
+                    SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                    SqliteValue::Integer(flags),
+                ])
+                .expect_err("SQL json_valid must reject flags outside 1..=15");
+            assert!(
+                err.to_string().contains("between 1 and 15")
+                    || err.to_string().contains("out of range"),
+                "unexpected error for flags {flags}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_json_valid_empty_string() {
         assert_eq!(json_valid("", None), 0);
     }
@@ -4121,6 +4155,30 @@ mod tests {
     fn test_json_remove_from_end_index() {
         let out = json_remove("[1,2,3]", &["$[#-1]"]).unwrap();
         assert_eq!(out, "[1,2]");
+    }
+
+    #[test]
+    fn test_registered_json_remove_root_returns_sql_null() {
+        let func = JsonRemoveFunc;
+        let out = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                SqliteValue::Text(SmallText::from_string("$")),
+            ])
+            .expect("json_remove root path should execute");
+        assert_eq!(out, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_registered_jsonb_remove_root_returns_sql_null() {
+        let func = JsonbRemoveFunc;
+        let out = func
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string(r#"{"a":1}"#)),
+                SqliteValue::Text(SmallText::from_string("$")),
+            ])
+            .expect("jsonb_remove root path should execute");
+        assert_eq!(out, SqliteValue::Null);
     }
 
     // -----------------------------------------------------------------------
