@@ -7519,10 +7519,7 @@ impl VdbeEngine {
                 Opcode::Copy => {
                     // Copy registers p1..p1+p3 to p2..p2+p3 (deep copy).
                     // p3 = number of ADDITIONAL registers to copy (0 = just one).
-                    for i in 0..=op.p3 {
-                        let val = self.get_reg(op.p1 + i).clone();
-                        self.set_reg_fast(op.p2 + i, val);
-                    }
+                    self.copy_reg_range(op.p1, op.p2, op.p3);
                     pc += 1;
                 }
 
@@ -11809,10 +11806,7 @@ impl VdbeEngine {
             // Keeping the loop form preserves semantics for the rare range
             // copies while leaving the single-reg case a straight line.
             Opcode::Copy => {
-                for i in 0..=op.p3 {
-                    let val = self.get_reg(op.p1 + i).clone();
-                    self.set_reg_fast(op.p2 + i, val);
-                }
+                self.copy_reg_range(op.p1, op.p2, op.p3);
                 *pc += 1;
                 Ok(true)
             }
@@ -12747,6 +12741,29 @@ impl VdbeEngine {
         }
 
         for (offset, value) in temp.into_iter().enumerate() {
+            if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
+                self.set_reg_fast(dst, value);
+            }
+        }
+    }
+
+    #[inline]
+    fn copy_reg_range(&mut self, src_start: i32, dst_start: i32, additional: i32) {
+        let Ok(additional) = usize::try_from(additional) else {
+            return;
+        };
+        let Some(count) = additional.checked_add(1) else {
+            return;
+        };
+
+        if count == 1 {
+            let value = self.clone_reg_materialized(src_start);
+            self.set_reg_fast(dst_start, value);
+            return;
+        }
+
+        let values = self.collect_reg_range(src_start, count);
+        for (offset, value) in values.into_iter().enumerate() {
             if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
                 self.set_reg_fast(dst, value);
             }
@@ -17502,6 +17519,67 @@ mod tests {
             vec![
                 SqliteValue::Integer(7),
                 SqliteValue::Text("payload-track-s".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_copy_materializes_make_record_sideband_before_copying() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Integer, 33, 1, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::String8,
+                0,
+                2,
+                0,
+                P4::Str("copy-sideband".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::MakeRecord, 1, 2, 3, P4::None, 0);
+            b.emit_op(Opcode::Copy, 3, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(vdbe_test_sideband_materialization_count_snapshot(), 1);
+        assert_eq!(
+            decode_record(&rows[0][0]).expect("copied record blob should decode"),
+            vec![
+                SqliteValue::Integer(33),
+                SqliteValue::Text("copy-sideband".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_copy_range_uses_source_snapshot_when_ranges_overlap() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 20, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 30, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Copy, 1, 2, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(20),
+                SqliteValue::Integer(30),
             ]
         );
     }
