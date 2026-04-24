@@ -2485,7 +2485,7 @@ fn wait_for_page_lock_holder_change(
     let started = Instant::now();
     let mut next_full_checkpoint = PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL;
     loop {
-        let elapsed = started.elapsed();
+        let mut elapsed = started.elapsed();
         // Keep the hot per-slice path cheap, but do not make e-process/native
         // cancellation wait for the whole busy timeout when the same holder
         // stays parked on the page. The old code ran a full checkpoint every
@@ -2493,6 +2493,7 @@ fn wait_for_page_lock_holder_change(
         // preserving most of the perf win from the cheap local check.
         if elapsed >= next_full_checkpoint {
             observe_execution_cancellation(cx)?;
+            elapsed = started.elapsed();
             next_full_checkpoint = elapsed.saturating_add(PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL);
         } else if cx.is_cancel_requested() {
             return Err(FrankenError::Abort);

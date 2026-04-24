@@ -8,7 +8,7 @@
 use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
@@ -1316,15 +1316,34 @@ static GROUP_COMMIT_QUEUES: OnceLock<Mutex<HashMap<PathBuf, GroupCommitQueueRef>
 // `BusyRecovery` to the caller.
 static RECOVERY_FENCES: OnceLock<Mutex<HashMap<PathBuf, Arc<RecoveryFence>>>> = OnceLock::new();
 
+fn lexical_normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
 fn shared_file_state_key(db_path: &Path) -> PathBuf {
     std::fs::canonicalize(db_path).unwrap_or_else(|_| {
-        if db_path.is_absolute() {
+        let absolute = if db_path.is_absolute() {
             db_path.to_path_buf()
         } else {
             std::env::current_dir()
                 .map(|cwd| cwd.join(db_path))
                 .unwrap_or_else(|_| db_path.to_path_buf())
-        }
+        };
+        lexical_normalize_path(absolute)
     })
 }
 
@@ -9612,6 +9631,34 @@ mod tests {
         let abs = std::env::current_dir().unwrap().join(rel);
 
         assert_eq!(shared_file_state_key(rel), shared_file_state_key(&abs));
+    }
+
+    #[test]
+    fn shared_file_state_key_normalizes_fallback_dot_components() {
+        let probe = Path::new("__fsqlite_nonexistent_shared_state_key_probe__.db");
+        let dotted = Path::new(".").join(probe);
+        let parent = Path::new("__fsqlite_unused_probe_parent__")
+            .join("..")
+            .join(probe);
+
+        assert_eq!(shared_file_state_key(probe), shared_file_state_key(&dotted));
+        assert_eq!(shared_file_state_key(probe), shared_file_state_key(&parent));
+    }
+
+    #[test]
+    fn shared_file_state_key_matches_before_and_after_file_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_path = dir.path().join("coordination.db");
+        let dotted_path = dir.path().join(".").join("coordination.db");
+
+        let before_create_key = shared_file_state_key(&dotted_path);
+        std::fs::write(&canonical_path, b"").unwrap();
+        let after_create_key = shared_file_state_key(&dotted_path);
+
+        assert_eq!(
+            before_create_key, after_create_key,
+            "shared state keys must stay stable when the db file is created after first open"
+        );
     }
 
     fn default_commit_service_fairness_budget(max_wait: Duration) -> Duration {
