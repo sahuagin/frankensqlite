@@ -140,7 +140,7 @@ impl StatementParseScratch {
     pub fn reset(&mut self) {
         self.tokens.clear();
         self.errors.clear();
-        self.identifier_interner.clear();
+        self.identifier_interner.reset();
     }
 
     #[must_use]
@@ -169,6 +169,11 @@ impl StatementParseScratch {
     #[cfg(test)]
     fn identifier_interner_is_empty(&self) -> bool {
         self.identifier_interner.is_empty()
+    }
+
+    #[cfg(test)]
+    fn identifier_interner_len(&self) -> usize {
+        self.identifier_interner.len()
     }
 }
 
@@ -2204,7 +2209,7 @@ fn parse_statements_with_scratch_inner(
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
     scratch.tokens.clear();
-    scratch.identifier_interner.clear();
+    scratch.identifier_interner.prepare_for_next_parse();
     scratch.errors = errors;
     let first_error = scratch.errors.first().cloned();
     scratch.errors.clear();
@@ -8187,7 +8192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_statements_with_scratch_releases_identifier_interns() {
+    fn test_parse_statements_with_scratch_reuses_identifier_interns_across_parses() {
         let mut scratch = StatementParseScratch::default();
         let mut sql = String::from("SELECT ");
         for i in 0..32 {
@@ -8201,15 +8206,48 @@ mod tests {
         let statements = parse_statements_with_scratch(&sql, &mut scratch)
             .expect("identifier-heavy statement should parse");
         assert_eq!(statements.len(), 1);
+        let interner_len = scratch.identifier_interner_len();
         assert!(
-            scratch.identifier_interner_is_empty(),
-            "identifier interns are statement-scoped and must not leak across parses",
+            interner_len > 0,
+            "scratch should retain identifier interns for the next parse",
+        );
+
+        let statements = parse_statements_with_scratch(&sql, &mut scratch)
+            .expect("repeat parse should also succeed");
+        assert_eq!(statements.len(), 1);
+        assert_eq!(
+            scratch.identifier_interner_len(),
+            interner_len,
+            "repeated parse should reuse the retained interner set instead of growing it",
         );
 
         scratch.reset();
         assert!(
             scratch.identifier_interner_is_empty(),
             "explicit scratch reset should also keep the interner logically empty",
+        );
+    }
+
+    #[test]
+    fn test_parse_statements_with_scratch_drops_oversized_identifier_interner() {
+        let mut scratch = StatementParseScratch::default();
+        let mut sql = String::from("SELECT ");
+        for i in 0..300 {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!(
+                "very_long_unique_identifier_{i:03} AS alias_{i:03}"
+            ));
+        }
+        sql.push(';');
+
+        let statements = parse_statements_with_scratch(&sql, &mut scratch)
+            .expect("oversized identifier-heavy statement should parse");
+        assert_eq!(statements.len(), 1);
+        assert!(
+            scratch.identifier_interner_is_empty(),
+            "oversized identifier interners should be dropped instead of retained indefinitely",
         );
     }
 

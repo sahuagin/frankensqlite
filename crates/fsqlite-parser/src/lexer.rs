@@ -124,6 +124,10 @@ pub fn reset_tokenize_metrics() {
     FSQLITE_TOKENIZE_DURATION_SECONDS_SUM_MICROS.store(0, Ordering::Relaxed);
 }
 
+/// Bound retained identifier interners so scratch reuse does not grow without limit.
+const MAX_RETAINED_IDENTIFIER_INTERNER_ENTRIES: usize = 256;
+const MAX_RETAINED_IDENTIFIER_INTERNER_BYTES: usize = 16 * 1024;
+
 /// SQL lexer that produces a stream of tokens from source text.
 #[derive(Debug, Default)]
 pub(crate) struct IdentifierInterner {
@@ -142,8 +146,8 @@ impl IdentifierInterner {
         inserted
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
+    pub(crate) fn reset(&mut self) {
+        self.values = HashSet::new();
     }
 
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -157,9 +161,22 @@ impl IdentifierInterner {
             .saturating_add(interned_value_bytes)
     }
 
+    pub(crate) fn prepare_for_next_parse(&mut self) {
+        if self.values.len() > MAX_RETAINED_IDENTIFIER_INTERNER_ENTRIES
+            || self.retained_bytes() > MAX_RETAINED_IDENTIFIER_INTERNER_BYTES
+        {
+            self.reset();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.values.len()
     }
 }
 
