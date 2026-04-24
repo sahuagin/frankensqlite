@@ -3544,7 +3544,7 @@ impl<P: PageWriter> BtCursor<P> {
     fn refresh_rightmost_leaf_cache_after_insert(&mut self, cx: &Cx, rowid: i64) -> Result<()> {
         if let Some(cached) = self
             .rightmost_leaf_cache
-            .clone()
+            .as_ref()
             .filter(|cached| cached.rowid == rowid)
         {
             let cursor_on_cached_leaf = !self.at_eof
@@ -3557,18 +3557,23 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             if let Some(cell_idx) = cached.header.cell_count.checked_sub(1) {
-                let mutation_counter = Self::page_mutation_counter(&cached.page_data);
+                let page_no = cached.page_no;
+                let page_data = cached.page_data.clone();
+                let header = cached.header;
+                let cell_pointers = cached.cell_pointers.clone();
+                let tree_depth = cached.tree_depth;
+                let mutation_counter = Self::page_mutation_counter(&page_data);
                 self.stack.clear();
                 self.stack.push(StackEntry {
-                    page_no: cached.page_no,
-                    page_data: cached.page_data.clone(),
-                    header: cached.header,
-                    cell_pointers: cached.cell_pointers.clone(),
+                    page_no,
+                    page_data,
+                    header,
+                    cell_pointers,
                     mutation_counter,
                     cell_idx,
                 });
                 self.at_eof = false;
-                self.last_known_depth = Some(cached.tree_depth);
+                self.last_known_depth = Some(tree_depth);
                 return Ok(());
             }
         }
