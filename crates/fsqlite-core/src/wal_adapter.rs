@@ -311,73 +311,49 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             (None, None) => 0,
         };
 
-        let update_result = match last_commit_frame {
+        let scan_result = match last_commit_frame {
             None => {
                 Arc::make_mut(&mut page_index).clear();
                 index_is_partial = false;
-                Ok(())
+                Ok(0)
             }
             Some(current_last_commit) => {
-                let start = match (previous_generation == generation, previous_last_commit) {
-                    (true, Some(previous_last_commit))
-                        if previous_last_commit < current_last_commit =>
-                    {
-                        previous_last_commit.saturating_add(1)
-                    }
-                    (true, Some(previous_last_commit))
-                        if previous_last_commit == current_last_commit =>
-                    {
-                        current_last_commit.saturating_add(1)
-                    }
-                    _ => {
-                        Arc::make_mut(&mut page_index).clear();
-                        index_is_partial = false;
-                        0
-                    }
-                };
+                let (start, base_commit_count) =
+                    match (previous_generation == generation, previous_last_commit) {
+                        (true, Some(previous_last_commit))
+                            if previous_last_commit < current_last_commit =>
+                        {
+                            (
+                                previous_last_commit.saturating_add(1),
+                                previous_commit_count,
+                            )
+                        }
+                        (true, Some(previous_last_commit))
+                            if previous_last_commit == current_last_commit =>
+                        {
+                            (current_last_commit.saturating_add(1), previous_commit_count)
+                        }
+                        _ => {
+                            Arc::make_mut(&mut page_index).clear();
+                            index_is_partial = false;
+                            (0, 0)
+                        }
+                    };
                 if start <= current_last_commit {
-                    self.build_index_range(
+                    self.index_range_and_count_commits(
                         cx,
                         Arc::make_mut(&mut page_index),
                         &mut index_is_partial,
                         start,
                         current_last_commit,
                     )
+                    .map(|delta| base_commit_count.saturating_add(delta))
                 } else {
-                    Ok(())
+                    Ok(base_commit_count)
                 }
             }
         };
-        let commit_count_result = match last_commit_frame {
-            None => Ok(0),
-            Some(current_last_commit) => {
-                match (previous_generation == generation, previous_last_commit) {
-                    (true, Some(previous_last_commit))
-                        if previous_last_commit < current_last_commit =>
-                    {
-                        self.count_commit_frames_in_range(
-                            cx,
-                            previous_last_commit.saturating_add(1),
-                            current_last_commit,
-                        )
-                        .map(|delta| previous_commit_count.saturating_add(delta))
-                    }
-                    (true, Some(previous_last_commit))
-                        if previous_last_commit == current_last_commit =>
-                    {
-                        Ok(previous_commit_count)
-                    }
-                    _ => self.count_commit_frames_in_range(cx, 0, current_last_commit),
-                }
-            }
-        };
-        if let Err(error) = update_result {
-            if previous_generation == generation {
-                self.published_snapshot.page_index = page_index;
-            }
-            return Err(error);
-        }
-        let commit_count = match commit_count_result {
+        let commit_count = match scan_result {
             Ok(commit_count) => commit_count,
             Err(error) => {
                 if previous_generation == generation {
@@ -452,18 +428,24 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         }
     }
 
-    /// Scan frame headers from `start..=end` (inclusive) and populate the page index.
+    /// Scan frame headers from `start..=end` (inclusive), populate the page index,
+    /// and count commit frames in the same pass.
     ///
     /// Since we scan forward, later frames naturally overwrite earlier entries
     /// for the same page number, ensuring "newest frame wins" semantics.
-    fn build_index_range(
+    fn index_range_and_count_commits(
         &self,
         cx: &Cx,
         page_index: &mut HashMap<u32, usize>,
         index_is_partial: &mut bool,
         start: usize,
         end: usize,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        if start > end {
+            return Ok(0);
+        }
+
+        let mut commit_count = 0_u64;
         for frame_index in start..=end {
             let header = self.wal.read_frame_header(cx, frame_index)?;
             // Only insert if we haven't hit the capacity cap, or if this page
@@ -478,19 +460,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 // trusted and must fall back to a linear scan.
                 *index_is_partial = true;
             }
-        }
-        Ok(())
-    }
-
-    /// Count commit frames within the visible range `start..=end`.
-    fn count_commit_frames_in_range(&self, cx: &Cx, start: usize, end: usize) -> Result<u64> {
-        if start > end {
-            return Ok(0);
-        }
-
-        let mut commit_count = 0_u64;
-        for frame_index in start..=end {
-            if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+            if header.is_commit() {
                 commit_count = commit_count.saturating_add(1);
             }
         }
