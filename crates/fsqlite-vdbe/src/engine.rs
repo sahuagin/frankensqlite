@@ -2518,16 +2518,6 @@ fn wait_for_page_lock_holder_change(
             return Ok(true);
         }
 
-        if ctx.lock_table.holder(page_no) != Some(holder) {
-            add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
-            add_vdbe_duration_if(
-                metrics_enabled,
-                &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAIT_TIME_NS_TOTAL,
-                started,
-            );
-            return Ok(true);
-        }
-
         if wait_budget == wait_slice {
             add_vdbe_counter_if(metrics_enabled, &FSQLITE_VDBE_MVCC_PAGE_LOCK_WAITS_TOTAL, 1);
             add_vdbe_duration_if(
@@ -19573,7 +19563,7 @@ mod tests {
                     left: Box::new(Expr::Column(
                         ColumnRef {
                             table: None,
-                            column: "rowid".to_owned(),
+                            column: "rowid".into(),
                         },
                         span(),
                     )),
@@ -19617,7 +19607,7 @@ mod tests {
                     left: Box::new(Expr::Column(
                         ColumnRef {
                             table: None,
-                            column: "rowid".to_owned(),
+                            column: "rowid".into(),
                         },
                         span(),
                     )),
