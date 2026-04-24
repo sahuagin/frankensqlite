@@ -2007,17 +2007,46 @@ struct ActiveEdgeDiscoveryIndex {
     all_writers: Vec<usize>,
     readers_with_global_keys: Vec<usize>,
     writers_with_global_keys: Vec<usize>,
-    readers_by_page: HashMap<PageNumber, Vec<usize>>,
-    writers_by_page: HashMap<PageNumber, Vec<usize>>,
-    readers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
-    writers_by_page_witness: HashMap<PageNumber, Vec<usize>>,
+    // Identity-hashed by PageNumber via `PageNumberBuildHasher`. The default
+    // `RandomState` was the `reserve_rehash` hotspot under
+    // `ActiveEdgeDiscoveryIndex::build` in the MT 16t profile (1.03%
+    // self-time — see
+    // tests/artifacts/perf/bd-m4s2c-20260423T013614Z/perf-report-mt_writers_16x500.txt).
+    readers_by_page: PageMap<Vec<usize>>,
+    writers_by_page: PageMap<Vec<usize>>,
+    readers_by_page_witness: PageMap<Vec<usize>>,
+    writers_by_page_witness: PageMap<Vec<usize>>,
     readers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
     writers_by_exact_cell: HashMap<(PageNumber, u64), Vec<usize>>,
 }
 
 impl ActiveEdgeDiscoveryIndex {
     fn build(views: &[HandleView]) -> Self {
-        let mut index = Self::default();
+        // Pre-size the PageNumber-keyed maps to avoid the reserve_rehash
+        // chain that otherwise doubles capacity on every insert
+        // (0 → 3 → 7 → 15 → ...). Four slots per view is a conservative
+        // lower bound for typical MT workloads; overshooting is cheap
+        // because each bucket is pointer-sized.
+        let page_cap = views.len().saturating_mul(4);
+        let mut index = Self {
+            readers_by_page: PageMap::with_capacity_and_hasher(
+                page_cap,
+                PageNumberBuildHasher::default(),
+            ),
+            writers_by_page: PageMap::with_capacity_and_hasher(
+                page_cap,
+                PageNumberBuildHasher::default(),
+            ),
+            readers_by_page_witness: PageMap::with_capacity_and_hasher(
+                page_cap,
+                PageNumberBuildHasher::default(),
+            ),
+            writers_by_page_witness: PageMap::with_capacity_and_hasher(
+                page_cap,
+                PageNumberBuildHasher::default(),
+            ),
+            ..Self::default()
+        };
         for (idx, view) in views.iter().enumerate() {
             if view.has_read_witnesses() {
                 index.all_readers.push(idx);
@@ -6215,5 +6244,86 @@ mod tests {
                 "metadata-exempt pages should not track write conflicts"
             );
         }
+    }
+
+    /// Microbench for `ActiveEdgeDiscoveryIndex::build`. Constructs N handle
+    /// views with M disjoint read/write pages each and times the build loop.
+    /// Reports ns/build averaged over trials. Not a correctness test; ignored
+    /// by default.
+    ///
+    /// Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_active_edge_index_build --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_active_edge_index_build() {
+        use std::cell::Cell;
+        use std::collections::HashSet;
+        use std::time::Instant;
+
+        use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags};
+
+        fn make_view(token_id: u64, page_base: u32, pages_per_view: u32) -> HandleView {
+            let read_pages: HashSet<PageNumber> = (0..pages_per_view)
+                .map(|i| test_page(page_base + i))
+                .collect();
+            let write_pages: HashSet<PageNumber> = (0..pages_per_view)
+                .map(|i| test_page(page_base + pages_per_view + i))
+                .collect();
+            HandleView {
+                token: test_token(token_id),
+                begin_seq: CommitSeq::new(1),
+                flags: HandleViewFlags(HandleViewFlags::ACTIVE),
+                read_pages: read_pages.clone(),
+                read_page_witness_pages: read_pages,
+                read_exact_cells: HashSet::new(),
+                write_pages: write_pages.clone(),
+                write_page_witness_pages: write_pages,
+                write_exact_cells: HashSet::new(),
+                has_in_rw: Cell::new(false),
+                has_out_rw: Cell::new(false),
+            }
+        }
+
+        // MT 16t with ~10 pages-per-txn is the profile scenario the hasher
+        // swap targets.
+        const VIEWS: usize = 16;
+        const PAGES_PER_VIEW: u32 = 10;
+        const BUILDS_PER_TRIAL: u32 = 20_000;
+        const TRIALS: usize = 7;
+
+        let views: Vec<HandleView> = (0..VIEWS)
+            .map(|i| {
+                make_view(
+                    (i as u64) + 1,
+                    (i as u32) * PAGES_PER_VIEW * 2 + 1,
+                    PAGES_PER_VIEW,
+                )
+            })
+            .collect();
+
+        // Warm-up.
+        for _ in 0..BUILDS_PER_TRIAL {
+            std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
+        }
+
+        let mut samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..BUILDS_PER_TRIAL {
+                std::hint::black_box(ActiveEdgeDiscoveryIndex::build(&views));
+            }
+            let elapsed = start.elapsed();
+            let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
+            eprintln!("  trial: {ns_per_build:.0} ns/build ({elapsed:?} total)");
+            samples.push(ns_per_build);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = samples[TRIALS / 2];
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "bench_active_edge_index_build: median={median:.0} ns/build, mean={mean:.0} \
+             ns/build (n={TRIALS}, views={VIEWS}, pages_per_view={PAGES_PER_VIEW})"
+        );
     }
 }
