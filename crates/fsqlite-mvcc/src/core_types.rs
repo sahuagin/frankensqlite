@@ -10,14 +10,14 @@
 use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
 use crate::cache_aligned::{
-    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis, CacheAligned,
-    SharedTxnSlot, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
+    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
 };
 use crate::ebr::VersionGuardTicket;
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
@@ -3769,8 +3769,8 @@ mod tests {
 
     #[test]
     fn test_commit_index_latest_monotone_under_concurrent_updates() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::thread;
 
         const FINAL_SEQ: u64 = 256;
@@ -4793,8 +4793,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
-        TAG_CLAIMING, TAG_CLEANING,
+        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING, TAG_CLEANING,
+        encode_claiming, encode_cleaning,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.
@@ -5826,7 +5826,7 @@ mod tests {
 
     #[test]
     fn test_txn_slot_cross_process_visibility_shared_slot() {
-        use std::sync::{mpsc, Arc, Mutex};
+        use std::sync::{Arc, Mutex, mpsc};
         use std::time::Instant;
 
         let scenario_started = Instant::now();
@@ -6180,17 +6180,23 @@ mod tests {
             .unwrap();
 
         // txn_b contends on page 10.
-        assert!(table
-            .try_acquire(PageNumber::new(10).unwrap(), txn_b)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_b)
+                .is_err()
+        );
         // txn_c contends on page 10.
-        assert!(table
-            .try_acquire(PageNumber::new(10).unwrap(), txn_c)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_c)
+                .is_err()
+        );
         // txn_b contends on page 20.
-        assert!(table
-            .try_acquire(PageNumber::new(20).unwrap(), txn_b)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(20).unwrap(), txn_b)
+                .is_err()
+        );
 
         assert_eq!(
             obs.metrics()
@@ -6338,8 +6344,8 @@ mod tests {
         // bd-3wop3.4: 8 threads each wait for a different page. Release one page.
         // Only the thread waiting for that page should wake quickly; others
         // should remain parked (or wake much later via spurious wakeup).
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         const NUM_THREADS: usize = 8;
         let table = Arc::new(InProcessPageLockTable::new());
