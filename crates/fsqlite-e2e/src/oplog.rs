@@ -211,7 +211,8 @@ pub fn preset_commutative_inserts_disjoint_keys(
     rows_per_worker: u32,
 ) -> OpLog {
     let transaction_size = 1;
-    let range_width = i64::from(rows_per_worker) * 2;
+    let seed_rows_per_worker = rows_per_worker.max(64);
+    let range_width = i64::from(seed_rows_per_worker) * 2;
 
     let header = OpLogHeader {
         fixture_id: fixture_id.to_owned(),
@@ -240,11 +241,14 @@ pub fn preset_commutative_inserts_disjoint_keys(
     });
     op_id += 1;
 
-    // Pre-shape the tree so the measured inserts land into worker-local ranges
-    // instead of all queueing behind the empty-table right edge.
+    // Pre-shape the tree so the measured inserts land into worker-local leaf
+    // ranges instead of all queueing behind the empty-table right edge.  Keep
+    // the seed floor high enough to split low-scale runs into multiple leaves;
+    // otherwise each worker gets disjoint rowids that still live on the same
+    // physical B-tree pages.
     for w in 0..worker_count {
         let base_key = i64::from(w) * range_width;
-        for r in 0..rows_per_worker {
+        for r in 0..seed_rows_per_worker {
             let seed_key = base_key + (i64::from(r) * 2);
             records.push(OpRecord {
                 op_id,
@@ -2314,20 +2318,20 @@ mod tests {
 
         assert_eq!(log.header.concurrency.transaction_size, 1);
 
-        // 1 CREATE + 40 setup INSERT SQL statements
+        // 1 CREATE + 4 × 64 setup INSERT SQL statements
         // + 4 workers × (10 × (1 BEGIN + 1 INSERT + 1 COMMIT))
-        // + 1 SELECT = 162
-        assert_eq!(log.records.len(), 162);
+        // + 1 SELECT = 378
+        assert_eq!(log.records.len(), 378);
 
         let setup_sql_count = log
             .records
             .iter()
             .take_while(|record| matches!(record.kind, OpKind::Sql { .. }))
             .count();
-        assert_eq!(setup_sql_count, 41);
+        assert_eq!(setup_sql_count, 257);
 
         // Verify measured inserts target disjoint odd-key ranges:
-        // worker 0 = {1,3,...,19}, worker 1 = {21,23,...,39}, etc.
+        // worker 0 = {1,3,...,19}, worker 1 = {129,131,...,147}, etc.
         let insert_keys: Vec<(u16, i64)> = log
             .records
             .iter()

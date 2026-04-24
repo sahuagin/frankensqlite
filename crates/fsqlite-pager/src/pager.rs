@@ -5209,26 +5209,28 @@ where
         };
 
         let journal_path = Self::journal_path(path);
-        // bd-yfdb6: acquire the per-path recovery fence before running the
-        // hot-journal probe. If another connection is already running
-        // recovery on this path, we block with bounded backoff
-        // (RECOVERY_FENCE_BACKOFF * RECOVERY_FENCE_MAX_RETRIES) and then
-        // surface BusyRecovery if the fence is still held — letting the
-        // caller retry cleanly.
-        let recovery_fence = recovery_fence_for_backend(&*vfs, path);
-        let _recovery_guard = recovery_fence.acquire_for_recovery()?;
+        let rollback_journal_exists = vfs.access(cx, &journal_path, AccessFlags::EXISTS)?;
+        if rollback_journal_exists {
+            // bd-yfdb6 / bd-ma5m2.1: acquire the per-path recovery fence only
+            // when there is a rollback journal to recover. Clean WAL-mode
+            // shared-file startup storms should not serialize every opener
+            // through a recovery fence just to rediscover "no journal".
+            let recovery_fence = recovery_fence_for_backend(&*vfs, path);
+            let _recovery_guard = recovery_fence.acquire_for_recovery()?;
 
-        // Hot journal recovery writes the database image back to its durable
-        // pre-commit state, so acquire EXCLUSIVE before replay even during
-        // initial open.
-        let _ = Self::recover_rollback_journal_if_present_locked(
-            cx,
-            &*vfs,
-            &mut db_file,
-            &journal_path,
-            page_size,
-            LockLevel::None,
-        )?;
+            // Hot journal recovery writes the database image back to its durable
+            // pre-commit state, so acquire EXCLUSIVE before replay even during
+            // initial open. The recovery helper re-checks journal existence
+            // after the fence in case another opener completed recovery first.
+            let _ = Self::recover_rollback_journal_if_present_locked(
+                cx,
+                &*vfs,
+                &mut db_file,
+                &journal_path,
+                page_size,
+                LockLevel::None,
+            )?;
+        }
 
         // Refresh file size after potential recovery.
         file_size = db_file.file_size(cx)?;
@@ -9875,6 +9877,50 @@ mod tests {
         assert_eq!(
             before_create_key, after_create_key,
             "shared state keys must stay stable when the db file is created after first open"
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn open_without_rollback_journal_skips_recovery_fence_convoy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clean-open.db");
+        let cx = Cx::new();
+
+        {
+            let _pager = SimplePager::open_with_cx(
+                &cx,
+                fsqlite_vfs::UnixVfs::new(),
+                &path,
+                PageSize::DEFAULT,
+            )
+            .expect("create clean database");
+        }
+
+        let journal_path = SimplePager::<fsqlite_vfs::UnixVfs>::journal_path(&path);
+        assert!(
+            !fsqlite_vfs::UnixVfs::new()
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .expect("journal existence probe"),
+            "test precondition: clean database must not have a rollback journal"
+        );
+
+        let fence = recovery_fence_for_path(&path);
+        let held = fence
+            .try_acquire_for_recovery()
+            .expect("hold recovery fence to simulate unrelated opener recovery");
+
+        let started = std::time::Instant::now();
+        let _reopened =
+            SimplePager::open_with_cx(&cx, fsqlite_vfs::UnixVfs::new(), &path, PageSize::DEFAULT)
+                .expect("clean open should not wait behind recovery fence");
+        let elapsed = started.elapsed();
+        drop(held);
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "clean shared-file open should skip the recovery fence when no rollback journal exists \
+             (elapsed {elapsed:?})"
         );
     }
 
@@ -22348,9 +22394,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let g = shared.read().unwrap();
-                    std::hint::black_box(
-                        g.load(std::sync::atomic::Ordering::Relaxed),
-                    );
+                    std::hint::black_box(g.load(std::sync::atomic::Ordering::Relaxed));
                 })
             })
             .collect();
