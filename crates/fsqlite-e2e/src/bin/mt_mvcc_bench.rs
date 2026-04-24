@@ -52,22 +52,27 @@
 //! * Each iteration creates a fresh tempfile so there's no state carried
 //!   across runs. `--iters=3` reports p50/p95/p99 across those 3 samples.
 
-use std::sync::{Arc, Barrier};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{fmt::Write as _, fs, path::Path, path::PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // ─── Defaults ─────────────────────────────────────────────────────────────
 
 const DEFAULT_ROWS_PER_THREAD: usize = 1_000;
 const DEFAULT_THREADS: &[usize] = &[1, 2, 4, 8, 16];
 const DEFAULT_ITERS: usize = 3;
+const DEFAULT_HISTORY_JSON: &str = ".bench-history/mt-mvcc-bench.latest.json";
 const ROWID_BASE_STRIDE: i64 = 1_000_000;
 const MAX_RETRIES: usize = 32;
 const RETRY_SLEEP_MS: u64 = 1;
-const REPORT_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench_report.v1";
+const STARTUP_COORDINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const PASS_OVER_PASS_SCHEMA_V1: &str = "fsqlite-e2e.mt_mvcc_bench.pass_over_pass.v1";
+const PASS_OVER_PASS_MAX_RATIO_DROP_PCT: f64 = 5.0;
+const REPORT_SCHEMA_V2: &str = "fsqlite-e2e.mt_mvcc_bench_report.v2";
 
 // ─── CLI parsing (manual — no clap in workspace) ─────────────────────────
 
@@ -78,6 +83,7 @@ struct Options {
     iters: usize,
     json_output: Option<PathBuf>,
     summary_md: Option<PathBuf>,
+    history_json: PathBuf,
 }
 
 impl Default for Options {
@@ -88,6 +94,7 @@ impl Default for Options {
             iters: DEFAULT_ITERS,
             json_output: None,
             summary_md: None,
+            history_json: PathBuf::from(DEFAULT_HISTORY_JSON),
         }
     }
 }
@@ -95,10 +102,12 @@ impl Default for Options {
 fn print_usage_and_exit(code: i32) -> ! {
     eprintln!(
         "usage: mt-mvcc-bench [--rows-per-thread=N] [--threads=N,N,...] [--iters=N] \\\n\
-         [--json-output=PATH] [--summary-md=PATH]\n\
+         [--json-output=PATH] [--summary-md=PATH] [--history-json=PATH]\n\
          \n\
          defaults: --rows-per-thread={DEFAULT_ROWS_PER_THREAD} \
-         --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}"
+         --threads=1,2,4,8,16 --iters={DEFAULT_ITERS}\n\
+         note: --rows-per-thread=0 reduces the run to shared-file worker open + synchronized start,\n\
+         which is the minimal repro for the 13+ thread startup-open failure."
     );
     std::process::exit(code);
 }
@@ -150,6 +159,9 @@ fn parse_args() -> Options {
             }
             "--summary-md" => {
                 opts.summary_md = Some(PathBuf::from(val));
+            }
+            "--history-json" => {
+                opts.history_json = PathBuf::from(val);
             }
             other => {
                 eprintln!("unknown argument: {other}");
@@ -234,7 +246,7 @@ impl RunStats {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ThreadComparisonReport {
     threads: usize,
     fsqlite_wps_p50: f64,
@@ -261,6 +273,55 @@ struct MtMvccBenchReport {
     rows_per_thread: usize,
     iterations: usize,
     thread_results: Vec<ThreadComparisonReport>,
+    pass_over_pass_gate: PassOverPassGateReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct PassOverPassGateReport {
+    schema_version: &'static str,
+    history_json_path: String,
+    threshold_ratio_drop_pct: f64,
+    status: &'static str,
+    previous_report_found: bool,
+    regressions: Vec<RatioRegression>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RatioRegression {
+    threads: usize,
+    previous_ratio: f64,
+    current_ratio: f64,
+    ratio_drop_pct: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HistoricalMtMvccBenchReport {
+    thread_results: Vec<ThreadComparisonReport>,
+}
+
+#[derive(Debug, Clone)]
+struct StartupFailure {
+    tid: usize,
+    error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupResultKind {
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct StartupOutcome {
+    tid: usize,
+    kind: StartupResultKind,
+    error: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StartupGateState {
+    release: bool,
+    abort: bool,
 }
 
 fn build_thread_report(
@@ -318,6 +379,26 @@ fn render_markdown_summary(report: &MtMvccBenchReport) -> String {
     let _ = writeln!(out, "- Rows per thread: `{}`", report.rows_per_thread);
     let _ = writeln!(out, "- Iterations: `{}`", report.iterations);
     let _ = writeln!(out, "- Schema: `{}`\n", report.schema_version);
+    let gate = &report.pass_over_pass_gate;
+    let _ = writeln!(
+        out,
+        "- Pass-over-pass gate: `{}` (threshold `{:.2}%`, history `{}`)",
+        gate.status, gate.threshold_ratio_drop_pct, gate.history_json_path
+    );
+    if !gate.regressions.is_empty() {
+        let _ = writeln!(out, "- Regressions:");
+        for regression in &gate.regressions {
+            let _ = writeln!(
+                out,
+                "  - {} threads: {:.2}x -> {:.2}x ({:.2}% drop)",
+                regression.threads,
+                regression.previous_ratio,
+                regression.current_ratio,
+                regression.ratio_drop_pct
+            );
+        }
+    }
+    let _ = writeln!(out);
     let _ = writeln!(
         out,
         "| Threads | fsqlite p50 wps | sqlite p50 wps | Throughput ratio | fsqlite p50 ms | sqlite p50 ms | Time ratio | fsqlite failed | sqlite failed |"
@@ -357,6 +438,92 @@ fn write_markdown_summary(path: &Path, report: &MtMvccBenchReport) -> Result<(),
         .map_err(|error| format!("write markdown summary {}: {error}", path.display()))
 }
 
+fn load_previous_report(path: &Path) -> Result<Option<HistoricalMtMvccBenchReport>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("read history report {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("parse history report {}: {error}", path.display()))
+}
+
+fn build_pass_over_pass_gate(
+    history_json: &Path,
+    previous: Option<&HistoricalMtMvccBenchReport>,
+    current_rows: &[ThreadComparisonReport],
+) -> PassOverPassGateReport {
+    let regressions = previous
+        .map(|previous| {
+            let previous_by_threads: BTreeMap<usize, f64> = previous
+                .thread_results
+                .iter()
+                .map(|row| (row.threads, row.throughput_ratio))
+                .collect();
+            current_rows
+                .iter()
+                .filter_map(|row| {
+                    let previous_ratio = *previous_by_threads.get(&row.threads)?;
+                    if previous_ratio <= 0.0 || row.throughput_ratio >= previous_ratio {
+                        return None;
+                    }
+                    let ratio_drop_pct =
+                        ((previous_ratio - row.throughput_ratio) / previous_ratio) * 100.0;
+                    (ratio_drop_pct > PASS_OVER_PASS_MAX_RATIO_DROP_PCT).then_some(
+                        RatioRegression {
+                            threads: row.threads,
+                            previous_ratio,
+                            current_ratio: row.throughput_ratio,
+                            ratio_drop_pct,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let status = if previous.is_none() {
+        "no_prior_report"
+    } else if regressions.is_empty() {
+        "passed"
+    } else {
+        "failed"
+    };
+    PassOverPassGateReport {
+        schema_version: PASS_OVER_PASS_SCHEMA_V1,
+        history_json_path: history_json.display().to_string(),
+        threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
+        status,
+        previous_report_found: previous.is_some(),
+        regressions,
+    }
+}
+
+fn format_startup_failures(label: &str, failures: &[StartupFailure]) -> String {
+    let details = failures
+        .iter()
+        .map(|failure| format!("t{}={}", failure.tid, failure.error))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{label} startup failed before synchronized start: {details}")
+}
+
+fn prepare_fsqlite_schema(path: &str) -> Result<(), String> {
+    let conn = fsqlite::Connection::open(path.to_owned())
+        .map_err(|error| format!("fsqlite open (init): {error}"))?;
+    for pragma in [
+        "PRAGMA page_size=4096;",
+        "PRAGMA journal_mode=WAL;",
+        "PRAGMA synchronous=NORMAL;",
+        "PRAGMA cache_size=-64000;",
+    ] {
+        let _ = conn.execute(pragma);
+    }
+    conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)")
+        .map_err(|error| format!("create table: {error}"))?;
+    Ok(())
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
     if values.is_empty() {
@@ -378,7 +545,15 @@ fn percentile_value(mut values: Vec<f64>, percentile: f64) -> f64 {
 
 // ─── FrankenSQLite workload ──────────────────────────────────────────────
 
-fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
+fn open_fsqlite_worker(path: &str) -> Result<(fsqlite::Connection, bool), String> {
+    let conn = fsqlite::Connection::open(path.to_owned())
+        .map_err(|error| format!("fsqlite open (worker): {error}"))?;
+    let concurrent_ok = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
+    let _ = conn.execute("PRAGMA busy_timeout=5000;");
+    Ok((conn, concurrent_ok))
+}
+
+fn run_fsqlite(threads: usize, rows_per_thread: usize) -> Result<RunResult, String> {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     let path = tmp
         .path()
@@ -386,36 +561,56 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
         .expect("tempfile path is utf-8")
         .to_owned();
 
-    // Initialise schema with a single connection before spawning workers.
-    {
-        let conn = fsqlite::Connection::open(path.clone()).expect("fsqlite open (init)");
-        for pragma in [
-            "PRAGMA page_size=4096;",
-            "PRAGMA journal_mode=WAL;",
-            "PRAGMA synchronous=NORMAL;",
-            "PRAGMA cache_size=-64000;",
-        ] {
-            let _ = conn.execute(pragma);
-        }
-        conn.execute("CREATE TABLE IF NOT EXISTS bench (id INTEGER PRIMARY KEY, payload TEXT)")
-            .expect("create table");
-    }
+    prepare_fsqlite_schema(&path)?;
 
     let path = Arc::new(path);
     let barrier = Arc::new(Barrier::new(threads));
+    let startup_gate = Arc::new((Mutex::new(StartupGateState::default()), Condvar::new()));
+    let (startup_tx, startup_rx) = mpsc::channel::<StartupOutcome>();
     let mut handles = Vec::with_capacity(threads);
 
     let t0 = Instant::now();
     for tid in 0..threads {
         let path = Arc::clone(&path);
         let barrier = Arc::clone(&barrier);
-        let handle = thread::spawn(move || -> (Duration, usize) {
+        let startup_gate = Arc::clone(&startup_gate);
+        let startup_tx = startup_tx.clone();
+        let handle = thread::spawn(move || -> Result<(Duration, usize), String> {
             // Each thread owns its own Connection (Connection: !Send + !Sync).
-            let conn =
-                fsqlite::Connection::open(path.as_str().to_owned()).expect("fsqlite open (worker)");
-            // MVCC + BEGIN CONCURRENT opt-in.
-            let concurrent_ok = conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").is_ok();
-            let _ = conn.execute("PRAGMA busy_timeout=5000;");
+            let (conn, concurrent_ok) = match open_fsqlite_worker(path.as_str()) {
+                Ok(worker) => {
+                    let _ = startup_tx.send(StartupOutcome {
+                        tid,
+                        kind: StartupResultKind::Ready,
+                        error: None,
+                    });
+                    worker
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(StartupOutcome {
+                        tid,
+                        kind: StartupResultKind::Failed,
+                        error: Some(error.clone()),
+                    });
+                    return Err(error);
+                }
+            };
+
+            let (gate_lock, gate_cv) = &*startup_gate;
+            let mut gate_state = gate_lock
+                .lock()
+                .map_err(|_| "fsqlite startup gate poisoned".to_owned())?;
+            while !gate_state.release && !gate_state.abort {
+                gate_state = gate_cv
+                    .wait(gate_state)
+                    .map_err(|_| "fsqlite startup gate poisoned while waiting".to_owned())?;
+            }
+            if gate_state.abort {
+                return Err(format!(
+                    "fsqlite t{tid} startup aborted after peer open failure"
+                ));
+            }
+            drop(gate_state);
 
             barrier.wait();
             let start = Instant::now();
@@ -450,16 +645,14 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
                         thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
                         continue;
                     }
-                    eprintln!("[fsqlite t{tid}] BEGIN failed: {e}");
-                    return (start.elapsed(), rows_per_thread);
+                    return Err(format!("[fsqlite t{tid}] BEGIN failed: {e}"));
                 }
 
                 let stmt = match conn.prepare(insert_sql) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("[fsqlite t{tid}] prepare failed: {e}");
                         let _ = conn.execute("ROLLBACK");
-                        return (start.elapsed(), rows_per_thread);
+                        return Err(format!("[fsqlite t{tid}] prepare failed: {e}"));
                     }
                 };
 
@@ -494,31 +687,67 @@ fn run_fsqlite(threads: usize, rows_per_thread: usize) -> RunResult {
                         thread::sleep(Duration::from_millis(RETRY_SLEEP_MS));
                     }
                     Err(e) => {
-                        eprintln!("[fsqlite t{tid}] COMMIT failed: {e}");
                         let _ = conn.execute("ROLLBACK");
-                        failed += rows_per_thread;
-                        break 'outer;
+                        return Err(format!("[fsqlite t{tid}] COMMIT failed: {e}"));
                     }
                 }
             }
 
-            (start.elapsed(), failed)
+            Ok((start.elapsed(), failed))
         });
         handles.push(handle);
     }
+    drop(startup_tx);
+
+    let mut startup_failures = Vec::new();
+    for _ in 0..threads {
+        let outcome = startup_rx.recv_timeout(STARTUP_COORDINATION_TIMEOUT).map_err(|error| {
+            format!(
+                "fsqlite startup coordination timed out after {:?}: {error}",
+                STARTUP_COORDINATION_TIMEOUT
+            )
+        })?;
+        if outcome.kind == StartupResultKind::Failed {
+            startup_failures.push(StartupFailure {
+                tid: outcome.tid,
+                error: outcome
+                    .error
+                    .unwrap_or_else(|| "unknown startup failure".to_owned()),
+            });
+        }
+    }
+
+    {
+        let (gate_lock, gate_cv) = &*startup_gate;
+        let mut gate_state = gate_lock
+            .lock()
+            .map_err(|_| "fsqlite startup gate poisoned".to_owned())?;
+        gate_state.release = startup_failures.is_empty();
+        gate_state.abort = !startup_failures.is_empty();
+        gate_cv.notify_all();
+    }
+
+    if !startup_failures.is_empty() {
+        for handle in handles {
+            let _ = handle.join();
+        }
+        return Err(format_startup_failures("fsqlite", &startup_failures));
+    }
 
     let mut total_failed = 0usize;
-    for h in handles {
-        let (_d, failed) = h.join().expect("thread join");
+    for (tid, h) in handles.into_iter().enumerate() {
+        let (_d, failed) = h
+            .join()
+            .map_err(|_| format!("fsqlite worker t{tid} panicked"))??;
         total_failed += failed;
     }
     let elapsed = t0.elapsed();
 
-    RunResult {
+    Ok(RunResult {
         best_elapsed: elapsed,
         total_rows: threads * rows_per_thread,
         failed_rows: total_failed,
-    }
+    })
 }
 
 // ─── C SQLite (rusqlite) workload ────────────────────────────────────────
@@ -654,12 +883,15 @@ fn run_rusqlite(threads: usize, rows_per_thread: usize) -> RunResult {
 
 // ─── Driver ───────────────────────────────────────────────────────────────
 
-fn collect_samples<F: FnMut() -> RunResult>(iters: usize, mut f: F) -> RunStats {
+fn collect_samples<F: FnMut() -> Result<RunResult, String>>(
+    iters: usize,
+    mut f: F,
+) -> Result<RunStats, String> {
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
-        samples.push(f());
+        samples.push(f()?);
     }
-    RunStats::new(samples)
+    Ok(RunStats::new(samples))
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -687,8 +919,8 @@ fn run() -> Result<(), String> {
         if n == 0 {
             continue;
         }
-        let fs = collect_samples(opts.iters, || run_fsqlite(n, opts.rows_per_thread));
-        let cs = collect_samples(opts.iters, || run_rusqlite(n, opts.rows_per_thread));
+        let fs = collect_samples(opts.iters, || run_fsqlite(n, opts.rows_per_thread))?;
+        let cs = collect_samples(opts.iters, || Ok(run_rusqlite(n, opts.rows_per_thread)))?;
         let report = build_thread_report(n, &fs, &cs);
 
         println!(
@@ -713,11 +945,16 @@ fn run() -> Result<(), String> {
         thread_results.push(report);
     }
 
+    let previous_report = load_previous_report(&opts.history_json)?;
+    let pass_over_pass_gate =
+        build_pass_over_pass_gate(&opts.history_json, previous_report.as_ref(), &thread_results);
+
     let full_report = MtMvccBenchReport {
-        schema_version: REPORT_SCHEMA_V1,
+        schema_version: REPORT_SCHEMA_V2,
         rows_per_thread: opts.rows_per_thread,
         iterations: opts.iters,
         thread_results,
+        pass_over_pass_gate,
     };
 
     if let Some(path) = opts.json_output.as_deref() {
@@ -727,6 +964,31 @@ fn run() -> Result<(), String> {
     if let Some(path) = opts.summary_md.as_deref() {
         write_markdown_summary(path, &full_report)?;
         eprintln!("mt-mvcc-bench: wrote markdown summary {}", path.display());
+    }
+    if full_report.pass_over_pass_gate.status != "failed" {
+        write_json_report(&opts.history_json, &full_report)?;
+        eprintln!(
+            "mt-mvcc-bench: updated pass-over-pass history {}",
+            opts.history_json.display()
+        );
+    }
+    if !full_report.pass_over_pass_gate.regressions.is_empty() {
+        return Err(format!(
+            "pass-over-pass ratio gate failed: {}",
+            full_report
+                .pass_over_pass_gate
+                .regressions
+                .iter()
+                .map(|regression| format!(
+                    "{}t {:.2}x -> {:.2}x ({:.2}% drop)",
+                    regression.threads,
+                    regression.previous_ratio,
+                    regression.current_ratio,
+                    regression.ratio_drop_pct
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     Ok(())
@@ -763,7 +1025,7 @@ mod tests {
     #[test]
     fn markdown_summary_renders_thread_rows() {
         let report = MtMvccBenchReport {
-            schema_version: REPORT_SCHEMA_V1,
+            schema_version: REPORT_SCHEMA_V2,
             rows_per_thread: 250,
             iterations: 1,
             thread_results: vec![ThreadComparisonReport {
@@ -785,11 +1047,83 @@ mod tests {
                 fsqlite_failed_rows: 0,
                 sqlite_failed_rows: 0,
             }],
+            pass_over_pass_gate: PassOverPassGateReport {
+                schema_version: PASS_OVER_PASS_SCHEMA_V1,
+                history_json_path: DEFAULT_HISTORY_JSON.to_owned(),
+                threshold_ratio_drop_pct: PASS_OVER_PASS_MAX_RATIO_DROP_PCT,
+                status: "passed",
+                previous_report_found: true,
+                regressions: Vec::new(),
+            },
         };
 
         let rendered = render_markdown_summary(&report);
 
         assert!(rendered.contains("# mt-mvcc-bench Summary"));
         assert!(rendered.contains("| 8 | 6090 | 55406 | 0.11x |"));
+        assert!(rendered.contains("Pass-over-pass gate"));
+    }
+
+    #[test]
+    fn pass_over_pass_gate_flags_ratio_drop_over_five_percent() {
+        let previous = HistoricalMtMvccBenchReport {
+            thread_results: vec![ThreadComparisonReport {
+                threads: 8,
+                fsqlite_wps_p50: 0.0,
+                fsqlite_wps_p95: 0.0,
+                fsqlite_wps_p99: 0.0,
+                sqlite_wps_p50: 0.0,
+                sqlite_wps_p95: 0.0,
+                sqlite_wps_p99: 0.0,
+                throughput_ratio: 0.50,
+                fsqlite_ms_p50: 0.0,
+                fsqlite_ms_p95: 0.0,
+                fsqlite_ms_p99: 0.0,
+                sqlite_ms_p50: 0.0,
+                sqlite_ms_p95: 0.0,
+                sqlite_ms_p99: 0.0,
+                time_ratio: 0.0,
+                fsqlite_failed_rows: 0,
+                sqlite_failed_rows: 0,
+            }],
+        };
+        let current = vec![ThreadComparisonReport {
+            threads: 8,
+            fsqlite_wps_p50: 0.0,
+            fsqlite_wps_p95: 0.0,
+            fsqlite_wps_p99: 0.0,
+            sqlite_wps_p50: 0.0,
+            sqlite_wps_p95: 0.0,
+            sqlite_wps_p99: 0.0,
+            throughput_ratio: 0.46,
+            fsqlite_ms_p50: 0.0,
+            fsqlite_ms_p95: 0.0,
+            fsqlite_ms_p99: 0.0,
+            sqlite_ms_p50: 0.0,
+            sqlite_ms_p95: 0.0,
+            sqlite_ms_p99: 0.0,
+            time_ratio: 0.0,
+            fsqlite_failed_rows: 0,
+            sqlite_failed_rows: 0,
+        }];
+
+        let gate = build_pass_over_pass_gate(
+            Path::new(DEFAULT_HISTORY_JSON),
+            Some(&previous),
+            &current,
+        );
+
+        assert_eq!(gate.status, "failed");
+        assert_eq!(gate.regressions.len(), 1);
+        assert_eq!(gate.regressions[0].threads, 8);
+        assert!((gate.regressions[0].ratio_drop_pct - 8.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn pass_over_pass_gate_skips_without_prior_report() {
+        let gate = build_pass_over_pass_gate(Path::new(DEFAULT_HISTORY_JSON), None, &[]);
+
+        assert_eq!(gate.status, "no_prior_report");
+        assert!(gate.regressions.is_empty());
     }
 }
