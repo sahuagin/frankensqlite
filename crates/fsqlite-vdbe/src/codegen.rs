@@ -30117,7 +30117,7 @@ mod tests {
                 left: Box::new(Expr::Column(
                     fsqlite_ast::ColumnRef {
                         table: None,
-                        column: "b".to_owned(),
+                        column: "b".into(),
                     },
                     Span::ZERO,
                 )),
