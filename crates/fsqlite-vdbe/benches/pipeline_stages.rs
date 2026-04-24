@@ -397,6 +397,7 @@ criterion_group!(
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,
     bench_vdbe_execute_decrjumpzero_stage,
+    bench_vdbe_execute_ifpos_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);
