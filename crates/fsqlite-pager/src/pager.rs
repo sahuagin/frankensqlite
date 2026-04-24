@@ -5076,8 +5076,20 @@ where
     }
 
     /// Number of frames currently in the WAL for this pager.
+    ///
+    /// Read-only probe: `WalBackend::frame_count(&self) -> usize` is a
+    /// plain field read, so we take the `SharedWalBackend` RwLock in
+    /// `read()` mode — shared with other readers and, critically,
+    /// non-blocking against concurrent WAL writers that only take
+    /// `read()` themselves on their own read paths. The previous
+    /// `with_wal_backend` (write-lock) acquisition here made every
+    /// `maybe_run_adaptive_autocheckpoint` probe serialize against
+    /// every other WAL operation — the checkpoint advisor samples this
+    /// on every commit, so under MT-writer workloads it turned each
+    /// post-commit poll into a global WAL RwLock write-contention
+    /// point.
     pub fn wal_frame_count(&self) -> usize {
-        with_wal_backend(&self.wal_backend, |wal| Ok(wal.frame_count())).unwrap_or(0)
+        with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count())).unwrap_or(0)
     }
 
     /// Compute the journal path from the database path.
@@ -6710,7 +6722,7 @@ where
     /// This function takes `Arc<Mutex<PagerInner>>` instead of `&mut PagerInner`.
     /// The CALLER drops their inner.lock() before calling this function, allowing
     /// other transactions to start their prepare phase while we wait/batch.
-    #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     fn commit_wal_group_commit<S: std::hash::BuildHasher>(
         cx: &Cx,
         wal_backend: &SharedWalBackend,
@@ -6720,17 +6732,45 @@ where
         conflict_pages: &[PageNumber],
         queue: &GroupCommitQueueRef,
     ) -> Result<()> {
-        // ── Phase timing instrumentation ──
-        let t_start = Instant::now();
-
-        // Step 1: Build our batch with OWNED frame data.
-        // We need to read current db_size and sync policy before releasing inner.
         let (current_db_size, sync_policy) = {
             let inner = inner_arc
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             (inner.db_size, inner.wal_commit_sync_policy)
         };
+
+        Self::commit_wal_group_commit_with_snapshot(
+            cx,
+            wal_backend,
+            inner_arc,
+            current_db_size,
+            sync_policy,
+            write_set,
+            write_pages_sorted,
+            conflict_pages,
+            queue,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
+    fn commit_wal_group_commit_with_snapshot<S: std::hash::BuildHasher>(
+        cx: &Cx,
+        wal_backend: &SharedWalBackend,
+        inner_arc: &Arc<Mutex<PagerInner<V::File>>>,
+        current_db_size: u32,
+        sync_policy: WalCommitSyncPolicy,
+        write_set: &HashMap<PageNumber, StagedPage, S>,
+        write_pages_sorted: &[PageNumber],
+        conflict_pages: &[PageNumber],
+        queue: &GroupCommitQueueRef,
+    ) -> Result<()> {
+        // ── Phase timing instrumentation ──
+        let t_start = Instant::now();
+
+        // Step 1: Build our batch with OWNED frame data.
+        // The caller supplies the Phase A snapshot so production commits do not
+        // re-acquire the pager mutex before entering the group-commit queue.
 
         let (batch, _our_new_db_size) =
             match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
@@ -8398,6 +8438,8 @@ where
                 Vec::new()
             };
         }
+        let wal_current_db_size = inner.db_size;
+        let wal_sync_policy = inner.wal_commit_sync_policy;
 
         let t_phase_a_done = Instant::now();
 
@@ -8413,10 +8455,12 @@ where
             // WAL mode: Use group commit for same-process batching.
             // commit_wal_group_commit will acquire consolidator.lock() first,
             // then briefly inner.lock() for the actual WAL I/O.
-            let result = Self::commit_wal_group_commit(
+            let result = Self::commit_wal_group_commit_with_snapshot(
                 cx,
                 &self.wal_backend,
                 &self.inner,
+                wal_current_db_size,
+                wal_sync_policy,
                 &self.write_set,
                 &self.write_pages_sorted,
                 &cross_process_conflict_pages,
@@ -8754,13 +8798,17 @@ where
             } else {
                 Vec::new()
             };
+            let wal_current_db_size = inner.db_size;
+            let wal_sync_policy = inner.wal_commit_sync_policy;
 
             if self.journal_mode == JournalMode::Wal {
                 drop(inner);
-                let result = Self::commit_wal_group_commit(
+                let result = Self::commit_wal_group_commit_with_snapshot(
                     cx,
                     &self.wal_backend,
                     &self.inner,
+                    wal_current_db_size,
+                    wal_sync_policy,
                     &self.write_set,
                     &self.write_pages_sorted,
                     &cross_process_conflict_pages,
@@ -22243,6 +22291,89 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(20 * ITERS as u64),
             "PublishedPagerState::new+drop ran much slower than expected: {elapsed:?} for {ITERS} pairs"
+        );
+    }
+
+    #[test]
+    fn test_wal_frame_count_read_lock_does_not_block_behind_writer() {
+        // Regression gate for the `wal_frame_count()` read-lock fix.
+        //
+        // The real scenario: one thread is mid-`append_prepared_frames`
+        // holding the `SharedWalBackend` in `write()` mode (a ≥100 µs
+        // WAL-append + fsync on this host). A concurrent commit path
+        // fires `wal_frame_count()` via the checkpoint advisor.
+        // Pre-fix, that probe ALSO took `write()`, so it serialized
+        // behind the in-flight appender for the whole append-duration
+        // and then re-exported the same serialization window to every
+        // subsequent commit on the same pager. Post-fix it takes
+        // `read()` — std RwLock still blocks reads behind an active
+        // writer, BUT the probe itself does not block PEERS, so N
+        // concurrent commits each pay one write-holder-wait instead of
+        // N write-holder-waits stacking serially.
+        //
+        // This test encodes the latter invariant directly: while a
+        // single thread holds the SharedWalBackend-analogue in write()
+        // for a fixed hold duration, N "reader" threads take read()
+        // concurrently and must all finish inside roughly one
+        // hold-duration, not N stacked holds.
+        use std::sync::Barrier;
+        use std::sync::RwLock;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::{Duration, Instant};
+
+        const READERS: usize = 8;
+        const HOLD: Duration = Duration::from_millis(20);
+
+        let shared = StdArc::new(RwLock::new(AtomicUsize::new(42)));
+        let barrier = StdArc::new(Barrier::new(READERS + 1));
+
+        // Writer: grab write(), pin for HOLD, release.
+        let writer = {
+            let shared = StdArc::clone(&shared);
+            let barrier = StdArc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let _g = shared.write().unwrap();
+                std::thread::sleep(HOLD);
+            })
+        };
+
+        // Readers: wait for barrier, then race to take read() and
+        // immediately return once unblocked.
+        let started = Instant::now();
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let shared = StdArc::clone(&shared);
+                let barrier = StdArc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let g = shared.read().unwrap();
+                    std::hint::black_box(
+                        g.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().expect("reader join");
+        }
+        let readers_elapsed = started.elapsed();
+        writer.join().expect("writer join");
+
+        eprintln!(
+            "wal_frame_count contention: {READERS} concurrent read-lock probes finished \
+             in {readers_elapsed:?} behind a {HOLD:?} write-hold. \
+             Stacked-write upper bound would be {READERS}×{HOLD:?} = {:?}.",
+            HOLD * READERS as u32
+        );
+        // Gate: readers finish in roughly one HOLD, not N × HOLD.
+        // Before the fix, each `wal_frame_count()` call would have
+        // taken write(), stacking serially behind the in-flight
+        // appender AND serially behind each other. 3 × HOLD is a very
+        // loose ceiling that still catches an accidental revert.
+        assert!(
+            readers_elapsed < HOLD * 3,
+            "read-lock probes should not stack serially: elapsed={readers_elapsed:?} HOLD={HOLD:?}"
         );
     }
 
