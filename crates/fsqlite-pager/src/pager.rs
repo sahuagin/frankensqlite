@@ -9643,8 +9643,7 @@ where
             // `wal_backend.write()` exclusively — a serialization
             // bubble for every concurrent commit on this pager.
             let wal_is_empty =
-                with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count()))
-                    .unwrap_or(0)
+                with_wal_backend_read(&self.wal_backend, |wal| Ok(wal.frame_count())).unwrap_or(0)
                     == 0;
             if wal_is_empty {
                 drop(inner);
