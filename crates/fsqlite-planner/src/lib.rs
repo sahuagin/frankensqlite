@@ -789,8 +789,16 @@ fn normalize_plan_cache_capacity(capacity: usize) -> NonZeroUsize {
     }
 }
 
+const PLAN_CACHE_DIRECT_SEED_TAG: u64 = 0x5A00_0000_0000_0000;
+const PLAN_CACHE_JOIN_SEED_TAG: u64 = 0xA500_0000_0000_0000;
+const PLAN_CACHE_FEATURE_LEAPFROG: u64 = 1_u64 << 32;
+const PLAN_CACHE_FEATURE_DPCCP: u64 = 1_u64 << 33;
+
 fn plan_cache_key(sql_template: &str, schema_cookie: u32) -> u64 {
-    xxh3_64_with_seed(sql_template.as_bytes(), u64::from(schema_cookie))
+    xxh3_64_with_seed(
+        sql_template.as_bytes(),
+        PLAN_CACHE_DIRECT_SEED_TAG | u64::from(schema_cookie),
+    )
 }
 
 fn plan_cache_key_with_feature_flags(
@@ -800,11 +808,20 @@ fn plan_cache_key_with_feature_flags(
 ) -> u64 {
     // Keep the schema cookie in the low 32 bits and pack feature toggles above
     // it so each plan-cache variant gets a distinct seed without heap work.
-    let feature_mask = (u64::from(u8::from(feature_flags.leapfrog_join)) << 32)
-        | (u64::from(u8::from(feature_flags.dpccp_join)) << 33);
+    // The high tag separates this join-order cache from the generic
+    // `cached_plan()` API; both APIs share `QueryPlanner::plan_cache`.
+    let feature_mask = if feature_flags.leapfrog_join {
+        PLAN_CACHE_FEATURE_LEAPFROG
+    } else {
+        0
+    } | if feature_flags.dpccp_join {
+        PLAN_CACHE_FEATURE_DPCCP
+    } else {
+        0
+    };
     xxh3_64_with_seed(
         sql_template.as_bytes(),
-        u64::from(schema_cookie) | feature_mask,
+        PLAN_CACHE_JOIN_SEED_TAG | u64::from(schema_cookie) | feature_mask,
     )
 }
 
@@ -9599,6 +9616,43 @@ mod tests {
         assert_eq!(*second, uncached);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(planner.plan_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_query_planner_cache_separates_generic_and_join_entries() {
+        let tables = vec![TableStats {
+            name: "users".to_owned(),
+            n_pages: 16,
+            n_rows: 1_000,
+            source: StatsSource::Heuristic,
+        }];
+        let sql_template = "SELECT * FROM users WHERE id = ?1";
+        let schema_cookie = 31;
+        let mut planner = QueryPlanner::default();
+
+        let generic = planner.cached_plan(sql_template, schema_cookie, || {
+            sample_cached_query_plan("generic-sentinel")
+        });
+        let join_plan = planner.order_joins_with_cache(
+            sql_template,
+            schema_cookie,
+            &tables,
+            &[],
+            &[],
+            None,
+            &[],
+            None,
+            None,
+            PlannerFeatureFlags::default(),
+        );
+
+        assert_eq!(generic.join_order, vec!["generic-sentinel".to_owned()]);
+        assert_eq!(join_plan.join_order, vec!["users".to_owned()]);
+        assert!(
+            !Arc::ptr_eq(&generic, &join_plan),
+            "generic cached_plan entries and join-order cache entries must not alias"
+        );
+        assert_eq!(planner.plan_cache_len(), 2);
     }
 
     #[test]
