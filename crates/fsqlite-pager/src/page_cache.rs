@@ -7006,9 +7006,8 @@ mod tests {
             0,
             "all resident pages should be drained before clear"
         );
-        assert_eq!(
+        assert!(
             slots.has_tombstones.load(Ordering::Acquire),
-            true,
             "drained colliders should leave a tombstone cleanup hint before clear"
         );
 
@@ -7017,9 +7016,8 @@ mod tests {
             removed, 0,
             "clearing a fully drained table should not report extra page evictions"
         );
-        assert_eq!(
-            slots.has_tombstones.load(Ordering::Acquire),
-            false,
+        assert!(
+            !slots.has_tombstones.load(Ordering::Acquire),
             "clear should consume the tombstone cleanup hint when no eviction races it"
         );
         assert!(
