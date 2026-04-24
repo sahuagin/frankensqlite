@@ -1375,13 +1375,13 @@ struct FlatPageSlots {
     mask: usize,
     /// Number of occupied (non-empty, non-tombstone) slots.
     count: AtomicUsize,
-    /// Number of deleted slots left behind to preserve linear-probe chains.
+    /// Conservative hint that deleted slots may be present.
     ///
     /// Tombstones are cheap to reuse during ordinary insert churn, but a
-    /// cache-wide clear is supposed to be a cold reset. Tracking them lets
-    /// `clear()` keep the empty fast path without leaving old probe-chain
-    /// pollution behind once all resident pages have been evicted.
-    tombstones: AtomicUsize,
+    /// cache-wide clear is supposed to be a cold reset. This flag lets
+    /// `clear()` keep the empty fast path without depending on an exact
+    /// tombstone count that could race with concurrent evictions.
+    has_tombstones: AtomicBool,
     /// Next slot index to probe first for arbitrary eviction.
     ///
     /// Sequential scans can force frequent evictions once the buffer pool
@@ -1409,7 +1409,7 @@ impl FlatPageSlots {
             mask: capacity - 1,
             slots: slots.into_boxed_slice(),
             count: AtomicUsize::new(0),
-            tombstones: AtomicUsize::new(0),
+            has_tombstones: AtomicBool::new(false),
             eviction_cursor: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -1499,14 +1499,6 @@ impl FlatPageSlots {
         }
     }
 
-    fn decrement_tombstones_after_reclaim(&self) {
-        let _ = self
-            .tombstones
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-                (count > 0).then_some(count - 1)
-            });
-    }
-
     /// Try to insert a page buffer. Returns `Ok(true)` if newly inserted,
     /// `Ok(false)` if an existing entry was updated, or `Err(buf)` if the
     /// table is full (caller should use overflow shards).
@@ -1555,9 +1547,6 @@ impl FlatPageSlots {
         ) {
             Ok(_) => {
                 *data_guard = Some(CachedPageEntry::new(buf));
-                if expected == SLOT_TOMBSTONE {
-                    self.decrement_tombstones_after_reclaim();
-                }
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -1583,7 +1572,7 @@ impl FlatPageSlots {
         {
             let _ = self.slots[idx].data.lock().take();
             self.count.fetch_sub(1, Ordering::Relaxed);
-            self.tombstones.fetch_add(1, Ordering::Relaxed);
+            self.has_tombstones.store(true, Ordering::Release);
             self.evictions.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1611,7 +1600,7 @@ impl FlatPageSlots {
             {
                 let _ = self.slots[idx].data.lock().take();
                 self.count.fetch_sub(1, Ordering::Relaxed);
-                self.tombstones.fetch_add(1, Ordering::Relaxed);
+                self.has_tombstones.store(true, Ordering::Release);
                 self.eviction_cursor
                     .store(idx.wrapping_add(1), Ordering::Relaxed);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1627,7 +1616,8 @@ impl FlatPageSlots {
         // every slot on each clear call. Under MT-writer contention this
         // accounted for 3.02% self-time at 8t on the 2026-04-23 post-T1
         // capture (`fsqlite-mt-post-t1t2t7-184420`).
-        if self.count.load(Ordering::Acquire) == 0 && self.tombstones.load(Ordering::Acquire) == 0 {
+        let had_tombstones = self.has_tombstones.swap(false, Ordering::AcqRel);
+        if self.count.load(Ordering::Acquire) == 0 && !had_tombstones {
             self.eviction_cursor.store(0, Ordering::Relaxed);
             return 0;
         }
@@ -1647,7 +1637,6 @@ impl FlatPageSlots {
             }
         }
         self.count.store(0, Ordering::Relaxed);
-        self.tombstones.store(0, Ordering::Relaxed);
         self.eviction_cursor.store(0, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
         self.evictions.fetch_add(removed as u64, Ordering::Relaxed);
@@ -1682,7 +1671,10 @@ impl std::fmt::Debug for FlatPageSlots {
         f.debug_struct("FlatPageSlots")
             .field("capacity", &(self.mask + 1))
             .field("count", &self.count.load(Ordering::Relaxed))
-            .field("tombstones", &self.tombstones.load(Ordering::Relaxed))
+            .field(
+                "has_tombstones",
+                &self.has_tombstones.load(Ordering::Relaxed),
+            )
             .field("hits", &self.hits.load(Ordering::Relaxed))
             .field("misses", &self.misses.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -7015,9 +7007,9 @@ mod tests {
             "all resident pages should be drained before clear"
         );
         assert_eq!(
-            slots.tombstones.load(Ordering::Relaxed),
-            4,
-            "each drained collider should leave a tombstone before clear"
+            slots.has_tombstones.load(Ordering::Acquire),
+            true,
+            "drained colliders should leave a tombstone cleanup hint before clear"
         );
 
         let removed = slots.clear();
@@ -7026,9 +7018,9 @@ mod tests {
             "clearing a fully drained table should not report extra page evictions"
         );
         assert_eq!(
-            slots.tombstones.load(Ordering::Relaxed),
-            0,
-            "clear should remove tombstones even when resident count is already zero"
+            slots.has_tombstones.load(Ordering::Acquire),
+            false,
+            "clear should consume the tombstone cleanup hint when no eviction races it"
         );
         assert!(
             slots
