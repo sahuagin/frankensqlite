@@ -1375,6 +1375,13 @@ struct FlatPageSlots {
     mask: usize,
     /// Number of occupied (non-empty, non-tombstone) slots.
     count: AtomicUsize,
+    /// Number of deleted slots left behind to preserve linear-probe chains.
+    ///
+    /// Tombstones are cheap to reuse during ordinary insert churn, but a
+    /// cache-wide clear is supposed to be a cold reset. Tracking them lets
+    /// `clear()` keep the empty fast path without leaving old probe-chain
+    /// pollution behind once all resident pages have been evicted.
+    tombstones: AtomicUsize,
     /// Next slot index to probe first for arbitrary eviction.
     ///
     /// Sequential scans can force frequent evictions once the buffer pool
@@ -1402,6 +1409,7 @@ impl FlatPageSlots {
             mask: capacity - 1,
             slots: slots.into_boxed_slice(),
             count: AtomicUsize::new(0),
+            tombstones: AtomicUsize::new(0),
             eviction_cursor: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -1491,6 +1499,14 @@ impl FlatPageSlots {
         }
     }
 
+    fn decrement_tombstones_after_reclaim(&self) {
+        let _ = self
+            .tombstones
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count > 0).then_some(count - 1)
+            });
+    }
+
     /// Try to insert a page buffer. Returns `Ok(true)` if newly inserted,
     /// `Ok(false)` if an existing entry was updated, or `Err(buf)` if the
     /// table is full (caller should use overflow shards).
@@ -1539,6 +1555,9 @@ impl FlatPageSlots {
         ) {
             Ok(_) => {
                 *data_guard = Some(CachedPageEntry::new(buf));
+                if expected == SLOT_TOMBSTONE {
+                    self.decrement_tombstones_after_reclaim();
+                }
                 self.count.fetch_add(1, Ordering::Relaxed);
                 self.admits.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
@@ -1564,6 +1583,7 @@ impl FlatPageSlots {
         {
             let _ = self.slots[idx].data.lock().take();
             self.count.fetch_sub(1, Ordering::Relaxed);
+            self.tombstones.fetch_add(1, Ordering::Relaxed);
             self.evictions.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -1591,6 +1611,7 @@ impl FlatPageSlots {
             {
                 let _ = self.slots[idx].data.lock().take();
                 self.count.fetch_sub(1, Ordering::Relaxed);
+                self.tombstones.fetch_add(1, Ordering::Relaxed);
                 self.eviction_cursor
                     .store(idx.wrapping_add(1), Ordering::Relaxed);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
@@ -1606,9 +1627,7 @@ impl FlatPageSlots {
         // every slot on each clear call. Under MT-writer contention this
         // accounted for 3.02% self-time at 8t on the 2026-04-23 post-T1
         // capture (`fsqlite-mt-post-t1t2t7-184420`).
-        if self.count.load(Ordering::Acquire) == 0 {
-            // Even when no pages are resident, tombstones can accumulate; we
-            // still want to reset the cursor to probe from the front.
+        if self.count.load(Ordering::Acquire) == 0 && self.tombstones.load(Ordering::Acquire) == 0 {
             self.eviction_cursor.store(0, Ordering::Relaxed);
             return 0;
         }
@@ -1618,10 +1637,7 @@ impl FlatPageSlots {
             // every slot even when the slot is already empty, which is the
             // dominant shape for a mostly-drained flat table.
             let observed = slot.pgno.load(Ordering::Relaxed);
-            if observed == SLOT_EMPTY || observed == SLOT_TOMBSTONE {
-                // Still record the state with a non-contending store in case
-                // another thread raced the load — the `!= SLOT_EMPTY` branch
-                // below handles genuine transitions.
+            if observed == SLOT_EMPTY {
                 continue;
             }
             let pgno = slot.pgno.swap(SLOT_EMPTY, Ordering::AcqRel);
@@ -1631,6 +1647,7 @@ impl FlatPageSlots {
             }
         }
         self.count.store(0, Ordering::Relaxed);
+        self.tombstones.store(0, Ordering::Relaxed);
         self.eviction_cursor.store(0, Ordering::Relaxed);
         #[allow(clippy::cast_possible_truncation)]
         self.evictions.fetch_add(removed as u64, Ordering::Relaxed);
@@ -1665,6 +1682,7 @@ impl std::fmt::Debug for FlatPageSlots {
         f.debug_struct("FlatPageSlots")
             .field("capacity", &(self.mask + 1))
             .field("count", &self.count.load(Ordering::Relaxed))
+            .field("tombstones", &self.tombstones.load(Ordering::Relaxed))
             .field("hits", &self.hits.load(Ordering::Relaxed))
             .field("misses", &self.misses.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -6968,6 +6986,69 @@ mod tests {
                 "replacement_page": replacement.get(),
                 "reclaimed_slot": removed_slot
             }),
+        );
+    }
+
+    #[test]
+    fn test_track_q_flat_hash_clear_reclaims_tombstones_after_full_drain() {
+        let slots = FlatPageSlots::new(64);
+        let target_bucket = slots.hash_pgno(PageNumber::ONE.get());
+        let colliders = track_q_collision_pages(&slots, target_bucket, 6);
+
+        for page_no in colliders.iter().copied().take(4) {
+            slots
+                .try_insert(page_no, track_q_page_buf(page_no))
+                .expect("tombstone-clear setup insert should stay in flat slots");
+        }
+
+        for page_no in colliders.iter().copied().take(4) {
+            assert!(
+                slots.remove(page_no),
+                "setup page {} should be removable",
+                page_no.get()
+            );
+        }
+
+        assert_eq!(
+            slots.len(),
+            0,
+            "all resident pages should be drained before clear"
+        );
+        assert_eq!(
+            slots.tombstones.load(Ordering::Relaxed),
+            4,
+            "each drained collider should leave a tombstone before clear"
+        );
+
+        let removed = slots.clear();
+        assert_eq!(
+            removed, 0,
+            "clearing a fully drained table should not report extra page evictions"
+        );
+        assert_eq!(
+            slots.tombstones.load(Ordering::Relaxed),
+            0,
+            "clear should remove tombstones even when resident count is already zero"
+        );
+        assert!(
+            slots
+                .slots
+                .iter()
+                .all(|slot| slot.pgno.load(Ordering::Acquire) == SLOT_EMPTY),
+            "clear should restore every flat slot to the empty sentinel"
+        );
+
+        let replacement = colliders[4];
+        assert!(
+            slots
+                .try_insert(replacement, track_q_page_buf(replacement))
+                .expect("replacement insert after clear should stay in flat slots"),
+            "replacement page should be newly inserted after clear"
+        );
+        assert_eq!(
+            track_q_probe_distance(&slots, replacement),
+            0,
+            "replacement should start a fresh probe chain after tombstone cleanup"
         );
     }
 
