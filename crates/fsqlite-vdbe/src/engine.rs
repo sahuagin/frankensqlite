@@ -11810,6 +11810,20 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // SCopy is the shallow single-register copy — used whenever
+            // codegen needs to shuttle a value between two registers without
+            // the range semantics of Copy. The body is `clone + set_reg_fast`,
+            // same shape as Copy with p3=0, so the dispatch-shortening benefit
+            // carries over. Mirrors the existing main-match arm exactly (no
+            // sideband materialization — preserved to avoid behaviour drift
+            // from the pre-existing SCopy semantics; fix that in a separate
+            // commit if/when oracle tests expose the gap).
+            Opcode::SCopy => {
+                let val = self.get_reg(op.p1).clone();
+                self.set_reg_fast(op.p2, val);
+                *pc += 1;
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -20280,6 +20294,35 @@ mod tests {
         });
         assert_eq!(rows[0], vec![SqliteValue::Text("copy_me".into())]);
         assert_eq!(rows[1], vec![SqliteValue::Text("copy_me".into())]);
+    }
+
+    #[test]
+    fn test_scopy_register_via_hot_path() {
+        // SCopy (shallow copy) lives in `try_execute_hot_opcode`: this test
+        // pins the hot-path arm to the same single-register `clone + write`
+        // semantics as the main-match arm. Uses a heap-carrying Text so a
+        // subsequent mutation of the destination can't alias the source.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let src = b.alloc_reg();
+            let dst = b.alloc_reg();
+            b.emit_op(
+                Opcode::String8,
+                0,
+                src,
+                0,
+                P4::Str("shallow_me".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, src, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, dst, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("shallow_me".into())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("shallow_me".into())]);
     }
 
     #[test]
