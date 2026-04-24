@@ -731,10 +731,12 @@ impl CellSlotCache {
                     .slots
                     .iter()
                     .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
-                if slot.is_some() {
-                    CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
-                } else {
-                    CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                if crate::instrumentation::copy_profile_enabled() {
+                    if slot.is_some() {
+                        CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
+                    } else {
+                        CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                    }
                 }
                 return slot;
             }
@@ -771,10 +773,12 @@ impl CellSlotCache {
             }
         }
         let Some(entry_idx) = matching_idx else {
-            if saw_page {
-                CELL_SLOT_CACHE_MISS_INVALIDATED.fetch_add(1, Relaxed);
-            } else {
-                CELL_SLOT_CACHE_MISS_COLD.fetch_add(1, Relaxed);
+            if crate::instrumentation::copy_profile_enabled() {
+                if saw_page {
+                    CELL_SLOT_CACHE_MISS_INVALIDATED.fetch_add(1, Relaxed);
+                } else {
+                    CELL_SLOT_CACHE_MISS_COLD.fetch_add(1, Relaxed);
+                }
             }
             return None;
         };
@@ -784,7 +788,9 @@ impl CellSlotCache {
             .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
         match slot {
             Some(found) => {
-                CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
+                if crate::instrumentation::copy_profile_enabled() {
+                    CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
+                }
                 if entry_idx != 0 {
                     let entry = self.entries.remove(entry_idx);
                     self.entries.insert(0, entry);
@@ -792,7 +798,9 @@ impl CellSlotCache {
                 Some(found)
             }
             None => {
-                CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                if crate::instrumentation::copy_profile_enabled() {
+                    CELL_SLOT_CACHE_MISS_SLOT.fetch_add(1, Relaxed);
+                }
                 None
             }
         }
@@ -945,6 +953,24 @@ impl TableAppendHint {
     pub fn without_page_data(mut self) -> Self {
         self.page_data = None;
         self
+    }
+
+    /// In-place variant of [`Self::without_page_data`] for hot-path
+    /// callers that already have a `&mut TableAppendHint` and want to
+    /// drop the cached page data without paying the two by-value
+    /// struct moves (take out, modify, put back) that the consuming
+    /// variant forces.
+    ///
+    /// On an INSERT hotpath this matters: `TableAppendHint` carries a
+    /// `BtreePageHeader` (Copy, ~32 B) plus the 48-byte `Option<PageData>`
+    /// plus the other fields, so each by-value round-trip is ~100 B of
+    /// memcpy per row. At 650 k wps on a 1-thread workload that is
+    /// ~150 MB/s of pointless motion; attributable to the
+    /// `store_prepared_direct_insert_append_hint` 3.98% self-time bar
+    /// observed in the 2026-04-24 1-thread profile
+    /// (`tests/artifacts/perf/1t-gap-20260424T2050Z/`).
+    pub fn clear_page_data(&mut self) {
+        self.page_data = None;
     }
 
     #[must_use]
@@ -14297,6 +14323,19 @@ mod tests {
     #[test]
     #[ignore = "audit benchmark; run with `--release --ignored --nocapture`"]
     fn audit_cell_slot_cache_hit_rate_write_vs_read() {
+        // bd-9e3xf.5: CellSlotCache hit/miss counters are now gated by the
+        // copy-profile flag (shared with other btree instrumentation) so the
+        // 1-thread write hot path doesn't pay a `lock xadd` per `get`. The
+        // audit needs the gate enabled to observe any counts.
+        crate::instrumentation::set_btree_copy_profile_enabled(true);
+        struct GateGuard;
+        impl Drop for GateGuard {
+            fn drop(&mut self) {
+                crate::instrumentation::set_btree_copy_profile_enabled(false);
+            }
+        }
+        let _gate_guard = GateGuard;
+
         const ROWS: i64 = 10_000;
         const PAYLOAD: &[u8] = b"cc_3_audit_payload_0123456789abcdef";
 
@@ -14506,6 +14545,82 @@ mod tests {
             "[replace_separator_inline] direct={fast_ns:.3}ns  parse_cell_at={slow_ns:.3}ns  \
              speedup={:.2}x  (children={CHILDREN}, iters={ITERS})",
             slow_ns / fast_ns.max(f64::EPSILON)
+        );
+    }
+
+    /// bd-9e3xf.5 microbench: CellSlotCache::get hot-front-entry path with
+    /// the copy-profile gate OFF (production default, 1t write path) vs ON
+    /// (observability mode, as used by the audit benchmark).
+    ///
+    /// The counters added in bd-9e3xf fire six `AtomicU64::fetch_add(1,
+    /// Relaxed)` callsites across `get`/`get_slow`. On the 1-thread write
+    /// hot path those counters are pure overhead. Gating them behind the
+    /// same profile flag that already gates `record_*_copy` etc. restores
+    /// the get-fast-path cost to where it was pre-instrumentation.
+    #[test]
+    #[ignore = "micro-benchmark; run with `--release --ignored --nocapture`"]
+    fn bench_cell_slot_cache_get_gate_on_vs_off() {
+        const PREFILL: u32 = 32;
+        const WARMUP: u32 = 200_000;
+        const ITERS: u32 = 10_000_000;
+
+        fn sample_slot(payload_size: u32) -> CachedCellSlot {
+            CachedCellSlot {
+                left_child: None,
+                rowid: Some(1),
+                payload_size,
+                local_size: payload_size,
+                payload_offset: 128,
+                overflow_page: None,
+            }
+        }
+
+        let hot_page = pn(999);
+        let hot_counter = 0x1234_5678_u64;
+        let slot = sample_slot(32);
+
+        let prime_cache = |cache: &mut CellSlotCache| {
+            for i in 0..PREFILL {
+                let page = pn(i + 2);
+                cache.insert_slow(page, u64::from(i.wrapping_add(0xAB00)), 0, sample_slot(16));
+            }
+            for warmup in 0..10_u16 {
+                cache.insert_slow(hot_page, hot_counter, warmup, slot);
+            }
+            assert_eq!(cache.entries.first().unwrap().page_no, hot_page);
+        };
+
+        // --- Gate OFF: production default (1t write path) ---
+        crate::instrumentation::set_btree_copy_profile_enabled(false);
+        let mut cache_off = CellSlotCache::default();
+        prime_cache(&mut cache_off);
+        for i in 0..WARMUP {
+            std::hint::black_box(cache_off.get(hot_page, hot_counter, (i % 10) as u16));
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            std::hint::black_box(cache_off.get(hot_page, hot_counter, (i % 10) as u16));
+        }
+        let off_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+
+        // --- Gate ON: observability / audit mode ---
+        crate::instrumentation::set_btree_copy_profile_enabled(true);
+        let mut cache_on = CellSlotCache::default();
+        prime_cache(&mut cache_on);
+        for i in 0..WARMUP {
+            std::hint::black_box(cache_on.get(hot_page, hot_counter, (i % 10) as u16));
+        }
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            std::hint::black_box(cache_on.get(hot_page, hot_counter, (i % 10) as u16));
+        }
+        let on_ns = t0.elapsed().as_secs_f64() * 1_000_000_000.0 / f64::from(ITERS);
+        crate::instrumentation::set_btree_copy_profile_enabled(false);
+
+        println!(
+            "[cell_slot_cache get gate] profile_off={off_ns:.3}ns  profile_on={on_ns:.3}ns  \
+             counter_cost={:.3}ns  (prefill={PREFILL}, iters={ITERS})",
+            on_ns - off_ns
         );
     }
 }

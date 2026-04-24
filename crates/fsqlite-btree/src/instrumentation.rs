@@ -203,7 +203,7 @@ static BTREE_NONROOT_BALANCE_CALLS: AtomicU64 = AtomicU64::new(0);
 static BTREE_NONROOT_BALANCE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-fn copy_profile_enabled() -> bool {
+pub(crate) fn copy_profile_enabled() -> bool {
     BTREE_COPY_PROFILE_ENABLED.load(Ordering::Relaxed)
 }
 
