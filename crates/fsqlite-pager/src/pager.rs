@@ -2670,7 +2670,8 @@ impl StripedCounter64 {
 }
 
 const ATOMIC_PUBLISHED_PAGE_LIMIT: u32 = 65_535;
-const ATOMIC_PUBLISHED_SLOT_COUNT: usize = 65_535;
+const ATOMIC_PUBLISHED_MIN_SLOT_COUNT: usize = 4_096;
+const ATOMIC_PUBLISHED_MAX_SLOT_COUNT: usize = ATOMIC_PUBLISHED_PAGE_LIMIT as usize;
 
 /// Direct-index slot for concurrently published pages below
 /// [`ATOMIC_PUBLISHED_PAGE_LIMIT`].
@@ -2691,8 +2692,14 @@ struct AtomicPublishedPages {
 }
 
 impl AtomicPublishedPages {
-    fn new() -> Self {
-        let slots = (0..ATOMIC_PUBLISHED_SLOT_COUNT)
+    fn new(initial_db_size: u32) -> Self {
+        let initial_pages =
+            usize::try_from(initial_db_size).unwrap_or(ATOMIC_PUBLISHED_MAX_SLOT_COUNT);
+        let slot_count = initial_pages.clamp(
+            ATOMIC_PUBLISHED_MIN_SLOT_COUNT,
+            ATOMIC_PUBLISHED_MAX_SLOT_COUNT,
+        );
+        let slots = (0..slot_count)
             .map(|_| AtomicPublishedPageSlot {
                 present: AtomicBool::new(false),
                 page: Mutex::new(None),
@@ -2706,16 +2713,27 @@ impl AtomicPublishedPages {
     }
 
     #[inline]
-    fn slot_index(page_no: PageNumber) -> Option<usize> {
+    fn slot_index(&self, page_no: PageNumber) -> Option<usize> {
         let raw = page_no.get();
         if raw > ATOMIC_PUBLISHED_PAGE_LIMIT {
             return None;
         }
-        usize::try_from(raw.saturating_sub(1)).ok()
+        let idx = usize::try_from(raw.saturating_sub(1)).ok()?;
+        (idx < self.slots.len()).then_some(idx)
+    }
+
+    #[inline]
+    fn accepts(&self, page_no: PageNumber) -> bool {
+        self.slot_index(page_no).is_some()
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.len()
     }
 
     fn get(&self, page_no: PageNumber) -> Option<PageData> {
-        let idx = Self::slot_index(page_no)?;
+        let idx = self.slot_index(page_no)?;
         let slot = &self.slots[idx];
         if !slot.present.load(AtomicOrdering::Acquire) {
             return None;
@@ -2727,7 +2745,7 @@ impl AtomicPublishedPages {
     }
 
     fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
-        let Some(idx) = Self::slot_index(page_no) else {
+        let Some(idx) = self.slot_index(page_no) else {
             return false;
         };
         let slot = &self.slots[idx];
@@ -2746,7 +2764,7 @@ impl AtomicPublishedPages {
     }
 
     fn remove(&self, page_no: PageNumber) -> bool {
-        let Some(idx) = Self::slot_index(page_no) else {
+        let Some(idx) = self.slot_index(page_no) else {
             return false;
         };
         let slot = &self.slots[idx];
@@ -2824,7 +2842,7 @@ impl AtomicPublishedPages {
     }
 
     fn prefetch_hint(&self, page_no: PageNumber) {
-        let Some(idx) = Self::slot_index(page_no) else {
+        let Some(idx) = self.slot_index(page_no) else {
             return;
         };
         let slot = &self.slots[idx];
@@ -2932,15 +2950,15 @@ struct PublishedPages {
 }
 
 impl PublishedPages {
-    fn new() -> Self {
+    fn new(initial_db_size: u32) -> Self {
         Self {
-            atomic: AtomicPublishedPages::new(),
+            atomic: AtomicPublishedPages::new(initial_db_size),
             overflow: ConcurrentPublishedPages::new(),
         }
     }
 
     fn get(&self, page_no: PageNumber) -> Option<PageData> {
-        if AtomicPublishedPages::slot_index(page_no).is_some() {
+        if self.atomic.accepts(page_no) {
             self.atomic.get(page_no)
         } else {
             self.overflow.get(page_no)
@@ -2948,7 +2966,7 @@ impl PublishedPages {
     }
 
     fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
-        if AtomicPublishedPages::slot_index(page_no).is_some() {
+        if self.atomic.accepts(page_no) {
             self.atomic.insert(page_no, page)
         } else {
             self.overflow.insert(page_no, page)
@@ -2956,7 +2974,7 @@ impl PublishedPages {
     }
 
     fn remove(&self, page_no: PageNumber) -> bool {
-        if AtomicPublishedPages::slot_index(page_no).is_some() {
+        if self.atomic.accepts(page_no) {
             self.atomic.remove(page_no)
         } else {
             self.overflow.remove(page_no)
@@ -2982,7 +3000,7 @@ impl PublishedPages {
     {
         let mut overflow_pages = Vec::new();
         for (page_no, page) in pages {
-            if AtomicPublishedPages::slot_index(page_no).is_some() {
+            if self.atomic.accepts(page_no) {
                 let _ = self.atomic.insert(page_no, page);
             } else {
                 overflow_pages.push((page_no, page));
@@ -2998,11 +3016,16 @@ impl PublishedPages {
     }
 
     fn prefetch_hint(&self, page_no: PageNumber) {
-        if AtomicPublishedPages::slot_index(page_no).is_some() {
+        if self.atomic.accepts(page_no) {
             self.atomic.prefetch_hint(page_no);
         } else {
             self.overflow.prefetch_hint(page_no);
         }
+    }
+
+    #[cfg(test)]
+    fn atomic_slot_count(&self) -> usize {
+        self.atomic.slot_count()
     }
 }
 
@@ -3200,7 +3223,7 @@ impl PublishedPagerState {
             publication_write_count: AtomicU64::new(0),
             read_retry_count: StripedCounter64::new(),
             published_page_hits: StripedCounter64::new(),
-            pages: PublishedPages::new(),
+            pages: PublishedPages::new(db_size),
         }
     }
 
@@ -21626,7 +21649,7 @@ mod tests {
 
     #[test]
     fn test_published_pages_len_tracks_insert_remove_clear() {
-        let published_pages = PublishedPages::new();
+        let published_pages = PublishedPages::new(0);
         let page_two = PageNumber::new(2).unwrap();
         let page_three = PageNumber::new(3).unwrap();
 
@@ -21655,7 +21678,7 @@ mod tests {
 
     #[test]
     fn test_published_pages_overflow_insert_remove_clear_tracks_count() {
-        let published_pages = PublishedPages::new();
+        let published_pages = PublishedPages::new(0);
         let overflow_page = PageNumber::new(70_000).unwrap();
 
         assert_eq!(published_pages.len(), 0);
@@ -21694,7 +21717,7 @@ mod tests {
 
     #[test]
     fn test_published_pages_insert_batch_and_retain_track_page_count() {
-        let published_pages = PublishedPages::new();
+        let published_pages = PublishedPages::new(0);
         let page_two = PageNumber::new(2).unwrap();
         let page_sixty_five = PageNumber::new(65).unwrap();
         let page_seventy_thousand = PageNumber::new(70_000).unwrap();
@@ -21726,6 +21749,32 @@ mod tests {
         assert!(published_pages.get(page_two).is_none());
         assert!(published_pages.get(page_sixty_five).is_some());
         assert!(published_pages.get(page_seventy_thousand).is_some());
+    }
+
+    #[test]
+    fn test_published_pages_direct_slots_use_small_database_floor() {
+        let published_pages = PublishedPages::new(1);
+        assert_eq!(
+            published_pages.atomic_slot_count(),
+            ATOMIC_PUBLISHED_MIN_SLOT_COUNT,
+            "small databases should not allocate the full direct-slot plane"
+        );
+
+        let floor_page =
+            u32::try_from(ATOMIC_PUBLISHED_MIN_SLOT_COUNT).expect("slot floor fits in u32");
+        let direct_edge = PageNumber::new(floor_page).unwrap();
+        let overflow_edge = PageNumber::new(floor_page + 1).unwrap();
+        assert!(published_pages.insert(direct_edge, PageData::from_vec(sample_page(0xA1))));
+        assert!(published_pages.insert(overflow_edge, PageData::from_vec(sample_page(0xA2))));
+        assert_eq!(
+            published_pages.get(direct_edge),
+            Some(PageData::from_vec(sample_page(0xA1)))
+        );
+        assert_eq!(
+            published_pages.get(overflow_edge),
+            Some(PageData::from_vec(sample_page(0xA2)))
+        );
+        assert_eq!(published_pages.len(), 2);
     }
 
     #[test]
@@ -24154,7 +24203,7 @@ mod tests {
     fn test_sharded_publish_no_reader_blocking() {
         const BEAD: &str = "bd-3wop3.8";
 
-        let pages = PublishedPages::new();
+        let pages = PublishedPages::new(0);
 
         let page_data = |seed: u8| -> PageData {
             let buf = vec![seed; PageSize::DEFAULT.as_usize()];
