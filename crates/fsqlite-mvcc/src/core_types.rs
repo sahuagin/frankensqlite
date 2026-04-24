@@ -1020,9 +1020,22 @@ impl InProcessPageLockTable {
                 drop(gate);
             }
 
-            // Unregister after waking (may have been removed by notify already,
-            // but unregister_waiter handles that gracefully).
-            self.unregister_waiter(page);
+            // Post-wake fast path: if the holder has changed, the release
+            // side's `notify_waiters_for_page` already drained our entry via
+            // `map.remove(&page)`, so we can return without taking the
+            // waiter-shard mutex. This skips one mutex acquire per successful
+            // wake. On the production MT 8t profile `unregister_waiter` shows
+            // 3.00% self-time (see memory/session_2026_04_23_profiling_campaign.md);
+            // this eliminates ~half of those calls on the successful-wake
+            // path. The spurious-wake / timeout branch still unregisters so
+            // the next iteration's `register_waiter` does not duplicate the
+            // thread in the queue.
+            match self.holder(page) {
+                Some(holder) if holder == observed_holder => {
+                    self.unregister_waiter(page);
+                }
+                _ => return true,
+            }
         }
     }
 
@@ -3279,6 +3292,109 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(10),
             "timeout path should not return immediately"
+        );
+    }
+
+    /// Microbench for the `wait_for_holder_change` post-park hot wake path
+    /// (bd-xeaze). Producer holds the page for a fixed ~30µs spin so the
+    /// consumer reliably enters the `park_timeout` branch of
+    /// `wait_for_holder_change`; the producer then releases (triggering
+    /// `notify_waiters_for_page`), flips the TxnId, and reacquires.
+    ///
+    /// The consumer uses a third TxnId and only observes the holder, so the
+    /// producer/consumer do not race for the lock. This isolates the
+    /// register/park/post-park-unregister cost from scheduler luck.
+    ///
+    /// Not a correctness test; ignored by default. Reports wakes/sec averaged
+    /// over N trials. Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    test_in_process_lock_table_wait_for_holder_change_microbench \
+    ///    --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn test_in_process_lock_table_wait_for_holder_change_microbench() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        fn run_trial(duration: Duration) -> u64 {
+            let table = Arc::new(InProcessPageLockTable::new());
+            let page = PageNumber::new(17).unwrap();
+            let txn_a = TxnId::new(1).unwrap();
+            let txn_b = TxnId::new(2).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let wakes = Arc::new(AtomicUsize::new(0));
+
+            table.try_acquire(page, txn_a).unwrap();
+
+            let t_prod = Arc::clone(&table);
+            let stop_p = Arc::clone(&stop);
+            // Producer holds for this many spin iterations between releases,
+            // giving the consumer enough time to reach `park_timeout` before
+            // the holder flips. Sized empirically to a few tens of µs on x86.
+            const PRODUCER_HOLD_SPINS: u32 = 4_000;
+            let producer = std::thread::spawn(move || {
+                let mut current = txn_a;
+                while !stop_p.load(Ordering::Relaxed) {
+                    for _ in 0..PRODUCER_HOLD_SPINS {
+                        std::hint::spin_loop();
+                    }
+                    let next = if current == txn_a { txn_b } else { txn_a };
+                    t_prod.release(page, current);
+                    while t_prod.try_acquire(page, next).is_err() {
+                        std::hint::spin_loop();
+                    }
+                    current = next;
+                }
+                t_prod.release(page, current);
+            });
+
+            // Multiple consumer threads contend on the same waiter shard for
+            // `page`, so notify/register/unregister traffic stresses the
+            // waiter-shard mutex path that `wait_for_holder_change` exercises.
+            const CONSUMERS: usize = 6;
+            let mut consumers = Vec::with_capacity(CONSUMERS);
+            for _ in 0..CONSUMERS {
+                let t_cons = Arc::clone(&table);
+                let stop_c = Arc::clone(&stop);
+                let wakes_c = Arc::clone(&wakes);
+                consumers.push(std::thread::spawn(move || {
+                    while !stop_c.load(Ordering::Relaxed) {
+                        let Some(holder) = t_cons.holder(page) else {
+                            continue;
+                        };
+                        if t_cons.wait_for_holder_change(page, holder, Duration::from_millis(5)) {
+                            wakes_c.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
+
+            std::thread::sleep(duration);
+            stop.store(true, Ordering::Relaxed);
+            producer.join().unwrap();
+            for c in consumers {
+                c.join().unwrap();
+            }
+
+            wakes.load(Ordering::Relaxed) as u64
+        }
+
+        const TRIALS: usize = 5;
+        let duration = Duration::from_millis(500);
+        let mut samples = Vec::with_capacity(TRIALS);
+        // Warm-up trial to prime caches/thread-local state.
+        let _ = run_trial(duration);
+        for _ in 0..TRIALS {
+            let wakes = run_trial(duration);
+            let rate = wakes as f64 / duration.as_secs_f64();
+            eprintln!("  trial: {wakes} wakes, {rate:.0} wakes/sec");
+            samples.push(rate);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = samples[TRIALS / 2];
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "wait_for_holder_change microbench: median={median:.0} wakes/sec, mean={mean:.0} \
+             wakes/sec (n={TRIALS}, {duration:?}/trial)"
         );
     }
 
