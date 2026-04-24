@@ -5,8 +5,8 @@
 
 use fsqlite_ast::Span;
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
+use hashbrown::HashSet;
 use memchr::memchr;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
