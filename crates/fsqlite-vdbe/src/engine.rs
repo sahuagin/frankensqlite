@@ -11824,6 +11824,31 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // DecrJumpZero is the canonical LIMIT counter: fires once per
+            // emitted result row. Body reads a register as integer,
+            // decrements if positive, writes the new value back, and jumps
+            // to p2 when the counter reaches zero. Every live DML/OLTP
+            // query with a LIMIT clause hits this on every row, so even a
+            // few-ns per-op dispatch saving compounds. Mirrors the
+            // existing main-match arm verbatim.
+            Opcode::DecrJumpZero => {
+                let mut val = self.get_reg(op.p1).to_integer();
+                if val > 0 {
+                    val -= 1;
+                    self.set_reg_int(op.p1, val);
+                    if val == 0 {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            *pc = op.p2 as usize;
+                        }
+                    } else {
+                        *pc += 1;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -27988,6 +28013,68 @@ mod tests {
             vec![
                 vec![SqliteValue::Integer(15)],
                 vec![SqliteValue::Integer(-1)],
+            ]
+        );
+    }
+
+    // ── DecrJumpZero opcode test ─────────────────────────────────
+
+    #[test]
+    fn test_decr_jump_zero_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm:
+        // - counter > 1: decrement, fall through (pc += 1)
+        // - counter == 1: decrement to 0, jump to p2
+        // - counter == 0: fall through (no write, no jump)
+        //
+        // `ResultRow` drains its source registers via `take_reg_range`, so
+        // the asserts below reflect that move-out.
+        //
+        // Trace (r_counter seeded to 2, r_hit to 0):
+        //   DecrJumpZero   val=2→1, fall through          (r_hit=0)
+        //   AddImm r_hit,1 r_hit=1
+        //   ResultRow r_hit                               emits [1], r_hit=NULL
+        //   DecrJumpZero   val=1→0, jump over AddImm      (r_hit=NULL)
+        //   ResultRow r_hit                               emits [NULL]
+        //   DecrJumpZero   val=0 not>0, fall through      (r_counter still 0)
+        //   AddImm r_hit,1 r_hit = NULL.to_integer() + 1 = 1
+        //   ResultRow r_counter                           emits [0]
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let skip1 = b.emit_label();
+            let skip2 = b.emit_label();
+            let skip3 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_counter = b.alloc_reg();
+            let r_hit = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 2, r_counter, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::DecrJumpZero, r_counter, 0, skip1, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip1);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::DecrJumpZero, r_counter, 0, skip2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip2);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::DecrJumpZero, r_counter, 0, skip3, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip3);
+            b.emit_op(Opcode::ResultRow, r_counter, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Null],
+                vec![SqliteValue::Integer(0)],
             ]
         );
     }

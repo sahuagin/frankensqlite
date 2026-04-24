@@ -89,6 +89,33 @@ fn build_execute_stage_scopy_program(op_repeats: usize) -> VdbeProgram {
         .expect("pipeline execute scopy benchmark program should build")
 }
 
+/// Build a dispatch-dominated program whose inner loop is a stream of
+/// `DecrJumpZero` ops (the canonical LIMIT counter opcode). The counter
+/// is seeded with `op_repeats + 1` so every dispatched opcode hits the
+/// decrement-and-fall-through path — none jump to the halt target,
+/// giving a stable per-op cost that isolates the hot-path pre-filter
+/// routing from the mostly-taken branch predictor.
+fn build_execute_stage_decrjumpzero_program(op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let end = builder.emit_label();
+    let halt = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+    let counter = builder.alloc_reg();
+    // Seed so op_repeats decrements leave the counter at 1 (never zero,
+    // so the jump is never taken).
+    let seed = i32::try_from(op_repeats + 1).unwrap_or(i32::MAX);
+    builder.emit_op(Opcode::Integer, seed, counter, 0, P4::None, 0);
+    for _ in 0..op_repeats {
+        builder.emit_jump_to_label(Opcode::DecrJumpZero, counter, 0, halt, P4::None, 0);
+    }
+    builder.resolve_label(halt);
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder.resolve_label(end);
+    builder
+        .finish()
+        .expect("pipeline execute decrjumpzero benchmark program should build")
+}
+
 fn prepare_commit_stage_fixture(dirty_pages: usize) -> (Cx, SimpleTransaction<MemoryVfs>) {
     let cx = Cx::new();
     let pager = SimplePager::open_with_cx(
@@ -240,6 +267,39 @@ fn bench_vdbe_execute_scopy_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_decrjumpzero_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_decrjumpzero");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let program = build_execute_stage_decrjumpzero_program(op_repeats);
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &program,
+            |b, program| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute decrjumpzero benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_commit_stage(c: &mut Criterion) {
     let mut group = c.benchmark_group("vdbe_pipeline_commit");
 
@@ -274,6 +334,7 @@ criterion_group!(
     bench_vdbe_execute_stage,
     bench_vdbe_execute_copy_stage,
     bench_vdbe_execute_scopy_stage,
+    bench_vdbe_execute_decrjumpzero_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);
