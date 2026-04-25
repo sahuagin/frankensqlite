@@ -11839,6 +11839,27 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // IfPos is the canonical OFFSET counter: fires once per
+            // skipped row in any LIMIT/OFFSET-bounded query (25 codegen
+            // sites). Body reads a register as integer; if positive,
+            // subtracts p3 and jumps to p2; otherwise falls through.
+            // Mirror-structure to DecrJumpZero — same dispatch-shortening
+            // logic applies. Body mirrors the existing main-match arm
+            // verbatim.
+            Opcode::IfPos => {
+                let val = self.get_reg(op.p1).to_integer();
+                if val > 0 {
+                    let decremented = val - i64::from(op.p3);
+                    self.set_reg_int(op.p1, decremented);
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -28063,6 +28084,68 @@ mod tests {
             rows,
             vec![
                 vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Null],
+                vec![SqliteValue::Integer(0)],
+            ]
+        );
+    }
+
+    // ── IfPos opcode test ────────────────────────────────────────
+
+    #[test]
+    fn test_if_pos_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm:
+        // - val > 0: subtract p3, jump to p2 (taken branch)
+        // - val == 0: fall through (no write, no jump)
+        // - val < 0: fall through (no write, no jump)
+        //
+        // `ResultRow` drains its source register via `take_reg_range`, so
+        // the asserts below reflect that move-out.
+        //
+        // Trace (r_offset seeded to 2, r_hit to 0; each IfPos has p3=1):
+        //   IfPos r_offset → val=2>0: val-1=1, jump skip1 (skip AddImm)  r_offset=1, r_hit=0
+        //   skip1: ResultRow r_hit                                       emits [0], r_hit=NULL
+        //   IfPos r_offset → val=1>0: val-1=0, jump skip2 (skip AddImm)  r_offset=0, r_hit=NULL
+        //   skip2: ResultRow r_hit                                       emits [NULL]
+        //   IfPos r_offset → val=0 not>0, fall through                   r_offset=0
+        //   AddImm r_hit,1                                               r_hit = NULL.to_integer()+1 = 1
+        //   skip3: ResultRow r_offset                                    emits [0]
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let skip1 = b.emit_label();
+            let skip2 = b.emit_label();
+            let skip3 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_offset = b.alloc_reg();
+            let r_hit = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 2, r_offset, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+
+            // p3=1 (decrement-by-one OFFSET shape).
+            b.emit_jump_to_label(Opcode::IfPos, r_offset, 1, skip1, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip1);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::IfPos, r_offset, 1, skip2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip2);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::IfPos, r_offset, 1, skip3, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip3);
+            b.emit_op(Opcode::ResultRow, r_offset, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0)],
                 vec![SqliteValue::Null],
                 vec![SqliteValue::Integer(0)],
             ]
