@@ -329,26 +329,26 @@ static FSQLITE_SSI_COMMITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SSI_ABORTS_PIVOT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SSI_ABORTS_COMMITTED_PIVOT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT: AtomicU64 = AtomicU64::new(0);
-static FSQLITE_SSI_VALIDATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+// `validations_total` was previously a separate `AtomicU64` incremented on
+// every commit/abort. It is now derived at snapshot time as
+// `commits_total + aborts_total()` — the two are mathematically identical
+// because every SSI validation resolves into exactly one commit or one
+// categorised abort. Eliminating the redundant counter halves the atomic
+// store traffic on the SSI commit hot path.
 
 /// Record a successful SSI commit.
 pub fn record_ssi_commit() {
     FSQLITE_SSI_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    FSQLITE_SSI_VALIDATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record an SSI abort with reason label.
 pub fn record_ssi_abort(reason: SsiAbortCategory) {
-    match reason {
-        SsiAbortCategory::Pivot => FSQLITE_SSI_ABORTS_PIVOT.fetch_add(1, Ordering::Relaxed),
-        SsiAbortCategory::CommittedPivot => {
-            FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.fetch_add(1, Ordering::Relaxed)
-        }
-        SsiAbortCategory::MarkedForAbort => {
-            FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.fetch_add(1, Ordering::Relaxed)
-        }
+    let bucket = match reason {
+        SsiAbortCategory::Pivot => &FSQLITE_SSI_ABORTS_PIVOT,
+        SsiAbortCategory::CommittedPivot => &FSQLITE_SSI_ABORTS_COMMITTED_PIVOT,
+        SsiAbortCategory::MarkedForAbort => &FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT,
     };
-    FSQLITE_SSI_VALIDATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    bucket.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Point-in-time snapshot of SSI metrics.
@@ -398,12 +398,20 @@ impl std::fmt::Display for SsiMetricsSnapshot {
 /// Take a point-in-time snapshot of SSI metrics.
 #[must_use]
 pub fn ssi_metrics_snapshot() -> SsiMetricsSnapshot {
+    let commits_total = FSQLITE_SSI_COMMITS_TOTAL.load(Ordering::Relaxed);
+    let aborts_pivot = FSQLITE_SSI_ABORTS_PIVOT.load(Ordering::Relaxed);
+    let aborts_committed_pivot = FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.load(Ordering::Relaxed);
+    let aborts_marked_for_abort = FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.load(Ordering::Relaxed);
+    let validations_total = commits_total
+        .saturating_add(aborts_pivot)
+        .saturating_add(aborts_committed_pivot)
+        .saturating_add(aborts_marked_for_abort);
     SsiMetricsSnapshot {
-        commits_total: FSQLITE_SSI_COMMITS_TOTAL.load(Ordering::Relaxed),
-        aborts_pivot: FSQLITE_SSI_ABORTS_PIVOT.load(Ordering::Relaxed),
-        aborts_committed_pivot: FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.load(Ordering::Relaxed),
-        aborts_marked_for_abort: FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.load(Ordering::Relaxed),
-        validations_total: FSQLITE_SSI_VALIDATIONS_TOTAL.load(Ordering::Relaxed),
+        commits_total,
+        aborts_pivot,
+        aborts_committed_pivot,
+        aborts_marked_for_abort,
+        validations_total,
     }
 }
 
@@ -413,7 +421,6 @@ pub fn reset_ssi_metrics() {
     FSQLITE_SSI_ABORTS_PIVOT.store(0, Ordering::Relaxed);
     FSQLITE_SSI_ABORTS_COMMITTED_PIVOT.store(0, Ordering::Relaxed);
     FSQLITE_SSI_ABORTS_MARKED_FOR_ABORT.store(0, Ordering::Relaxed);
-    FSQLITE_SSI_VALIDATIONS_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -858,5 +865,73 @@ mod tests {
              (n={TRIALS}, {CYCLES_PER_TRIAL} est+rel cycles/trial)"
         );
         set_mvcc_snapshot_metrics_enabled(false);
+    }
+
+    /// Microbench for the redundant `validations_total` counter elimination.
+    ///
+    /// Pre-change `record_ssi_commit` did two unconditional relaxed
+    /// `fetch_add`s — one on `FSQLITE_SSI_COMMITS_TOTAL`, one on
+    /// `FSQLITE_SSI_VALIDATIONS_TOTAL`. The latter was redundant because
+    /// every validation resolves into one categorised commit/abort, so
+    /// `validations_total = commits_total + aborts_total` by definition.
+    /// Post-change derives `validations_total` at snapshot time and the
+    /// hot path drops to a single `fetch_add`.
+    ///
+    /// The bench reproduces the old shape locally so before/after numbers
+    /// land in the same run without bringing the static back.
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_record_ssi_commit_validations_pruning() {
+        use std::time::Instant;
+
+        const CYCLES_PER_TRIAL: u32 = 4_000_000;
+        const TRIALS: usize = 9;
+
+        // Local stand-in for the deleted FSQLITE_SSI_VALIDATIONS_TOTAL.
+        // Defined in the bench so the optimised path can stay clean.
+        let baseline_validations = AtomicU64::new(0);
+
+        fn run_old(extra: &AtomicU64, cycles: u32) -> f64 {
+            let start = Instant::now();
+            for _ in 0..cycles {
+                FSQLITE_SSI_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                extra.fetch_add(1, Ordering::Relaxed);
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(cycles)
+        }
+
+        fn run_new(cycles: u32) -> f64 {
+            let start = Instant::now();
+            for _ in 0..cycles {
+                record_ssi_commit();
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(cycles)
+        }
+
+        // Warmups (caches, branch predictor).
+        run_old(&baseline_validations, CYCLES_PER_TRIAL);
+        run_new(CYCLES_PER_TRIAL);
+
+        let mut old_samples = Vec::with_capacity(TRIALS);
+        let mut new_samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let old = run_old(&baseline_validations, CYCLES_PER_TRIAL);
+            let new_ = run_new(CYCLES_PER_TRIAL);
+            eprintln!(
+                "  old (2 fetch_adds): {old:.2} ns/call   new (1 fetch_add): {new_:.2} ns/call"
+            );
+            old_samples.push(old);
+            new_samples.push(new_);
+        }
+        old_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        new_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let old_med = old_samples[TRIALS / 2];
+        let new_med = new_samples[TRIALS / 2];
+        let delta_pct = (new_med - old_med) / old_med * 100.0;
+        eprintln!(
+            "bench_record_ssi_commit_validations_pruning: old median={old_med:.2} ns/call; \
+             new median={new_med:.2} ns/call; delta={delta_pct:+.1}% \
+             (n={TRIALS}, {CYCLES_PER_TRIAL} cycles/trial)"
+        );
     }
 }
