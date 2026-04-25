@@ -1888,6 +1888,16 @@ pub struct ShardedPageCache {
     /// Overflow: one cache-line aligned shard per configured partition.
     /// Used when the flat table is full or for CAS-failure fallback.
     shards: Box<[Mutex<PageCacheShard>]>,
+    /// Conservative hint that one of `shards` may hold a page.
+    ///
+    /// Set by overflow inserts after the shard lock is released, and cleared
+    /// by [`Self::clear`] / [`Self::enable_fast_path`] / [`Self::disable_fast_path`]
+    /// after they walk every shard. When the flat-slot path absorbs every
+    /// admitted page (the dominant case at MT8), the shards stay empty across
+    /// the connection's lifetime; this flag lets the per-connection cold reset
+    /// skip the 128-shard mutex walk that previously fired on every
+    /// `refresh_committed_state` from `Connection::open_with_env_and_pager`.
+    shards_dirty: AtomicBool,
     shard_mask: usize,
     shard_shift: u32,
     /// Shared page buffer pool (lock-free allocation).
@@ -2039,6 +2049,7 @@ impl ShardedPageCache {
         Self {
             flat_slots: FlatPageSlots::new(flat_capacity),
             shards,
+            shards_dirty: AtomicBool::new(false),
             shard_mask,
             shard_shift,
             pool,
@@ -2069,8 +2080,10 @@ impl ShardedPageCache {
                 fast.lock().cold_reset();
             }
             self.flat_slots.clear();
-            for shard in self.shards.iter() {
-                shard.lock().clear();
+            if self.shards_dirty.swap(false, Ordering::AcqRel) {
+                for shard in self.shards.iter() {
+                    shard.lock().clear();
+                }
             }
             self.clear_eviction_history();
         }
@@ -2089,8 +2102,10 @@ impl ShardedPageCache {
                 fast.lock().cold_reset();
             }
             self.flat_slots.clear();
-            for shard in self.shards.iter() {
-                shard.lock().clear();
+            if self.shards_dirty.swap(false, Ordering::AcqRel) {
+                for shard in self.shards.iter() {
+                    shard.lock().clear();
+                }
             }
             self.clear_eviction_history();
         }
@@ -2570,6 +2585,7 @@ impl ShardedPageCache {
         // Insert into flat slots; overflow to shard on CAS failure.
         if let Err(buf) = self.flat_slots.try_insert(page_no, buf) {
             self.shards[shard_idx].lock().insert(page_no, buf);
+            self.shards_dirty.store(true, Ordering::Release);
         }
         self.note_page_access_without_metrics(page_no);
         self.record_eviction_admit(page_no);
@@ -2673,7 +2689,9 @@ impl ShardedPageCache {
             Ok(is_new) => is_new,
             Err(buf) => {
                 let idx = self.shard_index(page_no);
-                self.shards[idx].lock().insert(page_no, buf)
+                let admitted = self.shards[idx].lock().insert(page_no, buf);
+                self.shards_dirty.store(true, Ordering::Release);
+                admitted
             }
         };
         self.mark_page_dirty(page_no);
@@ -2706,7 +2724,9 @@ impl ShardedPageCache {
             Ok(is_new) => is_new,
             Err(buf) => {
                 let idx = self.shard_index(page_no);
-                self.shards[idx].lock().insert(page_no, buf)
+                let admitted = self.shards[idx].lock().insert(page_no, buf);
+                self.shards_dirty.store(true, Ordering::Release);
+                admitted
             }
         };
         self.mark_page_clean(page_no);
@@ -2804,8 +2824,15 @@ impl ShardedPageCache {
             fast.lock().clear();
         }
         self.flat_slots.clear();
-        for shard in self.shards.iter() {
-            shard.lock().clear();
+        // Skip the 128-shard mutex walk when overflow shards are
+        // observably empty. The flag is set by overflow inserts after
+        // their lock release, so any insert ordered before our swap
+        // is visible to the subsequent shard walk; an insert ordered
+        // after our swap re-arms the flag for the next clear.
+        if self.shards_dirty.swap(false, Ordering::AcqRel) {
+            for shard in self.shards.iter() {
+                shard.lock().clear();
+            }
         }
         self.clear_eviction_history();
     }
@@ -5204,6 +5231,58 @@ mod tests {
         assert_eq!(
             m.evictions, 100,
             "bead_id={BEAD_3WOP3_2} case=clear_evictions"
+        );
+    }
+
+    /// Shape: connection-open `refresh_committed_state` calls `cache.clear()`
+    /// on a freshly-allocated cache where the flat-slot fast path has absorbed
+    /// every admit (the dominant case at MT8). Before the `shards_dirty`
+    /// short-circuit, this still walked all 128 shard mutexes per call.
+    ///
+    /// Toggling the flag's "true at start" state via `shards_dirty.store(true)`
+    /// lets us pair an apples-to-apples baseline (forced 128-shard walk) and
+    /// optimized run (early swap returns false) inside one bench, in one build,
+    /// avoiding cross-binary noise.
+    ///
+    /// Run via:
+    ///   cargo test -p fsqlite-pager --lib --release --
+    ///     --ignored --nocapture
+    ///     bench_sharded_cache_clear_empty_shards_microbench
+    #[test]
+    #[ignore]
+    fn bench_sharded_cache_clear_empty_shards_microbench() {
+        const ITERS: usize = 1_000_000;
+        let cache = ShardedPageCache::new(PageSize::DEFAULT);
+
+        // Warmup the optimized fast path.
+        for _ in 0..ITERS / 10 {
+            cache.clear();
+        }
+
+        // Optimized: shards_dirty starts false, swap returns false, no walk.
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            cache.clear();
+        }
+        let elapsed_opt = start.elapsed();
+        let per_call_opt = elapsed_opt / u32::try_from(ITERS).unwrap();
+
+        // Baseline: force shards_dirty=true at the top of every clear so the
+        // 128-shard mutex walk fires, the same shape the previous
+        // unconditional walk paid on every connection open.
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            cache.shards_dirty.store(true, Ordering::Release);
+            cache.clear();
+        }
+        let elapsed_base = start.elapsed();
+        let per_call_base = elapsed_base / u32::try_from(ITERS).unwrap();
+
+        let speedup = per_call_base.as_nanos() as f64 / per_call_opt.as_nanos().max(1) as f64;
+        eprintln!(
+            "bench_sharded_cache_clear_empty_shards_microbench: ITERS={ITERS} \
+             baseline={per_call_base:?} optimized={per_call_opt:?} \
+             speedup={speedup:.2}x"
         );
     }
 
