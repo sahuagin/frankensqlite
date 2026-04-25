@@ -2127,6 +2127,21 @@ impl<P: PageReader> BtCursor<P> {
         Ok(CachedCellSlot::from_cell_ref(&cell))
     }
 
+    fn parse_cell_ref_at(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
+        let idx_usize = usize::from(idx);
+        let offset = if idx_usize < entry.cell_pointers.len() {
+            usize::from(entry.cell_pointers[idx_usize])
+        } else {
+            usize::from(Self::read_stack_entry_cell_pointer_inline(entry, idx)?)
+        };
+        CellRef::parse(
+            entry.page_data.as_bytes(),
+            offset,
+            entry.header.page_type,
+            self.usable_size,
+        )
+    }
+
     /// Parse a cell at the given index on the top-of-stack page.
     fn parse_cell_at(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
         if idx >= entry.header.cell_count {
@@ -2168,8 +2183,7 @@ impl<P: PageReader> BtCursor<P> {
             });
         }
 
-        let slot = self.parse_cell_slot_at(entry, idx)?;
-        Ok(slot.into_cell_ref())
+        self.parse_cell_ref_at(entry, idx)
     }
 
     /// Move the cursor to the first entry in the subtree rooted at `page_no`.
