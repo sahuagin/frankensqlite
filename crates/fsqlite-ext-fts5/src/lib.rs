@@ -2019,6 +2019,9 @@ impl Fts5Table {
         column_values: Vec<String>,
         tokenizer: &dyn Fts5Tokenizer,
     ) {
+        if self.documents.contains_key(&rowid) {
+            self.index.remove_document(rowid);
+        }
         self.index_document_with_tokenizer(rowid, &column_values, tokenizer);
         self.next_rowid = self.next_rowid.max(rowid.saturating_add(1));
         self.documents.insert(rowid, column_values);
@@ -2395,21 +2398,32 @@ impl VirtualTable for Fts5Table {
                 self.next_rowid += 1;
                 r
             };
+            if self.documents.contains_key(&rowid) {
+                return Err(FrankenError::PrimaryKeyViolation);
+            }
 
             let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
             self.insert_document_owned(rowid, col_values);
             return Ok(Some(rowid));
         }
 
-        // UPDATE: delete old, insert new
+        // UPDATE: validate rowid movement before mutating so conflict failures
+        // preserve the old row and its index postings.
         let old_rowid = args[0].to_integer();
-        self.delete_document(old_rowid);
-
         let new_rowid = if args.len() > 1 && !args[1].is_null() {
             args[1].to_integer()
         } else {
             old_rowid
         };
+        if old_rowid != new_rowid && self.documents.contains_key(&new_rowid) {
+            return Err(FrankenError::PrimaryKeyViolation);
+        }
+        if !self.documents.contains_key(&old_rowid) {
+            return Err(FrankenError::Internal(
+                "fts5 update referenced a missing rowid".to_owned(),
+            ));
+        }
+        self.delete_document(old_rowid);
 
         let col_values: Vec<String> = args.iter().skip(2).map(SqliteValue::to_text).collect();
         self.insert_document_owned(new_rowid, col_values);
@@ -4468,6 +4482,88 @@ mod tests {
 
         let doc = vtab.get_document(1).unwrap();
         assert_eq!(doc, &["modified"]);
+        assert!(vtab.search("original").unwrap().is_empty());
+        assert_eq!(vtab.search("modified").unwrap()[0].0, 1);
+    }
+
+    #[test]
+    fn test_fts5_vtab_insert_duplicate_rowid_preserves_original() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+
+        vtab.update(
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Text(SmallText::from_string("alpha original")),
+            ],
+        )
+        .unwrap();
+
+        let err = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text(SmallText::from_string("beta duplicate")),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+
+        assert_eq!(vtab.get_document(1).unwrap(), &["alpha original"]);
+        assert_eq!(vtab.search("alpha").unwrap()[0].0, 1);
+        assert!(vtab.search("beta").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_rowid_conflict_preserves_original_entries() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+
+        for (rowid, text) in [(1, "alpha one"), (2, "beta two")] {
+            vtab.update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Text(SmallText::from_string(text)),
+                ],
+            )
+            .unwrap();
+        }
+
+        let err = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text(SmallText::from_string("gamma conflict")),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+
+        assert_eq!(vtab.get_document(1).unwrap(), &["alpha one"]);
+        assert_eq!(vtab.get_document(2).unwrap(), &["beta two"]);
+        assert_eq!(vtab.search("alpha").unwrap()[0].0, 1);
+        assert_eq!(vtab.search("beta").unwrap()[0].0, 2);
+        assert!(vtab.search("gamma").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_fts5_insert_document_replaces_existing_rowid_index_entries() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+
+        table.insert_document(1, &["old token".to_owned()]);
+        table.insert_document(1, &["new token".to_owned()]);
+
+        assert_eq!(table.get_document(1).unwrap(), &["new token"]);
+        assert!(table.search("old").unwrap().is_empty());
+        assert_eq!(table.search("new").unwrap()[0].0, 1);
     }
 
     #[test]
