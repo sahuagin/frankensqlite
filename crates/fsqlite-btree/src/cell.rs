@@ -282,6 +282,7 @@ pub fn read_cell_pointers(
 ///
 /// This is the low-level primitive; [`read_cell_pointers`] is a thin
 /// convenience wrapper that allocates a fresh `Vec`.
+#[allow(clippy::incompatible_msrv)] // `<[u8]>::as_chunks` (1.88+) under nightly toolchain.
 pub fn read_cell_pointers_into(
     page: &[u8],
     header: &BtreePageHeader,
@@ -313,20 +314,20 @@ pub fn read_cell_pointers_into(
     buf.clear();
     buf.reserve(count);
 
-    // Single bounds-checked slice + chunks_exact(2) lets LLVM eliminate the
-    // per-byte bounds checks and autovectorize the big-endian decode loop.
-    // Profiling (OPT-4) showed the previous explicit loop with page[off] /
-    // page[off + 1] was 7.84% self-time on the INSERT hot path.
+    // Slice once, then use `as_chunks::<2>` to hand LLVM `&[u8; 2]` per
+    // element instead of the unsized `&[u8]` from `chunks_exact`. The
+    // sized array drops the per-iteration bounds checks on `c[0]` /
+    // `c[1]` that `chunks_exact(2).map(|c| [c[0], c[1]])` was still
+    // paying — same array-conversion bounds-elide pattern that took
+    // `BtreePageHeader::parse` from 10.7 ns to 3.7 ns (commit 1f266968).
     let ptr_bytes = &page[ptr_array_start..ptr_array_end];
-    buf.extend(
-        ptr_bytes
-            .chunks_exact(CELL_POINTER_SIZE as usize)
-            .map(|c| u16::from_be_bytes([c[0], c[1]])),
-    );
+    let (chunks, _) = ptr_bytes.as_chunks::<2>();
+    buf.extend(chunks.iter().map(|c| u16::from_be_bytes(*c)));
     Ok(())
 }
 
 /// Write the cell pointer array into a page.
+#[allow(clippy::incompatible_msrv)] // `<[u8]>::as_chunks_mut` (1.88+) under nightly toolchain.
 pub fn write_cell_pointers(
     page: &mut [u8],
     header_offset: usize,
@@ -334,9 +335,15 @@ pub fn write_cell_pointers(
     pointers: &[u16],
 ) {
     let ptr_array_start = header_offset + header.page_type.header_size() as usize;
-    for (i, &ptr) in pointers.iter().enumerate() {
-        let off = ptr_array_start + i * CELL_POINTER_SIZE as usize;
-        page[off..off + 2].copy_from_slice(&ptr.to_be_bytes());
+    let ptr_array_end = ptr_array_start + pointers.len() * CELL_POINTER_SIZE as usize;
+    // Hoist the bounds check out of the loop with a single mut slice, then
+    // hand LLVM `&mut [u8; 2]` chunks via `as_chunks_mut::<2>`. The
+    // index-arithmetic `page[off..off + 2]` form forced a per-iteration
+    // bounds check that wouldn't fold even though `chunks` is exact.
+    let dst = &mut page[ptr_array_start..ptr_array_end];
+    let (chunks, _) = dst.as_chunks_mut::<2>();
+    for (chunk, &ptr) in chunks.iter_mut().zip(pointers) {
+        *chunk = ptr.to_be_bytes();
     }
 }
 
@@ -1594,6 +1601,154 @@ mod tests {
             println!(
                 "[trial {trial}] parse: optimized={opt_ns:.2} ns naive={naive_ns:.2} ns \
                  delta={delta_pct:+.1}% (mixed leaf/interior, n={iters})",
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Microbench (#[ignore]) — cell pointer array read/write
+    // ------------------------------------------------------------------
+    //
+    // Compares the optimized `read_cell_pointers_into` /
+    // `write_cell_pointers` against `#[inline(never)]` reference
+    // implementations that mirror the pre-change shapes. Both arms run
+    // in the same release build for a same-cache comparison.
+
+    #[inline(never)]
+    #[allow(clippy::incompatible_msrv)]
+    fn read_cell_pointers_into_naive(
+        page: &[u8],
+        header: &BtreePageHeader,
+        header_offset: usize,
+        buf: &mut Vec<u16>,
+    ) -> Result<()> {
+        let ptr_array_start = header_offset + header.page_type.header_size() as usize;
+        let count = header.cell_count as usize;
+        let ptr_array_end = ptr_array_start + count * CELL_POINTER_SIZE as usize;
+        if ptr_array_end > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell pointer array extends past page".to_owned(),
+            });
+        }
+        if ptr_array_end > header.cell_content_offset as usize {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell pointer array overlaps with cell content area".to_owned(),
+            });
+        }
+        buf.clear();
+        buf.reserve(count);
+        let ptr_bytes = &page[ptr_array_start..ptr_array_end];
+        buf.extend(
+            ptr_bytes
+                .chunks_exact(CELL_POINTER_SIZE as usize)
+                .map(|c| u16::from_be_bytes([c[0], c[1]])),
+        );
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn write_cell_pointers_naive(
+        page: &mut [u8],
+        header_offset: usize,
+        header: &BtreePageHeader,
+        pointers: &[u16],
+    ) {
+        let ptr_array_start = header_offset + header.page_type.header_size() as usize;
+        for (i, &ptr) in pointers.iter().enumerate() {
+            let off = ptr_array_start + i * CELL_POINTER_SIZE as usize;
+            page[off..off + 2].copy_from_slice(&ptr.to_be_bytes());
+        }
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --release --ignored --nocapture bench_cell_pointers"]
+    fn bench_cell_pointers() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Realistic leaf page with 64 cells (typical mid-sized leaf).
+        let cell_count: usize = 64;
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            #[allow(clippy::cast_possible_truncation)]
+            cell_count: cell_count as u16,
+            cell_content_offset: 3000,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+        let pointers: Vec<u16> = (0..cell_count).map(|i| 3000u16 + (i as u16) * 16).collect();
+        write_cell_pointers(&mut page, 0, &header, &pointers);
+
+        let iters: u64 = 200_000;
+        let trials = 5;
+        let mut buf: Vec<u16> = Vec::with_capacity(cell_count);
+
+        for trial in 0..trials {
+            // Read — optimized.
+            let t = Instant::now();
+            for _ in 0..iters {
+                read_cell_pointers_into(black_box(&page), black_box(&header), 0, &mut buf).unwrap();
+                black_box(&buf);
+            }
+            let read_opt = t.elapsed();
+
+            // Read — naive.
+            let t = Instant::now();
+            for _ in 0..iters {
+                read_cell_pointers_into_naive(black_box(&page), black_box(&header), 0, &mut buf)
+                    .unwrap();
+                black_box(&buf);
+            }
+            let read_naive = t.elapsed();
+
+            // Write — optimized.
+            let mut wpage = vec![0u8; 4096];
+            header.write(&mut wpage, 0);
+            let t = Instant::now();
+            for _ in 0..iters {
+                write_cell_pointers(
+                    black_box(&mut wpage),
+                    0,
+                    black_box(&header),
+                    black_box(&pointers),
+                );
+            }
+            let write_opt = t.elapsed();
+
+            // Write — naive.
+            let mut wpage = vec![0u8; 4096];
+            header.write(&mut wpage, 0);
+            let t = Instant::now();
+            for _ in 0..iters {
+                write_cell_pointers_naive(
+                    black_box(&mut wpage),
+                    0,
+                    black_box(&header),
+                    black_box(&pointers),
+                );
+            }
+            let write_naive = t.elapsed();
+
+            #[allow(clippy::cast_precision_loss)]
+            let total = (iters as f64) * (cell_count as f64);
+            #[allow(clippy::cast_precision_loss)]
+            let read_opt_ns = read_opt.as_nanos() as f64 / total;
+            #[allow(clippy::cast_precision_loss)]
+            let read_naive_ns = read_naive.as_nanos() as f64 / total;
+            let read_delta = (read_opt_ns - read_naive_ns) / read_naive_ns * 100.0;
+            #[allow(clippy::cast_precision_loss)]
+            let write_opt_ns = write_opt.as_nanos() as f64 / total;
+            #[allow(clippy::cast_precision_loss)]
+            let write_naive_ns = write_naive.as_nanos() as f64 / total;
+            let write_delta = (write_opt_ns - write_naive_ns) / write_naive_ns * 100.0;
+
+            println!(
+                "[trial {trial}] read:  opt={read_opt_ns:.3} ns/ptr  naive={read_naive_ns:.3} ns/ptr  delta={read_delta:+.1}% \
+                 | write: opt={write_opt_ns:.3} ns/ptr  naive={write_naive_ns:.3} ns/ptr  delta={write_delta:+.1}% \
+                 ({cell_count} ptrs/page, n={iters})",
             );
         }
     }
