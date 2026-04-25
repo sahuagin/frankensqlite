@@ -1428,7 +1428,23 @@ impl InProcessPageLockTable {
     }
 
     /// Unregister the current thread from the waiter queue for `page`.
+    ///
+    /// Fast path: when `waiter_count == 0` we know the global modification
+    /// order has already retired our entry — `register_waiter`'s
+    /// `fetch_add` and the matching drain's `fetch_sub` both update the
+    /// same atomic, so observing zero implies our entry is no longer in
+    /// any shard. Skipping the per-shard mutex avoids `parking_lot::Mutex`
+    /// acquisition on the post-park spurious-wake/re-acquire branch in
+    /// `wait_for_holder_change`, where the page-targeted notifier already
+    /// drained us inside its own shard mutex (with `unpark()` and
+    /// `fetch_sub` both sequenced before mutex release). The relaxed load
+    /// is safe: a stale non-zero observation only forces the slow path,
+    /// and a zero observation is a definitive abstract-state guarantee
+    /// (cumulative `fetch_add` minus `fetch_sub` = 0 across all shards).
     fn unregister_waiter(&self, page: PageNumber, current_id: ThreadId) {
+        if self.waiter_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
         let shard_idx = Self::shard_index_static(page);
         let mut map = self.waiter_shards[shard_idx].lock();
         if let Some(queue) = map.get_mut(&page) {
@@ -3572,6 +3588,82 @@ mod tests {
             page_fast[TRIALS / 2],
             page_slow[TRIALS / 2],
             TRIALS,
+        );
+    }
+
+    /// Same-run baseline-vs-optimized bench for the new `waiter_count == 0`
+    /// gate on `unregister_waiter`. The fast path returns after a single
+    /// relaxed atomic load; the slow body acquires the per-shard
+    /// `parking_lot::Mutex<HashMap>` and runs `get_mut(&page)` (None on
+    /// the post-park drained-by-notifier path).
+    ///
+    /// Toggle pattern (same as `bench_notify_waiters_no_waiters`): force
+    /// `waiter_count = 1` per slow iteration so the gate's load returns
+    /// non-zero and the slow body executes — but no entry was ever
+    /// inserted, so `get_mut` returns None and the inner mutate is
+    /// skipped (matches the production race where a notifier already
+    /// drained our entry before we reach unregister).
+    ///
+    /// Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_unregister_waiter_drained --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    #[allow(clippy::unit_arg)]
+    fn bench_unregister_waiter_drained() {
+        let table = InProcessPageLockTable::new();
+        let page = PageNumber::new(23).unwrap();
+        let tid = std::thread::current().id();
+
+        const ITERS_FAST: u32 = 5_000_000;
+        const ITERS_SLOW: u32 = 2_000_000;
+        const TRIALS: usize = 7;
+
+        // Warm-up.
+        for _ in 0..ITERS_FAST {
+            std::hint::black_box(table.unregister_waiter(page, tid));
+        }
+        debug_assert_eq!(table.waiter_count.load(Ordering::Relaxed), 0);
+
+        let mut fast = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_FAST {
+                std::hint::black_box(table.unregister_waiter(page, tid));
+            }
+            let elapsed = start.elapsed();
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_FAST);
+            eprintln!("  unregister fast trial: {ns:.1} ns/call ({elapsed:?} total)");
+            fast.push(ns);
+        }
+
+        let mut slow = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..ITERS_SLOW {
+                // Force the gate's load to see non-zero, exercising the
+                // slow body. No entry exists, so `get_mut` returns None
+                // and the mutate path is skipped (production-realistic:
+                // notifier drained our entry before we reach unregister).
+                table.waiter_count.store(1, Ordering::Relaxed);
+                std::hint::black_box(table.unregister_waiter(page, tid));
+            }
+            let elapsed = start.elapsed();
+            table.waiter_count.store(0, Ordering::Relaxed);
+            let ns = elapsed.as_nanos() as f64 / f64::from(ITERS_SLOW);
+            eprintln!("  unregister slow trial: {ns:.1} ns/call ({elapsed:?} total)");
+            slow.push(ns);
+        }
+
+        fast.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        slow.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let f_med = fast[TRIALS / 2];
+        let s_med = slow[TRIALS / 2];
+        let delta_pct = (f_med - s_med) / s_med * 100.0;
+        eprintln!(
+            "bench_unregister_waiter_drained: fast median={f_med:.1} ns/call, \
+             slow median={s_med:.1} ns/call, delta={delta_pct:+.1}% (n={TRIALS})"
         );
     }
 
