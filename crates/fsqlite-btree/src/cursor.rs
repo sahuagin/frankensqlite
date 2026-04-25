@@ -535,11 +535,69 @@ impl PageWriter for MemPageStore {
 }
 
 // ---------------------------------------------------------------------------
+// Cell-pointer Vec pool
+// ---------------------------------------------------------------------------
+//
+// Every fresh `load_page` allocated a `Vec<u16>` to hold the cell pointer
+// offsets for the page, and every pop/drop of that `StackEntry` freed it.
+// On the MT 8t mt-mvcc-bench profile `read_cell_pointers_into` was 1.55 %
+// self-time and the allocator helpers (`_int_malloc` 2.18 %, `finish_grow`
+// 0.62 %, `cfree` 0.71 %) compounded across hot operations that load many
+// pages per step (`table_seek_for_insert` 0.94 %, `move_to_rightmost_leaf`
+// 0.69 %). Pooling the `Vec<u16>` buffers across calls keeps the same
+// allocations alive for the life of the thread and lets `read_cell_pointers_into`
+// reuse an existing capacity-backed buffer on every load after the first few.
+//
+// The pool is thread-local because cursors are single-thread by construction
+// (each `BtCursor` is driven by one caller at a time). A thread-local pool
+// also amortises across concurrent cursors on the same thread — they share
+// the same warmed-up free list.
+
+thread_local! {
+    static CELL_POINTERS_POOL: RefCell<Vec<Vec<u16>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Maximum number of pooled `Vec<u16>` entries kept per thread.
+///
+/// Cursor stacks are bounded by [`BTREE_MAX_DEPTH`] (20) and individual
+/// cursor operations rarely hold more than a few live stack entries at
+/// once, so this cap keeps the free list small enough to fit in the
+/// thread's working set while still covering the typical working set
+/// of concurrent cursors on the same thread.
+const CELL_POINTERS_POOL_MAX_ENTRIES: usize = 32;
+
+/// Don't pool buffers whose capacity grew past this many u16 slots.
+///
+/// A 64 KiB page with 4-byte cells fits ~16 Ki cells, so capping at 8 Ki
+/// keeps normal-workload buffers pooled while releasing pathological ones
+/// back to the allocator.
+const CELL_POINTERS_POOL_MAX_CAPACITY: usize = 8192;
+
+fn take_pooled_cell_pointers() -> Vec<u16> {
+    CELL_POINTERS_POOL
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+fn recycle_cell_pointers(mut buf: Vec<u16>) {
+    if buf.capacity() == 0 || buf.capacity() > CELL_POINTERS_POOL_MAX_CAPACITY {
+        return;
+    }
+    CELL_POINTERS_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < CELL_POINTERS_POOL_MAX_ENTRIES {
+            buf.clear();
+            pool.push(buf);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Cursor stack entry
 // ---------------------------------------------------------------------------
 
 /// A single entry in the cursor's page stack.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct StackEntry {
     /// Page number of this page (retained for debugging and future use in
     /// mutation operations).
@@ -552,6 +610,9 @@ struct StackEntry {
     /// Cell pointer offsets (cached from the cell pointer array).
     /// bd-perf (V1.1): Vec instead of Box<[u16]> — eliminates the
     /// Box::from(Vec) reallocation+copy on every page load.
+    /// The Vec allocation is pooled thread-locally (see `CELL_POINTERS_POOL`),
+    /// so drops return the buffer for reuse and clones pull a fresh buffer
+    /// from the pool before copying.
     cell_pointers: Vec<u16>,
     /// Page-image mutation signature for validating cached cell-slot parses.
     mutation_counter: u64,
@@ -560,6 +621,27 @@ struct StackEntry {
     /// A value equal to `cell_count` means "past the right-most child" on
     /// interior pages, or "past the last cell" on leaf pages.
     cell_idx: u16,
+}
+
+impl Clone for StackEntry {
+    fn clone(&self) -> Self {
+        let mut cell_pointers = take_pooled_cell_pointers();
+        cell_pointers.extend_from_slice(&self.cell_pointers);
+        Self {
+            page_no: self.page_no,
+            page_data: self.page_data.clone(),
+            header: self.header,
+            cell_pointers,
+            mutation_counter: self.mutation_counter,
+            cell_idx: self.cell_idx,
+        }
+    }
+}
+
+impl Drop for StackEntry {
+    fn drop(&mut self) {
+        recycle_cell_pointers(std::mem::take(&mut self.cell_pointers));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +993,12 @@ struct RightmostLeafCacheEntry {
     page_data: PageData,
     header: BtreePageHeader,
     cell_pointers: Vec<u16>,
+}
+
+impl Drop for RightmostLeafCacheEntry {
+    fn drop(&mut self) {
+        recycle_cell_pointers(std::mem::take(&mut self.cell_pointers));
+    }
 }
 
 /// Opaque retained append hint for monotonic table inserts.
@@ -2075,7 +2163,13 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let mut cell_pointers = take_pooled_cell_pointers();
+        cell::read_cell_pointers_into(
+            page_data.as_bytes(),
+            &header,
+            header_offset,
+            &mut cell_pointers,
+        )?;
         let mutation_counter = Self::page_mutation_counter(&page_data);
 
         Ok(StackEntry {
@@ -2099,7 +2193,13 @@ impl<P: PageReader> BtCursor<P> {
         let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let cell_pointers = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
+        let mut cell_pointers = take_pooled_cell_pointers();
+        cell::read_cell_pointers_into(
+            page_data.as_bytes(),
+            &header,
+            header_offset,
+            &mut cell_pointers,
+        )?;
         let mutation_counter = Self::page_mutation_counter(&page_data);
         Ok(StackEntry {
             page_no,
@@ -14787,5 +14887,44 @@ mod tests {
              counter_cost={:.3}ns  (prefill={PREFILL}, iters={ITERS})",
             on_ns - off_ns
         );
+    }
+
+    #[test]
+    fn cell_pointers_pool_recycles_buffer_capacity() {
+        // Drain the thread-local pool so this test sees a known starting state.
+        CELL_POINTERS_POOL.with(|pool| pool.borrow_mut().clear());
+
+        let mut warm = Vec::with_capacity(64);
+        warm.extend_from_slice(&[1, 2, 3, 4]);
+        let warm_ptr = warm.as_ptr();
+        recycle_cell_pointers(warm);
+
+        let recycled = take_pooled_cell_pointers();
+        assert_eq!(recycled.len(), 0, "pooled buffer must be returned cleared");
+        assert!(
+            recycled.capacity() >= 64,
+            "pooled buffer must retain its capacity (got {})",
+            recycled.capacity()
+        );
+        assert!(
+            std::ptr::eq(recycled.as_ptr(), warm_ptr),
+            "pool should hand back the same heap allocation"
+        );
+
+        // Empty / oversized buffers must not poison the pool.
+        recycle_cell_pointers(Vec::<u16>::new());
+        let mut huge = Vec::<u16>::with_capacity(CELL_POINTERS_POOL_MAX_CAPACITY + 1);
+        huge.push(0);
+        recycle_cell_pointers(huge);
+        recycle_cell_pointers(recycled);
+
+        let pool_len = CELL_POINTERS_POOL.with(|pool| pool.borrow().len());
+        assert_eq!(
+            pool_len, 1,
+            "only the in-range buffer should remain pooled (got {pool_len})"
+        );
+
+        // Cleanup so we don't leak a buffer into other tests on this thread.
+        CELL_POINTERS_POOL.with(|pool| pool.borrow_mut().clear());
     }
 }
