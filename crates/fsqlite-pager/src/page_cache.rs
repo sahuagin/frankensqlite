@@ -5249,7 +5249,7 @@ mod tests {
     ///     --ignored --nocapture
     ///     bench_sharded_cache_clear_empty_shards_microbench
     #[test]
-    #[ignore]
+    #[ignore = "microbench, run with --ignored --nocapture"]
     fn bench_sharded_cache_clear_empty_shards_microbench() {
         const ITERS: usize = 1_000_000;
         let cache = ShardedPageCache::new(PageSize::DEFAULT);

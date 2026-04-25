@@ -3036,6 +3036,15 @@ impl ConcurrentPublishedPages {
 
     /// Clear the concurrent overflow plane.
     fn clear(&self) {
+        // All publish-side mutations on this plane (insert / remove / retain /
+        // insert_batch / clear) are serialized by `PublishedPagerState::publish_lock`,
+        // so `page_count == 0` observed here implies the DashMap is empty and
+        // we can skip the per-shard sweep `DashMap::clear` performs unconditionally.
+        // Mirrors `AtomicPublishedPages::clear`'s identical short-circuit on its
+        // own `page_count` and the `ShardedPageCache::clear` shards-dirty short-circuit.
+        if self.page_count.load(AtomicOrdering::Acquire) == 0 {
+            return;
+        }
         self.pages.clear();
         self.page_count.store(0, AtomicOrdering::Release);
     }
@@ -22278,6 +22287,65 @@ mod tests {
             "bead_id=bd-uvdnk case=overflow_clear_removes_page"
         );
         assert_eq!(published_pages.len(), 0);
+    }
+
+    /// Shape: `PublishedPagerState::publish_clear_if` and the metadata-only
+    /// single-connection publish path call `PublishedPages::clear()` under
+    /// `publish_lock` on every transaction commit / rollback / metadata-only
+    /// republish. The atomic plane already short-circuits on `page_count == 0`;
+    /// the overflow plane previously walked every DashMap shard via
+    /// `pages.clear()` even when nothing had ever been admitted to the overflow
+    /// (the dominant case at MT8, where bench page numbers stay well below
+    /// the 65535-page direct-slot limit).
+    ///
+    /// Force `page_count = 1` to defeat the new short-circuit on the baseline
+    /// pass; both passes operate on an empty DashMap so the only difference is
+    /// the per-shard sweep `DashMap::clear` performs unconditionally. Pairing
+    /// baseline and optimized in one binary avoids cross-build timing noise.
+    ///
+    /// Run via:
+    ///   cargo test -p fsqlite-pager --lib --release --
+    ///     --ignored --nocapture
+    ///     bench_concurrent_published_pages_clear_empty_overflow_microbench
+    #[test]
+    #[ignore = "microbench, run with --ignored --nocapture"]
+    fn bench_concurrent_published_pages_clear_empty_overflow_microbench() {
+        use std::time::Instant;
+
+        const ITERS: usize = 1_000_000;
+        let overflow = ConcurrentPublishedPages::new();
+
+        // Warm up the optimized fast path.
+        for _ in 0..ITERS / 10 {
+            overflow.clear();
+        }
+
+        // Optimized: page_count starts at 0, the new short-circuit returns
+        // immediately without acquiring any DashMap shard locks.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            overflow.clear();
+        }
+        let elapsed_opt = start.elapsed();
+        let per_call_opt = elapsed_opt / u32::try_from(ITERS).unwrap();
+
+        // Baseline: force page_count to 1 at the top of every iteration so the
+        // short-circuit fails and we fall through into `pages.clear()` —
+        // matching the previous unconditional shard sweep on every publish.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            overflow.page_count.store(1, AtomicOrdering::Release);
+            overflow.clear();
+        }
+        let elapsed_base = start.elapsed();
+        let per_call_base = elapsed_base / u32::try_from(ITERS).unwrap();
+
+        let speedup = per_call_base.as_nanos() as f64 / per_call_opt.as_nanos().max(1) as f64;
+        eprintln!(
+            "bench_concurrent_published_pages_clear_empty_overflow_microbench: ITERS={ITERS} \
+             baseline={per_call_base:?} optimized={per_call_opt:?} \
+             speedup={speedup:.2}x"
+        );
     }
 
     #[test]
