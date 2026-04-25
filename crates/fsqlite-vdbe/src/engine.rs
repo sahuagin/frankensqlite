@@ -1861,12 +1861,7 @@ impl SharedTxnPageIo {
             return Ok(ConcurrentWriteTier::Tier0AlreadyOwned);
         }
 
-        let page_one_tracking_required = self
-            .txn
-            .borrow()
-            .write_page_requires_page_one_conflict_tracking(page_no)?;
-
-        if page_one_tracking_required {
+        if page_no == PageNumber::ONE {
             Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare)
         } else {
             Ok(ConcurrentWriteTier::Tier1FirstTouch)
@@ -30146,6 +30141,77 @@ mod tests {
         assert!(
             !guard.tracks_write_conflict_page(PageNumber::ONE),
             "tier-1 leased growth should not synthesize page-one conflict tracking before commit planning"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_high_page_write_skips_conservative_page_one_probe() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let target_page = PageNumber::new(2).unwrap();
+
+        let (session_id, handle, blocker_session) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            let blocker_session = guard
+                .begin_concurrent(snapshot)
+                .expect("blocker session should register");
+            (session_id, handle, blocker_session)
+        };
+
+        {
+            let guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut blocker = guard
+                .get_mut(blocker_session)
+                .expect("blocker handle should be present");
+            concurrent_track_write_conflict_page(
+                &mut blocker,
+                &lock_table,
+                blocker_session,
+                PageNumber::ONE,
+            )
+            .expect("blocker must hold page-one tracking");
+        }
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            txn,
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        page_io
+            .write_page(&cx, target_page, &vec![0x7B; PageSize::DEFAULT.as_usize()])
+            .expect("ordinary high-page concurrent writes must not probe page-one tracking");
+
+        let guard = handle.lock();
+        assert!(
+            guard.tracks_write_conflict_page(target_page),
+            "the high page must still enter the write-conflict surface"
+        );
+        assert!(
+            !guard.tracks_write_conflict_page(PageNumber::ONE),
+            "high-page writes must not synthesize page-one conflict tracking"
         );
     }
 
