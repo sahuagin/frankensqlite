@@ -1056,16 +1056,29 @@ impl<F: VfsFile> WalFile<F> {
     /// syscalls on hot commit paths. Durability is still controlled by
     /// [`Self::sync`] or a higher-level caller.
     pub fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
-        if frames.is_empty() {
+        self.append_frame_iter(cx, frames.len(), frames.iter().copied())
+    }
+
+    /// Append a known-size iterator of frame references without first
+    /// materializing a borrowed descriptor slice.
+    pub(crate) fn append_frame_iter<'a, I>(
+        &mut self,
+        cx: &Cx,
+        frame_count: usize,
+        frames: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = WalAppendFrameRef<'a>>,
+    {
+        if frame_count == 0 {
             return Ok(());
         }
 
         #[cfg(any(test, feature = "fault-injection"))]
-        crate::fault_hooks::maybe_inject_append_busy(self.frame_count, frames.len())?;
+        crate::fault_hooks::maybe_inject_append_busy(self.frame_count, frame_count)?;
 
         let frame_size = self.frame_size();
-        let total_bytes = frames
-            .len()
+        let total_bytes = frame_count
             .checked_mul(frame_size)
             .ok_or(FrankenError::DatabaseFull)?;
         let page_size = self.page_size;
@@ -1083,8 +1096,16 @@ impl<F: VfsFile> WalFile<F> {
         let append_result = (|| -> Result<()> {
             let mut running_checksum = self.running_checksum;
             let mut last_commit_offset: Option<usize> = None;
+            let mut observed_frame_count = 0usize;
 
-            for (idx, frame) in frames.iter().enumerate() {
+            for (idx, frame) in frames.into_iter().enumerate() {
+                if idx >= frame_count {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "append batch frame count mismatch: expected {frame_count}, got more than declared"
+                        ),
+                    });
+                }
                 if frame.page_data.len() != page_size {
                     return Err(FrankenError::WalCorrupt {
                         detail: format!(
@@ -1116,12 +1137,21 @@ impl<F: VfsFile> WalFile<F> {
                 if frame.db_size_if_commit != 0 {
                     last_commit_offset = Some(idx);
                 }
+                observed_frame_count = idx + 1;
+            }
+
+            if observed_frame_count != frame_count {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "append batch frame count mismatch: expected {frame_count}, got {observed_frame_count}"
+                    ),
+                });
             }
 
             self.append_finalized_prepared_frame_bytes(
                 cx,
                 &frame_scratch,
-                frames.len(),
+                frame_count,
                 running_checksum,
                 last_commit_offset,
             )
@@ -1130,7 +1160,7 @@ impl<F: VfsFile> WalFile<F> {
 
         #[cfg(any(test, feature = "fault-injection"))]
         if append_result.is_ok() {
-            crate::fault_hooks::maybe_inject_after_append(frame_count_before, frames.len())?;
+            crate::fault_hooks::maybe_inject_after_append(frame_count_before, frame_count)?;
         }
 
         append_result
@@ -2100,7 +2130,7 @@ mod tests {
         for i in 1..=3_u32 {
             let page = sample_page(i as u8);
             wal.append_frame(&cx, i, &page, i)
-                .unwrap_or_else(|e| panic!("append frame {i}: {e}"));
+                .expect("append frame before reset fault injection");
         }
         wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
         assert_eq!(wal.frame_count(), 3, "pre-reset: 3 frames");

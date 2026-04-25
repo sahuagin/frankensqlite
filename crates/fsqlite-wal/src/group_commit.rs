@@ -1448,16 +1448,13 @@ pub fn write_consolidated_frames<F: VfsFile>(
     let total_bytes = total_frames
         .checked_mul(frame_size)
         .ok_or_else(|| FrankenError::Internal("frame batch size overflow".to_owned()))?;
-    let mut frame_refs = Vec::with_capacity(total_frames);
-    for batch in batches {
-        for frame in &batch.frames {
-            frame_refs.push(WalAppendFrameRef {
-                page_number: frame.page_number,
-                page_data: &frame.page_data,
-                db_size_if_commit: frame.db_size_if_commit,
-            });
-        }
-    }
+    let frame_refs = batches.iter().flat_map(|batch| {
+        batch.frames.iter().map(|frame| WalAppendFrameRef {
+            page_number: frame.page_number,
+            page_data: &frame.page_data,
+            db_size_if_commit: frame.db_size_if_commit,
+        })
+    });
 
     let span = tracing::info_span!(
         target: "fsqlite_wal::group_commit",
@@ -1468,7 +1465,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     );
     let _guard = span.enter();
 
-    wal.append_frames(cx, &frame_refs)?;
+    wal.append_frame_iter(cx, total_frames, frame_refs)?;
     wal.file_mut().sync(cx, SyncFlags::FULL)?;
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
 
