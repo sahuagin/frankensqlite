@@ -1864,12 +1864,19 @@ struct HandleView {
     token: TxnToken,
     begin_seq: CommitSeq,
     flags: HandleViewFlags,
-    read_pages: HashSet<PageNumber>,
-    read_page_witness_pages: HashSet<PageNumber>,
-    read_exact_cells: HashSet<(PageNumber, u64)>,
-    write_pages: HashSet<PageNumber>,
-    write_page_witness_pages: HashSet<PageNumber>,
-    write_exact_cells: HashSet<(PageNumber, u64)>,
+    // Sorted, dedup'd page sets queried via `binary_search`. Storing these
+    // as `HashSet<PageNumber>` (default `RandomState` hasher) cost
+    // SipHash13 on every insert + every overlap probe — `HandleView::new`
+    // showed 0.10% MT8 self-time as the residual SSI hot path, dominated
+    // by the six-HashSet build. The summaries handed to us by
+    // `summarize_witness_keys` are already sorted+dedup'd, so the page
+    // fields move in directly without a re-sort.
+    read_pages: Vec<PageNumber>,
+    read_page_witness_pages: Vec<PageNumber>,
+    read_exact_cells: Vec<(PageNumber, u64)>,
+    write_pages: Vec<PageNumber>,
+    write_page_witness_pages: Vec<PageNumber>,
+    write_exact_cells: Vec<(PageNumber, u64)>,
     has_in_rw: Cell<bool>,
     has_out_rw: Cell<bool>,
 }
@@ -1878,27 +1885,45 @@ impl HandleView {
     fn new(handle: &ConcurrentHandle) -> Self {
         let read_summary = summarize_witness_keys(&handle.read_witness_keys());
         let write_summary = summarize_witness_keys(&handle.write_witness_keys());
-        let mut write_pages: HashSet<PageNumber> =
-            handle.tracked_write_conflict_pages_iter().collect();
-        write_pages.extend(write_summary.pages.iter().copied());
+
+        // Union tracked-write-conflict pages with witness pages. The tracked
+        // iter yields HashMap-iteration order; the witness side is already
+        // sorted. Sort+dedup the combined Vec once instead of paying
+        // per-insert hashing.
+        let mut write_pages: Vec<PageNumber> = handle.tracked_write_conflict_pages_iter().collect();
+        write_pages.extend_from_slice(&write_summary.pages);
+        write_pages.sort_unstable();
+        write_pages.dedup();
+
+        // `summary.cell_witnesses` is sorted by full (root, leaf, tag);
+        // projecting to (root, tag) drops `leaf_page`, so the result may
+        // hold dup (root, tag) pairs across distinct leaves — sort+dedup.
+        let mut read_exact_cells: Vec<(PageNumber, u64)> = read_summary
+            .cell_witnesses
+            .iter()
+            .map(|cell| cell.exact_key())
+            .collect();
+        read_exact_cells.sort_unstable();
+        read_exact_cells.dedup();
+
+        let mut write_exact_cells: Vec<(PageNumber, u64)> = write_summary
+            .cell_witnesses
+            .iter()
+            .map(|cell| cell.exact_key())
+            .collect();
+        write_exact_cells.sort_unstable();
+        write_exact_cells.dedup();
+
         Self {
             token: handle.token(),
             begin_seq: handle.begin_seq(),
             flags: HandleViewFlags::from_handle(handle),
-            read_pages: read_summary.pages.iter().copied().collect(),
-            read_page_witness_pages: read_summary.page_witness_pages.iter().copied().collect(),
-            read_exact_cells: read_summary
-                .cell_witnesses
-                .iter()
-                .map(|cell| cell.exact_key())
-                .collect(),
+            read_pages: read_summary.pages,
+            read_page_witness_pages: read_summary.page_witness_pages,
+            read_exact_cells,
             write_pages,
-            write_page_witness_pages: write_summary.page_witness_pages.iter().copied().collect(),
-            write_exact_cells: write_summary
-                .cell_witnesses
-                .iter()
-                .map(|cell| cell.exact_key())
-                .collect(),
+            write_page_witness_pages: write_summary.page_witness_pages,
+            write_exact_cells,
             has_in_rw: Cell::new(handle.has_in_rw()),
             has_out_rw: Cell::new(handle.has_out_rw()),
         }
@@ -2265,18 +2290,28 @@ impl ActiveTxnView for HandleView {
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
         match key {
             WitnessKey::Page(p) | WitnessKey::ByteRange { page: p, .. } => {
-                self.read_pages.contains(p)
+                self.read_pages.binary_search(p).is_ok()
             }
             WitnessKey::Cell {
                 btree_root,
                 leaf_page,
                 tag,
             } => {
-                self.read_page_witness_pages.contains(btree_root)
-                    || self.read_page_witness_pages.contains(leaf_page)
-                    || self.read_exact_cells.contains(&(*btree_root, *tag))
+                self.read_page_witness_pages
+                    .binary_search(btree_root)
+                    .is_ok()
+                    || self
+                        .read_page_witness_pages
+                        .binary_search(leaf_page)
+                        .is_ok()
+                    || self
+                        .read_exact_cells
+                        .binary_search(&(*btree_root, *tag))
+                        .is_ok()
             }
-            WitnessKey::KeyRange { btree_root, .. } => self.read_pages.contains(btree_root),
+            WitnessKey::KeyRange { btree_root, .. } => {
+                self.read_pages.binary_search(btree_root).is_ok()
+            }
             WitnessKey::Custom { .. } => {
                 !self.read_pages.is_empty() || self.has_global_read_witnesses()
             }
@@ -2286,18 +2321,28 @@ impl ActiveTxnView for HandleView {
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
         match key {
             WitnessKey::Page(p) | WitnessKey::ByteRange { page: p, .. } => {
-                self.write_pages.contains(p)
+                self.write_pages.binary_search(p).is_ok()
             }
             WitnessKey::Cell {
                 btree_root,
                 leaf_page,
                 tag,
             } => {
-                self.write_page_witness_pages.contains(btree_root)
-                    || self.write_page_witness_pages.contains(leaf_page)
-                    || self.write_exact_cells.contains(&(*btree_root, *tag))
+                self.write_page_witness_pages
+                    .binary_search(btree_root)
+                    .is_ok()
+                    || self
+                        .write_page_witness_pages
+                        .binary_search(leaf_page)
+                        .is_ok()
+                    || self
+                        .write_exact_cells
+                        .binary_search(&(*btree_root, *tag))
+                        .is_ok()
             }
-            WitnessKey::KeyRange { btree_root, .. } => self.write_pages.contains(btree_root),
+            WitnessKey::KeyRange { btree_root, .. } => {
+                self.write_pages.binary_search(btree_root).is_ok()
+            }
             WitnessKey::Custom { .. } => {
                 !self.write_pages.is_empty() || self.has_global_write_witnesses()
             }
@@ -6548,28 +6593,29 @@ mod tests {
     #[ignore = "microbench — run manually"]
     fn bench_active_edge_index_build() {
         use std::cell::Cell;
-        use std::collections::HashSet;
         use std::time::Instant;
 
         use super::{ActiveEdgeDiscoveryIndex, HandleView, HandleViewFlags};
 
         fn make_view(token_id: u64, page_base: u32, pages_per_view: u32) -> HandleView {
-            let read_pages: HashSet<PageNumber> = (0..pages_per_view)
+            let mut read_pages: Vec<PageNumber> = (0..pages_per_view)
                 .map(|i| test_page(page_base + i))
                 .collect();
-            let write_pages: HashSet<PageNumber> = (0..pages_per_view)
+            read_pages.sort_unstable();
+            let mut write_pages: Vec<PageNumber> = (0..pages_per_view)
                 .map(|i| test_page(page_base + pages_per_view + i))
                 .collect();
+            write_pages.sort_unstable();
             HandleView {
                 token: test_token(token_id),
                 begin_seq: CommitSeq::new(1),
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
                 read_pages: read_pages.clone(),
                 read_page_witness_pages: read_pages,
-                read_exact_cells: HashSet::new(),
+                read_exact_cells: Vec::new(),
                 write_pages: write_pages.clone(),
                 write_page_witness_pages: write_pages,
-                write_exact_cells: HashSet::new(),
+                write_exact_cells: Vec::new(),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -6721,7 +6767,6 @@ mod tests {
     #[ignore = "microbench — run manually"]
     fn bench_incoming_candidate_refs_empty_readers() {
         use std::cell::Cell;
-        use std::collections::HashSet;
         use std::time::Instant;
 
         use super::{
@@ -6729,19 +6774,20 @@ mod tests {
         };
 
         fn make_writer_view(token_id: u64, pages: &[u32]) -> HandleView {
-            let write_pages: HashSet<PageNumber> = pages.iter().copied().map(test_page).collect();
+            let mut write_pages: Vec<PageNumber> = pages.iter().copied().map(test_page).collect();
+            write_pages.sort_unstable();
             HandleView {
                 token: test_token(token_id),
                 begin_seq: CommitSeq::new(1),
                 flags: HandleViewFlags(HandleViewFlags::ACTIVE),
                 // Read side intentionally empty — all_readers stays empty
                 // so the short-circuit fires.
-                read_pages: HashSet::new(),
-                read_page_witness_pages: HashSet::new(),
-                read_exact_cells: HashSet::new(),
+                read_pages: Vec::new(),
+                read_page_witness_pages: Vec::new(),
+                read_exact_cells: Vec::new(),
                 write_pages: write_pages.clone(),
                 write_page_witness_pages: write_pages,
-                write_exact_cells: HashSet::new(),
+                write_exact_cells: Vec::new(),
                 has_in_rw: Cell::new(false),
                 has_out_rw: Cell::new(false),
             }
@@ -6805,6 +6851,77 @@ mod tests {
         eprintln!(
             "bench_incoming_candidate_refs_empty_readers: median={median:.1} ns/call, \
              mean={mean:.1} ns/call (n={TRIALS}, views={VIEWS}, write_pages={PAGES_PER_VIEW})"
+        );
+    }
+
+    /// Microbench for `HandleView::new` on the typical MT writer shape:
+    /// 10 read-witness pages + 10 staged write pages (which feed both the
+    /// `tracked_write_conflict_pages_iter` chain and the write-witness
+    /// summary). Six set-shaped fields are built per call; switching the
+    /// representation from `HashSet<PageNumber>` (default `RandomState`)
+    /// to sorted `Vec<PageNumber>` with `binary_search`-backed
+    /// `check_*_overlap` removes per-insert SipHash13 cost and lets the
+    /// summary's already-sorted Vecs move in directly.
+    ///
+    /// Run with:
+    /// `cargo test -p fsqlite-mvcc --lib --release -- \
+    ///    bench_handle_view_new_typical --ignored --nocapture`
+    #[test]
+    #[ignore = "microbench — run manually"]
+    fn bench_handle_view_new_typical() {
+        use std::time::Instant;
+
+        use super::HandleView;
+
+        const READ_PAGES: u32 = 10;
+        const WRITE_PAGES: u32 = 10;
+        const BUILDS_PER_TRIAL: u32 = 200_000;
+        const TRIALS: usize = 7;
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            for i in 1..=READ_PAGES {
+                handle.record_read_witness(WitnessKey::Page(test_page(i)));
+            }
+            for i in 1..=WRITE_PAGES {
+                concurrent_write_page(
+                    &mut handle,
+                    &lock_table,
+                    session_id,
+                    test_page(READ_PAGES + i),
+                    test_data(),
+                )
+                .unwrap();
+            }
+        }
+
+        let handle = registry.get(session_id).unwrap();
+
+        // Warm-up.
+        for _ in 0..BUILDS_PER_TRIAL {
+            std::hint::black_box(HandleView::new(&handle));
+        }
+
+        let mut samples = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            for _ in 0..BUILDS_PER_TRIAL {
+                std::hint::black_box(HandleView::new(&handle));
+            }
+            let elapsed = start.elapsed();
+            let ns_per_build = elapsed.as_nanos() as f64 / f64::from(BUILDS_PER_TRIAL);
+            eprintln!("  trial: {ns_per_build:.1} ns/build ({elapsed:?} total)");
+            samples.push(ns_per_build);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = samples[TRIALS / 2];
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        eprintln!(
+            "bench_handle_view_new_typical: median={median:.1} ns/build, \
+             mean={mean:.1} ns/build (n={TRIALS}, read={READ_PAGES}, write={WRITE_PAGES})"
         );
     }
 }
