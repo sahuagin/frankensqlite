@@ -15,6 +15,8 @@
 //! - **Table B-trees (intkey):** Keyed by `i64` rowid, leaves store record payloads.
 //! - **Index B-trees (blobkey):** Keyed by arbitrary byte sequences, leaves are key-only.
 
+use std::borrow::Cow;
+
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
 
@@ -162,6 +164,17 @@ pub trait BtreeCursorOps: sealed::Sealed {
         let rowid = self.rowid(cx)?;
         self.payload_into(cx, buf)?;
         Ok(rowid)
+    }
+
+    /// Read the rowid and payload at the current cursor position, returning a
+    /// borrowed payload when the implementation can safely expose one.
+    ///
+    /// The default keeps mock and non-specialized cursors correct by owning the
+    /// payload bytes. Real table cursors override this to borrow local page
+    /// payloads and allocate only for overflow chains.
+    fn rowid_and_payload_cow<'a>(&'a self, cx: &Cx) -> Result<(i64, Cow<'a, [u8]>)> {
+        let rowid = self.rowid(cx)?;
+        Ok((rowid, Cow::Owned(self.payload(cx)?)))
     }
 
     /// Read only a prefix of the payload at the current cursor position into

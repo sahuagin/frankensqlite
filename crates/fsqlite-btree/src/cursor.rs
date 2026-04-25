@@ -7437,6 +7437,21 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn rowid_and_payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<i64> {
+        let (rowid, payload) = self.rowid_and_payload_cow(cx)?;
+        buf.clear();
+        match payload {
+            Cow::Borrowed(bytes) => {
+                instrumentation::record_local_payload_copy(bytes.len());
+                buf.extend_from_slice(bytes);
+            }
+            Cow::Owned(bytes) => {
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        Ok(rowid)
+    }
+
+    fn rowid_and_payload_cow<'a>(&'a self, cx: &Cx) -> Result<(i64, Cow<'a, [u8]>)> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
@@ -7446,23 +7461,25 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at_uncached(top, top.cell_idx)?;
-        self.read_cell_payload_into(cx, top, &cell, buf)?;
+        let payload = self.read_cell_payload(cx, top, &cell)?;
         if let Some(rowid) = cell.rowid {
-            return Ok(rowid);
+            return Ok((rowid, payload));
         }
 
         // Index cursor fallback: match rowid() semantics, but reuse the
         // payload bytes already materialized above instead of reading them a
         // second time.
-        let key_values = parse_record(buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "malformed index key record while extracting rowid".to_owned(),
-        })?;
-        key_values
+        let key_values =
+            parse_record(payload.as_ref()).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed index key record while extracting rowid".to_owned(),
+            })?;
+        let rowid = key_values
             .last()
             .and_then(fsqlite_types::SqliteValue::as_integer)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "index key record missing trailing integer rowid".to_owned(),
-            })
+            })?;
+        Ok((rowid, payload))
     }
 
     fn payload_prefix_into(
