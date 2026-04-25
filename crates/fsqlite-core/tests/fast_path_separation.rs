@@ -1705,10 +1705,20 @@ fn test_fast_path_count_star_sum_sees_writes_after_repeated_overlay_reads()
         Some(fsqlite_types::SqliteValue::Integer(230)),
     );
 
-    conn.execute("INSERT INTO t VALUES (4, 40)")?;
+    let insert = conn.prepare("INSERT INTO t VALUES (?1, ?2)")?;
+    insert.execute_with_params(&[
+        fsqlite_types::SqliteValue::Integer(4),
+        fsqlite_types::SqliteValue::Integer(40),
+    ])?;
     let after_insert = stmt.query_row()?;
+    let after_insert_again = stmt.query_row()?;
     assert_count_star_sum_row(
         &after_insert,
+        3,
+        Some(fsqlite_types::SqliteValue::Integer(270)),
+    );
+    assert_count_star_sum_row(
+        &after_insert_again,
         3,
         Some(fsqlite_types::SqliteValue::Integer(270)),
     );
