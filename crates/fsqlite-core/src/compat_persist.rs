@@ -500,11 +500,16 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
         configure_btree_cursor_page_size(&mut cursor, usable_size, page_size);
 
         if cursor.first(cx)? {
+            let mut payload_buf: Vec<u8> = Vec::new();
             loop {
-                let rowid = cursor.rowid(cx)?;
-                let payload = cursor.payload(cx)?;
+                // bd-9e3xf.6: fuse rowid+payload via the cursor accessor
+                // landed in 5459d778 — saves one parse_cell_at per row on
+                // the schema replay path, where N can be the full count of
+                // sqlite_master rows in the database.
+                payload_buf.clear();
+                let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
                 let values =
-                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    parse_record(&payload_buf).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "sqlite_master row {rowid} payload is not a valid SQLite record"
                         ),
@@ -690,10 +695,14 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         "loading populated WITHOUT ROWID table `{table_name_for_err}` is not yet supported"
                     )));
                 }
+                let mut payload_buf: Vec<u8> = Vec::new();
                 loop {
-                    let rowid = cursor.rowid(cx)?;
-                    let payload = cursor.payload(cx)?;
-                    let mut values = parse_record(&payload).ok_or_else(|| {
+                    // bd-9e3xf.6: fused accessor (5459d778) avoids a second
+                    // parse_cell_at on every row of the legacy table-replay
+                    // hot path used by file-backed schema hydration.
+                    payload_buf.clear();
+                    let rowid = cursor.rowid_and_payload_into(cx, &mut payload_buf)?;
+                    let mut values = parse_record(&payload_buf).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
                                 "table `{table_name_for_err}` rowid {rowid} payload is not a valid SQLite record"
