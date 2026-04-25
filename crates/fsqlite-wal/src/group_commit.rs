@@ -248,6 +248,8 @@ pub struct PhaseHistogram {
     count: AtomicU64,
     /// Running sum for mean computation.
     sum_us: AtomicU64,
+    /// Cheap decaying tail estimate for hot-path policy decisions.
+    recent_tail_us: AtomicU64,
 }
 
 impl PhaseHistogram {
@@ -262,6 +264,7 @@ impl PhaseHistogram {
             max_us: AtomicU64::new(0),
             count: AtomicU64::new(0),
             sum_us: AtomicU64::new(0),
+            recent_tail_us: AtomicU64::new(0),
         }
     }
 
@@ -285,6 +288,31 @@ impl PhaseHistogram {
                 Err(actual) => prev = actual,
             }
         }
+
+        // Hot-path consumers need a cheap tail-pressure signal but must not
+        // call `percentiles()`, which copies and sorts the whole ring. Maintain
+        // a conservative decaying maximum: spikes influence a few subsequent
+        // decisions, then fade without requiring a telemetry snapshot.
+        let mut prev_tail = self.recent_tail_us.load(Ordering::Relaxed);
+        loop {
+            let decayed = prev_tail.saturating_mul(15) / 16;
+            let next_tail = value_us.max(decayed);
+            match self.recent_tail_us.compare_exchange_weak(
+                prev_tail,
+                next_tail,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev_tail = actual,
+            }
+        }
+    }
+
+    /// Return a constant-time recent tail estimate for scheduler hot paths.
+    #[must_use]
+    pub fn recent_tail_us(&self) -> u64 {
+        self.recent_tail_us.load(Ordering::Relaxed)
     }
 
     /// Snapshot percentiles: returns (p50, p95, p99, max, count, mean_us).
@@ -340,6 +368,7 @@ impl PhaseHistogram {
         self.max_us.store(0, Ordering::Relaxed);
         self.count.store(0, Ordering::Relaxed);
         self.sum_us.store(0, Ordering::Relaxed);
+        self.recent_tail_us.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2058,6 +2087,30 @@ mod tests {
             Some(2),
             "wake reasons should preserve all fields"
         );
+    }
+
+    #[test]
+    fn test_phase_histogram_recent_tail_decays_without_snapshot() {
+        let h = PhaseHistogram::new();
+        h.record(1_600);
+        assert_eq!(h.recent_tail_us(), 1_600);
+
+        h.record(0);
+        assert_eq!(
+            h.recent_tail_us(),
+            1_500,
+            "recent tail should decay by one sixteenth per sample"
+        );
+
+        h.record(2_000);
+        assert_eq!(
+            h.recent_tail_us(),
+            2_000,
+            "new spikes should replace the decayed tail immediately"
+        );
+
+        h.reset();
+        assert_eq!(h.recent_tail_us(), 0);
     }
 
     /// Deterministic proof that consolidation achieves fsync reduction.

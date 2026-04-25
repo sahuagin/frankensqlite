@@ -223,13 +223,17 @@ fn commit_service_fairness_budget(
 }
 
 fn recent_queue_age_p95(fill_age: Duration) -> Duration {
-    let recent_arrival_wait_p95 = Duration::from_micros(
+    // This runs in the group-commit flusher's scheduling loop. Do not call
+    // `GLOBAL_CONSOLIDATION_METRICS.snapshot()` here: the report path copies
+    // and sorts the histogram ring to compute exact percentiles. A decaying
+    // tail estimate preserves the starvation-pressure signal without turning
+    // every flush decision into a telemetry aggregation.
+    let recent_arrival_wait_tail = Duration::from_micros(
         GLOBAL_CONSOLIDATION_METRICS
-            .snapshot()
             .hist_arrival_wait
-            .p95,
+            .recent_tail_us(),
     );
-    std::cmp::max(fill_age, recent_arrival_wait_p95)
+    std::cmp::max(fill_age, recent_arrival_wait_tail)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
