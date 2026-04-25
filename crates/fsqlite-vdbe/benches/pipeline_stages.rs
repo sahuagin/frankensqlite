@@ -206,6 +206,26 @@ fn build_execute_stage_rowid_program(root_page: i32, op_repeats: usize) -> VdbeP
         .expect("pipeline execute rowid benchmark program should build")
 }
 
+/// Mirrors `build_execute_stage_rowid_program` but emits `IdxRowid`
+/// in the body loop.  Both opcodes route through `cursor_rowid`, so
+/// this isolates dispatch routing cost for the `IdxRowid` arm specifically
+/// — same shape pattern as the Rowid bench.
+fn build_execute_stage_idx_rowid_program(root_page: i32, op_repeats: usize) -> VdbeProgram {
+    let mut builder = ProgramBuilder::new();
+    let halt = builder.emit_label();
+    builder.emit_op(Opcode::OpenWrite, 0, root_page, 0, P4::Int(1), 0);
+    builder.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+    let r_out = builder.alloc_reg();
+    for _ in 0..op_repeats {
+        builder.emit_op(Opcode::IdxRowid, 0, r_out, 0, P4::None, 0);
+    }
+    builder.resolve_label(halt);
+    builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    builder
+        .finish()
+        .expect("pipeline execute idx_rowid benchmark program should build")
+}
+
 fn build_execute_stage_ifnot_program(op_repeats: usize) -> VdbeProgram {
     // Mirrors the IsNull builder's always-taken-jump shape: each
     // IfNot's p2 jump target is the immediately-next instruction, so
@@ -527,6 +547,48 @@ fn bench_vdbe_execute_rowid_stage(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_vdbe_execute_idx_rowid_stage(c: &mut Criterion) {
+    set_vdbe_jit_enabled(false);
+    let mut group = c.benchmark_group("vdbe_pipeline_execute_idx_rowid");
+
+    for op_repeats in EXECUTE_STAGE_OP_REPEATS {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert_row(1, vec![SqliteValue::Integer(42)]);
+        let program = build_execute_stage_idx_rowid_program(root, op_repeats);
+
+        group.throughput(Throughput::Elements(
+            u64::try_from(op_repeats).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(op_repeats),
+            &(program, db),
+            |b, (program, db)| {
+                let execution_cx = Cx::new();
+                let mut engine = VdbeEngine::new_with_execution_cx(
+                    program.register_count(),
+                    &execution_cx,
+                    PageSize::DEFAULT,
+                );
+                engine.set_collect_result_rows(false);
+                engine.enable_storage_cursors(true);
+                engine.set_database(db.clone());
+                engine.set_reject_mem_fallback(false);
+                b.iter(|| {
+                    let outcome = engine
+                        .execute(program)
+                        .expect("pipeline execute idx_rowid benchmark should execute");
+                    black_box(outcome);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_vdbe_execute_ifnot_stage(c: &mut Criterion) {
     set_vdbe_jit_enabled(false);
     let mut group = c.benchmark_group("vdbe_pipeline_execute_ifnot");
@@ -599,6 +661,7 @@ criterion_group!(
     bench_vdbe_execute_isnull_stage,
     bench_vdbe_execute_ifnot_stage,
     bench_vdbe_execute_rowid_stage,
+    bench_vdbe_execute_idx_rowid_stage,
     bench_vdbe_commit_stage
 );
 criterion_main!(benches);

@@ -11934,6 +11934,28 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // IdxRowid extracts the trailing rowid field from the index-key
+            // record at cursor p1's current position into register p2.  Body
+            // is byte-identical to Rowid above — both arms route through
+            // `cursor_rowid`, which dispatches uniformly across storage
+            // cursors (table & index B-trees), legacy in-memory cursors, and
+            // virtual-table cursors.  Emitted ~13 production sites in
+            // fsqlite-vdbe + fsqlite-planner codegen, firing once per matched
+            // index row in every index-driven JOIN, IN-list lookup, covering-
+            // index scan converting index entries to table rowids for the
+            // subsequent SeekRowid probe, and any DELETE/UPDATE walking an
+            // index to find row keys.  Same family as the just-promoted
+            // Rowid: small body (HashMap probe + cursor.rowid call), high
+            // call frequency along JOIN inner loops, dispatch routing cost
+            // is a meaningful fraction of per-op cost.
+            Opcode::IdxRowid => {
+                let cursor_id = op.p1;
+                let target = op.p2;
+                let val = self.cursor_rowid(cursor_id)?;
+                self.set_reg_fast(target, val);
+                *pc += 1;
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -28442,6 +28464,55 @@ mod tests {
                 vec![SqliteValue::Null],
                 vec![SqliteValue::Integer(7)],
                 vec![SqliteValue::Integer(11)],
+            ]
+        );
+    }
+
+    // ── IdxRowid opcode test ─────────────────────────────────────
+
+    #[test]
+    fn test_idx_rowid_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm.
+        // IdxRowid shares the `cursor_rowid` helper with Rowid, so the
+        // hot-path arm is byte-equivalent to the main-match arm; this
+        // test exercises both input classes that helper handles:
+        //   - storage cursor positioned on a row → emit Integer(rowid)
+        //   - cursor id never opened            → emit Null
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(13, vec![SqliteValue::Integer(130)]);
+        table.insert(17, vec![SqliteValue::Integer(170)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let halt = b.emit_label();
+
+            // Probe a never-opened cursor id first → expects Null.
+            let r_unopened = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, 99, r_unopened, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_unopened, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, halt, P4::None, 0);
+
+            let body = b.current_addr();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.resolve_label(halt);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Null],
+                vec![SqliteValue::Integer(13)],
+                vec![SqliteValue::Integer(17)],
             ]
         );
     }
