@@ -294,10 +294,19 @@ impl WriteCoordinator {
     }
 
     /// Allocate the next commit sequence number atomically.
+    ///
+    /// `AcqRel` matches the rest of the commit-seq counters in the tree
+    /// (`Connection::next_commit_seq` in fsqlite-core uses `AcqRel`;
+    /// `CommitSequenceCombiner::next_commit_seq` in commit_combiner.rs
+    /// uses `AcqRel`). The previous `SeqCst` here was the only outlier
+    /// — strictly conservative but unnecessary for monotonic-counter
+    /// publication. The producer's `Release` on `fetch_add` pairs with
+    /// any reader's `Acquire` load (e.g. `load_next_commit_seq` in
+    /// shm.rs already uses `Acquire`).
     fn allocate_commit_seq(&self) -> CommitSeq {
         let seq = self
             .next_commit_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         debug_assert!(seq < u64::MAX, "CommitSeq allocation overflow");
         CommitSeq::new(seq)
     }
