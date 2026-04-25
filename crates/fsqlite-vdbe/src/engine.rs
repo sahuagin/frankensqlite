@@ -11872,6 +11872,27 @@ impl VdbeEngine {
                 }
                 Ok(true)
             }
+            // IsNull is the highest-frequency unpromoted opcode in
+            // codegen (87 emit sites — more than Goto/Column/Copy/Null
+            // individually). It backs every NOT NULL constraint check,
+            // every IS NULL / IS NOT NULL WHERE clause, and the
+            // null-guarding boilerplate around aggregate folding,
+            // CASE/COALESCE evaluation, and JOIN match probing. Body
+            // is a single `is_null` read + branch — the smallest
+            // possible body shape, where dispatch routing cost
+            // dominates work cost. Mirrors the existing main-match
+            // arm verbatim.
+            Opcode::IsNull => {
+                if self.get_reg(op.p1).is_null() {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
             // bd-perf (V2.1): Fused NewRowid + MakeRecord + Insert for
             // sequential append. Combines 3 opcodes into 1 dispatch.
             // P1=cursor, P2=first_reg, P3=num_cols, P5=insert_flags.
@@ -28160,6 +28181,75 @@ mod tests {
                 vec![SqliteValue::Integer(0)],
                 vec![SqliteValue::Null],
                 vec![SqliteValue::Integer(0)],
+            ]
+        );
+    }
+
+    // ── IsNull opcode test ───────────────────────────────────────
+
+    #[test]
+    fn test_is_null_via_hot_path() {
+        // Pins the hot-path arm's behaviour to the main-match arm:
+        // - val IS NULL: jump to p2 (taken branch)
+        // - val IS NOT NULL: fall through (no jump, no register write)
+        //
+        // The hot-path arm only covers control flow — neither branch
+        // mutates the source register, so the seeded value stays put
+        // across each IsNull dispatch.
+        //
+        // `ResultRow` drains its source register via `take_reg_range`,
+        // so the asserts below reflect that move-out.
+        //
+        // Trace (r_null seeded to NULL, r_int seeded to 7, r_hit to 0):
+        //   IsNull r_null  → NULL: jump skip1 (skip AddImm)            r_hit=0
+        //   skip1: ResultRow r_hit                                     emits [0], r_hit=NULL
+        //   IsNull r_int   → not NULL: fall through                    r_hit=NULL
+        //   AddImm r_hit,1 r_hit = NULL.to_integer()+1 = 1
+        //   skip2: ResultRow r_hit                                     emits [1], r_hit=NULL
+        //   IsNull r_null  → NULL: jump skip3 (skip AddImm)            r_hit=NULL
+        //   skip3: ResultRow r_int                                     emits [7]
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let skip1 = b.emit_label();
+            let skip2 = b.emit_label();
+            let skip3 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_null = b.alloc_reg();
+            let r_int = b.alloc_reg();
+            let r_hit = b.alloc_reg();
+            // r_null left as the default Null seed; explicitly set the
+            // others so the test reads as a complete state machine
+            // even if `alloc_reg`'s initial value ever changes.
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_int, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_hit, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::IsNull, r_null, 0, skip1, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip1);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::IsNull, r_int, 0, skip2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip2);
+            b.emit_op(Opcode::ResultRow, r_hit, 1, 0, P4::None, 0);
+
+            b.emit_jump_to_label(Opcode::IsNull, r_null, 0, skip3, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_hit, 1, 0, P4::None, 0);
+            b.resolve_label(skip3);
+            b.emit_op(Opcode::ResultRow, r_int, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(7)],
             ]
         );
     }
