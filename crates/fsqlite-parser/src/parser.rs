@@ -567,7 +567,8 @@ impl Parser {
         &mut self,
         f: fn(&mut Self) -> Result<T, ParseError>,
     ) -> Result<Vec<T>, ParseError> {
-        let mut v = vec![f(self)?];
+        let mut v = Vec::with_capacity(4);
+        v.push(f(self)?);
         while self.eat(&TokenKind::Comma) {
             v.push(f(self)?);
         }
