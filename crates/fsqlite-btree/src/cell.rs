@@ -138,18 +138,31 @@ impl BtreePageHeader {
     ///
     /// `header_offset` is typically 0, except for page 1 where the database
     /// file header occupies the first 100 bytes (`header_offset = 100`).
+    //
+    // Hot path: this runs once per page on every cursor `load_page`. The
+    // body is inlined so cross-crate callers (the `parse_page_header`
+    // wrapper, plus direct uses in `cursor.rs` / `balance.rs`) can fold
+    // the constant `header_offset` away. Bytes are pulled out through a
+    // single `page.get(..).try_into()::<&[u8; 8]>` so every subsequent
+    // index becomes statically in-bounds — replacing the eight separate
+    // `h[i]` accesses (each previously bounds-checked because LLVM could
+    // not see the saturating-sub guard) with one branchless load.
+    #[inline]
     pub fn parse(page: &[u8], header_offset: usize) -> Result<Self> {
-        let remaining = page.len().saturating_sub(header_offset);
-        if remaining < BTREE_LEAF_HEADER_SIZE as usize {
-            return Err(FrankenError::DatabaseCorrupt {
+        const LEAF: usize = BTREE_LEAF_HEADER_SIZE as usize;
+        const INTERIOR_TAIL: usize = BTREE_INTERIOR_HEADER_SIZE as usize - LEAF;
+
+        let leaf_end = header_offset.saturating_add(LEAF);
+        let h: &[u8; LEAF] = page
+            .get(header_offset..leaf_end)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "page too small for B-tree header: {} bytes at offset {}",
-                    remaining, header_offset
+                    page.len().saturating_sub(header_offset),
+                    header_offset
                 ),
-            });
-        }
-
-        let h = &page[header_offset..];
+            })?;
 
         let page_type =
             BtreePageType::from_flag(h[0]).ok_or_else(|| FrankenError::DatabaseCorrupt {
@@ -167,12 +180,14 @@ impl BtreePageHeader {
         let fragmented_free_bytes = h[7];
 
         let right_child = if page_type.is_interior() {
-            if remaining < BTREE_INTERIOR_HEADER_SIZE as usize {
-                return Err(FrankenError::DatabaseCorrupt {
+            let interior_end = leaf_end + INTERIOR_TAIL;
+            let tail: &[u8; INTERIOR_TAIL] = page
+                .get(leaf_end..interior_end)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "page too small for interior B-tree header".to_owned(),
-                });
-            }
-            let pgno = u32::from_be_bytes([h[8], h[9], h[10], h[11]]);
+                })?;
+            let pgno = u32::from_be_bytes(*tail);
             Some(
                 PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "interior page has zero right-child pointer".to_owned(),
@@ -219,6 +234,11 @@ impl BtreePageHeader {
 
 /// Parse a B-tree page header using the canonical header offset for `page_no`
 /// and attach page-number context to corruption errors.
+//
+// Inlined so the constant 0 / 100 `header_offset` produced by
+// `header_offset_for_page` folds into the inner `parse` body for every
+// non-page-1 caller.
+#[inline]
 pub fn parse_page_header(page: &[u8], page_no: PageNumber) -> Result<BtreePageHeader> {
     let header_offset = header_offset_for_page(page_no);
     BtreePageHeader::parse(page, header_offset).map_err(|error| FrankenError::DatabaseCorrupt {
@@ -698,6 +718,7 @@ impl CellRef {
 /// Page 1 has the 100-byte database file header before the B-tree header.
 /// All other pages start at offset 0.
 #[must_use]
+#[inline]
 pub const fn header_offset_for_page(page_no: PageNumber) -> usize {
     if page_no.get() == 1 {
         DB_HEADER_SIZE as usize
@@ -1440,6 +1461,139 @@ mod tests {
             assert!(
                 max_tbl > max_idx,
                 "page_size={page_size}: max_tbl={max_tbl} <= max_idx={max_idx}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Microbench (#[ignore]) — parse hot path
+    // ------------------------------------------------------------------
+    //
+    // Compares the optimized `BtreePageHeader::parse` against a reference
+    // implementation that mirrors the pre-optimisation per-byte indexing
+    // shape (`let h = &page[off..]; h[0]; h[1]; ...`). Both arms run in
+    // the same release build so allocator / cache state is shared; the
+    // delta isolates the bounds-check elision + `#[inline]`d header-offset
+    // folding.
+
+    #[inline(never)]
+    fn parse_header_naive(page: &[u8], header_offset: usize) -> Result<BtreePageHeader> {
+        let remaining = page.len().saturating_sub(header_offset);
+        if remaining < BTREE_LEAF_HEADER_SIZE as usize {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page too small for B-tree header: {remaining} bytes at offset {header_offset}",
+                ),
+            });
+        }
+        let h = &page[header_offset..];
+        let page_type =
+            BtreePageType::from_flag(h[0]).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid B-tree page type flag: {:#04x}", h[0]),
+            })?;
+        let first_freeblock = u16::from_be_bytes([h[1], h[2]]);
+        let cell_count = u16::from_be_bytes([h[3], h[4]]);
+        let raw_content_offset = u16::from_be_bytes([h[5], h[6]]);
+        let cell_content_offset = if raw_content_offset == 0 {
+            65536
+        } else {
+            u32::from(raw_content_offset)
+        };
+        let fragmented_free_bytes = h[7];
+        let right_child = if page_type.is_interior() {
+            if remaining < BTREE_INTERIOR_HEADER_SIZE as usize {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "page too small for interior B-tree header".to_owned(),
+                });
+            }
+            let pgno = u32::from_be_bytes([h[8], h[9], h[10], h[11]]);
+            Some(
+                PageNumber::new(pgno).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior page has zero right-child pointer".to_owned(),
+                })?,
+            )
+        } else {
+            None
+        };
+        Ok(BtreePageHeader {
+            page_type,
+            first_freeblock,
+            cell_count,
+            cell_content_offset,
+            fragmented_free_bytes,
+            right_child,
+        })
+    }
+
+    fn build_leaf_page() -> Vec<u8> {
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 17,
+            cell_content_offset: 3800,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+        page
+    }
+
+    fn build_interior_page() -> Vec<u8> {
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: 9,
+            cell_content_offset: 2048,
+            fragmented_free_bytes: 0,
+            right_child: PageNumber::new(7),
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+        page
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --release --ignored --nocapture bench_parse_page_header"]
+    fn bench_parse_page_header() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let leaf = build_leaf_page();
+        let interior = build_interior_page();
+        let pages: [&[u8]; 4] = [&leaf, &interior, &leaf, &interior];
+
+        let iters: u64 = 4_000_000;
+        let trials = 5;
+
+        for trial in 0..trials {
+            // Optimized parse (current `BtreePageHeader::parse`).
+            let t = Instant::now();
+            for i in 0..iters {
+                let page = pages[(i as usize) & 3];
+                let header = BtreePageHeader::parse(black_box(page), black_box(0)).unwrap();
+                black_box(header);
+            }
+            let opt = t.elapsed();
+
+            // Naive baseline (per-byte indexing, no `#[inline]`).
+            let t = Instant::now();
+            for i in 0..iters {
+                let page = pages[(i as usize) & 3];
+                let header = parse_header_naive(black_box(page), black_box(0)).unwrap();
+                black_box(header);
+            }
+            let naive = t.elapsed();
+
+            #[allow(clippy::cast_precision_loss)]
+            let opt_ns = opt.as_nanos() as f64 / iters as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let naive_ns = naive.as_nanos() as f64 / iters as f64;
+            let delta_pct = (opt_ns - naive_ns) / naive_ns * 100.0;
+
+            println!(
+                "[trial {trial}] parse: optimized={opt_ns:.2} ns naive={naive_ns:.2} ns \
+                 delta={delta_pct:+.1}% (mixed leaf/interior, n={iters})",
             );
         }
     }
