@@ -3439,6 +3439,19 @@ impl PublishedPagerState {
         self.pages.get(page_no)
     }
 
+    /// Read just the publish-cycle generation counter without touching the
+    /// metadata fields published alongside it.
+    ///
+    /// The seqlock recheck in [`SimpleTransaction::get_page`] only consumes
+    /// the snapshot generation, but `snapshot()` reads six other atomics on
+    /// every confirmation. At 1t a single page read goes through this path
+    /// twice — once to take a snapshot and once to confirm — so a gen-only
+    /// recheck collapses the second reading from seven atomic loads down to
+    /// one.
+    fn current_sequence_gen(&self) -> u64 {
+        self.sequence.load(AtomicOrdering::Acquire)
+    }
+
     fn prefetch_page_hint(&self, page_no: PageNumber) {
         self.pages.prefetch_hint(page_no);
     }
@@ -7847,8 +7860,7 @@ where
         {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
-                let confirm = self.published.snapshot();
-                if confirm.snapshot_gen == snapshot.snapshot_gen {
+                if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                     tracing::trace!(
                         target: "fsqlite.snapshot_publication",
                         trace_id = cx.trace_id(),
@@ -7876,8 +7888,7 @@ where
             }
 
             if let Some(page) = self.published.try_get_page(page_no) {
-                let confirm = self.published.snapshot();
-                if confirm.snapshot_gen == snapshot.snapshot_gen {
+                if self.published.current_sequence_gen() == snapshot.snapshot_gen {
                     self.published.note_published_hit();
                     tracing::trace!(
                         target: "fsqlite.snapshot_publication",
@@ -21196,6 +21207,46 @@ mod tests {
             data.as_ref()[0],
             0xAA,
             "bead_id={BEAD_E2E} case=journal_recovery_restores_committed"
+        );
+    }
+
+    #[test]
+    fn test_published_current_sequence_gen_tracks_snapshot_gen() {
+        // The seqlock recheck in `SimpleTransaction::get_page` relies on
+        // `current_sequence_gen()` returning exactly the value that
+        // `snapshot()` would have produced for `snapshot_gen`. Drift between
+        // the two would mean a published-read fast path could either falsely
+        // pass (return a torn page) or falsely fail (force a needless retry).
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let before_snap = pager.published_snapshot();
+        assert_eq!(
+            pager.published.current_sequence_gen(),
+            before_snap.snapshot_gen,
+            "bead_id={BEAD_ID} case=current_sequence_gen_matches_snapshot_before_commit"
+        );
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x5A; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let after_snap = pager.published_snapshot();
+        assert_eq!(
+            pager.published.current_sequence_gen(),
+            after_snap.snapshot_gen,
+            "bead_id={BEAD_ID} case=current_sequence_gen_matches_snapshot_after_commit"
+        );
+        assert!(
+            after_snap.snapshot_gen > before_snap.snapshot_gen,
+            "bead_id={BEAD_ID} case=current_sequence_gen_advances_after_publish"
+        );
+        assert!(
+            pager.published.current_sequence_gen() % 2 == 0,
+            "bead_id={BEAD_ID} case=current_sequence_gen_quiescent_value_is_even"
         );
     }
 
