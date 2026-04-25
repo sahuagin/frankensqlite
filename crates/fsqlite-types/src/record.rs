@@ -489,7 +489,7 @@ pub fn record_column_count(data: &[u8]) -> Option<usize> {
 /// Stores the serial type and byte range within the record body so that
 /// individual columns can be decoded on demand without scanning the entire
 /// record's data section.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnOffset {
     /// SQLite serial type code for this column.
     pub serial_type: u64,
@@ -497,6 +497,34 @@ pub struct ColumnOffset {
     pub body_offset: u32,
     /// Length of the value bytes.
     pub value_len: u32,
+}
+
+/// Projected offsets parsed from a record header without materializing a full
+/// offset table.
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectedColumnOffsets {
+    /// Number of serial-type entries in the record header.
+    pub column_count: usize,
+    /// Offset for the primary projected column, if that column exists in the
+    /// stored record image.
+    pub primary: Option<ColumnOffset>,
+    /// Offset for an optional secondary projected column, if requested and
+    /// present in the stored record image.
+    pub secondary: Option<ColumnOffset>,
+}
+
+/// Numeric shape of a SQLite record value for aggregate fast paths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NumericColumnValue {
+    /// SQL NULL, including NaN REAL values after SQLite normalization.
+    Null,
+    /// Integer value.
+    Integer(i64),
+    /// Floating-point value.
+    Float(f64),
+    /// Text or blob. Callers that need exact SQLite numeric coercion should
+    /// fall back to the ordinary aggregate implementation.
+    NonNumeric,
 }
 
 /// Parse only the record header into a caller-owned offset table.
@@ -552,6 +580,76 @@ pub fn parse_record_header_into(data: &[u8], offsets: &mut Vec<ColumnOffset>) ->
     }
 
     Some(offsets.len())
+}
+
+/// Parse the record header and retain offsets for at most two projected
+/// columns.
+///
+/// This keeps the same malformed-record checks as [`parse_record_header_into`]
+/// but avoids clearing and filling a caller-owned `Vec<ColumnOffset>` when a
+/// scan only needs one column.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_projected_column_offsets(
+    data: &[u8],
+    primary_index: usize,
+    secondary_index: Option<usize>,
+) -> Option<ProjectedColumnOffsets> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+    let mut column_index = 0usize;
+    let mut primary = None;
+    let mut secondary = None;
+
+    while offset < header_size {
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+
+        let value_len_u64 = serial_type_len(serial_type)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        let body_start = body_offset;
+        body_offset = body_offset.checked_add(value_len)?;
+
+        if body_offset > data.len() {
+            return None;
+        }
+
+        if column_index == primary_index || secondary_index == Some(column_index) {
+            let column = ColumnOffset {
+                serial_type,
+                body_offset: u32::try_from(body_start).ok()?,
+                value_len: u32::try_from(value_len).ok()?,
+            };
+            if column_index == primary_index {
+                primary = Some(column);
+            }
+            if secondary_index == Some(column_index) {
+                secondary = Some(column);
+            }
+        }
+
+        column_index = column_index.checked_add(1)?;
+    }
+
+    if body_offset != data.len() {
+        return None;
+    }
+
+    Some(ProjectedColumnOffsets {
+        column_count: column_index,
+        primary,
+        secondary,
+    })
 }
 
 /// Parse only the record header from a partial record prefix.
@@ -613,6 +711,47 @@ pub fn decode_column_from_offset(
         return None;
     }
     decode_value(col.serial_type, &data[start..end], profile_enabled)
+}
+
+/// Decode only the numeric aggregate-relevant shape of a projected column.
+///
+/// Text/blob values are reported as [`NumericColumnValue::NonNumeric`] without
+/// allocation or UTF-8 validation; callers that need SQLite's text-to-number
+/// coercions must fall back to the full aggregate path.
+#[inline]
+pub fn decode_numeric_column_from_offset(
+    data: &[u8],
+    col: &ColumnOffset,
+) -> Option<NumericColumnValue> {
+    let start = col.body_offset as usize;
+    let end = start.checked_add(col.value_len as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    let bytes = &data[start..end];
+
+    match classify_serial_type(col.serial_type) {
+        SerialTypeClass::Null => Some(NumericColumnValue::Null),
+        SerialTypeClass::Zero => Some(NumericColumnValue::Integer(0)),
+        SerialTypeClass::One => Some(NumericColumnValue::Integer(1)),
+        SerialTypeClass::Integer => {
+            Some(NumericColumnValue::Integer(decode_big_endian_signed(bytes)))
+        }
+        SerialTypeClass::Float => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let bits = u64::from_be_bytes(bytes.try_into().ok()?);
+            let value = f64::from_bits(bits);
+            Some(if value.is_nan() {
+                NumericColumnValue::Null
+            } else {
+                NumericColumnValue::Float(value)
+            })
+        }
+        SerialTypeClass::Text | SerialTypeClass::Blob => Some(NumericColumnValue::NonNumeric),
+        SerialTypeClass::Reserved => None,
+    }
 }
 
 /// Decode a single column, reusing the previous row's cached `Arc` when the
@@ -2551,6 +2690,46 @@ mod tests {
         };
         assert_eq!(Arc::as_ptr(&reused), original_ptr);
         assert_eq!(reused.as_ref(), blob.as_slice());
+    }
+
+    #[test]
+    fn projected_column_offsets_match_full_header_parse() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(11),
+            SqliteValue::Text(SmallText::new("skip me")),
+            SqliteValue::Float(2.5),
+        ]);
+        let mut offsets = Vec::new();
+        assert_eq!(parse_record_header_into(&record, &mut offsets), Some(3));
+
+        let projected = parse_record_projected_column_offsets(&record, 2, Some(0))
+            .expect("projected header parse should succeed");
+        assert_eq!(projected.column_count, 3);
+        assert_eq!(projected.primary, Some(offsets[2]));
+        assert_eq!(projected.secondary, Some(offsets[0]));
+        assert_eq!(
+            decode_numeric_column_from_offset(&record, &projected.primary.unwrap()),
+            Some(NumericColumnValue::Float(2.5))
+        );
+    }
+
+    #[test]
+    fn numeric_column_decode_classifies_text_blob_without_materializing() {
+        let record = serialize_record(&[
+            SqliteValue::Text(SmallText::new("123")),
+            SqliteValue::Blob(Arc::from([1_u8, 2, 3].as_slice())),
+        ]);
+        let projected = parse_record_projected_column_offsets(&record, 0, Some(1))
+            .expect("projected header parse should succeed");
+
+        assert_eq!(
+            decode_numeric_column_from_offset(&record, &projected.primary.unwrap()),
+            Some(NumericColumnValue::NonNumeric)
+        );
+        assert_eq!(
+            decode_numeric_column_from_offset(&record, &projected.secondary.unwrap()),
+            Some(NumericColumnValue::NonNumeric)
+        );
     }
 
     #[test]
