@@ -147,16 +147,16 @@ use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::ConcurrentPageState;
-#[cfg(test)]
-use fsqlite_mvcc::concurrent_write_page;
 use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
     MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
-    concurrent_clear_page_state, concurrent_free_page, concurrent_page_is_freed,
-    concurrent_page_state, concurrent_prepare_write_page, concurrent_read_page,
+    concurrent_clear_page_state, concurrent_free_page, concurrent_has_page_state,
+    concurrent_page_read_state, concurrent_page_state, concurrent_prepare_write_page,
     concurrent_restore_page_state, concurrent_stage_prepared_write_page,
     concurrent_track_write_conflict_page, create_time_travel_snapshot,
 };
+#[cfg(test)]
+use fsqlite_mvcc::{concurrent_read_page, concurrent_write_page};
 use fsqlite_pager::{TransactionHandle, TransactionKind};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
@@ -2678,16 +2678,23 @@ impl PageReader for SharedTxnPageIo {
             let txn_id = ctx.txn_id;
             let snapshot_high = ctx.snapshot_high.get();
             let mut handle = ctx.handle.lock();
-            if concurrent_page_is_freed(&handle, page_no) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "page {} was freed earlier in concurrent transaction {}",
-                        page_no.get(),
-                        txn_id
-                    ),
-                });
-            }
-            let write_set_page = concurrent_read_page(&handle, page_no).cloned();
+            // Read-only transactions never stage page state, so skip the
+            // compound probe entirely on the empty-map fast path.
+            let write_set_page = if concurrent_has_page_state(&handle) {
+                let (is_freed, staged) = concurrent_page_read_state(&handle, page_no);
+                if is_freed {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "page {} was freed earlier in concurrent transaction {}",
+                            page_no.get(),
+                            txn_id
+                        ),
+                    });
+                }
+                staged
+            } else {
+                None
+            };
             handle.record_read(page_no);
 
             if let Some(page) = write_set_page {
@@ -2723,16 +2730,21 @@ impl PageReader for SharedTxnPageIo {
     fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
         if let Some(ctx) = self.concurrent_context() {
             let mut handle = ctx.handle.lock();
-            if concurrent_page_is_freed(&handle, page_no) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "page {} was freed earlier in concurrent transaction {}",
-                        page_no.get(),
-                        ctx.txn_id
-                    ),
-                });
-            }
-            let write_set_page = concurrent_read_page(&handle, page_no).cloned();
+            let write_set_page = if concurrent_has_page_state(&handle) {
+                let (is_freed, staged) = concurrent_page_read_state(&handle, page_no);
+                if is_freed {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "page {} was freed earlier in concurrent transaction {}",
+                            page_no.get(),
+                            ctx.txn_id
+                        ),
+                    });
+                }
+                staged
+            } else {
+                None
+            };
             handle.record_read(page_no);
             if let Some(page) = write_set_page {
                 return Ok(page);
