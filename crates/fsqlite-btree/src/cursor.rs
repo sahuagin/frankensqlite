@@ -7170,6 +7170,25 @@ impl<P: PageWriter> BtCursor<P> {
             Cow::Borrowed(&page[payload_offset..local_end]),
         )))
     }
+
+    fn local_leaf_table_payload_prefix_into(
+        &self,
+        entry: &StackEntry,
+        idx: u16,
+        max_prefix_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let Some((_, payload)) = self.local_leaf_table_rowid_and_payload(entry, idx)? else {
+            return Ok(false);
+        };
+        out.clear();
+        let prefix_len = payload.len().min(max_prefix_bytes);
+        if prefix_len > 0 {
+            instrumentation::record_local_payload_copy(prefix_len);
+            out.extend_from_slice(&payload[..prefix_len]);
+        }
+        Ok(true)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7715,6 +7734,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .stack
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        if self.local_leaf_table_payload_prefix_into(top, top.cell_idx, max_prefix_bytes, buf)? {
+            return Ok(());
+        }
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
         self.read_cell_payload_prefix_into(cx, top, &cell, max_prefix_bytes, buf)
@@ -12910,6 +12932,12 @@ mod tests {
             matches!(got, Cow::Borrowed(_)),
             "local leaf-table payloads should stay borrowed"
         );
+
+        let mut prefix = Vec::new();
+        cursor
+            .payload_prefix_into(&cx, 5, &mut prefix)
+            .expect("local leaf prefix read should succeed");
+        assert_eq!(prefix, b"small");
     }
 
     #[test]

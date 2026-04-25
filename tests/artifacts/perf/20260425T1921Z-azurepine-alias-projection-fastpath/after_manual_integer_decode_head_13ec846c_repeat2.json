@@ -1,0 +1,182 @@
+{
+  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v3",
+  "generated_at_utc": "2026-04-25 20:25:59 UTC",
+  "total_elapsed_ms": 5192,
+  "config": {
+    "quick": true,
+    "filter": "mixed",
+    "warmup_iterations": 2,
+    "min_iterations": 3,
+    "max_iterations": 10,
+    "target_duration_secs": 5,
+    "row_counts": [
+      100,
+      1000,
+      10000
+    ],
+    "html_output_path": null,
+    "json_output_path": "tests/artifacts/perf/20260425T1921Z-azurepine-alias-projection-fastpath/after_manual_integer_decode_head_13ec846c_repeat2.json",
+    "json_stdout": false
+  },
+  "environment": {
+    "os": "Ubuntu 25.10",
+    "arch": "x86_64",
+    "kernel_release": "6.17.0-19-generic",
+    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+    "cpu_cores": 128,
+    "ram_gb": 499.2539825439453,
+    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')",
+    "rust_version": "rustc 1.97.0-nightly (7c61a357e 2026-04-24)",
+    "cargo_version": "cargo 1.97.0-nightly (06ac0e7c0 2026-04-21)",
+    "git_commit_sha": "5dc7c13fec0f893f08971fc3b0c3eebcd18768ff",
+    "git_branch": "main",
+    "build_profile": "release-perf"
+  },
+  "summary": {
+    "total_scenarios": 1,
+    "franken_faster": 1,
+    "comparable": 0,
+    "csqlite_faster": 0,
+    "avg_ratio": 0.9094488459782356,
+    "average_ratio": 0.9094488459782356,
+    "geomean_ratio": 0.9094488459782356,
+    "median_ratio": 0.9094488459782356,
+    "p90_ratio": 0.9094488459782356,
+    "p99_ratio": 0.9094488459782356,
+    "primary_metric": "per_category_weighted.score",
+    "per_category": {
+      "concurrent_writers": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "mixed": {
+        "n": 1,
+        "avg_ratio": 0.9094488459782356,
+        "geomean_ratio": 0.9094488459782356,
+        "median_ratio": 0.9094488459782356,
+        "p90_ratio": 0.9094488459782356,
+        "p99_ratio": 0.9094488459782356
+      },
+      "read_aggregate": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "read_single": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_bulk": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      },
+      "write_single": {
+        "n": 0,
+        "avg_ratio": null,
+        "geomean_ratio": null,
+        "median_ratio": null,
+        "p90_ratio": null,
+        "p99_ratio": null
+      }
+    },
+    "per_category_weighted": {
+      "primary": true,
+      "score": 0.9094488459782356,
+      "weights": {
+        "concurrent_writers": 0.05,
+        "mixed": 0.05,
+        "read_aggregate": 0.15,
+        "read_single": 0.35,
+        "write_bulk": 0.1,
+        "write_single": 0.3
+      },
+      "observed_weight": 0.05,
+      "missing_categories": [
+        "concurrent_writers",
+        "read_aggregate",
+        "read_single",
+        "write_bulk",
+        "write_single"
+      ]
+    }
+  },
+  "ci_regression_gate": {
+    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
+    "bead_id": "bd-m4tju",
+    "depends_on_bead_id": "bd-0winn",
+    "status": "rich_scorecard_schema_ready",
+    "thresholds": {
+      "avg_ratio_baseline": 2.74,
+      "avg_ratio_max": null,
+      "mt_p95_ratio_max": null,
+      "primary_score_max_regression_pct": 0.03,
+      "geomean_max_regression_pct": 0.05,
+      "per_category_geomean_max_regression_pct": 0.1,
+      "p90_max_regression_pct": 0.15,
+      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
+    },
+    "observed": {
+      "avg_ratio": 0.9094488459782356,
+      "primary_score": 0.9094488459782356,
+      "geomean_ratio": 0.9094488459782356,
+      "median_ratio": 0.9094488459782356,
+      "p90_ratio": 0.9094488459782356,
+      "max_mt_p95_ratio": null,
+      "max_mt_p95_scenario_id": null
+    }
+  },
+  "sections": [
+    {
+      "section_id": "mixed-oltp-workload-80-read-20-write",
+      "title": "Mixed OLTP Workload (80% read / 20% write)",
+      "description": "Pre-seeded with 5K rows. Runs 5K operations with realistic distribution: 40% point lookups, 20% range scans, 20% aggregates, 15% inserts, 3% updates, 2% deletes.",
+      "rows": [
+        {
+          "scenario_id": "mixed-oltp-workload-80-read-20-write__5k-ops-80r-20w-on-5k-row-table",
+          "scenario": "5K ops (80r/20w) on 5K-row table",
+          "category": "mixed",
+          "csqlite": {
+            "median_ms": 221.996983,
+            "mean_ms": 222.15272199999998,
+            "min_ms": 221.44418900000002,
+            "p95_ms": 223.108535,
+            "p99_ms": 223.108535,
+            "stddev_ms": 0.537774,
+            "cv_pct": 0.24207400888835384,
+            "rows_per_sec": 22522.828609792414,
+            "us_per_row": 44.3993966,
+            "iterations": 10
+          },
+          "fsqlite": {
+            "median_ms": 201.89489999999998,
+            "mean_ms": 201.830169,
+            "min_ms": 197.723158,
+            "p95_ms": 209.89399,
+            "p99_ms": 209.89399,
+            "stddev_ms": 3.662391,
+            "cv_pct": 1.8145904639261339,
+            "rows_per_sec": 24765.360591079814,
+            "us_per_row": 40.37898,
+            "iterations": 10
+          },
+          "ratio_fsqlite_over_csqlite": 0.9094488459782356
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+
+[1/10] Mixed OLTP workload
+  Benchmarking mixed OLTP C SQLite...     [cs_oltp] warmup 1/2...    [cs_oltp] warmup 2/2...    [cs_oltp] iter 1/10 (total: 0.0s)        [cs_oltp] iter 2/10 (total: 0.2s)        [cs_oltp] iter 3/10 (total: 0.5s)        [cs_oltp] iter 4/10 (total: 0.7s)        [cs_oltp] iter 5/10 (total: 0.9s)        [cs_oltp] iter 6/10 (total: 1.2s)        [cs_oltp] iter 7/10 (total: 1.4s)        [cs_oltp] iter 8/10 (total: 1.7s)        [cs_oltp] iter 9/10 (total: 1.9s)        [cs_oltp] iter 10/10 (total: 2.1s)                                                                                    C=237.68 ms
+  Benchmarking mixed OLTP FrankenSQLite...     [fs_oltp] warmup 1/2...    [fs_oltp] warmup 2/2...    [fs_oltp] iter 1/10 (total: 0.0s)        [fs_oltp] iter 2/10 (total: 0.2s)        [fs_oltp] iter 3/10 (total: 0.4s)        [fs_oltp] iter 4/10 (total: 0.6s)        [fs_oltp] iter 5/10 (total: 0.8s)        [fs_oltp] iter 6/10 (total: 1.0s)        [fs_oltp] iter 7/10 (total: 1.2s)        [fs_oltp] iter 8/10 (total: 1.4s)        [fs_oltp] iter 9/10 (total: 1.6s)        [fs_oltp] iter 10/10 (total: 1.8s)                                                                                    F=200.70 ms
+
+Benchmark complete in 5.4s. Generating reports...
+JSON report written to: tests/artifacts/perf/20260425T1921Z-azurepine-alias-projection-fastpath/after_alias_projection_fastpath_head_13ec846c_repeat2.json
