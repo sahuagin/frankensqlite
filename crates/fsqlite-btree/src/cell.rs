@@ -1752,4 +1752,162 @@ mod tests {
             );
         }
     }
+
+    // ------------------------------------------------------------------
+    // Microbench (#[ignore]) — single cell-pointer read pattern
+    // ------------------------------------------------------------------
+    //
+    // Mirrors the shape of `BtCursor::read_cell_pointer_inline`. The
+    // cursor function showed up as a separate ~0.37% MT8 self-time
+    // symbol on the dyn-IO monomorphization in
+    // `tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/perf_mt8_flat.txt`
+    // because the in-body `format!` blocked inlining and LLVM was
+    // re-checking each `page[ptr_offset + i]` index after a separate
+    // `ptr_offset + 2 > page.len()` guard. The optimised arm here uses
+    // a single `page.get(..).try_into::<&[u8; 2]>()` (one bounds
+    // check) and outlines the corruption-error builder via
+    // `#[cold] #[inline(never)]`; the naive arm reproduces the
+    // pre-change shape.
+
+    #[cold]
+    #[inline(never)]
+    fn cell_pointer_oob_bench(
+        cell_idx: u16,
+        page_no: PageNumber,
+        ptr_offset: usize,
+        page_len: usize,
+    ) -> FrankenError {
+        FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "cell pointer {cell_idx} extends past page {} (ptr_offset={ptr_offset} len={page_len})",
+                page_no.get(),
+            ),
+        }
+    }
+
+    #[inline]
+    fn read_cell_pointer_inline_optimized(
+        page: &[u8],
+        page_no: PageNumber,
+        header_size: usize,
+        cell_idx: u16,
+    ) -> Result<u16> {
+        let header_offset = header_offset_for_page(page_no);
+        let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
+        let bytes: &[u8; 2] = page
+            .get(ptr_offset..ptr_offset + 2)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| cell_pointer_oob_bench(cell_idx, page_no, ptr_offset, page.len()))?;
+        Ok(u16::from_be_bytes(*bytes))
+    }
+
+    #[inline(never)]
+    fn read_cell_pointer_inline_naive(
+        page: &[u8],
+        page_no: PageNumber,
+        header_size: usize,
+        cell_idx: u16,
+    ) -> Result<u16> {
+        let header_offset = header_offset_for_page(page_no);
+        let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
+        if ptr_offset + 2 > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell pointer {cell_idx} extends past page {} (ptr_offset={ptr_offset} len={})",
+                    page_no.get(),
+                    page.len()
+                ),
+            });
+        }
+        Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))
+    }
+
+    #[test]
+    #[ignore = "microbench; run with --release --ignored --nocapture bench_read_cell_pointer_inline"]
+    fn bench_read_cell_pointer_inline() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // Realistic interior-page descent target: 32 cell pointers, header
+        // size 12 (interior page header), page_no 7 (non-page-1 path so
+        // header_offset_for_page folds to 0 just like the production
+        // descent loop).
+        let cell_count: usize = 32;
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            #[allow(clippy::cast_possible_truncation)]
+            cell_count: cell_count as u16,
+            cell_content_offset: 3000,
+            fragmented_free_bytes: 0,
+            right_child: PageNumber::new(99),
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+        // Populate the cell-pointer array with deterministic offsets so
+        // the read result is predictable but non-trivial.
+        let header_size = usize::from(header.page_type.header_size());
+        for i in 0..cell_count {
+            let off = header_size + i * 2;
+            #[allow(clippy::cast_possible_truncation)]
+            let payload = (3000 + i as u16 * 10).to_be_bytes();
+            page[off] = payload[0];
+            page[off + 1] = payload[1];
+        }
+
+        let page_no = PageNumber::new(7).unwrap();
+        let iters: u64 = 4_000_000;
+        let trials = 5;
+
+        for trial in 0..trials {
+            // Optimized — array-conversion + cold-outlined error.
+            let t = Instant::now();
+            let mut sum_opt = 0u64;
+            for i in 0..iters {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = (i as usize % cell_count) as u16;
+                let v = read_cell_pointer_inline_optimized(
+                    black_box(&page),
+                    black_box(page_no),
+                    black_box(header_size),
+                    black_box(idx),
+                )
+                .unwrap();
+                sum_opt = sum_opt.wrapping_add(u64::from(v));
+            }
+            let opt = t.elapsed();
+            black_box(sum_opt);
+
+            // Naive — guard + per-index access + in-body format!.
+            let t = Instant::now();
+            let mut sum_naive = 0u64;
+            for i in 0..iters {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = (i as usize % cell_count) as u16;
+                let v = read_cell_pointer_inline_naive(
+                    black_box(&page),
+                    black_box(page_no),
+                    black_box(header_size),
+                    black_box(idx),
+                )
+                .unwrap();
+                sum_naive = sum_naive.wrapping_add(u64::from(v));
+            }
+            let naive = t.elapsed();
+            black_box(sum_naive);
+
+            assert_eq!(sum_opt, sum_naive);
+
+            #[allow(clippy::cast_precision_loss)]
+            let opt_ns = opt.as_nanos() as f64 / iters as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let naive_ns = naive.as_nanos() as f64 / iters as f64;
+            let delta_pct = (opt_ns - naive_ns) / naive_ns * 100.0;
+
+            println!(
+                "[trial {trial}] read_cell_pointer_inline: optimized={opt_ns:.3} ns naive={naive_ns:.3} ns \
+                 delta={delta_pct:+.1}% (n={iters}, cells={cell_count})",
+            );
+        }
+    }
 }

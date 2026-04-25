@@ -275,6 +275,28 @@ pub struct TransactionPageIo<'a, T: TransactionHandle + ?Sized> {
     txn: &'a mut T,
 }
 
+/// Cold corruption-error builder for `BtCursor::read_cell_pointer_inline`.
+///
+/// Outlined as a free `#[cold]` function so a single non-generic copy is
+/// shared across every `BtCursor<P>` monomorphization, and so the heavy
+/// `format!` machinery cannot block inlining of the hot 2-byte cell-pointer
+/// read in the cursor descent loop.
+#[cold]
+#[inline(never)]
+fn cell_pointer_oob(
+    cell_idx: u16,
+    page_no: PageNumber,
+    ptr_offset: usize,
+    page_len: usize,
+) -> FrankenError {
+    FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "cell pointer {cell_idx} extends past page {} (ptr_offset={ptr_offset} len={page_len})",
+            page_no.get(),
+        ),
+    }
+}
+
 impl<'a, T: TransactionHandle + ?Sized> TransactionPageIo<'a, T> {
     /// Wrap a pager transaction handle for use as a B-tree page I/O backend.
     #[must_use]
@@ -1975,6 +1997,20 @@ impl<P: PageReader> BtCursor<P> {
     /// raw page bytes without allocating a Vec<u16> copy. The cell pointer
     /// array starts right after the page header, so staying on the page image
     /// keeps the descent hot path on the node's contiguous prefix.
+    //
+    // Hot path: invoked once per cell during binary-search descent and per
+    // visited child during full-tree walks. The body is small (one offset
+    // calc + one 2-byte BE load) but the in-body `format!` previously kept
+    // the function out of the inliner, so the dyn-IO monomorphization
+    // showed up as a separate ~0.37% MT8 self-time symbol on
+    // `tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/perf_mt8_flat.txt`.
+    // Outlining the cold corruption-error builder lets `#[inline]` apply,
+    // and `page.get(..).try_into::<&[u8; 2]>()` collapses the manual
+    // `ptr_offset + 2 > page.len()` guard plus the two `page[i]` indices
+    // into a single bounds check (same array-conversion bounds-elide
+    // pattern that took `BtreePageHeader::parse` from 10.7 ns to 3.7 ns
+    // in commit 1f266968).
+    #[inline]
     fn read_cell_pointer_inline(
         page: &[u8],
         page_no: PageNumber,
@@ -1983,16 +2019,11 @@ impl<P: PageReader> BtCursor<P> {
     ) -> Result<u16> {
         let header_offset = cell::header_offset_for_page(page_no);
         let ptr_offset = header_offset + header_size + (cell_idx as usize) * 2;
-        if ptr_offset + 2 > page.len() {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "cell pointer {cell_idx} extends past page {} (ptr_offset={ptr_offset} len={})",
-                    page_no.get(),
-                    page.len()
-                ),
-            });
-        }
-        Ok(u16::from_be_bytes([page[ptr_offset], page[ptr_offset + 1]]))
+        let bytes: &[u8; 2] = page
+            .get(ptr_offset..ptr_offset + 2)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| cell_pointer_oob(cell_idx, page_no, ptr_offset, page.len()))?;
+        Ok(u16::from_be_bytes(*bytes))
     }
 
     #[inline]
