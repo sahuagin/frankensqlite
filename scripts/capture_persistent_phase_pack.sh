@@ -56,6 +56,8 @@ RERUN_SH="${OUTPUT_DIR}/rerun.sh"
 THREAD_COUNTS_CSV="${THREAD_COUNTS:-8,16}"
 RENDER_ONLY="${RENDER_ONLY:-0}"
 SKIP_RUN="${SKIP_RUN:-0}"
+FSQLITE_USE_RCH="${FSQLITE_USE_RCH:-0}"
+RCH_BIN="${RCH_BIN:-rch}"
 HEALTHY_MARGIN_MIN="${HEALTHY_MARGIN_MIN:-1.10}"
 TAIL_COLLAPSE_P95_US="${TAIL_COLLAPSE_P95_US:-250000}"
 TAIL_COLLAPSE_P99_US="${TAIL_COLLAPSE_P99_US:-500000}"
@@ -65,6 +67,26 @@ WAL_APPEND_COLLAPSE_P99_US="${WAL_APPEND_COLLAPSE_P99_US:-250000}"
 
 mkdir -p "$PROVENANCE_DIR"
 IFS=',' read -ra THREAD_COUNTS <<< "$THREAD_COUNTS_CSV"
+
+cargo_runner_label() {
+    if [[ "$FSQLITE_USE_RCH" == "1" ]]; then
+        echo "rch"
+    else
+        echo "local"
+    fi
+}
+
+run_cargo() {
+    if [[ "$FSQLITE_USE_RCH" == "1" ]]; then
+        local env_args=()
+        if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+            env_args+=("CARGO_TARGET_DIR=${CARGO_TARGET_DIR}")
+        fi
+        "$RCH_BIN" exec -- env "${env_args[@]}" cargo "$@"
+    else
+        cargo "$@"
+    fi
+}
 
 write_environment_provenance() {
     local cpu_model="unknown"
@@ -89,6 +111,9 @@ write_environment_provenance() {
         echo "git_dirty_files: $(git -C "$PROJECT_ROOT" diff --name-only 2>/dev/null | wc -l || echo unknown)"
         echo "rust_version: $(rustc --version 2>/dev/null || echo unknown)"
         echo "cargo_profile: release-perf"
+        echo "cargo_runner: $(cargo_runner_label)"
+        echo "cargo_target_dir: ${CARGO_TARGET_DIR:-unset}"
+        echo "rch_bin: ${RCH_BIN}"
         echo "bench_entrypoint: crates/fsqlite-e2e/benches/concurrent_write_persistent_bench.rs"
         echo "capture_env: FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR"
         echo "reference_comparator: C SQLite via rusqlite (built-in to bench)"
@@ -105,10 +130,10 @@ write_environment_provenance() {
 }
 
 ensure_bench_binary() {
-    echo "--- Building release-perf benchmark binary (local) ---"
+    echo "--- Building release-perf benchmark binary ($(cargo_runner_label)) ---"
     (
         cd "$PROJECT_ROOT"
-        cargo bench --profile release-perf -p fsqlite-e2e \
+        run_cargo bench --profile release-perf -p fsqlite-e2e \
             --bench concurrent_write_persistent_bench --no-run 2>&1 | tail -5
     )
 }
@@ -135,7 +160,7 @@ run_persistent_bench() {
     (
         cd "$PROJECT_ROOT"
         FSQLITE_PERSISTENT_PHASE_ATTRIBUTION_DIR="$run_dir" \
-        cargo bench --profile release-perf -p fsqlite-e2e \
+        run_cargo bench --profile release-perf -p fsqlite-e2e \
             --bench concurrent_write_persistent_bench \
             -- "persistent_concurrent_write_${thread_count}t"
     ) 2>&1 | tee "$run_dir/criterion_stdout.log"
@@ -772,6 +797,11 @@ write_rerun_script() {
 # Bead: ${BEAD_ID}
 set -euo pipefail
 cd "$PROJECT_ROOT"
+export FSQLITE_USE_RCH="\${FSQLITE_USE_RCH:-${FSQLITE_USE_RCH}}"
+export RCH_BIN="\${RCH_BIN:-${RCH_BIN}}"
+if [[ -n "\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}" ]]; then
+    export CARGO_TARGET_DIR="\${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR:-}}"
+fi
 exec ./scripts/capture_persistent_phase_pack.sh "\${1:-$OUTPUT_DIR.rerun_\$(date +%Y%m%d_%H%M%S)}"
 RERUN_EOF
     chmod +x "$RERUN_SH"
