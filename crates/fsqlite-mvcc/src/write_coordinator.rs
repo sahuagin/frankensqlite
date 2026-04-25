@@ -607,10 +607,16 @@ impl WriteCoordinator {
             // Step 3: WAL Append — compute offset and record it.
             // This MUST be inside the index lock to ensure that the physical WAL
             // order strictly matches the logical commit sequence.
+            //
+            // `AcqRel` matches `allocate_commit_seq` and the rest of the
+            // monotonic counters in the tree (Connection::next_commit_seq,
+            // CommitSequenceCombiner::next_commit_seq). The enclosing
+            // `commit_page_index.write()` already provides a total order on
+            // commit-batches, so SeqCst here was strictly conservative.
             let frame_header_size = 24_u64;
             let page_size = self.infer_page_size(&req.write_set);
             let batch_bytes = page_numbers.len() as u64 * (frame_header_size + page_size);
-            let offset = self.wal_offset.fetch_add(batch_bytes, Ordering::SeqCst);
+            let offset = self.wal_offset.fetch_add(batch_bytes, Ordering::AcqRel);
 
             (seq, offset)
         };
@@ -724,7 +730,9 @@ impl WriteCoordinator {
                 let page_size = self.infer_page_size(&req.write_set);
                 let page_count = req.write_set.page_count() as u64;
                 let commit_bytes = page_count * (frame_header_size + page_size);
-                let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::SeqCst);
+                // SeqCst → AcqRel: monotonic counter under the index write
+                // lock. See compat_commit() for the full rationale.
+                let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::AcqRel);
                 total_batch_bytes += commit_bytes;
 
                 // Eagerly reserve to prevent intra-batch conflicts and concurrent conflicts.
