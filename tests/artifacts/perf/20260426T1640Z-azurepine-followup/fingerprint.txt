@@ -1,0 +1,7 @@
+git_head=25c9398f
+git_branch=main
+rustc=rustc 1.97.0-nightly (9838411cb 2026-04-25)
+kernel=Linux 6.17.0-19-generic x86_64 GNU/Linux
+target_dir=/data/tmp/cargo-target-azurepine-followup
+build_profile=release-perf debug=line-tables-only strip=false frame-pointers=yes
+scenario=comprehensive-bench --quick --filter mixed --no-html; perf-update-delete 10000 50 both
