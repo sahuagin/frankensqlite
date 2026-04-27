@@ -1,6 +1,7 @@
 //! WAL checksum and integrity helpers.
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::PageSize;
 use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -253,10 +254,13 @@ impl WalHeader {
                 ),
             });
         }
+        let page_size = read_be_u32_at(buf, 8);
+        ensure_valid_wal_header_page_size(page_size)?;
+
         Ok(Self {
             magic,
             format_version,
-            page_size: read_be_u32_at(buf, 8),
+            page_size,
             checkpoint_seq: read_be_u32_at(buf, 12),
             salts: WalSalts {
                 salt1: read_be_u32_at(buf, WAL_HEADER_SALT1_OFFSET),
@@ -271,6 +275,8 @@ impl WalHeader {
 
     /// Serialize this header into a 32-byte buffer and compute the checksum.
     pub fn to_bytes(&self) -> Result<[u8; WAL_HEADER_SIZE]> {
+        ensure_valid_wal_header_page_size(self.page_size)?;
+
         let mut buf = [0u8; WAL_HEADER_SIZE];
         write_be_u32_at(&mut buf, 0, self.magic);
         write_be_u32_at(&mut buf, 4, self.format_version);
@@ -1363,11 +1369,7 @@ pub fn validate_wal_chain(
     big_endian_checksum_words: bool,
 ) -> Result<WalChainValidation> {
     ensure_min_len(wal_bytes, WAL_HEADER_SIZE, "WAL bytes")?;
-    if page_size == 0 {
-        return Err(FrankenError::WalCorrupt {
-            detail: "WAL page_size must be greater than zero".to_owned(),
-        });
-    }
+    ensure_valid_wal_page_size(page_size, "WAL page_size")?;
 
     let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     let wal_header = &wal_bytes[..WAL_HEADER_SIZE];
@@ -1580,13 +1582,34 @@ fn ensure_min_len(bytes: &[u8], minimum: usize, label: &str) -> Result<()> {
 }
 
 fn ensure_frame_len(frame: &[u8], page_size: usize) -> Result<()> {
-    if page_size == 0 {
-        return Err(FrankenError::WalCorrupt {
-            detail: "frame page_size must be > 0".to_owned(),
-        });
-    }
+    ensure_valid_wal_page_size(page_size, "frame page_size")?;
     let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     ensure_min_len(frame, frame_size, "WAL frame")
+}
+
+fn ensure_valid_wal_header_page_size(page_size: u32) -> Result<()> {
+    if PageSize::new(page_size).is_none() {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "invalid WAL header page_size {page_size}; expected power-of-two in 512..=65536"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_valid_wal_page_size(page_size: usize, label: &str) -> Result<()> {
+    let Ok(page_size_u32) = u32::try_from(page_size) else {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!("{label} {page_size} does not fit in u32"),
+        });
+    };
+    if PageSize::new(page_size_u32).is_none() {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!("invalid {label} {page_size}; expected power-of-two in 512..=65536"),
+        });
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1724,6 +1747,33 @@ mod tests {
         write_be_u32_at(&mut bytes, 4, WAL_FORMAT_VERSION + 1);
         let err = WalHeader::from_bytes(&bytes).expect_err("invalid version must be rejected");
         assert!(matches!(err, FrankenError::WalCorrupt { .. }));
+    }
+
+    #[test]
+    fn test_wal_header_rejects_invalid_page_size_on_parse_and_serialize() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 0,
+            salts: WalSalts { salt1: 1, salt2: 2 },
+            checksum: SqliteWalChecksum::default(),
+        };
+
+        let mut bytes = header.to_bytes().expect("valid header should serialize");
+        write_be_u32_at(&mut bytes, 8, 3000);
+        let parse_err =
+            WalHeader::from_bytes(&bytes).expect_err("invalid page size must be rejected");
+        assert!(matches!(parse_err, FrankenError::WalCorrupt { .. }));
+
+        let invalid_header = WalHeader {
+            page_size: 3000,
+            ..header
+        };
+        let serialize_err = invalid_header
+            .to_bytes()
+            .expect_err("invalid page size must not serialize");
+        assert!(matches!(serialize_err, FrankenError::WalCorrupt { .. }));
     }
 
     #[test]
@@ -2575,7 +2625,7 @@ mod tests {
         let wal = build_valid_wal(5);
         let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         // Truncate in the middle of frame 4 (index 3).
-        let cut = WAL_HEADER_SIZE + 2 * frame_size + frame_size / 2;
+        let cut = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
         let torn = &wal[..cut];
         let v = validate_wal_chain(torn, PAGE_SIZE, false).expect("validate");
         assert_eq!(
