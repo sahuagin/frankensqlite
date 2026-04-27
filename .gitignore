@@ -291,3 +291,8 @@ heaptrack.*.zst
 
 # Beads recovery artifacts (timestamped directories at repo root)
 .beads.recovery_*/
+
+# Per-bead progress reports — belong under docs/progress/, not repo root
+/progress.md
+/progress_bd-*.md
+/bd-*.md
