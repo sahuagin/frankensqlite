@@ -46,6 +46,30 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+fn invalid_io_input(message: String) -> FrankenError {
+    FrankenError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
+fn checked_io_range(offset: u64, len: usize, op: &'static str) -> Result<()> {
+    let len = u64::try_from(len)
+        .map_err(|_| invalid_io_input(format!("unix vfs {op} length too large")))?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| invalid_io_input(format!("offset overflow during unix vfs {op}")))?;
+    Ok(())
+}
+
+fn checked_io_offset(offset: u64, total: usize, op: &'static str) -> Result<u64> {
+    let total = u64::try_from(total)
+        .map_err(|_| invalid_io_input(format!("unix vfs {op} offset advance too large")))?;
+    offset
+        .checked_add(total)
+        .ok_or_else(|| invalid_io_input(format!("offset overflow during unix vfs {op}")))
+}
+
 #[cfg(test)]
 macro_rules! lock_debug {
     ($($arg:tt)*) => {
@@ -1673,10 +1697,10 @@ impl VfsFile for UnixFile {
 
     fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "read")?;
         let mut total = 0_usize;
         while total < buf.len() {
-            #[allow(clippy::cast_possible_truncation)]
-            let off = offset + total as u64;
+            let off = checked_io_offset(offset, total, "read")?;
             let n = self
                 .file
                 .read_at(&mut buf[total..], off)
@@ -1697,10 +1721,10 @@ impl VfsFile for UnixFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "write")?;
         let mut total = 0_usize;
         while total < buf.len() {
-            #[allow(clippy::cast_possible_truncation)]
-            let off = offset + total as u64;
+            let off = checked_io_offset(offset, total, "write")?;
             match self.file.write_at(&buf[total..], off) {
                 Ok(0) => {
                     return Err(FrankenError::Io(std::io::Error::new(
@@ -2109,6 +2133,24 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as _};
     use std::process::{Child, Stdio};
     use std::process::{Command, Output};
+
+    fn assert_invalid_input_error(err: FrankenError, expected_detail: &str) {
+        match err {
+            FrankenError::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(
+                    io_err.to_string().contains(expected_detail),
+                    "expected error detail containing {expected_detail:?}, got {io_err}"
+                );
+            }
+            other => {
+                assert!(
+                    matches!(&other, FrankenError::Io(_)),
+                    "expected Io error, got {other:?}"
+                );
+            }
+        }
+    }
 
     fn debug_dump_sqlite_wal_files(coordinator: &mut UnixFile) {
         use std::fmt::Write as _;
@@ -3215,6 +3257,29 @@ mod tests {
         assert!(buf.iter().all(|&b| b == 0), "gap should be zeroed");
 
         file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_read_rejects_overflowing_offset_range() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("read_overflow.db");
+
+        let mut buf = [0_u8; 2];
+        let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let err = file.read(&cx, &mut buf, u64::MAX).unwrap_err();
+        assert_invalid_input_error(err, "offset overflow during unix vfs read");
+    }
+
+    #[test]
+    fn test_unix_vfs_write_rejects_overflowing_offset_range() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("write_overflow.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let err = file.write(&cx, &[1, 2], u64::MAX).unwrap_err();
+        assert_invalid_input_error(err, "offset overflow during unix vfs write");
     }
 
     #[test]
