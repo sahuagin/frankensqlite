@@ -1384,11 +1384,11 @@ fn highlight_sql(sql: &str) -> String {
                 while i < bytes.len() && is_identifier_continue(bytes[i]) {
                     i += 1;
                 }
-                let token = &sql[start..i];
-                if is_sql_keyword(token) {
-                    push_colored_segment(&mut highlighted, token, ANSI_BOLD_BLUE);
+                let word = &sql[start..i];
+                if is_sql_keyword(word) {
+                    push_colored_segment(&mut highlighted, word, ANSI_BOLD_BLUE);
                 } else {
-                    highlighted.push_str(token);
+                    highlighted.push_str(word);
                 }
             }
             _ => {
@@ -1836,6 +1836,8 @@ where
         }
     }
 
+    write_sqlite_sequence_dump(connection, filter, colorize_sql, out)?;
+
     let object_rows = match filter {
         Some(filter) => connection
             .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())]),
@@ -1851,6 +1853,60 @@ where
     }
 
     write_sql_statement(out, "COMMIT;", colorize_sql).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn write_sqlite_sequence_dump<W>(
+    connection: &Connection,
+    filter: Option<&str>,
+    colorize_sql: bool,
+    out: &mut W,
+) -> Result<(), String>
+where
+    W: Write,
+{
+    let exists = connection
+        .query(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'sqlite_sequence'",
+        )
+        .map_err(|error| error.to_string())?;
+    if exists.is_empty() {
+        return Ok(());
+    }
+
+    let sql = "SELECT name, seq FROM sqlite_sequence ORDER BY name";
+    let filtered_sql = "\
+        SELECT name, seq \
+        FROM sqlite_sequence \
+        WHERE name LIKE ?1 \
+        ORDER BY name";
+    let rows = match filter {
+        Some(filter) => {
+            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
+        }
+        None => connection.query(sql),
+    }
+    .map_err(|error| error.to_string())?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    write_sql_statement(out, "DELETE FROM sqlite_sequence;", colorize_sql)
+        .map_err(|error| error.to_string())?;
+    let quoted_table = quote_identifier("sqlite_sequence");
+    for row in rows {
+        writeln!(
+            out,
+            "INSERT INTO {quoted_table} VALUES({});",
+            row.values()
+                .iter()
+                .map(sql_literal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -2696,6 +2752,75 @@ INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
         assert!(
             stdout.contains("COMMIT;"),
             "expected transaction trailer in dump, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_dump_preserves_autoincrement_sequence_for_restore() {
+        let mut dump_input = Cursor::new(
+            b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+INSERT INTO ai(name) VALUES('a');\n\
+INSERT INTO ai(name) VALUES('b');\n\
+DELETE FROM ai WHERE id = 2;\n\
+.dump\n"
+                .to_vec(),
+        );
+        let mut dump_out = Vec::new();
+        let mut dump_err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let dump_exit = run_with_shell_options(
+            args,
+            &mut dump_input,
+            &mut dump_out,
+            &mut dump_err,
+            ShellOptions::batch(),
+        );
+        assert_eq!(dump_exit, 0);
+        assert!(
+            dump_err.is_empty(),
+            "unexpected dump stderr: {:?}",
+            dump_err
+        );
+
+        let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
+        assert!(
+            dump.contains("DELETE FROM sqlite_sequence;"),
+            "expected dump to reset sqlite_sequence before restoring AUTOINCREMENT state: {dump}",
+        );
+        assert!(
+            dump.contains("INSERT INTO \"sqlite_sequence\" VALUES('ai', 2);"),
+            "expected dump to preserve AUTOINCREMENT high-water mark: {dump}",
+        );
+
+        let restore_script = format!(
+            "{dump}\n\
+INSERT INTO ai(name) VALUES('c');\n\
+SELECT id FROM ai WHERE name = 'c';\n"
+        );
+        let mut restore_input = Cursor::new(restore_script.into_bytes());
+        let mut restore_out = Vec::new();
+        let mut restore_err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let restore_exit = run_with_shell_options(
+            args,
+            &mut restore_input,
+            &mut restore_out,
+            &mut restore_err,
+            ShellOptions::batch(),
+        );
+        assert_eq!(restore_exit, 0);
+        assert!(
+            restore_err.is_empty(),
+            "unexpected restore stderr: {:?}",
+            restore_err
+        );
+
+        let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
+        assert!(
+            restored.lines().any(|line| line.trim() == "3"),
+            "restored AUTOINCREMENT table should continue at id=3, got: {restored}",
         );
     }
 
