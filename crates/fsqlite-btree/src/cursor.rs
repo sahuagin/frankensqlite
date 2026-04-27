@@ -146,7 +146,11 @@ const TABLE_LEAF_INTERPOLATION_MAX_PROBES: usize = 3;
 /// Dispatch strategy:
 /// - N <= 20: inline insertion sort with already-sorted early-continue,
 ///   covering the majority of DELETE samples the flamegraph highlights.
-/// - N >  20: `sort_unstable_by` with a direct `b.0.cmp(&a.0)` reverse
+/// - N >  20: first check whether the page is already laid out in monotone
+///   cell-offset order. Descending can stream directly; ascending only needs
+///   `reverse()`. Both are common after repeated compact-defrag cycles, and
+///   both avoid the generic pdqsort closure/comparison path.
+/// - Otherwise: `sort_unstable_by` with a direct `b.0.cmp(&a.0)` reverse
 ///   comparison. Avoids the `Reverse<usize>` newtype allocation that
 ///   `sort_unstable_by_key(|k| Reverse(k.0))` materializes per comparison.
 #[inline(always)]
@@ -168,6 +172,27 @@ fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
             v[j] = cur;
         }
     } else {
+        let mut seen_ascending_pair = false;
+        let mut seen_descending_pair = false;
+        for pair in v.windows(2) {
+            if pair[0].0 < pair[1].0 {
+                seen_ascending_pair = true;
+            } else if pair[0].0 > pair[1].0 {
+                seen_descending_pair = true;
+            }
+
+            if seen_ascending_pair && seen_descending_pair {
+                break;
+            }
+        }
+        if !seen_ascending_pair {
+            return;
+        }
+        if !seen_descending_pair {
+            v.reverse();
+            return;
+        }
+
         // sort_unstable_by avoids the Reverse<usize> wrapper allocation that
         // sort_unstable_by_key materialises on every comparison.
         #[allow(clippy::unnecessary_sort_by)]
@@ -14483,6 +14508,22 @@ mod tests {
         let keys_got: Vec<usize> = v.iter().map(|t| t.0).collect();
         let keys_exp: Vec<usize> = expected.iter().map(|t| t.0).collect();
         assert_eq!(keys_got, keys_exp);
+
+        // Large monotone pages should not need pdqsort: descending is already
+        // ready for defrag, and ascending only needs a linear reverse.
+        let mut descending: Vec<(usize, usize, usize)> =
+            (0..80).map(|i| (4096 - i * 37, 16 + i % 11, i)).collect();
+        let mut expected = descending.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut descending);
+        assert_eq!(descending, expected);
+
+        let mut ascending: Vec<(usize, usize, usize)> =
+            (0..80).map(|i| (512 + i * 37, 16 + i % 11, i)).collect();
+        let mut expected = ascending.clone();
+        expected.sort_unstable_by_key(|k| Reverse(k.0));
+        sort_cells_desc_by_ptr(&mut ascending);
+        assert_eq!(ascending, expected);
     }
 
     /// Micro-benchmark: size-dispatched sort vs unconditional std `sort_unstable_by_key`.
