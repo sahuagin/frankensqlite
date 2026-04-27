@@ -251,16 +251,18 @@ impl ShmRegion {
     pub fn lock(&self) -> ShmRegionGuard<'_> {
         match &self.backing {
             ShmRegionBacking::Heap(data) => ShmRegionGuard {
-                inner: ShmRegionGuardInner::Heap(
-                    data.lock()
+                inner: ShmRegionGuardInner::Heap {
+                    guard: data
+                        .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ),
+                    visible_len: self.len,
+                },
             },
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => ShmRegionGuard {
                 inner: ShmRegionGuardInner::Mmap {
                     ptr: m.ptr,
-                    len: m.len,
+                    visible_len: self.len.min(m.len),
                     _guard: m
                         .mutex
                         .lock()
@@ -655,11 +657,14 @@ pub struct ShmRegionGuard<'a> {
 }
 
 enum ShmRegionGuardInner<'a> {
-    Heap(MutexGuard<'a, Vec<u8>>),
+    Heap {
+        guard: MutexGuard<'a, Vec<u8>>,
+        visible_len: usize,
+    },
     #[cfg(unix)]
     Mmap {
         ptr: *mut u8,
-        len: usize,
+        visible_len: usize,
         /// The in-process lock protecting this region.
         _guard: MutexGuard<'a, ()>,
         /// Prevent the `MmapBacking` from being dropped while we hold a
@@ -673,13 +678,17 @@ impl Deref for ShmRegionGuard<'_> {
 
     fn deref(&self) -> &[u8] {
         match &self.inner {
-            ShmRegionGuardInner::Heap(guard) => guard.as_slice(),
+            ShmRegionGuardInner::Heap { guard, visible_len } => {
+                &guard[..(*visible_len).min(guard.len())]
+            }
             #[cfg(unix)]
-            ShmRegionGuardInner::Mmap { ptr, len, .. } => {
+            ShmRegionGuardInner::Mmap {
+                ptr, visible_len, ..
+            } => {
                 // SAFETY: The MmapBacking reference guarantees the region is
-                // still mapped. `ptr` and `len` were set from a successful
-                // `mmap` call.
-                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+                // still mapped. `visible_len` is capped to the successful
+                // `mmap` length when the guard is created.
+                unsafe { std::slice::from_raw_parts(*ptr, *visible_len) }
             }
         }
     }
@@ -688,12 +697,17 @@ impl Deref for ShmRegionGuard<'_> {
 impl DerefMut for ShmRegionGuard<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
         match &mut self.inner {
-            ShmRegionGuardInner::Heap(guard) => guard.as_mut_slice(),
+            ShmRegionGuardInner::Heap { guard, visible_len } => {
+                let end = (*visible_len).min(guard.len());
+                &mut guard[..end]
+            }
             #[cfg(unix)]
-            ShmRegionGuardInner::Mmap { ptr, len, .. } => {
+            ShmRegionGuardInner::Mmap {
+                ptr, visible_len, ..
+            } => {
                 // SAFETY: Same invariants as Deref. The mmap was created with
                 // PROT_READ | PROT_WRITE.
-                unsafe { std::slice::from_raw_parts_mut(*ptr, *len) }
+                unsafe { std::slice::from_raw_parts_mut(*ptr, *visible_len) }
             }
         }
     }
@@ -970,6 +984,22 @@ mod tests {
 
         let err = clone.read_u64_le(8).unwrap_err();
         assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_shm_region_stale_clone_after_grow_lock_respects_cached_len() {
+        let mut region = ShmRegion::new(4);
+        let clone = region.clone();
+        region.try_resize_heap(8).unwrap();
+
+        assert_eq!(region.len(), 8);
+        assert_eq!(region.lock().len(), 8);
+        assert_eq!(clone.len(), 4);
+        assert_eq!(
+            clone.lock().len(),
+            4,
+            "stale clones must not see newly mapped bytes until remapped"
+        );
     }
 
     #[test]
