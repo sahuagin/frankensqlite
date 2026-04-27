@@ -73,18 +73,6 @@ impl WalChecksumTransform {
         }
     }
 
-    #[must_use]
-    fn from_checksum_words(x0: u32, x1: u32) -> Self {
-        Self {
-            a11: 1,
-            a12: 1,
-            a21: 1,
-            a22: 2,
-            c1: x0,
-            c2: x0.wrapping_add(x1),
-        }
-    }
-
     /// Apply this transform to a running checksum seed.
     #[must_use]
     pub fn apply(self, seed: SqliteWalChecksum) -> SqliteWalChecksum {
@@ -150,7 +138,23 @@ impl WalChecksumTransform {
         for chunk in data.chunks_exact(8) {
             let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
             let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
-            transform = transform.then(Self::from_checksum_words(x0, x1));
+            // Apply the fixed SQLite two-word checksum step directly:
+            // (s1, s2) -> (s1 + s2 + x0, s1 + 2*s2 + x0 + x1).
+            let double_a21 = transform.a21.wrapping_add(transform.a21);
+            let double_a22 = transform.a22.wrapping_add(transform.a22);
+            let double_c2 = transform.c2.wrapping_add(transform.c2);
+            transform = Self {
+                a11: transform.a11.wrapping_add(transform.a21),
+                a12: transform.a12.wrapping_add(transform.a22),
+                a21: transform.a11.wrapping_add(double_a21),
+                a22: transform.a12.wrapping_add(double_a22),
+                c1: transform.c1.wrapping_add(transform.c2).wrapping_add(x0),
+                c2: transform
+                    .c1
+                    .wrapping_add(double_c2)
+                    .wrapping_add(x0)
+                    .wrapping_add(x1),
+            };
         }
 
         Ok(transform)
