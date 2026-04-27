@@ -582,7 +582,6 @@ impl WindowsFile {
             return Err(FrankenError::Busy);
         }
 
-        slot_state.shared_holders.remove(&owner_id);
         slot_state.exclusive_owner = Some(owner_id);
         Ok(())
     }
@@ -1013,6 +1012,26 @@ mod tests {
             "resizing must preserve shared backing for existing mappings"
         );
         assert_eq!(region_large.read_u32_le(32).unwrap(), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_exclusive_unlock_preserves_prior_shared_lock() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_lock_downgrade.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .expect("acquire shared");
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .expect("upgrade to exclusive");
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .expect("downgrade from exclusive");
+        file.shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .expect("release preserved shared lock");
     }
 
     #[test]
