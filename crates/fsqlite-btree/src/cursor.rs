@@ -5521,7 +5521,11 @@ impl<P: PageWriter> BtCursor<P> {
                 ),
             });
         }
-        ptrs.remove(delete_idx);
+        let compact_cell_area = header.first_freeblock == 0
+            && header.fragmented_free_bytes == 0
+            && ptrs.iter().copied().min().is_some_and(|min_ptr| {
+                usize::from(min_ptr) == header.content_offset(self.usable_size)
+            });
 
         // Keep table-leaf deletes conservative: compact the remaining cells
         // immediately instead of maintaining an incremental freeblock chain.
@@ -5531,26 +5535,60 @@ impl<P: PageWriter> BtCursor<P> {
         // defragment-on-delete strategy; table leaves should prefer the same
         // SQLite-compatible shape over a fragile micro-optimization.
         let ptr_array_end =
-            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+            header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
-        for (i, &off) in ptrs.iter().enumerate() {
-            let ptr = usize::from(off);
-            // OPT-A3: size-only fast path, same as replace_interior_cell defrag.
-            let size = cell::cell_on_page_size_fast(
-                page_data.as_bytes(),
-                ptr,
-                header.page_type,
-                self.usable_size,
-            )?;
-            cells_to_move.push((ptr, size, i));
+        if compact_cell_area {
+            for (original_idx, &off) in ptrs.iter().enumerate() {
+                let post_delete_idx = match original_idx.cmp(&delete_idx) {
+                    std::cmp::Ordering::Less => original_idx,
+                    std::cmp::Ordering::Equal => usize::MAX,
+                    std::cmp::Ordering::Greater => original_idx - 1,
+                };
+                cells_to_move.push((usize::from(off), 0, post_delete_idx));
+            }
+        } else {
+            ptrs.remove(delete_idx);
+            for (i, &off) in ptrs.iter().enumerate() {
+                let ptr = usize::from(off);
+                // OPT-A3: size-only fast path, same as replace_interior_cell defrag.
+                let size = cell::cell_on_page_size_fast(
+                    page_data.as_bytes(),
+                    ptr,
+                    header.page_type,
+                    self.usable_size,
+                )?;
+                cells_to_move.push((ptr, size, i));
+            }
         }
         // OPT-7 follow-up: size-dispatched sort for typical small N here too.
         sort_cells_desc_by_ptr(&mut cells_to_move);
+        if compact_cell_area {
+            let mut next_boundary = self.usable_size as usize;
+            for cell in &mut cells_to_move {
+                if cell.0 >= next_boundary {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                    });
+                }
+                cell.1 = next_boundary - cell.0;
+                next_boundary = cell.0;
+            }
+            if next_boundary != header.content_offset(self.usable_size) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf content offset does not match cell extent"
+                        .to_owned(),
+                });
+            }
+            ptrs.remove(delete_idx);
+        }
 
         {
             let page_bytes = page_data.as_bytes_mut();
             let mut new_content_offset = self.usable_size as usize;
             for (ptr, size, i) in cells_to_move {
+                if i == usize::MAX {
+                    continue;
+                }
                 new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
                     FrankenError::DatabaseCorrupt {
                         detail: "table leaf cell size overflow during delete defragmentation"
