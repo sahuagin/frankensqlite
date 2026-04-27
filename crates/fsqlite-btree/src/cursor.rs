@@ -2813,8 +2813,16 @@ impl<P: PageReader> BtCursor<P> {
             });
         }
 
-        let offset = entry.cell_pointers[idx] as usize;
-        let cell_data = &entry.page_data.as_bytes()[offset..];
+        let offset = usize::from(entry.cell_pointers[idx]);
+        let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "table leaf cell pointer {} points past page end (len {})",
+                    offset,
+                    entry.page_data.as_bytes().len()
+                ),
+            }
+        })?;
         if let Some((_, payload_varint_len)) = read_varint(cell_data) {
             if let Some((rowid, _)) = read_varint(&cell_data[payload_varint_len..]) {
                 #[allow(clippy::cast_possible_wrap)]
@@ -2967,7 +2975,15 @@ impl<P: PageReader> BtCursor<P> {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, mid)?);
-            let cell_data = &entry.page_data.as_bytes()[offset..];
+            let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "interior table cell pointer {} points past page end (len {})",
+                        offset,
+                        entry.page_data.as_bytes().len()
+                    ),
+                }
+            })?;
             if cell_data.len() < 4 {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "interior table cell too short for child pointer".to_owned(),
@@ -9019,6 +9035,46 @@ mod tests {
         let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
         assert_eq!(mutated_cell.rowid, Some(10));
         assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
+    }
+
+    #[test]
+    fn test_table_leaf_rowid_at_rejects_out_of_range_cell_pointer() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let mut page = build_leaf_table(&[(1, b"one"), (2, b"two")]);
+        page[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(root.get(), page);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let entry = cursor.load_page(&cx, root).expect("page header loads");
+
+        let err = BtCursor::<MemPageStore>::table_leaf_rowid_at(&entry, 0)
+            .expect_err("out-of-range cell pointer must be corruption, not panic");
+        assert!(
+            matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_table_interior_search_rejects_out_of_range_cell_pointer() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let mut page = build_interior_table(&[(pn(3), 10)], pn(4));
+        page[12..14].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(root.get(), page);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+        let entry = cursor.load_page(&cx, root).expect("page header loads");
+
+        let err = BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 5)
+            .expect_err("out-of-range interior pointer must be corruption, not panic");
+        assert!(
+            matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
