@@ -490,13 +490,19 @@ impl SharedMemoryLayout {
     fn load_u64_field(&self, offset: usize, fallback: &AtomicU64, ordering: Ordering) -> u64 {
         self.mapped_region.as_ref().map_or_else(
             || fallback.load(ordering),
-            |region| region.atomic_load_u64_le(offset, ordering),
+            |region| {
+                region
+                    .atomic_load_u64_le(offset, ordering)
+                    .expect("mapped MVCC SHM layout offset is valid")
+            },
         )
     }
 
     fn store_u64_field(&self, offset: usize, fallback: &AtomicU64, value: u64, ordering: Ordering) {
         if let Some(region) = &self.mapped_region {
-            region.atomic_store_u64_le(offset, value, ordering);
+            region
+                .atomic_store_u64_le(offset, value, ordering)
+                .expect("mapped MVCC SHM layout offset is valid");
         } else {
             fallback.store(value, ordering);
         }
@@ -511,7 +517,11 @@ impl SharedMemoryLayout {
     ) -> u64 {
         self.mapped_region.as_ref().map_or_else(
             || fallback.fetch_add(delta, ordering),
-            |region| region.atomic_fetch_add_u64_le(offset, delta, ordering),
+            |region| {
+                region
+                    .atomic_fetch_add_u64_le(offset, delta, ordering)
+                    .expect("mapped MVCC SHM layout offset is valid")
+            },
         )
     }
 
@@ -526,7 +536,11 @@ impl SharedMemoryLayout {
     ) -> std::result::Result<u64, u64> {
         self.mapped_region.as_ref().map_or_else(
             || fallback.compare_exchange(current, new, success, failure),
-            |region| region.atomic_compare_exchange_u64_le(offset, current, new, success, failure),
+            |region| {
+                region
+                    .atomic_compare_exchange_u64_le(offset, current, new, success, failure)
+                    .expect("mapped MVCC SHM layout offset is valid")
+            },
         )
     }
 

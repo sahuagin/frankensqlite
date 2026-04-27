@@ -9,7 +9,7 @@
 //!
 //! [`VfsFile`]: crate::traits::VfsFile
 
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Range};
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
@@ -273,28 +273,30 @@ impl ShmRegion {
 
     /// Read a little-endian `u32` at the given byte offset.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 4 > self.len()`.
-    #[must_use]
-    pub fn read_u32_le(&self, offset: usize) -> u32 {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 4 > self.len()`.
+    pub fn read_u32_le(&self, offset: usize) -> Result<u32> {
         let bytes: [u8; 4] = {
             let guard = self.lock();
-            guard[offset..offset + 4]
-                .try_into()
-                .expect("slice is exactly 4 bytes")
+            let range = self.checked_range(offset, 4, guard.len(), "SHM u32 LE read")?;
+            guard[range].try_into().expect("slice is exactly 4 bytes")
         };
-        u32::from_le_bytes(bytes)
+        Ok(u32::from_le_bytes(bytes))
     }
 
     /// Write a little-endian `u32` at the given byte offset.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 4 > self.len()`.
-    pub fn write_u32_le(&self, offset: usize, val: u32) {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 4 > self.len()`.
+    pub fn write_u32_le(&self, offset: usize, val: u32) -> Result<()> {
         let mut guard = self.lock();
-        guard[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        let range = self.checked_range(offset, 4, guard.len(), "SHM u32 LE write")?;
+        guard[range].copy_from_slice(&val.to_le_bytes());
+        Ok(())
     }
 
     /// Read a native-endian `u32` at the given byte offset.
@@ -303,56 +305,60 @@ impl ShmRegion {
     /// portable across architectures — it is reconstructed from the WAL
     /// on startup).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 4 > self.len()`.
-    #[must_use]
-    pub fn read_u32_ne(&self, offset: usize) -> u32 {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 4 > self.len()`.
+    pub fn read_u32_ne(&self, offset: usize) -> Result<u32> {
         let bytes: [u8; 4] = {
             let guard = self.lock();
-            guard[offset..offset + 4]
-                .try_into()
-                .expect("slice is exactly 4 bytes")
+            let range = self.checked_range(offset, 4, guard.len(), "SHM u32 native-endian read")?;
+            guard[range].try_into().expect("slice is exactly 4 bytes")
         };
-        u32::from_ne_bytes(bytes)
+        Ok(u32::from_ne_bytes(bytes))
     }
 
     /// Write a native-endian `u32` at the given byte offset.
     ///
     /// SHM WAL-index fields use native byte order.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 4 > self.len()`.
-    pub fn write_u32_ne(&self, offset: usize, val: u32) {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 4 > self.len()`.
+    pub fn write_u32_ne(&self, offset: usize, val: u32) -> Result<()> {
         let mut guard = self.lock();
-        guard[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
+        let range = self.checked_range(offset, 4, guard.len(), "SHM u32 native-endian write")?;
+        guard[range].copy_from_slice(&val.to_ne_bytes());
+        Ok(())
     }
 
     /// Read a little-endian `u64` at the given byte offset.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()`.
-    #[must_use]
-    pub fn read_u64_le(&self, offset: usize) -> u64 {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 8 > self.len()`.
+    pub fn read_u64_le(&self, offset: usize) -> Result<u64> {
         let bytes: [u8; 8] = {
             let guard = self.lock();
-            guard[offset..offset + 8]
-                .try_into()
-                .expect("slice is exactly 8 bytes")
+            let range = self.checked_range(offset, 8, guard.len(), "SHM u64 LE read")?;
+            guard[range].try_into().expect("slice is exactly 8 bytes")
         };
-        u64::from_le_bytes(bytes)
+        Ok(u64::from_le_bytes(bytes))
     }
 
     /// Write a little-endian `u64` at the given byte offset.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()`.
-    pub fn write_u64_le(&self, offset: usize, val: u64) {
+    /// Returns [`FrankenError::OutOfRange`] if the offset would overflow or
+    /// `offset + 8 > self.len()`.
+    pub fn write_u64_le(&self, offset: usize, val: u64) -> Result<()> {
         let mut guard = self.lock();
-        guard[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
+        let range = self.checked_range(offset, 8, guard.len(), "SHM u64 LE write")?;
+        guard[range].copy_from_slice(&val.to_le_bytes());
+        Ok(())
     }
 
     /// Atomically load a little-endian `u64` at the given byte offset.
@@ -361,16 +367,25 @@ impl ShmRegion {
     /// Mmap-backed regions use a native `AtomicU64` over the shared mapping so
     /// updates are visible across processes that map the same file.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
-    #[must_use]
-    pub fn atomic_load_u64_le(&self, offset: usize, ordering: Ordering) -> u64 {
-        self.assert_aligned_u64_offset(offset);
+    /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
+    /// overflow, or `offset + 8 > self.len()`.
+    pub fn atomic_load_u64_le(&self, offset: usize, ordering: Ordering) -> Result<u64> {
         match &self.backing {
-            ShmRegionBacking::Heap(_) => self.read_u64_le(offset),
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u64_offset(offset, guard.len())?;
+                let bytes: [u8; 8] = guard[range]
+                    .try_into()
+                    .expect("slice is exactly 8 bytes");
+                Ok(u64::from_le_bytes(bytes))
+            }
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u64_offset(offset, m.len)?;
                 let _guard = m
                     .mutex
                     .lock()
@@ -378,22 +393,30 @@ impl ShmRegion {
                 // SAFETY: `offset` bounds/alignment were validated above and
                 // the mapping stays alive for the duration of the guard.
                 let raw = unsafe { atomic_u64_at(m.ptr, offset) }.load(ordering);
-                u64::from_le(raw)
+                Ok(u64::from_le(raw))
             }
         }
     }
 
     /// Atomically store a little-endian `u64` at the given byte offset.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
-    pub fn atomic_store_u64_le(&self, offset: usize, val: u64, ordering: Ordering) {
-        self.assert_aligned_u64_offset(offset);
+    /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
+    /// overflow, or `offset + 8 > self.len()`.
+    pub fn atomic_store_u64_le(&self, offset: usize, val: u64, ordering: Ordering) -> Result<()> {
         match &self.backing {
-            ShmRegionBacking::Heap(_) => self.write_u64_le(offset, val),
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u64_offset(offset, guard.len())?;
+                guard[range].copy_from_slice(&val.to_le_bytes());
+                Ok(())
+            }
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u64_offset(offset, m.len)?;
                 let _guard = m
                     .mutex
                     .lock()
@@ -401,34 +424,41 @@ impl ShmRegion {
                 // SAFETY: `offset` bounds/alignment were validated above and
                 // the mapping stays alive for the duration of the guard.
                 unsafe { atomic_u64_at(m.ptr, offset) }.store(val.to_le(), ordering);
+                Ok(())
             }
         }
     }
 
     /// Atomically add `delta` to a little-endian `u64`, returning the previous value.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
-    #[must_use]
-    pub fn atomic_fetch_add_u64_le(&self, offset: usize, delta: u64, ordering: Ordering) -> u64 {
-        self.assert_aligned_u64_offset(offset);
+    /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
+    /// overflow, or `offset + 8 > self.len()`.
+    pub fn atomic_fetch_add_u64_le(
+        &self,
+        offset: usize,
+        delta: u64,
+        ordering: Ordering,
+    ) -> Result<u64> {
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u64_offset(offset, guard.len())?;
                 let current = u64::from_le_bytes(
-                    guard[offset..offset + 8]
+                    guard[range.clone()]
                         .try_into()
                         .expect("slice is exactly 8 bytes"),
                 );
                 let next = current.wrapping_add(delta);
-                guard[offset..offset + 8].copy_from_slice(&next.to_le_bytes());
-                current
+                guard[range].copy_from_slice(&next.to_le_bytes());
+                Ok(current)
             }
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u64_offset(offset, m.len)?;
                 let _guard = m
                     .mutex
                     .lock()
@@ -448,7 +478,7 @@ impl ShmRegion {
                         )
                         .is_ok()
                     {
-                        return current;
+                        return Ok(current);
                     }
                 }
             }
@@ -457,12 +487,13 @@ impl ShmRegion {
 
     /// Atomically compare-exchange a little-endian `u64`.
     ///
-    /// Returns `Ok(previous)` on success and `Err(actual)` on failure, matching
-    /// `AtomicU64::compare_exchange`.
+    /// Returns `Ok(Ok(previous))` on success and `Ok(Err(actual))` on compare
+    /// failure, matching `AtomicU64::compare_exchange`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `offset + 8 > self.len()` or the offset is not 8-byte aligned.
+    /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
+    /// overflow, or `offset + 8 > self.len()`.
     pub fn atomic_compare_exchange_u64_le(
         &self,
         offset: usize,
@@ -470,37 +501,38 @@ impl ShmRegion {
         new: u64,
         success: Ordering,
         failure: Ordering,
-    ) -> std::result::Result<u64, u64> {
-        self.assert_aligned_u64_offset(offset);
+    ) -> Result<std::result::Result<u64, u64>> {
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range = self.checked_aligned_u64_offset(offset, guard.len())?;
                 let actual = u64::from_le_bytes(
-                    guard[offset..offset + 8]
+                    guard[range.clone()]
                         .try_into()
                         .expect("slice is exactly 8 bytes"),
                 );
                 if actual == current {
-                    guard[offset..offset + 8].copy_from_slice(&new.to_le_bytes());
-                    Ok(actual)
+                    guard[range].copy_from_slice(&new.to_le_bytes());
+                    Ok(Ok(actual))
                 } else {
-                    Err(actual)
+                    Ok(Err(actual))
                 }
             }
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => {
+                self.checked_aligned_u64_offset(offset, m.len)?;
                 let _guard = m
                     .mutex
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // SAFETY: `offset` bounds/alignment were validated above and
                 // the mapping stays alive for the duration of the guard.
-                unsafe { atomic_u64_at(m.ptr, offset) }
+                Ok(unsafe { atomic_u64_at(m.ptr, offset) }
                     .compare_exchange(current.to_le(), new.to_le(), success, failure)
                     .map(u64::from_le)
-                    .map_err(u64::from_le)
+                    .map_err(u64::from_le))
             }
         }
     }
@@ -587,12 +619,43 @@ impl ShmRegion {
         }
     }
 
-    fn assert_aligned_u64_offset(&self, offset: usize) {
-        assert!(
-            offset % std::mem::align_of::<u64>() == 0,
-            "u64 SHM access requires 8-byte alignment"
-        );
-        assert!(offset.checked_add(8).is_some_and(|end| end <= self.len()));
+    fn checked_range(
+        &self,
+        offset: usize,
+        width: usize,
+        actual_len: usize,
+        what: &'static str,
+    ) -> Result<Range<usize>> {
+        Self::checked_range_for_len(offset, width, self.len.min(actual_len), what)
+    }
+
+    fn checked_aligned_u64_offset(&self, offset: usize, actual_len: usize) -> Result<Range<usize>> {
+        if !offset.is_multiple_of(std::mem::align_of::<u64>()) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u64 access".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        self.checked_range(offset, 8, actual_len, "SHM atomic u64 access")
+    }
+
+    fn checked_range_for_len(
+        offset: usize,
+        width: usize,
+        len: usize,
+        what: &'static str,
+    ) -> Result<Range<usize>> {
+        let end = offset.checked_add(width).ok_or_else(|| FrankenError::OutOfRange {
+            what: what.to_owned(),
+            value: format!("offset={offset} width={width} len={len}"),
+        })?;
+        if end > len {
+            return Err(FrankenError::OutOfRange {
+                what: what.to_owned(),
+                value: format!("offset={offset} width={width} len={len}"),
+            });
+        }
+        Ok(offset..end)
     }
 }
 
@@ -600,8 +663,8 @@ impl ShmRegion {
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn atomic_u64_at<'a>(ptr: *mut u8, offset: usize) -> &'a AtomicU64 {
     // SAFETY: callers only use this on MAP_SHARED mmap regions. mmap returns
-    // page-aligned base addresses, and `assert_aligned_u64_offset()` ensures the
-    // final byte offset stays 8-byte aligned and in-bounds.
+    // page-aligned base addresses, and `checked_aligned_u64_offset()` ensures
+    // the final byte offset stays 8-byte aligned and in-bounds.
     unsafe { &*ptr.add(offset).cast::<AtomicU64>() }
 }
 
@@ -673,47 +736,53 @@ mod tests {
     #[test]
     fn test_shm_region_read_write_u32() {
         let region = ShmRegion::new(64);
-        region.write_u32_le(0, 0xDEAD_BEEF);
-        region.write_u32_le(4, 42);
-        assert_eq!(region.read_u32_le(0), 0xDEAD_BEEF);
-        assert_eq!(region.read_u32_le(4), 42);
+        region.write_u32_le(0, 0xDEAD_BEEF).unwrap();
+        region.write_u32_le(4, 42).unwrap();
+        assert_eq!(region.read_u32_le(0).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(region.read_u32_le(4).unwrap(), 42);
     }
 
     #[test]
     fn test_shm_region_read_write_u64() {
         let region = ShmRegion::new(64);
-        region.write_u64_le(0, 0x0102_0304_0506_0708);
-        assert_eq!(region.read_u64_le(0), 0x0102_0304_0506_0708);
+        region.write_u64_le(0, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(region.read_u64_le(0).unwrap(), 0x0102_0304_0506_0708);
     }
 
     #[test]
     fn test_shm_region_atomic_u64_round_trip() {
         let region = ShmRegion::new(64);
 
-        region.atomic_store_u64_le(8, 41, Ordering::SeqCst);
-        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 41);
+        region.atomic_store_u64_le(8, 41, Ordering::SeqCst).unwrap();
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst).unwrap(), 41);
 
-        let before = region.atomic_fetch_add_u64_le(8, 1, Ordering::SeqCst);
+        let before = region
+            .atomic_fetch_add_u64_le(8, 1, Ordering::SeqCst)
+            .unwrap();
         assert_eq!(before, 41);
-        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 42);
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst).unwrap(), 42);
 
         assert_eq!(
-            region.atomic_compare_exchange_u64_le(8, 42, 99, Ordering::SeqCst, Ordering::SeqCst),
+            region
+                .atomic_compare_exchange_u64_le(8, 42, 99, Ordering::SeqCst, Ordering::SeqCst)
+                .unwrap(),
             Ok(42)
         );
-        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst), 99);
+        assert_eq!(region.atomic_load_u64_le(8, Ordering::SeqCst).unwrap(), 99);
     }
 
     #[test]
     fn test_shm_region_atomic_compare_exchange_reports_actual_value() {
         let region = ShmRegion::new(64);
-        region.atomic_store_u64_le(16, 7, Ordering::SeqCst);
+        region.atomic_store_u64_le(16, 7, Ordering::SeqCst).unwrap();
 
         assert_eq!(
-            region.atomic_compare_exchange_u64_le(16, 8, 9, Ordering::SeqCst, Ordering::SeqCst),
+            region
+                .atomic_compare_exchange_u64_le(16, 8, 9, Ordering::SeqCst, Ordering::SeqCst)
+                .unwrap(),
             Err(7)
         );
-        assert_eq!(region.atomic_load_u64_le(16, Ordering::SeqCst), 7);
+        assert_eq!(region.atomic_load_u64_le(16, Ordering::SeqCst).unwrap(), 7);
     }
 
     #[test]
@@ -771,8 +840,8 @@ mod tests {
         let r1 = ShmRegion::new(16);
         let r2 = r1.clone();
 
-        r1.write_u32_le(0, 0x1234_5678);
-        assert_eq!(r2.read_u32_le(0), 0x1234_5678);
+        r1.write_u32_le(0, 0x1234_5678).unwrap();
+        assert_eq!(r2.read_u32_le(0).unwrap(), 0x1234_5678);
     }
 
     #[test]
@@ -792,38 +861,38 @@ mod tests {
     #[test]
     fn test_shm_region_u32_at_nonzero_offset() {
         let region = ShmRegion::new(32);
-        region.write_u32_le(12, 999);
-        region.write_u32_le(28, u32::MAX);
-        assert_eq!(region.read_u32_le(12), 999);
-        assert_eq!(region.read_u32_le(28), u32::MAX);
+        region.write_u32_le(12, 999).unwrap();
+        region.write_u32_le(28, u32::MAX).unwrap();
+        assert_eq!(region.read_u32_le(12).unwrap(), 999);
+        assert_eq!(region.read_u32_le(28).unwrap(), u32::MAX);
         // Bytes in between should still be zero.
-        assert_eq!(region.read_u32_le(16), 0);
+        assert_eq!(region.read_u32_le(16).unwrap(), 0);
     }
 
     #[test]
     fn test_shm_region_u64_at_nonzero_offset() {
         let region = ShmRegion::new(32);
-        region.write_u64_le(8, u64::MAX);
-        assert_eq!(region.read_u64_le(8), u64::MAX);
-        assert_eq!(region.read_u64_le(0), 0);
+        region.write_u64_le(8, u64::MAX).unwrap();
+        assert_eq!(region.read_u64_le(8).unwrap(), u64::MAX);
+        assert_eq!(region.read_u64_le(0).unwrap(), 0);
     }
 
     #[test]
     fn test_shm_region_u32_min_max() {
         let region = ShmRegion::new(8);
-        region.write_u32_le(0, 0);
-        assert_eq!(region.read_u32_le(0), 0);
-        region.write_u32_le(0, u32::MAX);
-        assert_eq!(region.read_u32_le(0), u32::MAX);
+        region.write_u32_le(0, 0).unwrap();
+        assert_eq!(region.read_u32_le(0).unwrap(), 0);
+        region.write_u32_le(0, u32::MAX).unwrap();
+        assert_eq!(region.read_u32_le(0).unwrap(), u32::MAX);
     }
 
     #[test]
     fn test_shm_region_u64_min_max() {
         let region = ShmRegion::new(16);
-        region.write_u64_le(0, 0);
-        assert_eq!(region.read_u64_le(0), 0);
-        region.write_u64_le(0, u64::MAX);
-        assert_eq!(region.read_u64_le(0), u64::MAX);
+        region.write_u64_le(0, 0).unwrap();
+        assert_eq!(region.read_u64_le(0).unwrap(), 0);
+        region.write_u64_le(0, u64::MAX).unwrap();
+        assert_eq!(region.read_u64_le(0).unwrap(), u64::MAX);
     }
 
     #[test]
@@ -863,17 +932,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
     fn test_shm_region_read_u32_out_of_bounds() {
         let region = ShmRegion::new(4);
-        let _ = region.read_u32_le(2); // offset 2 + 4 = 6 > 4
+        let err = region.read_u32_le(2).unwrap_err(); // offset 2 + 4 = 6 > 4
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
     }
 
     #[test]
-    #[should_panic(expected = "out of range")]
     fn test_shm_region_read_u64_out_of_bounds() {
         let region = ShmRegion::new(8);
-        let _ = region.read_u64_le(4); // offset 4 + 8 = 12 > 8
+        let err = region.read_u64_le(4).unwrap_err(); // offset 4 + 8 = 12 > 8
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
     }
 
     #[test]
@@ -886,31 +955,31 @@ mod tests {
     #[test]
     fn test_shm_region_interleaved_u32_u64() {
         let region = ShmRegion::new(16);
-        region.write_u32_le(0, 42);
-        region.write_u64_le(8, 0xCAFE_BABE_DEAD_BEEF);
-        assert_eq!(region.read_u32_le(0), 42);
-        assert_eq!(region.read_u64_le(8), 0xCAFE_BABE_DEAD_BEEF);
+        region.write_u32_le(0, 42).unwrap();
+        region.write_u64_le(8, 0xCAFE_BABE_DEAD_BEEF).unwrap();
+        assert_eq!(region.read_u32_le(0).unwrap(), 42);
+        assert_eq!(region.read_u64_le(8).unwrap(), 0xCAFE_BABE_DEAD_BEEF);
     }
 
     #[test]
     fn test_shm_region_read_write_u32_ne() {
         let region = ShmRegion::new(64);
-        region.write_u32_ne(0, 0xDEAD_BEEF);
-        region.write_u32_ne(4, 42);
-        assert_eq!(region.read_u32_ne(0), 0xDEAD_BEEF);
-        assert_eq!(region.read_u32_ne(4), 42);
+        region.write_u32_ne(0, 0xDEAD_BEEF).unwrap();
+        region.write_u32_ne(4, 42).unwrap();
+        assert_eq!(region.read_u32_ne(0).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(region.read_u32_ne(4).unwrap(), 42);
     }
 
     #[test]
     fn test_shm_region_native_endian_consistency() {
         let region = ShmRegion::new(16);
         let value = 0x1234_5678_u32;
-        region.write_u32_ne(0, value);
+        region.write_u32_ne(0, value).unwrap();
         // Native endian read should round-trip.
-        assert_eq!(region.read_u32_ne(0), value);
+        assert_eq!(region.read_u32_ne(0).unwrap(), value);
         // On little-endian platforms, ne == le.
         if cfg!(target_endian = "little") {
-            assert_eq!(region.read_u32_le(0), value);
+            assert_eq!(region.read_u32_le(0).unwrap(), value);
         }
     }
 

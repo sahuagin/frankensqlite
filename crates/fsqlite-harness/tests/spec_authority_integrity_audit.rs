@@ -10,14 +10,14 @@ use proptest::prelude::*;
 use serde::Serialize;
 
 const BEAD_ID: &str = "bd-1wx.5";
-const SPEC_REL_PATH: &str = "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md";
+const SPEC_REL_PATH: &str = "docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md";
 const REPORT_REL_PATH: &str = "target/spec_authority_integrity_report.json";
 const EXPECTED_SECTIONS: std::ops::RangeInclusive<u8> = 0..=23;
 const LEGACY_DOCS: &[&str] = &[
-    "PROPOSED_ARCHITECTURE.md",
-    "MVCC_SPECIFICATION.md",
-    "PLAN_TO_PORT_SQLITE_TO_RUST.md",
-    "EXISTING_SQLITE_STRUCTURE.md",
+    "docs/planning/PROPOSED_ARCHITECTURE.md",
+    "docs/planning/MVCC_SPECIFICATION.md",
+    "docs/planning/PLAN_TO_PORT_SQLITE_TO_RUST.md",
+    "docs/planning/EXISTING_SQLITE_STRUCTURE.md",
 ];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

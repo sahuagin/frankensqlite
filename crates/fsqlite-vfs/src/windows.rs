@@ -1001,18 +1001,18 @@ mod tests {
             .expect("open file");
 
         let region_small = file.shm_map(&cx, 0, 32, true).expect("initial map");
-        region_small.write_u32_le(0, 0x1122_3344);
+        region_small.write_u32_le(0, 0x1122_3344).unwrap();
 
         let region_large = file.shm_map(&cx, 0, 64, true).expect("resized map");
-        region_large.write_u32_le(0, 0x5566_7788);
-        region_large.write_u32_le(32, 0xAABB_CCDD);
+        region_large.write_u32_le(0, 0x5566_7788).unwrap();
+        region_large.write_u32_le(32, 0xAABB_CCDD).unwrap();
 
         assert_eq!(
-            region_small.read_u32_le(0),
+            region_small.read_u32_le(0).unwrap(),
             0x5566_7788,
             "resizing must preserve shared backing for existing mappings"
         );
-        assert_eq!(region_large.read_u32_le(32), 0xAABB_CCDD);
+        assert_eq!(region_large.read_u32_le(32).unwrap(), 0xAABB_CCDD);
     }
 
     #[test]

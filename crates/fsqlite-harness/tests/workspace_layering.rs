@@ -310,7 +310,7 @@ fn fsqlite_cargo_toml() -> Result<String, String> {
 }
 
 fn spec_section_8_3() -> Result<String, String> {
-    let path = workspace_root().join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
+    let path = workspace_root().join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
     let spec = fs::read_to_string(&path).map_err(|error| {
         format!(
             "bead_id={DESC_BEAD_ID} case=read_comprehensive_spec path={} error={error}",
@@ -345,7 +345,7 @@ fn spec_section_8_3() -> Result<String, String> {
 }
 
 fn spec_section_8_4() -> Result<String, String> {
-    let path = workspace_root().join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
+    let path = workspace_root().join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
     let spec = fs::read_to_string(&path).map_err(|error| {
         format!(
             "bead_id={DESC_BEAD_ID} case=read_comprehensive_spec path={} error={error}",

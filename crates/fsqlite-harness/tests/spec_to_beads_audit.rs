@@ -433,7 +433,7 @@ fn test_e2e_spec_to_beads_audit_report_schema_stable() {
     let root = workspace_root();
     let report_path = root.join("target/spec_to_beads_audit.json");
     let config = AuditConfig {
-        spec_path: root.join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"),
+        spec_path: root.join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"),
         beads_path: root.join(".beads/issues.jsonl"),
         mode: AuditMode::Strict,
     };
@@ -468,7 +468,7 @@ fn test_e2e_spec_to_beads_audit_report_schema_stable() {
 fn test_e2e_bd_1wx_3_compliance() {
     let root = workspace_root();
     let config = AuditConfig {
-        spec_path: root.join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"),
+        spec_path: root.join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"),
         beads_path: root.join(".beads/issues.jsonl"),
         mode: AuditMode::Strict,
     };

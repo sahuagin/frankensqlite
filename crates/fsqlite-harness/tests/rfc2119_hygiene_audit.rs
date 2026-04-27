@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const BEAD_ID: &str = "bd-1wx.4";
-const SPEC_REL_PATH: &str = "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md";
+const SPEC_REL_PATH: &str = "docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md";
 const BEADS_REL_PATH: &str = ".beads/issues.jsonl";
 const CHECKLIST_REL_PATH: &str = "docs/rfc2119_hygiene_checklist.md";
 const REPORT_REL_PATH: &str = "target/rfc2119_hygiene_report.json";

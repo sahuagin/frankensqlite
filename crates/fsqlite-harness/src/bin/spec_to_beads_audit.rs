@@ -16,7 +16,7 @@ fn real_main() -> Result<(), String> {
     let workspace_root = workspace_root();
 
     let mut mode = AuditMode::Strict;
-    let mut spec_path = workspace_root.join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
+    let mut spec_path = workspace_root.join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
     let mut beads_path = workspace_root.join(".beads/issues.jsonl");
     let mut report_path = workspace_root.join("target/spec_to_beads_audit.json");
 

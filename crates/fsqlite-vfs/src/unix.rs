@@ -592,7 +592,10 @@ impl ShmInfo {
         }
         let mut marks = [0u32; WAL_NREADER_USIZE];
         for (i, mark) in marks.iter_mut().enumerate() {
-            *mark = region_0.read_u32_ne(SHM_READ_MARK_OFFSET + i * 4);
+            let Ok(value) = region_0.read_u32_ne(SHM_READ_MARK_OFFSET + i * 4) else {
+                return [0; WAL_NREADER_USIZE];
+            };
+            *mark = value;
         }
         marks
     }
@@ -1484,7 +1487,7 @@ impl UnixFile {
 
         let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
         let shm_offset = SHM_READ_MARK_OFFSET + slot_idx * 4;
-        let current_mark = region_0.read_u32_ne(shm_offset);
+        let current_mark = region_0.read_u32_ne(shm_offset)?;
 
         if current_mark == snapshot_mark {
             self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
@@ -1493,7 +1496,7 @@ impl UnixFile {
 
         // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
-        region_0.write_u32_ne(shm_offset, snapshot_mark);
+        region_0.write_u32_ne(shm_offset, snapshot_mark)?;
         self.shm_barrier();
         self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
@@ -3463,10 +3466,10 @@ mod tests {
         assert!(region.is_mmap_backed());
 
         // Write through the mmap region and read back.
-        region.write_u32_le(0, 0xDEAD_BEEF);
-        region.write_u64_le(8, 0x0102_0304_0506_0708);
-        assert_eq!(region.read_u32_le(0), 0xDEAD_BEEF);
-        assert_eq!(region.read_u64_le(8), 0x0102_0304_0506_0708);
+        region.write_u32_le(0, 0xDEAD_BEEF).unwrap();
+        region.write_u64_le(8, 0x0102_0304_0506_0708).unwrap();
+        assert_eq!(region.read_u32_le(0).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(region.read_u64_le(8).unwrap(), 0x0102_0304_0506_0708);
 
         // Verify writes are visible in the SHM file on disk.
         file.shm_barrier();
@@ -3498,12 +3501,12 @@ mod tests {
         assert!(region_b.is_mmap_backed());
 
         // Write a distinctive pattern at offset 256 in the SHM region.
-        region_a.write_u32_le(256, 0xCAFE_BABE);
+        region_a.write_u32_le(256, 0xCAFE_BABE).unwrap();
         file_a.shm_barrier();
         file_b.shm_barrier();
 
         assert_eq!(
-            region_b.read_u32_le(256),
+            region_b.read_u32_le(256).unwrap(),
             0xCAFE_BABE,
             "mmap write at offset 256 must be visible to another handle (same process)"
         );
@@ -3527,12 +3530,12 @@ mod tests {
         let region1 = file.shm_map(&cx, 1, 32768, true).unwrap();
 
         // Write different data to each region.
-        region0.write_u32_le(0, 0xAAAA_AAAA);
-        region1.write_u32_le(0, 0xBBBB_BBBB);
+        region0.write_u32_le(0, 0xAAAA_AAAA).unwrap();
+        region1.write_u32_le(0, 0xBBBB_BBBB).unwrap();
 
         // Verify regions are independent.
-        assert_eq!(region0.read_u32_le(0), 0xAAAA_AAAA);
-        assert_eq!(region1.read_u32_le(0), 0xBBBB_BBBB);
+        assert_eq!(region0.read_u32_le(0).unwrap(), 0xAAAA_AAAA);
+        assert_eq!(region1.read_u32_le(0).unwrap(), 0xBBBB_BBBB);
 
         // Verify SHM file is at least 2 * 32KB.
         let shm_path = sqlite_shm_path(&file.path);
@@ -3584,7 +3587,7 @@ mod tests {
         assert!(region.is_mmap_backed());
 
         // Write a distinctive pattern at offset 256 in the SHM region.
-        region.write_u32_le(256, 0xCAFE_BABE);
+        region.write_u32_le(256, 0xCAFE_BABE).unwrap();
         file.shm_barrier();
 
         // Read the SHM file directly (simulating another process) and verify.
@@ -3615,14 +3618,14 @@ mod tests {
         let r_region = reader.shm_map(&cx, 0, 32768, true).unwrap();
 
         // Write a sequence of values with barriers between them.
-        w_region.write_u32_le(0, 1);
+        w_region.write_u32_le(0, 1).unwrap();
         writer.shm_barrier();
-        w_region.write_u32_le(4, 2);
+        w_region.write_u32_le(4, 2).unwrap();
         writer.shm_barrier();
 
         reader.shm_barrier();
-        let v1 = r_region.read_u32_le(0);
-        let v2 = r_region.read_u32_le(4);
+        let v1 = r_region.read_u32_le(0).unwrap();
+        let v2 = r_region.read_u32_le(4).unwrap();
         assert_eq!(v1, 1, "first write must be visible after barrier");
         assert_eq!(v2, 2, "second write must be visible after barrier");
 
@@ -3659,7 +3662,7 @@ mod tests {
             .unwrap();
 
         // Write data under the lock.
-        w_region.write_u32_le(200, 0x1234_5678);
+        w_region.write_u32_le(200, 0x1234_5678).unwrap();
         writer.shm_barrier();
 
         // Reader should fail to get exclusive lock on same slot (BUSY).
@@ -3677,7 +3680,7 @@ mod tests {
         // But reader can still read the mmap data (SHM is MAP_SHARED).
         reader.shm_barrier();
         assert_eq!(
-            r_region.read_u32_le(200),
+            r_region.read_u32_le(200).unwrap(),
             0x1234_5678,
             "reader must see writer's data through mmap even without its own exclusive lock"
         );

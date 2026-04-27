@@ -99,12 +99,12 @@ c_sqlite_refs=(
 )
 
 project_docs=(
-    "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"
-    "EXISTING_SQLITE_STRUCTURE.md"
+    "docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"
+    "docs/planning/EXISTING_SQLITE_STRUCTURE.md"
     "docs/rfc6330.txt"
     "AGENTS.md"
-    "MVCC_SPECIFICATION.md"
-    "PROPOSED_ARCHITECTURE.md"
+    "docs/planning/MVCC_SPECIFICATION.md"
+    "docs/planning/PROPOSED_ARCHITECTURE.md"
 )
 
 asupersync_refs=(

@@ -990,7 +990,7 @@ fn parent_has_room_for_table_leaf_split<R: crate::cursor::PageReader>(
 ///
 /// Inspired by B-link tree designs (Lehman & Yao, 1981) which prioritize
 /// reducing structural modifications for concurrent access, and by the
-/// observation in `STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md` that the
+/// observation in `docs/planning/STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md` that the
 /// best shared-page conflict is the one that never happens.
 fn choose_leaf_table_split_index(
     cells: &[GatheredCell],
