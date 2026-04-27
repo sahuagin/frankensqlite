@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::{LockLevel, PageSize};
 #[cfg(test)]
 use tracing::debug;
 use tracing::{error, warn};
@@ -177,6 +177,11 @@ fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
     Ok((s1, s2))
 }
 
+fn sqlite_wal_index_page_size(raw: u16) -> Option<u32> {
+    let page_size = if raw == 1 { 65_536 } else { u32::from(raw) };
+    PageSize::new(page_size).map(PageSize::get)
+}
+
 fn write_ne_u32(buf: &mut [u8], offset: usize, value: u32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
 }
@@ -243,6 +248,20 @@ fn sqlite_wal_shm_header_is_valid(buf: &[u8]) -> Result<bool> {
     }
 
     if h1[12] == 0 {
+        return Ok(false);
+    }
+
+    let version = u32::from_ne_bytes([h1[0], h1[1], h1[2], h1[3]]);
+    if version != SQLITE_WAL_INDEX_VERSION {
+        return Ok(false);
+    }
+
+    if h1[13] > 1 {
+        return Ok(false);
+    }
+
+    let raw_page_size = u16::from_ne_bytes([h1[14], h1[15]]);
+    if sqlite_wal_index_page_size(raw_page_size).is_none() {
         return Ok(false);
     }
 
@@ -3012,6 +3031,15 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn refresh_wal_shm_header_checksums(header: &mut [u8; SQLITE_WAL_SHM_HEADER_BYTES]) {
+        for offset in [0, 48] {
+            let (ck1, ck2) = sqlite_wal_checksum_native_8byte_chunks(&header[offset..offset + 40])
+                .expect("test header checksum input is aligned");
+            write_ne_u32(header, offset + 40, ck1);
+            write_ne_u32(header, offset + 44, ck2);
+        }
+    }
+
     #[test]
     #[allow(clippy::cast_possible_truncation)]
     fn test_page_size_from_header_valid_sizes() {
@@ -3104,6 +3132,33 @@ mod tests {
         // Corrupt a data byte in the checksum area.
         header[8] ^= 0xFF;
         header[48 + 8] ^= 0xFF;
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_version_even_with_valid_checksum() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        write_ne_u32(&mut header, 0, SQLITE_WAL_INDEX_VERSION + 1);
+        write_ne_u32(&mut header, 48, SQLITE_WAL_INDEX_VERSION + 1);
+        refresh_wal_shm_header_checksums(&mut header);
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_checksum_endian_flag_even_with_valid_checksum() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        header[13] = 2;
+        header[48 + 13] = 2;
+        refresh_wal_shm_header_checksums(&mut header);
+        assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
+    }
+
+    #[test]
+    fn test_wal_shm_header_invalid_page_size_even_with_valid_checksum() {
+        let mut header = build_empty_sqlite_wal_shm_header(4096, 5).unwrap();
+        header[14..16].copy_from_slice(&3_u16.to_ne_bytes());
+        header[48 + 14..48 + 16].copy_from_slice(&3_u16.to_ne_bytes());
+        refresh_wal_shm_header_checksums(&mut header);
         assert!(!sqlite_wal_shm_header_is_valid(&header).unwrap());
     }
 

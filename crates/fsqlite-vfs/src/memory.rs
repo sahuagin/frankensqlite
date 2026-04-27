@@ -279,6 +279,17 @@ fn u64_to_usize(value: u64, what: &str) -> Result<usize> {
     })
 }
 
+fn checked_memory_io_range(offset: u64, len: usize, what: &str) -> Result<(usize, usize)> {
+    let offset = u64_to_usize(offset, what)?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: format!("{what} + length"),
+            value: format!("{offset}+{len}"),
+        })?;
+    Ok((offset, end))
+}
+
 fn round_up_to_chunk(required: usize, chunk: usize) -> usize {
     if chunk <= 1 {
         return required;
@@ -485,10 +496,11 @@ impl MemoryFile {
         buf: &[u8],
         offset: u64,
     ) -> Result<()> {
-        let offset = u64_to_usize(offset, "write offset")?;
-        let end = offset.checked_add(buf.len()).ok_or_else(|| {
-            FrankenError::Io(std::io::Error::other("write offset + length overflow"))
-        })?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        let (offset, end) = checked_memory_io_range(offset, buf.len(), "write offset")?;
 
         let old_len = storage.data.len();
         let old_reserved = storage.data.capacity();
@@ -745,7 +757,7 @@ impl VfsFile for MemoryFile {
         checkpoint_or_abort(cx)?;
         let storage = self.storage.lock().map_err(|_| lock_err())?;
 
-        let offset = u64_to_usize(offset, "read offset")?;
+        let (offset, _) = checked_memory_io_range(offset, buf.len(), "read offset")?;
         let file_len = storage.data.len();
 
         if offset >= file_len {
@@ -792,12 +804,16 @@ impl VfsFile for MemoryFile {
         let mut normalized_writes = Vec::with_capacity(writes.len());
         let mut required_len = storage.data.len();
         for &(offset, data) in writes {
-            let offset = u64_to_usize(offset, "write offset")?;
-            let end = offset.checked_add(data.len()).ok_or_else(|| {
-                FrankenError::Io(std::io::Error::other("write offset + length overflow"))
-            })?;
+            if data.is_empty() {
+                continue;
+            }
+            let (offset, end) = checked_memory_io_range(offset, data.len(), "write offset")?;
             required_len = required_len.max(end);
             normalized_writes.push((offset, data));
+        }
+
+        if normalized_writes.is_empty() {
+            return Ok(());
         }
 
         let old_len = storage.data.len();
@@ -1405,6 +1421,35 @@ mod tests {
             .unwrap();
 
         let err = file.write(&cx, b"ab", u64::MAX).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn read_offset_overflow_returns_error() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (file, _) = vfs
+            .open(&cx, Some(Path::new("read_overflow_offset.db")), flags)
+            .unwrap();
+
+        let mut buf = [0_u8; 2];
+        let err = file.read(&cx, &mut buf, u64::MAX).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn write_page_batch_offset_overflow_returns_error() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("batch_overflow_offset.db")), flags)
+            .unwrap();
+
+        let err = file
+            .write_page_batch(&cx, &[(u64::MAX, &[1_u8, 2_u8][..])])
+            .unwrap_err();
         assert!(matches!(err, FrankenError::OutOfRange { .. }));
     }
 
