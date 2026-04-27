@@ -1892,10 +1892,24 @@ where
         return Ok(());
     }
 
-    write_sql_statement(out, "DELETE FROM sqlite_sequence;", colorize_sql)
-        .map_err(|error| error.to_string())?;
+    let scoped_reset = filter.is_some();
+    if !scoped_reset {
+        write_sql_statement(out, "DELETE FROM sqlite_sequence;", colorize_sql)
+            .map_err(|error| error.to_string())?;
+    }
     let quoted_table = quote_identifier("sqlite_sequence");
     for row in rows {
+        if scoped_reset {
+            let Some(sequence_name) = row.get(0) else {
+                continue;
+            };
+            let delete_statement = format!(
+                "DELETE FROM sqlite_sequence WHERE name = {};",
+                sql_literal(sequence_name)
+            );
+            write_sql_statement(out, &delete_statement, colorize_sql)
+                .map_err(|error| error.to_string())?;
+        }
         writeln!(
             out,
             "INSERT INTO {quoted_table} VALUES({});",
@@ -2821,6 +2835,79 @@ SELECT id FROM ai WHERE name = 'c';\n"
         assert!(
             restored.lines().any(|line| line.trim() == "3"),
             "restored AUTOINCREMENT table should continue at id=3, got: {restored}",
+        );
+    }
+
+    #[test]
+    fn test_filtered_dump_does_not_reset_unrelated_autoincrement_sequence() {
+        let mut dump_input = Cursor::new(
+            b"CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+INSERT INTO ai(name) VALUES('a');\n\
+INSERT INTO ai(name) VALUES('b');\n\
+DELETE FROM ai WHERE id = 2;\n\
+.dump ai\n"
+                .to_vec(),
+        );
+        let mut dump_out = Vec::new();
+        let mut dump_err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let dump_exit = run_with_shell_options(
+            args,
+            &mut dump_input,
+            &mut dump_out,
+            &mut dump_err,
+            ShellOptions::batch(),
+        );
+        assert_eq!(dump_exit, 0);
+        assert!(
+            dump_err.is_empty(),
+            "unexpected dump stderr: {:?}",
+            dump_err
+        );
+
+        let dump = String::from_utf8(dump_out).expect("dump output should be utf-8");
+        assert!(
+            !dump.contains("DELETE FROM sqlite_sequence;"),
+            "filtered dump must not clear unrelated sqlite_sequence rows: {dump}",
+        );
+        assert!(
+            dump.contains("DELETE FROM sqlite_sequence WHERE name = 'ai';"),
+            "filtered dump should reset only the dumped table sequence row: {dump}",
+        );
+
+        let restore_script = format!(
+            "CREATE TABLE keep(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);\n\
+INSERT INTO keep(name) VALUES('k1');\n\
+INSERT INTO keep(name) VALUES('k2');\n\
+DELETE FROM keep WHERE id = 2;\n\
+{dump}\n\
+INSERT INTO keep(name) VALUES('k3');\n\
+SELECT id FROM keep WHERE name = 'k3';\n"
+        );
+        let mut restore_input = Cursor::new(restore_script.into_bytes());
+        let mut restore_out = Vec::new();
+        let mut restore_err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let restore_exit = run_with_shell_options(
+            args,
+            &mut restore_input,
+            &mut restore_out,
+            &mut restore_err,
+            ShellOptions::batch(),
+        );
+        assert_eq!(restore_exit, 0);
+        assert!(
+            restore_err.is_empty(),
+            "unexpected restore stderr: {:?}",
+            restore_err
+        );
+
+        let restored = String::from_utf8(restore_out).expect("restore output should be utf-8");
+        assert!(
+            restored.lines().any(|line| line.trim() == "3"),
+            "filtered restore should preserve unrelated AUTOINCREMENT sequence state, got: {restored}",
         );
     }
 
