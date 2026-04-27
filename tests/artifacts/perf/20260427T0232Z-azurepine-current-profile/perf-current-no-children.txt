@@ -1,0 +1,518 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 4423732047
+#
+# Overhead  Symbol                                                                                                                                                                                                       IPC   [IPC Coverage]
+# ........  ...........................................................................................................................................................................................................  ....................
+#
+     7.97%  [.] __memmove_avx_unaligned_erms                                                                                                                                                                             -      -
+            |
+             --7.61%--__memcpy_avx_unaligned_erms (inlined)
+                       |
+                        --0.51%--fsqlite_pager::pager::build_group_commit_batch::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+                                  copy_to_nonoverlapping<u8> (inlined)
+                                  to_vec<u8, alloc::alloc::Global> (inlined)
+                                  to_vec_in<u8, alloc::alloc::Global> (inlined)
+                                  to_vec<u8> (inlined)
+                                  build_group_commit_batch<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>> (inlined)
+                                  <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit_with_snapshot::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>
+                                  <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs> as fsqlite_pager::traits::TransactionHandle>::commit
+                                  <fsqlite_core::connection::Connection>::execute_commit_with_cx
+                                  with_handle_mut<core::result::Result<(), fsqlite_error::FrankenError>, fsqlite_pager::traits::{impl#18}::commit::{closure_env#0}> (inlined)
+                                  commit (inlined)
+                                  <fsqlite_core::connection::Connection>::execute_commit_with_cx
+                                  <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+
+     4.41%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert                                                                                                                            -      -
+            |
+            |--2.19%--<fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+            |
+             --0.63%--execute_prepared_direct_simple_insert_with_cursor<fsqlite_vdbe::engine::SharedTxnPageIo> (inlined)
+                       <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_insert
+
+     4.16%  [.] _int_malloc                                                                                                                                                                                              -      -
+            |
+             --3.88%--_int_malloc
+                       |
+                       |--0.62%--<hashbrown::map::HashMap<i32, fsqlite_vdbe::engine::MemTable, foldhash::fast::FixedState> as core::clone::Clone>::clone
+                       |          clone_from_impl<(i32, fsqlite_vdbe::engine::MemTable), allocator_api2::stable::alloc::global::Global> (inlined)
+                       |          clone_from_spec<(i32, fsqlite_vdbe::engine::MemTable), allocator_api2::stable::alloc::global::Global> (inlined)
+                       |          clone<(i32, fsqlite_vdbe::engine::MemTable), allocator_api2::stable::alloc::global::Global> (inlined)
+                       |          clone<i32, fsqlite_vdbe::engine::MemTable, foldhash::fast::FixedState, allocator_api2::stable::alloc::global::Global> (inlined)
+                       |          <fsqlite_core::connection::Connection>::capture_time_travel_snapshot
+                       |          clone (inlined)
+                       |          capture_time_travel_snapshot (inlined)
+                       |          <fsqlite_core::connection::Connection>::execute_commit_with_cx
+                       |          <fsqlite_core::connection::Connection>::execute_statement_dispatch_impl
+                       |
+                       |--0.55%--<fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+                       |
+                        --0.54%--__libc_malloc2
+                                  <std::alloc::System as core::alloc::global::GlobalAlloc>::alloc (inlined)
+                                  __rustc::__rdl_alloc (inlined)
+                                  alloc (inlined)
+                                  alloc_impl_runtime (inlined)
+                                  alloc_impl (inlined)
+                                  allocate (inlined)
+
+     3.82%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::delete                                                                                -      -
+            |
+            |--1.51%--remove_table_cell_from_leaf_deferred<fsqlite_vdbe::engine::SharedTxnPageIo> (inlined)
+            |          {closure#0}<fsqlite_vdbe::engine::SharedTxnPageIo> (inlined)
+            |          with_btree_op<fsqlite_vdbe::engine::SharedTxnPageIo, (), fsqlite_btree::cursor::{impl#19}::delete::{closure_env#0}<fsqlite_vdbe::engine::SharedTxnPageIo>> (inlined)
+            |          delete<fsqlite_vdbe::engine::SharedTxnPageIo> (inlined)
+            |
+             --1.22%--<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::delete
+
+     3.69%  [.] core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>         -      -
+            |
+            |--1.50%--core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+            |          |
+            |           --0.97%--{closure#0}<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+            |                     partition_lomuto_branchless_cyclic<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+            |                     partition<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+            |                     core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+            |
+            |--0.90%--partition_lomuto_branchless_cyclic<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+            |          partition<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+            |          core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+            |
+             --0.74%--copy_nonoverlapping<(usize, usize, usize)> (inlined)
+                       {closure#0}<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+                       partition_lomuto_branchless_cyclic<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+                       partition<(usize, usize, usize), core::slice::{impl#0}::sort_unstable_by::{closure_env#0}<(usize, usize, usize), fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure_env#0}>> (inlined)
+                       core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+
+     3.64%  [.] fsqlite_btree::cell::cell_on_page_size_fast                                                                                                                                                              -      -
+            |
+            |--2.45%--fsqlite_btree::cell::cell_on_page_size_fast
+            |          |
+            |           --0.78%--core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+            |                     |
+            |                      --0.60%--core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+            |
+             --0.64%--read_varint (inlined)
+                       fsqlite_btree::cell::cell_on_page_size_fast
+                       |
+                        --0.60%--core::slice::sort::unstable::quicksort::quicksort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+
+     2.88%  [.] core::slice::sort::shared::smallsort::small_sort_general::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>  -      -
+            |
+             --2.16%--core::slice::sort::shared::smallsort::small_sort_general::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>
+
+     2.33%  [.] core::str::converts::from_utf8                                                                                                                                                                           -      -
+            |
+            |--1.16%--core::str::validations::run_utf8_validation (inlined)
+            |          core::str::converts::from_utf8
+            |
+             --0.73%--core::str::converts::from_utf8
+
+     2.08%  [.] fsqlite_types::record::parse_record_into                                                                                                                                                                 -      -
+            |
+             --1.63%--fsqlite_types::record::parse_record_into
+
+     2.08%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal                                                                                                                                             -      -
+            |
+             --1.61%--<fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal
+
+     1.86%  [.] _int_free_merge_chunk                                                                                                                                                                                    -      -
+            |
+            |--1.12%--_int_free_create_chunk (inlined)
+            |          _int_free_merge_chunk
+            |
+             --0.74%--_int_free_merge_chunk
+
+     1.83%  [.] <fsqlite_types::value::SqliteValue as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>                                                                                                      -      -
+            |
+             --1.33%--<fsqlite_types::value::SqliteValue as <[_]>::to_vec_in::ConvertVec>::to_vec::<alloc::alloc::Global>
+                       |
+                        --0.58%--to_vec<fsqlite_types::value::SqliteValue, alloc::alloc::Global> (inlined)
+
+     1.36%  [.] <fsqlite_types::value::SmallText>::new.1931                                                                                                                                                              -      -
+            |
+             --1.08%--<fsqlite_types::value::SmallText>::new.1931
+
+     1.35%  [.] <fsqlite_wal::checksum::WalChecksumTransform>::for_wal_frame                                                                                                                                             -      -
+            |
+             --1.23%--<fsqlite_wal::checksum::WalChecksumTransform>::for_wal_frame
+                       |
+                        --0.80%--then (inlined)
+                                  from_aligned_bytes (inlined)
+                                  for_wal_frame (inlined)
+
+     1.31%  [.] <hashbrown::map::HashMap<i32, fsqlite_vdbe::engine::MemTable, foldhash::fast::FixedState>>::get_inner_mut::<i32>                                                                                         -      -
+            |
+             --0.95%--<hashbrown::map::HashMap<i32, fsqlite_vdbe::engine::MemTable, foldhash::fast::FixedState>>::get_inner_mut::<i32>
+
+     1.26%  [.] fsqlite_btree::cell::read_cell_pointers_into                                                                                                                                                             -      -
+            |
+             --0.62%--swap_bytes (inlined)
+                       from_be (inlined)
+                       from_be_bytes (inlined)
+                       {closure#0} (inlined)
+                       {closure#0}<&[u8; 2], u16, (), fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}, core::iter::traits::iterator::Iterator::for_each::call::{closure_env#0}<u16, alloc::vec::{impl#21}::extend_trusted::{closure_env#0}<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>>>> (inlined)
+                       fold<[u8; 2], (), core::iter::adapters::map::map_fold::{closure_env#0}<&[u8; 2], u16, (), fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}, core::iter::traits::iterator::Iterator::for_each::call::{closure_env#0}<u16, alloc::vec::{impl#21}::extend_trusted::{closure_env#0}<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>>>>> (inlined)
+                       fold<u16, core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}, (), core::iter::traits::iterator::Iterator::for_each::call::{closure_env#0}<u16, alloc::vec::{impl#21}::extend_trusted::{closure_env#0}<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>>>> (inlined)
+                       for_each<core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>, alloc::vec::{impl#21}::extend_trusted::{closure_env#0}<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>>> (inlined)
+                       extend_trusted<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>> (inlined)
+                       spec_extend<u16, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>, alloc::alloc::Global> (inlined)
+                       extend<u16, alloc::alloc::Global, core::iter::adapters::map::Map<core::slice::iter::Iter<[u8; 2]>, fsqlite_btree::cell::read_cell_pointers_into::{closure_env#0}>> (inlined)
+                       fsqlite_btree::cell::read_cell_pointers_into
+
+     1.21%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read_page_data                                                                                                             -      -
+            |
+             --1.04%--<fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageReader>::read_page_data
+
+     1.18%  [.] fsqlite_types::record::decode_value                                                                                                                                                                      -      -
+     1.14%  [k] 0xffffffff9421a2b7                                                                                                                                                                                       -      -
+            |
+             --0.51%--0xffffffff92c01199
+
+     1.06%  [.] <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status                                                                                                             -      -
+     1.05%  [.] cfree@GLIBC_2.2.5                                                                                                                                                                                        -      -
+            |
+             --0.87%--__GI___libc_free (inlined)
+
+     1.03%  [.] _int_free_chunk                                                                                                                                                                                          -      -
+            |
+             --0.85%--_int_free_chunk
+
+     1.00%  [.] __memset_avx2_unaligned_erms                                                                                                                                                                             -      -
+     0.98%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid                                                                          -      -
+            |
+             --0.79%--<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_table_append_on_hinted_leaf_with_known_last_rowid
+
+     0.96%  [.] 0x0000000000000983                                                                                                                                                                                       -      -
+     0.95%  [.] fsqlite_types::record::decode_value_into                                                                                                                                                                 -      -
+     0.95%  [.] core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemTable>                                                                                                                                               -      -
+     0.91%  [.] <fsqlite_types::record::PrecomputedSerialTypeKind>::serial_byte_and_payload_len                                                                                                                          -      -
+            |
+             --0.57%--<fsqlite_types::record::PrecomputedSerialTypeKind>::serial_byte_and_payload_len
+
+     0.88%  [.] <fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_expr                                                                                                                          -      -
+            |
+             --0.70%--<fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_expr
+
+     0.86%  [.] fsqlite_types::record::append_serialized_value                                                                                                                                                           -      -
+            |
+             --0.59%--fsqlite_types::record::append_serialized_value
+
+     0.83%  [.] <fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode                                                                                                                                  -      -
+            |
+             --0.56%--<fsqlite_core::connection::Connection>::reload_memdb_from_txn_with_mode
+
+     0.82%  [.] fsqlite_mvcc::begin_concurrent::concurrent_page_state                                                                                                                                                    -      -
+     0.81%  [.] <hashbrown::map::HashMap<fsqlite_types::PageNumber, fsqlite_pager::pager::StagedPage, core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>>::insert                                          -      -
+     0.76%  [.] _int_free_maybe_consolidate                                                                                                                                                                              -      -
+     0.76%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow                                                                             -      -
+            |
+             --0.56%--<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::try_append_table_leaf_payload_in_place_no_overflow
+
+     0.73%  [.] malloc                                                                                                                                                                                                   -      -
+     0.71%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert                                                                                                          -      -
+     0.71%  [.] core::ptr::drop_in_place::<fsqlite_types::value::SqliteValue>                                                                                                                                            -      -
+            |
+             --0.62%--core::ptr::drop_in_place::<fsqlite_types::value::SqliteValue>
+
+     0.70%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::rowid_and_payload_cow                -      -
+            |
+             --0.61%--<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::rowid_and_payload_cow
+
+     0.68%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::advance_next_impl                                                             -      -
+            |
+             --0.50%--<fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::advance_next_impl
+
+     0.63%  [.] <fsqlite_core::connection::Connection>::push_prepared_direct_simple_insert_value                                                                                                                         -      -
+     0.63%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::write_page_data                                                                                                    -      -
+     0.62%  [.] __libc_malloc2                                                                                                                                                                                           -      -
+            |
+             --0.53%--__libc_malloc2
+
+     0.56%  [.] fsqlite_core::connection::eval_binary_op                                                                                                                                                                 -      -
+     0.55%  [.] <fsqlite_core::connection::Connection>::stmt_microbatch_try_carry                                                                                                                                        -      -
+     0.55%  [.] <fsqlite_core::connection::Connection>::concurrent_exec_context                                                                                                                                          -      -
+     0.54%  [.] core::ptr::drop_in_place::<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>                                                                                                       -      -
+     0.54%  [.] unlink_chunk.isra.0                                                                                                                                                                                      -      -
+     0.54%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::finish_btree_op_postlude                                                                                                       -      -
+     0.54%  [.] core::ptr::drop_in_place::<fsqlite_vdbe::engine::MemTable>                                                                                                                                               -      -
+     0.53%  [.] <fsqlite_core::connection::Connection>::qf_record_insert                                                                                                                                                 -      -
+     0.50%  [.] fsqlite_types::record::parse_record                                                                                                                                                                      -      -
+     0.48%  [.] fsqlite_mvcc::begin_concurrent::concurrent_page_read_state                                                                                                                                               -      -
+     0.46%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_update                                                                                                                            -      -
+     0.41%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data                                                                                                            -      -
+     0.40%  [.] <fsqlite_core::connection::Connection>::store_prepared_direct_insert_append_hint                                                                                                                         -      -
+     0.39%  [.] <[u8]>::copy_within::<core::ops::range::Range<usize>>                                                                                                                                                    -      -
+     0.37%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::clear_stale_synthetic_pending_commit_surface                                                                                                                    -      -
+     0.36%  [.] <fsqlite_types::PageData>::as_bytes_mut                                                                                                                                                                  -      -
+     0.36%  [.] <alloc::raw_vec::RawVecInner>::finish_grow                                                                                                                                                               -      -
+     0.36%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_try_append_cached_rightmost_leaf_hint::{closure#0}                                                                       -      -
+     0.36%  [.] <fsqlite_vdbe::engine::MemTable>::insert::<alloc::vec::Vec<fsqlite_types::value::SqliteValue>>                                                                                                           -      -
+     0.35%  [.] <fsqlite_core::connection::Connection>::eval_prepared_direct_simple_insert_concat_chain                                                                                                                  -      -
+     0.34%  [.] fsqlite_pager::pager::insert_staged_page::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>                                                                                              -      -
+     0.33%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page                                                                                                                      -      -
+     0.30%  [.] fsqlite_btree::cell::read_table_leaf_rowid_at_offset                                                                                                                                                     -      -
+     0.29%  [.] <fsqlite_types::value::SqliteValue>::is_float_numeric_type                                                                                                                                               -      -
+     0.29%  [.] <fsqlite_types::PageData>::invalidate_owned_snapshot_cache_if_needed                                                                                                                                     -      -
+     0.28%  [.] <alloc::rc::Rc<core::cell::RefCell<core::option::Option<fsqlite_vdbe::engine::ConcurrentContext>>>>::drop_slow                                                                                           -      -
+     0.28%  [.] <fsqlite_core::connection::Connection>::reset_prepared_direct_insert_statement_scratch                                                                                                                   -      -
+     0.27%  [.] <fsqlite_types::value::SqliteValue>::apply_affinity                                                                                                                                                      -      -
+     0.27%  [.] <fsqlite_core::connection::Connection>::append_prepared_direct_simple_insert_text                                                                                                                        -      -
+     0.27%  [.] <fsqlite_mvcc::begin_concurrent::ConcurrentHandle>::ensure_page_state                                                                                                                                    -      -
+     0.27%  [.] <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::ensure_writer                                                                                                                 -      -
+     0.25%  [.] core::slice::sort::unstable::ipnsort::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>                      -      -
+     0.25%  [k] 0xffffffff94228e6b                                                                                                                                                                                       -      -
+     0.24%  [.] fsqlite_mvcc::begin_concurrent::concurrent_stage_prepared_write_page                                                                                                                                     -      -
+     0.23%  [.] <fsqlite_vdbe::engine::MemTable>::insert_unique_keys                                                                                                                                                     -      -
+     0.23%  [.] core::ptr::drop_in_place::<fsqlite_pager::pager::StagedPageBacking>                                                                                                                                      -      -
+     0.23%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_delete                                                                                                                            -      -
+     0.23%  [.] std::thread::functions::available_parallelism                                                                                                                                                            -      -
+     0.22%  [.] fsqlite_types::record::serialize_record_iter_with_precomputed_header_into::<core::slice::iter::Iter<fsqlite_types::value::SqliteValue>>                                                                  -      -
+     0.22%  [.] <fsqlite_btree::cell::CellRef>::parse                                                                                                                                                                    -      -
+     0.21%  [.] <fsqlite_btree::cell::BtreePageHeader>::parse                                                                                                                                                            -      -
+     0.20%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_insert_from_current_position                                                                                             -      -
+     0.20%  [.] <alloc::sync::Arc<[u8]>>::drop_slow                                                                                                                                                                      -      -
+     0.19%  [.] <fsqlite_btree::cursor::CellSlotCache>::insert_slow                                                                                                                                                      -      -
+     0.19%  [.] <fsqlite_core::connection::Connection>::retained_autocommit_count_sum_cache_note_insert                                                                                                                  -      -
+     0.19%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::remember_table_seek                                                           -      -
+     0.19%  [.] <fsqlite_mvcc::begin_concurrent::ConcurrentHandle>::record_read                                                                                                                                          -      -
+     0.19%  [k] 0xffffffff92d04109                                                                                                                                                                                       -      -
+     0.19%  [k] 0xffffffff92c01192                                                                                                                                                                                       -      -
+     0.19%  [.] perf_update_delete::main                                                                                                                                                                                 -      -
+     0.18%  [.] <std::sys::pal::unix::time::Timespec>::now                                                                                                                                                               -      -
+     0.18%  [.] <alloc::raw_vec::RawVec<fsqlite_types::glossary::WitnessKey>>::grow_one                                                                                                                                  -      -
+     0.18%  [.] realloc                                                                                                                                                                                                  -      -
+     0.18%  [.] <smallvec::SmallVec<[fsqlite_btree::cursor::StackEntry; 4]>>::push                                                                                                                                       -      -
+     0.18%  [.] <fsqlite_types::value::SmallText>::as_str                                                                                                                                                                -      -
+     0.18%  [.] <fsqlite_core::connection::Connection>::maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb                                                                                                  -      -
+     0.18%  [.] <asupersync::cx::cx::Cx>::checkpoint                                                                                                                                                                     -      -
+     0.18%  [.] core::slice::sort::shared::pivot::median3_rec::<(usize, usize, usize), <[(usize, usize, usize)]>::sort_unstable_by<fsqlite_btree::cursor::sort_cells_desc_by_ptr::{closure#0}>::{closure#0}>             -      -
+     0.18%  [.] core::ptr::drop_in_place::<fsqlite_types::value::SqliteValue>                                                                                                                                            -      -
+     0.18%  [.] <fsqlite_pager::pager::StagedPage>::into_buf                                                                                                                                                             -      -
+     0.17%  [k] 0xffffffff9348fa7c                                                                                                                                                                                       -      -
+     0.17%  [.] <fsqlite_parser::token::TokenKind>::lookup_keyword_bytes                                                                                                                                                 -      -
+     0.16%  [.] core::ptr::drop_in_place::<core::option::Option<fsqlite_ast::CreateTableStatement>>                                                                                                                      -      -
+     0.16%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::reload_page_fresh                                                                                                              -      -
+     0.15%  [.] <fsqlite_core::connection::Connection>::execute_statement_impl_after_background_status                                                                                                                   -      -
+     0.14%  [.] <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit_with_snapshot::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>::{closure#3}         -      -
+     0.14%  [k] 0xffffffff94208ce3                                                                                                                                                                                       -      -
+     0.13%  [.] 0x000000000000096c                                                                                                                                                                                       -      -
+     0.13%  [k] 0xffffffff93452769                                                                                                                                                                                       -      -
+     0.13%  [.] <alloc::raw_vec::RawVec<fsqlite_vdbe::engine::MemRow>>::grow_one                                                                                                                                         -      -
+     0.12%  [.] <fsqlite_pager::page_cache::ShardedPageCache>::insert_buffer                                                                                                                                             -      -
+     0.12%  [.] core::fmt::write                                                                                                                                                                                         -      -
+     0.11%  [k] 0xffffffff9341a384                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff933b7f99                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff93308ecd                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff92f2339e                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff9423968a                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff93089e8d                                                                                                                                                                                       -      -
+     0.11%  [k] 0xffffffff9383b106                                                                                                                                                                                       -      -
+     0.11%  [.] <fsqlite_core::connection::Connection>::execute_precompiled_prepared_update_or_delete                                                                                                                    -      -
+     0.11%  [.] <smallvec::SmallVec<[fsqlite_btree::cursor::StackEntry; 4]>>::truncate                                                                                                                                   -      -
+     0.10%  [k] 0xffffffff94210326                                                                                                                                                                                       -      -
+     0.10%  [.] core::ptr::drop_in_place::<fsqlite_btree::cursor::StackEntry>                                                                                                                                            -      -
+     0.10%  [k] 0xffffffff93343dff                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff9339b27c                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff93081a4d                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff934568cd                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff933d3d45                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff93457228                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff933a3336                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff9317f5c8                                                                                                                                                                                       -      -
+     0.10%  [k] 0xffffffff9308801a                                                                                                                                                                                       -      -
+     0.09%  [.] malloc_consolidate                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::search_integer_key_table_leaf                                                 -      -
+     0.09%  [.] <fsqlite_pager::page_cache::ShardedPageCache>::with_max_buffers_for_initial_pages                                                                                                                        -      -
+     0.09%  [k] 0xffffffff9344f30a                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933bb7b7                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff93458965                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_btree::cursor::TableAppendHint>::without_page_data                                                                                                                                              -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::coerce_explicit_rowid_value                                                                                                                                      -      -
+     0.09%  [k] 0xffffffff933b7f32                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933b7ebc                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::page_size                                                                                                          -      -
+     0.09%  [.] <fsqlite_core::connection::PreparedStatement>::execute_with_params                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::compile_and_wrap                                                                                                                                                 -      -
+     0.09%  [k] 0xffffffff934548fa                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_parser::token::TokenKind as core::cmp::PartialEq>::eq                                                                                                                                           -      -
+     0.09%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::allocate_page                                                                                                      -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::prepared_direct_simple_insert_param                                                                                                                              -      -
+     0.09%  [.] <alloc::raw_vec::RawVecInner>::finish_grow                                                                                                                                                               -      -
+     0.09%  [.] <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::commit_wal_group_commit_with_snapshot::<core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>                      -      -
+     0.09%  [k] 0xffffffff9336b41a                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff934960b6                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff94228b48                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff942270df                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_vdbe::engine::MemTable as core::clone::Clone>::clone                                                                                                                                            -      -
+     0.09%  [.] <fsqlite_pager::pager::PublishedPagerState>::new                                                                                                                                                         -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::capture_time_travel_snapshot                                                                                                                                     -      -
+     0.09%  [k] 0xffffffff934523e1                                                                                                                                                                                       -      -
+     0.09%  [.] 0x0000000000000983                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_pager::pager::StagedPage>::from_page_data_for_pool                                                                                                                                              -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::load_page                                                                     -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::background_status                                                                                                                                                -      -
+     0.09%  [.] fsqlite_btree::cursor::recycle_cell_pointers                                                                                                                                                             -      -
+     0.09%  [k] 0xffffffff9304bc74                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff93090cdc                                                                                                                                                                                       -      -
+     0.09%  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write                                                                                                                     -      -
+     0.09%  [.] <fsqlite_parser::lexer::Lexer>::tokenize_into_with_interner                                                                                                                                              -      -
+     0.09%  [k] 0xffffffff9330254f                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933b7f95                                                                                                                                                                                       -      -
+     0.09%  [.] fsqlite_btree::cell::write_cell_pointers                                                                                                                                                                 -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::table_insert                                                                          -      -
+     0.09%  [.] fsqlite_types::record::serialize_record_iter_into_impl::<core::slice::iter::Iter<fsqlite_types::value::SqliteValue>>                                                                                     -      -
+     0.09%  [k] 0xffffffff934be3d8                                                                                                                                                                                       -      -
+     0.09%  [.] fsqlite_types::record::encode_serialized_value                                                                                                                                                           -      -
+     0.09%  [.] <fsqlite_types::cx::Cx>::checkpoint                                                                                                                                                                      -      -
+     0.09%  [k] 0xffffffff9421397b                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff92d04104                                                                                                                                                                                       -      -
+     0.09%  [.] <alloc::sync::Arc<fsqlite_pager::page_cache::ShardedPageCache>>::drop_slow                                                                                                                               -      -
+     0.09%  [.] __divti3                                                                                                                                                                                                 -      -
+     0.09%  [k] 0xffffffff92c0155d                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff94239687                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_pager::pager::KeyedWaitRegistry>::signal                                                                                                                                                        -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>> as fsqlite_btree::traits::BtreeCursorOps>::table_insert::{closure#0}            -      -
+     0.09%  [k] 0xffffffff933dc243                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933ec51c                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933fc2de                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::encode_table_leaf_cell_into                                                                                                    -      -
+     0.09%  [k] 0xffffffff937bf567                                                                                                                                                                                       -      -
+     0.09%  [.] core::ptr::drop_in_place::<fsqlite_types::value::SqliteValue>                                                                                                                                            -      -
+     0.09%  [k] 0xffffffff92fc3dfc                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff930805b7                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933dd61a                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff9341d830                                                                                                                                                                                       -      -
+     0.09%  [.] alloc_perturb                                                                                                                                                                                            -      -
+     0.09%  [.] <fsqlite_ast::Expr as core::clone::Clone>::clone                                                                                                                                                         -      -
+     0.09%  [.] <fsqlite_pager::pager::PublishedPagerState>::publish_clear_if                                                                                                                                            -      -
+     0.09%  [k] 0xffffffff933f052c                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_core::connection::Connection>::clear_prepared_direct_insert_append_hint                                                                                                                         -      -
+     0.09%  [k] 0xffffffff93715df0                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff93090cb7                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::parse_cell_at                                                                 -      -
+     0.09%  [k] 0xffffffff93079c57                                                                                                                                                                                       -      -
+     0.09%  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&fsqlite_types::PageNumber>                                                                                                      -      -
+     0.09%  [k] 0xffffffff93341b00                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff92fe13e7                                                                                                                                                                                       -      -
+     0.09%  [.] 0x0000000000000937                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff933dc249                                                                                                                                                                                       -      -
+     0.09%  [.] <fsqlite_core::wal_adapter::WalBackendAdapter<fsqlite_vfs::memory::MemoryFile>>::resolve_visible_frame                                                                                                   -      -
+     0.09%  [k] 0xffffffff941f55ca                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff93458924                                                                                                                                                                                       -      -
+     0.09%  [k] 0xffffffff93302533                                                                                                                                                                                       -      -
+     0.08%  [.] <std::sys::pal::unix::time::Timespec>::sub_timespec                                                                                                                                                      -      -
+     0.08%  [.] <hashbrown::map::HashMap<fsqlite_types::PageNumber, fsqlite_types::PageData, core::hash::BuildHasherDefault<fsqlite_types::PageNumberHasher>>>::insert                                                   -      -
+     0.08%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::into_inner                                                                                                                                                      -      -
+     0.08%  [k] 0xffffffff94222c8e                                                                                                                                                                                       -      -
+     0.08%  [.] core::ptr::drop_in_place::<fsqlite_pager::traits::TransactionKind>                                                                                                                                       -      -
+     0.08%  [k] 0xffffffff92c01248                                                                                                                                                                                       -      -
+     0.08%  [k] 0xffffffff934a37d5                                                                                                                                                                                       -      -
+     0.08%  [k] 0xffffffff9422711f                                                                                                                                                                                       -      -
+     0.07%  [k] 0xffffffff93341bb2                                                                                                                                                                                       -      -
+     0.07%  [k] 0xffffffff92d0410b                                                                                                                                                                                       -      -
+     0.07%  [.] 0x000000000000097a                                                                                                                                                                                       -      -
+     0.06%  [k] 0xffffffff934afca9                                                                                                                                                                                       -      -
+     0.06%  [k] 0xffffffff92f233ef                                                                                                                                                                                       -      -
+     0.06%  [k] 0xffffffff92feb96b                                                                                                                                                                                       -      -
+     0.06%  [k] 0xffffffff933a47f3                                                                                                                                                                                       -      -
+     0.05%  [k] 0xffffffff9345825c                                                                                                                                                                                       -      -
+     0.02%  [k] 0xffffffff9421a868                                                                                                                                                                                       -      -
+     0.01%  [.] fsqlite_btree::balance::apply_child_replacement::<fsqlite_vdbe::engine::SharedTxnPageIo>                                                                                                                 -      -
+     0.01%  [.] <fsqlite_core::wal_adapter::WalBackendAdapter<fsqlite_vfs::memory::MemoryFile> as fsqlite_pager::traits::WalBackend>::append_prepared_frames                                                             -      -
+     0.01%  [.] _init                                                                                                                                                                                                    -      -
+     0.01%  [k] 0xffffffff94227a46                                                                                                                                                                                       -      -
+     0.01%  [k] 0xffffffff93138d0c                                                                                                                                                                                       -      -
+     0.01%  [k] 0xffffffff9345894e                                                                                                                                                                                       -      -
+     0.01%  [k] 0xffffffff93341028                                                                                                                                                                                       -      -
+     0.01%  [k] 0xffffffff94231e65                                                                                                                                                                                       -      -
+     0.01%  [k] 0xffffffff933a495e                                                                                                                                                                                       -      -
+     0.01%  [.] <hashbrown::raw::RawTableInner>::fallible_with_capacity::<alloc::alloc::Global>                                                                                                                          -      -
+     0.00%  [k] 0xffffffff933312b5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933f0432                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92c0188e                                                                                                                                                                                       -      -
+     0.00%  [.] <fsqlite_parser::parser::Parser>::eat_kw                                                                                                                                                                 -      -
+     0.00%  [.] compiler_builtins::int::specialized_div_rem::u128_div_rem                                                                                                                                                -      -
+     0.00%  [.] clock_gettime@@GLIBC_2.17                                                                                                                                                                                -      -
+     0.00%  [.] <fsqlite_pager::pager::StagedPage>::try_overwrite_bytes_in_place                                                                                                                                         -      -
+     0.00%  [.] fsqlite_pager::pager::physical_writer_batch_membership                                                                                                                                                   -      -
+     0.00%  [.] <fsqlite_vfs::memory::MemoryFile as fsqlite_vfs::traits::VfsFile>::read                                                                                                                                  -      -
+     0.00%  [.] <fsqlite_btree::cell::BtreePageHeader>::write                                                                                                                                                            -      -
+     0.00%  [.] __vdso_clock_gettime                                                                                                                                                                                     -      -
+     0.00%  [k] 0xffffffff934db5d5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9310ca69                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9310fbd9                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff930817b1                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff94203105                                                                                                                                                                                       -      -
+     0.00%  [.] <fsqlite_parser::parser::Parser>::parse_column_def                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93302529                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942241b4                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdc0                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92fdedcb                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92c01884                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce14                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93326689                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9421b6a1                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9421b6a9                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93123eec                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff930817af                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93123e61                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff930a72b8                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942279ac                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93326332                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdc5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce1b                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942241b1                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f8c991                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933262a6                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942278cd                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92ff0c51                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93326650                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942090ce                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff94238c19                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9422798e                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9422e44a                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff930b6aa8                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93123eb4                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9422640a                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942279a5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f8ca96                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933131fa                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff932fed09                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92c0181e                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93456395                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942278b8                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff94223c2a                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93313597                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdc6                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942239a5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdfc                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff94223b76                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce10                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce03                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce17                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92fdedcd                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff93104a60                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933006a6                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdc9                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f32f4e                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933006a5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdcc                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330ce0c                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f337a5                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f337a6                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff92f337a9                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff930c2926                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff933006bc                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff9330cdcb                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942242e1                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff942242e4                                                                                                                                                                                       -      -
+     0.00%  [k] 0xffffffff94227558                                                                                                                                                                                       -      -
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
