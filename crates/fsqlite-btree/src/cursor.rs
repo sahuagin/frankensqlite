@@ -202,6 +202,11 @@ fn sort_cells_desc_by_ptr(v: &mut [(usize, usize, usize)]) {
     }
 }
 
+#[inline]
+fn cell_ptrs_are_descending(ptrs: &[u16]) -> bool {
+    ptrs.windows(2).all(|pair| pair[0] >= pair[1])
+}
+
 // ---------------------------------------------------------------------------
 // Page reader trait (for testability)
 // ---------------------------------------------------------------------------
@@ -5536,57 +5541,21 @@ impl<P: PageWriter> BtCursor<P> {
         // SQLite-compatible shape over a fragile micro-optimization.
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
-        let mut cells_to_move = Vec::with_capacity(ptrs.len());
-        if compact_cell_area {
-            for (original_idx, &off) in ptrs.iter().enumerate() {
-                let post_delete_idx = match original_idx.cmp(&delete_idx) {
-                    std::cmp::Ordering::Less => original_idx,
-                    std::cmp::Ordering::Equal => usize::MAX,
-                    std::cmp::Ordering::Greater => original_idx - 1,
-                };
-                cells_to_move.push((usize::from(off), 0, post_delete_idx));
-            }
-        } else {
-            ptrs.remove(delete_idx);
-            for (i, &off) in ptrs.iter().enumerate() {
-                let ptr = usize::from(off);
-                // OPT-A3: size-only fast path, same as replace_interior_cell defrag.
-                let size = cell::cell_on_page_size_fast(
-                    page_data.as_bytes(),
-                    ptr,
-                    header.page_type,
-                    self.usable_size,
-                )?;
-                cells_to_move.push((ptr, size, i));
-            }
-        }
-        // OPT-7 follow-up: size-dispatched sort for typical small N here too.
-        sort_cells_desc_by_ptr(&mut cells_to_move);
-        if compact_cell_area {
+
+        if compact_cell_area && cell_ptrs_are_descending(&ptrs) {
+            let page_bytes = page_data.as_bytes_mut();
             let mut next_boundary = self.usable_size as usize;
-            for cell in &mut cells_to_move {
-                if cell.0 >= next_boundary {
+            let mut new_content_offset = self.usable_size as usize;
+            for (original_idx, ptr_slot) in ptrs.iter_mut().enumerate().take(original_len) {
+                let ptr = usize::from(*ptr_slot);
+                if ptr >= next_boundary {
                     return Err(FrankenError::DatabaseCorrupt {
                         detail: "compact table leaf cell offsets are not monotone".to_owned(),
                     });
                 }
-                cell.1 = next_boundary - cell.0;
-                next_boundary = cell.0;
-            }
-            if next_boundary != header.content_offset(self.usable_size) {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "compact table leaf content offset does not match cell extent"
-                        .to_owned(),
-                });
-            }
-            ptrs.remove(delete_idx);
-        }
-
-        {
-            let page_bytes = page_data.as_bytes_mut();
-            let mut new_content_offset = self.usable_size as usize;
-            for (ptr, size, i) in cells_to_move {
-                if i == usize::MAX {
+                let size = next_boundary - ptr;
+                next_boundary = ptr;
+                if original_idx == delete_idx {
                     continue;
                 }
                 new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
@@ -5604,7 +5573,7 @@ impl<P: PageWriter> BtCursor<P> {
                 if new_content_offset != ptr {
                     page_bytes.copy_within(ptr..ptr + size, new_content_offset);
                 }
-                ptrs[i] = u16::try_from(new_content_offset).map_err(|_| {
+                *ptr_slot = u16::try_from(new_content_offset).map_err(|_| {
                     FrankenError::DatabaseCorrupt {
                         detail: format!(
                             "table leaf cell offset {} exceeds u16 range on page {}",
@@ -5614,7 +5583,13 @@ impl<P: PageWriter> BtCursor<P> {
                     }
                 })?;
             }
-
+            if next_boundary != header.content_offset(self.usable_size) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf content offset does not match cell extent"
+                        .to_owned(),
+                });
+            }
+            ptrs.remove(delete_idx);
             if new_content_offset > ptr_array_end {
                 page_bytes[ptr_array_end..new_content_offset].fill(0);
             }
@@ -5639,6 +5614,112 @@ impl<P: PageWriter> BtCursor<P> {
 
             header.write(page_bytes, header_offset);
             cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        } else {
+            let mut cells_to_move = Vec::with_capacity(ptrs.len());
+            if compact_cell_area {
+                for (original_idx, &off) in ptrs.iter().enumerate() {
+                    let post_delete_idx = match original_idx.cmp(&delete_idx) {
+                        std::cmp::Ordering::Less => original_idx,
+                        std::cmp::Ordering::Equal => usize::MAX,
+                        std::cmp::Ordering::Greater => original_idx - 1,
+                    };
+                    cells_to_move.push((usize::from(off), 0, post_delete_idx));
+                }
+            } else {
+                ptrs.remove(delete_idx);
+                for (i, &off) in ptrs.iter().enumerate() {
+                    let ptr = usize::from(off);
+                    // OPT-A3: size-only fast path, same as replace_interior_cell defrag.
+                    let size = cell::cell_on_page_size_fast(
+                        page_data.as_bytes(),
+                        ptr,
+                        header.page_type,
+                        self.usable_size,
+                    )?;
+                    cells_to_move.push((ptr, size, i));
+                }
+            }
+            // OPT-7 follow-up: size-dispatched sort for typical small N here too.
+            sort_cells_desc_by_ptr(&mut cells_to_move);
+            if compact_cell_area {
+                let mut next_boundary = self.usable_size as usize;
+                for cell in &mut cells_to_move {
+                    if cell.0 >= next_boundary {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                        });
+                    }
+                    cell.1 = next_boundary - cell.0;
+                    next_boundary = cell.0;
+                }
+                if next_boundary != header.content_offset(self.usable_size) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "compact table leaf content offset does not match cell extent"
+                            .to_owned(),
+                    });
+                }
+                ptrs.remove(delete_idx);
+            }
+
+            {
+                let page_bytes = page_data.as_bytes_mut();
+                let mut new_content_offset = self.usable_size as usize;
+                for (ptr, size, i) in cells_to_move {
+                    if i == usize::MAX {
+                        continue;
+                    }
+                    new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: "table leaf cell size overflow during delete defragmentation"
+                                .to_owned(),
+                        }
+                    })?;
+                    if new_content_offset < ptr_array_end {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                                .to_owned(),
+                        });
+                    }
+                    if new_content_offset != ptr {
+                        page_bytes.copy_within(ptr..ptr + size, new_content_offset);
+                    }
+                    ptrs[i] = u16::try_from(new_content_offset).map_err(|_| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table leaf cell offset {} exceeds u16 range on page {}",
+                                new_content_offset,
+                                leaf_page_no.get()
+                            ),
+                        }
+                    })?;
+                }
+
+                if new_content_offset > ptr_array_end {
+                    page_bytes[ptr_array_end..new_content_offset].fill(0);
+                }
+                header.first_freeblock = 0;
+                header.fragmented_free_bytes = 0;
+                header.cell_content_offset = u32::try_from(new_content_offset).map_err(|_| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf cell content offset {} exceeds u32 range on page {}",
+                            new_content_offset,
+                            leaf_page_no.get()
+                        ),
+                    }
+                })?;
+
+                header.cell_count =
+                    u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table leaf page {} cell count exceeds u16 range during delete",
+                            leaf_page_no.get()
+                        ),
+                    })?;
+
+                header.write(page_bytes, header_offset);
+                cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+            }
         }
 
         self.pager.write_page_data(cx, leaf_page_no, page_data)?;
