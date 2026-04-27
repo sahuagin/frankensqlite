@@ -2,7 +2,10 @@
 
 ## Scope
 
-- Baseline commit: `8ffdf9e0` (`fix(btree): reject out-of-range table cell pointers`)
+- Initial baseline commit: `8ffdf9e0`
+  (`fix(btree): reject out-of-range table cell pointers`)
+- Parent-baseline control: `18c0778e`
+  (`fix(wal): harden parallel segment record decoding`)
 - Candidate source: `crates/fsqlite-btree/src/cursor.rs`
 - Workload: `perf-update-delete 10000 50 both` and `perf-update-delete 10000 200 both`
 - Build profile: `release-perf` with frame pointers and line-table debug symbols
@@ -89,6 +92,28 @@ candidate binary was rebuilt and rerun on a short sanity pass:
 
 Final-source sanity medians: total `851 ms -> 809 ms`, update `268 ms -> 235 ms`,
 delete `137 ms -> 124 ms`.
+
+While this slice was in progress, the unrelated WAL hardening commit
+`18c0778e` landed underneath the final B-tree commit. To isolate this source
+change from that parent movement, I built a detached `18c0778e` baseline and
+reran a short comparison against the exact final candidate binary:
+
+```bash
+git worktree add --detach /data/tmp/frankensqlite-azurepine-btree-baseline-18c-20260427 18c0778e
+```
+
+```bash
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cargo-target-azurepine-20260427-btree-baseline-18c CARGO_PROFILE_RELEASE_PERF_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_PERF_STRIP=false RUSTFLAGS='-C force-frame-pointers=yes' cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete
+```
+
+| Run | Parent baseline total | Candidate total | Parent baseline update | Candidate update | Parent baseline delete | Candidate delete |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 843 ms | 810 ms | 268 ms | 238 ms | 121 ms | 119 ms |
+| 2 | 865 ms | 816 ms | 278 ms | 241 ms | 137 ms | 127 ms |
+| 3 | 848 ms | 812 ms | 265 ms | 241 ms | 142 ms | 122 ms |
+
+Parent-baseline medians: total `848 ms -> 812 ms`, update `268 ms -> 241 ms`,
+delete `137 ms -> 122 ms`.
 
 ## Profile Check
 
