@@ -81,6 +81,8 @@ pub enum JournalError {
     },
     /// Invalid page size in journal header.
     InvalidPageSize { raw: u32 },
+    /// Invalid page count in journal header.
+    InvalidPageCount { raw: i32 },
 }
 
 impl fmt::Display for JournalError {
@@ -114,6 +116,9 @@ impl fmt::Display for JournalError {
             }
             Self::InvalidPageSize { raw } => {
                 write!(f, "invalid page size in journal header: {raw}")
+            }
+            Self::InvalidPageCount { raw } => {
+                write!(f, "invalid page count in journal header: {raw}")
             }
         }
     }
@@ -171,6 +176,10 @@ impl JournalHeader {
         let initial_db_size = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]);
         let sector_size = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
         let page_size = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+
+        if page_count < -1 {
+            return Err(JournalError::InvalidPageCount { raw: page_count });
+        }
 
         // Validate page size
         if PageSize::new(page_size).is_none() {
@@ -480,6 +489,20 @@ mod tests {
         encoded[24..28].copy_from_slice(&3000u32.to_be_bytes());
         let err = JournalHeader::decode(&encoded).unwrap_err();
         assert!(matches!(err, JournalError::InvalidPageSize { raw: 3000 }));
+    }
+
+    #[test]
+    fn test_journal_header_rejects_invalid_negative_page_count() {
+        let header = JournalHeader {
+            page_count: -2,
+            nonce: 0,
+            initial_db_size: 1,
+            sector_size: 512,
+            page_size: 4096,
+        };
+
+        let err = JournalHeader::decode(&header.encode()).unwrap_err();
+        assert!(matches!(err, JournalError::InvalidPageCount { raw: -2 }));
     }
 
     #[test]
