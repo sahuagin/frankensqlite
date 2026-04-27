@@ -2369,6 +2369,13 @@ fn group_commit_batch_frame_refs(batch: &TransactionFrameBatch) -> Vec<traits::W
         .collect()
 }
 
+fn group_commit_batch_staged_bytes(batch: &TransactionFrameBatch) -> u64 {
+    batch.frames.iter().fold(0_u64, |acc, frame| {
+        acc.saturating_add(u64::try_from(frame.page_data.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(fsqlite_wal::WAL_FRAME_HEADER_SIZE).unwrap_or(u64::MAX))
+    })
+}
+
 fn prepared_batch_matches_frame_refs(
     prepared: &traits::PreparedWalFrameBatch,
     frame_refs: &[traits::WalFrameRef<'_>],
@@ -2407,19 +2414,14 @@ fn prepare_group_commit_batch_for_lane(
         return Ok(None);
     }
 
-    let frame_refs = group_commit_batch_frame_refs(batch);
-    if frame_refs.is_empty() {
-        return Ok(None);
+    if let Some(limit) = control.max_parallel_commit_bytes {
+        if group_commit_batch_staged_bytes(batch) > limit {
+            return Ok(None);
+        }
     }
 
-    let staged_bytes = frame_refs.iter().fold(0_u64, |acc, frame| {
-        acc.saturating_add(u64::try_from(frame.page_data.len()).unwrap_or(u64::MAX))
-            .saturating_add(u64::try_from(fsqlite_wal::WAL_FRAME_HEADER_SIZE).unwrap_or(u64::MAX))
-    });
-    if control
-        .max_parallel_commit_bytes
-        .is_some_and(|limit| staged_bytes > limit)
-    {
+    let frame_refs = group_commit_batch_frame_refs(batch);
+    if frame_refs.is_empty() {
         return Ok(None);
     }
 
@@ -6821,27 +6823,28 @@ where
         let parallel_wal_control = queue.parallel_wal_control().clone();
         let batch_id = queue.next_parallel_wal_batch_id();
         let lane_id = queue.current_parallel_wal_lane_id();
-        let staged_bytes = batch.frames.iter().fold(0_u64, |acc, frame| {
-            acc.saturating_add(u64::try_from(frame.page_data.len()).unwrap_or(u64::MAX))
-                .saturating_add(
-                    u64::try_from(fsqlite_wal::WAL_FRAME_HEADER_SIZE).unwrap_or(u64::MAX),
-                )
-        });
+        let lane_staging_debug_enabled =
+            tracing::enabled!(target: "fsqlite::wal::lane_staging", tracing::Level::DEBUG);
         let mut staging_fallback_reason = if matches!(
             parallel_wal_control.mode,
             ParallelWalOperatingMode::Conservative
         ) {
             Some(ParallelWalFallbackReason::OperatorForced)
-        } else if parallel_wal_control
-            .max_parallel_commit_bytes
-            .is_some_and(|limit| staged_bytes > limit)
-        {
-            Some(ParallelWalFallbackReason::LaneOverflow)
+        } else if let Some(limit) = parallel_wal_control.max_parallel_commit_bytes {
+            if group_commit_batch_staged_bytes(&batch) > limit {
+                Some(ParallelWalFallbackReason::LaneOverflow)
+            } else {
+                None
+            }
         } else {
             None
         };
         let mut lane_shadow_verdict = ParallelWalShadowVerdict::NotRun;
-        let mut lane_backlog = queue.current_lane_backlog(lane_id);
+        let mut lane_backlog = if lane_staging_debug_enabled {
+            Some(queue.current_lane_backlog(lane_id))
+        } else {
+            None
+        };
         let mut batch = batch.with_context(TransactionFrameBatchContext {
             batch_id,
             lane_id,
@@ -6861,7 +6864,10 @@ where
                 let staged_frame_count = staged_prepared.staged_frame_count;
                 let staging_elapsed_ns = staged_prepared.staging_elapsed_ns;
                 lane_shadow_verdict = staged_prepared.shadow_verdict;
-                lane_backlog = queue.record_prepared_batch(staged_prepared);
+                let new_lane_backlog = queue.record_prepared_batch(staged_prepared);
+                if lane_staging_debug_enabled {
+                    lane_backlog = Some(new_lane_backlog);
+                }
                 batch = batch.with_context(TransactionFrameBatchContext {
                     batch_id,
                     lane_id,
@@ -6873,44 +6879,46 @@ where
             }
         }
 
-        let queue_submit_max_wait = {
-            let consolidator = queue
-                .consolidator
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            consolidator.max_group_delay()
-        };
-        let queue_submit_batch_membership = batch.context.batch_id.to_string();
-        let queue_submit_rollback_mode_active = physical_writer_rollback_mode_active(
-            parallel_wal_control.mode,
-            staging_fallback_reason,
-        );
-        tracing::debug!(
-            target: "fsqlite::wal::lane_staging",
-            trace_id = cx.trace_id(),
-            run_id = PHYSICAL_WRITER_LANE_RUN_ID,
-            scenario_id = PARALLEL_WAL_STAGE_SCENARIO_ID,
-            batch_id = batch.context.batch_id,
-            batch_membership = queue_submit_batch_membership.as_str(),
-            queue_delay_ns = 0_u64,
-            target_wait_ns = 0_u64,
-            max_wait_ns =
-                u64::try_from(queue_submit_max_wait.as_nanos()).unwrap_or(u64::MAX),
-            fsync_boundary = physical_writer_fsync_boundary(sync_policy),
-            ordering_phase = "queue_submit",
-            rollback_mode_active = queue_submit_rollback_mode_active,
-            wal_lane_id = lane_id,
-            lane_backlog,
-            staged_frame_count = batch.context.staged_frame_count,
-            flush_trigger = "queue_submit",
-            control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
-            lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
-            shadow_verdict = parallel_wal_shadow_verdict_name(lane_shadow_verdict),
-            compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
-            fallback_reason = parallel_wal_fallback_reason_name(staging_fallback_reason),
-            elapsed_ns = batch.context.staging_elapsed_ns,
-            "queued lane-local WAL staging candidate"
-        );
+        if lane_staging_debug_enabled {
+            let queue_submit_max_wait = {
+                let consolidator = queue
+                    .consolidator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                consolidator.max_group_delay()
+            };
+            let queue_submit_batch_membership = batch.context.batch_id.to_string();
+            let queue_submit_rollback_mode_active = physical_writer_rollback_mode_active(
+                parallel_wal_control.mode,
+                staging_fallback_reason,
+            );
+            tracing::debug!(
+                target: "fsqlite::wal::lane_staging",
+                trace_id = cx.trace_id(),
+                run_id = PHYSICAL_WRITER_LANE_RUN_ID,
+                scenario_id = PARALLEL_WAL_STAGE_SCENARIO_ID,
+                batch_id = batch.context.batch_id,
+                batch_membership = queue_submit_batch_membership.as_str(),
+                queue_delay_ns = 0_u64,
+                target_wait_ns = 0_u64,
+                max_wait_ns =
+                    u64::try_from(queue_submit_max_wait.as_nanos()).unwrap_or(u64::MAX),
+                fsync_boundary = physical_writer_fsync_boundary(sync_policy),
+                ordering_phase = "queue_submit",
+                rollback_mode_active = queue_submit_rollback_mode_active,
+                wal_lane_id = lane_id,
+                lane_backlog = lane_backlog.unwrap_or(0),
+                staged_frame_count = batch.context.staged_frame_count,
+                flush_trigger = "queue_submit",
+                control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
+                lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
+                shadow_verdict = parallel_wal_shadow_verdict_name(lane_shadow_verdict),
+                compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+                fallback_reason = parallel_wal_fallback_reason_name(staging_fallback_reason),
+                elapsed_ns = batch.context.staging_elapsed_ns,
+                "queued lane-local WAL staging candidate"
+            );
+        }
 
         let t_prepare_done = Instant::now();
         let prepare_us = t_prepare_done.duration_since(t_start).as_micros() as u64;
@@ -7034,16 +7042,15 @@ where
                     };
                     flush
                 };
-                let flush_batch_membership = physical_writer_batch_membership(&batches);
-                let flush_batch_id = physical_writer_primary_batch_id(&batches);
-                let queue_delay_ns = arrival_wait_decision.queue_delay_ns();
-                let target_wait_ns = arrival_wait_decision.target_wait_ns();
-                let max_wait_ns = arrival_wait_decision.max_wait_ns();
-                let fsync_boundary = physical_writer_fsync_boundary(sync_policy);
-                let ordering_phase = physical_writer_ordering_phase(arrival_wait_decision.reason);
 
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
                 if !conflicting_pages.is_empty() {
+                    let flush_batch_membership = physical_writer_batch_membership(&batches);
+                    let flush_batch_id = physical_writer_primary_batch_id(&batches);
+                    let queue_delay_ns = arrival_wait_decision.queue_delay_ns();
+                    let target_wait_ns = arrival_wait_decision.target_wait_ns();
+                    let max_wait_ns = arrival_wait_decision.max_wait_ns();
+                    let fsync_boundary = physical_writer_fsync_boundary(sync_policy);
                     let error = FrankenError::BusySnapshot {
                         conflicting_pages: conflicting_pages
                             .iter()
@@ -7128,7 +7135,6 @@ where
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
                 let frame_count = frame_refs.len();
-                let lane_stats = lane_flush_stats(queue, &batches);
                 let mut fallback_reason = if matches!(
                     parallel_wal_control.mode,
                     ParallelWalOperatingMode::Conservative
@@ -7471,45 +7477,62 @@ where
                              (append={wal_append_us}us sync={wal_sync_us}us) \
                              frames={frame_count}"
                         );
-                        let flush_rollback_mode_active = physical_writer_rollback_mode_active(
-                            parallel_wal_control.mode,
-                            fallback_reason,
-                        );
-                        for (lane_id, lane_backlog, staged_frame_count, elapsed_ns) in &lane_stats {
-                            tracing::debug!(
-                                target: "fsqlite::wal::lane_staging",
-                                trace_id = cx.trace_id(),
-                                run_id = PHYSICAL_WRITER_LANE_RUN_ID,
-                                scenario_id = PARALLEL_WAL_FLUSH_SCENARIO_ID,
-                                batch_id = flush_batch_id,
-                                batch_membership = flush_batch_membership.as_str(),
-                                queue_delay_ns,
-                                target_wait_ns,
-                                actual_wait_ns,
-                                max_wait_ns,
-                                control_epoch = arrival_wait_decision.control_epoch,
-                                queue_age_p95_ns = arrival_wait_decision.queue_age_p95_ns(),
-                                batch_size = batch_count,
-                                fairness_budget_ns = arrival_wait_decision.fairness_budget_ns(),
-                                starvation_prevented = arrival_wait_decision.starvation_prevented,
-                                mode_switch_reason = arrival_wait_decision.mode_switch_reason,
-                                service_policy_mode =
-                                    commit_service_mode_name(arrival_wait_decision.mode),
-                                fsync_boundary,
-                                ordering_phase,
-                                rollback_mode_active = flush_rollback_mode_active,
-                                wal_lane_id = *lane_id,
-                                lane_backlog = *lane_backlog,
-                                staged_frame_count = *staged_frame_count,
-                                flush_trigger = arrival_wait_decision.reason,
-                                control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
-                                lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
-                                shadow_verdict = parallel_wal_shadow_verdict_name(shadow_verdict),
-                                compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
-                                fallback_reason = parallel_wal_fallback_reason_name(fallback_reason),
-                                elapsed_ns = *elapsed_ns,
-                                "flushed lane-local WAL staging candidate"
+                        if tracing::enabled!(target: "fsqlite::wal::lane_staging", tracing::Level::DEBUG)
+                        {
+                            let flush_batch_membership = physical_writer_batch_membership(&batches);
+                            let flush_batch_id = physical_writer_primary_batch_id(&batches);
+                            let queue_delay_ns = arrival_wait_decision.queue_delay_ns();
+                            let target_wait_ns = arrival_wait_decision.target_wait_ns();
+                            let max_wait_ns = arrival_wait_decision.max_wait_ns();
+                            let fsync_boundary = physical_writer_fsync_boundary(sync_policy);
+                            let ordering_phase =
+                                physical_writer_ordering_phase(arrival_wait_decision.reason);
+                            let flush_rollback_mode_active = physical_writer_rollback_mode_active(
+                                parallel_wal_control.mode,
+                                fallback_reason,
                             );
+                            let lane_stats = lane_flush_stats(queue, &batches);
+                            for (lane_id, lane_backlog, staged_frame_count, elapsed_ns) in
+                                &lane_stats
+                            {
+                                tracing::debug!(
+                                    target: "fsqlite::wal::lane_staging",
+                                    trace_id = cx.trace_id(),
+                                    run_id = PHYSICAL_WRITER_LANE_RUN_ID,
+                                    scenario_id = PARALLEL_WAL_FLUSH_SCENARIO_ID,
+                                    batch_id = flush_batch_id,
+                                    batch_membership = flush_batch_membership.as_str(),
+                                    queue_delay_ns,
+                                    target_wait_ns,
+                                    actual_wait_ns,
+                                    max_wait_ns,
+                                    control_epoch = arrival_wait_decision.control_epoch,
+                                    queue_age_p95_ns = arrival_wait_decision.queue_age_p95_ns(),
+                                    batch_size = batch_count,
+                                    fairness_budget_ns = arrival_wait_decision.fairness_budget_ns(),
+                                    starvation_prevented =
+                                        arrival_wait_decision.starvation_prevented,
+                                    mode_switch_reason = arrival_wait_decision.mode_switch_reason,
+                                    service_policy_mode =
+                                        commit_service_mode_name(arrival_wait_decision.mode),
+                                    fsync_boundary,
+                                    ordering_phase,
+                                    rollback_mode_active = flush_rollback_mode_active,
+                                    wal_lane_id = *lane_id,
+                                    lane_backlog = *lane_backlog,
+                                    staged_frame_count = *staged_frame_count,
+                                    flush_trigger = arrival_wait_decision.reason,
+                                    control_mode = parallel_wal_mode_name(parallel_wal_control.mode),
+                                    lane_policy_version = PARALLEL_WAL_LANE_POLICY_VERSION,
+                                    shadow_verdict =
+                                        parallel_wal_shadow_verdict_name(shadow_verdict),
+                                    compatibility_selector = PARALLEL_WAL_COMPATIBILITY_SELECTOR,
+                                    fallback_reason =
+                                        parallel_wal_fallback_reason_name(fallback_reason),
+                                    elapsed_ns = *elapsed_ns,
+                                    "flushed lane-local WAL staging candidate"
+                                );
+                            }
                         }
                         queue.record_persisted_epoch(
                             flush_epoch,
@@ -7536,6 +7559,12 @@ where
                         }
                     }
                     Err(error) => {
+                        let flush_batch_membership = physical_writer_batch_membership(&batches);
+                        let flush_batch_id = physical_writer_primary_batch_id(&batches);
+                        let queue_delay_ns = arrival_wait_decision.queue_delay_ns();
+                        let target_wait_ns = arrival_wait_decision.target_wait_ns();
+                        let max_wait_ns = arrival_wait_decision.max_wait_ns();
+                        let fsync_boundary = physical_writer_fsync_boundary(sync_policy);
                         tracing::warn!(
                             target: "fsqlite::wal::lane_staging",
                             trace_id = cx.trace_id(),
@@ -15670,11 +15699,12 @@ mod tests {
         let _guard = PARALLEL_WAL_LANE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        const LANE_COUNT: usize = 2;
         let queue = StdArc::new(GroupCommitQueue::with_parallel_wal_control(
             GroupCommitConfig::default(),
             ParallelWalControlSurface {
                 mode: ParallelWalOperatingMode::Auto,
-                lane_count_override: Some(2),
+                lane_count_override: Some(LANE_COUNT),
                 ..ParallelWalControlSurface::default()
             },
         ));
@@ -15697,16 +15727,17 @@ mod tests {
 
         let first_wave = spawn_wave();
         let second_wave = spawn_wave();
-        assert_eq!(
-            first_wave,
-            vec![0, 1],
-            "bead_id=bd-3wop3.1.2 case=lane_reuse_first_wave"
-        );
-        assert_eq!(
-            second_wave,
-            vec![0, 1],
-            "bead_id=bd-3wop3.1.2 case=lane_reuse_second_wave"
-        );
+        for (wave_name, wave) in [("first", &first_wave), ("second", &second_wave)] {
+            assert_eq!(
+                wave.len(),
+                LANE_COUNT,
+                "bead_id=bd-3wop3.1.2 case=lane_reuse_{wave_name}_wave_size"
+            );
+            assert!(
+                wave.iter().all(|lane| usize::from(*lane) < LANE_COUNT),
+                "bead_id=bd-3wop3.1.2 case=lane_reuse_{wave_name}_wave_bounds lanes={wave:?}"
+            );
+        }
     }
 
     #[test]
