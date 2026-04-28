@@ -1852,19 +1852,19 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
-    fn classify_concurrent_write_tier(&self, page_no: PageNumber) -> Result<ConcurrentWriteTier> {
-        let Some(ctx) = self.concurrent_context() else {
-            return Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare);
-        };
-
+    fn classify_concurrent_write_tier(
+        &self,
+        ctx: &ConcurrentContext,
+        page_no: PageNumber,
+    ) -> ConcurrentWriteTier {
         if ctx.handle.lock().holds_page_lock(page_no) {
-            return Ok(ConcurrentWriteTier::Tier0AlreadyOwned);
+            return ConcurrentWriteTier::Tier0AlreadyOwned;
         }
 
         if page_no == PageNumber::ONE {
-            Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare)
+            ConcurrentWriteTier::Tier2CommitSurfaceRare
         } else {
-            Ok(ConcurrentWriteTier::Tier1FirstTouch)
+            ConcurrentWriteTier::Tier1FirstTouch
         }
     }
 
@@ -2339,7 +2339,7 @@ impl SharedTxnPageIo {
                 .write_page_data(cx, page_no, page_data_base);
         };
 
-        match self.classify_concurrent_write_tier(page_no)? {
+        match self.classify_concurrent_write_tier(&ctx, page_no) {
             ConcurrentWriteTier::Tier0AlreadyOwned => {
                 self.write_page_tier0_already_owned(cx, &ctx, page_no, page_data_base)
             }
