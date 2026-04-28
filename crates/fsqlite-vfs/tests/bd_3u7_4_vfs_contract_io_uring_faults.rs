@@ -1,6 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+#[cfg(all(feature = "native", target_os = "linux"))]
 use std::time::Instant;
 
 use fsqlite_error::{FrankenError, Result};
@@ -11,9 +12,12 @@ use fsqlite_vfs::IoUringVfs;
 #[cfg(all(feature = "native", unix))]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::{MemoryVfs, Vfs, VfsFile};
+#[cfg(all(feature = "native", unix))]
 use tempfile::tempdir;
 
+#[cfg(all(feature = "native", target_os = "linux"))]
 const PAGE_SIZE: usize = 4096;
+#[cfg(all(feature = "native", target_os = "linux"))]
 const PAGE_SIZE_U64: u64 = 4096;
 #[cfg(all(feature = "native", target_os = "linux"))]
 const BENCH_PAGE_COUNT: u64 = 128;

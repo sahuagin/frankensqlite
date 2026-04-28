@@ -10,10 +10,10 @@
 //! [`VfsFile`]: crate::traits::VfsFile
 
 use std::ops::{Deref, DerefMut, Range};
-use std::sync::{
-    Arc, Mutex, MutexGuard,
-    atomic::{AtomicU64, Ordering},
-};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use fsqlite_error::{FrankenError, Result};
 
@@ -374,6 +374,8 @@ impl ShmRegion {
     /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
     /// overflow, or `offset + 8 > self.len()`.
     pub fn atomic_load_u64_le(&self, offset: usize, ordering: Ordering) -> Result<u64> {
+        #[cfg(not(unix))]
+        let _ = ordering;
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let guard = data
@@ -405,6 +407,8 @@ impl ShmRegion {
     /// Returns [`FrankenError::OutOfRange`] if the offset is unaligned, would
     /// overflow, or `offset + 8 > self.len()`.
     pub fn atomic_store_u64_le(&self, offset: usize, val: u64, ordering: Ordering) -> Result<()> {
+        #[cfg(not(unix))]
+        let _ = ordering;
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data
@@ -441,6 +445,8 @@ impl ShmRegion {
         delta: u64,
         ordering: Ordering,
     ) -> Result<u64> {
+        #[cfg(not(unix))]
+        let _ = ordering;
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data
@@ -502,6 +508,8 @@ impl ShmRegion {
         success: Ordering,
         failure: Ordering,
     ) -> Result<std::result::Result<u64, u64>> {
+        #[cfg(not(unix))]
+        let _ = (success, failure);
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
                 let mut guard = data

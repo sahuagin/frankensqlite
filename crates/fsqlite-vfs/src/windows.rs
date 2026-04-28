@@ -29,10 +29,6 @@ use crate::traits::{Vfs, VfsFile};
 
 /// SQLite I/O capability bit indicating files cannot be deleted while open.
 const SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN: u32 = 0x0000_0800;
-const PENDING_BYTE: u64 = 0x4000_0000;
-const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
-const SHARED_FIRST: u64 = PENDING_BYTE + 2;
-const SHARED_SIZE: u64 = 510;
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -71,12 +67,6 @@ fn sqlite_reserved_lock_path(path: &Path) -> PathBuf {
 fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
     let mut p: OsString = path.as_os_str().to_owned();
     p.push("-lock-pending");
-    PathBuf::from(p)
-}
-
-fn sqlite_exclusive_lock_path(path: &Path) -> PathBuf {
-    let mut p: OsString = path.as_os_str().to_owned();
-    p.push("-lock-exclusive");
     PathBuf::from(p)
 }
 
@@ -230,7 +220,6 @@ struct WindowsOsLockFiles {
     shared_file: File,
     reserved_file: File,
     pending_file: File,
-    exclusive_file: File,
     held_levels: [bool; 4],
 }
 
@@ -249,7 +238,6 @@ impl WindowsOsLockFiles {
             shared_file: open_sidecar(&sqlite_shared_lock_path(path))?,
             reserved_file: open_sidecar(&sqlite_reserved_lock_path(path))?,
             pending_file: open_sidecar(&sqlite_pending_lock_path(path))?,
-            exclusive_file: open_sidecar(&sqlite_exclusive_lock_path(path))?,
             held_levels: [false; 4],
         })
     }
@@ -283,10 +271,9 @@ impl WindowsOsLockFiles {
     fn lock_file_for_level(&self, level: LockLevel) -> Option<&File> {
         match level {
             LockLevel::None => None,
-            LockLevel::Shared => Some(&self.shared_file),
+            LockLevel::Shared | LockLevel::Exclusive => Some(&self.shared_file),
             LockLevel::Reserved => Some(&self.reserved_file),
             LockLevel::Pending => Some(&self.pending_file),
-            LockLevel::Exclusive => Some(&self.exclusive_file),
         }
     }
 
@@ -309,25 +296,65 @@ impl WindowsOsLockFiles {
             return Ok(());
         }
 
+        if level == LockLevel::Shared {
+            // Match SQLite's pending-byte protocol: readers briefly take a
+            // shared lock on the pending sidecar before acquiring the shared
+            // range. A pending writer holds this sidecar exclusively, blocking
+            // new readers while existing readers drain.
+            Self::try_lock_shared(&self.pending_file)?;
+            let shared_result = Self::try_lock_shared(&self.shared_file);
+            let pending_unlock = Self::unlock_file(&self.pending_file);
+            if let Err(err) = shared_result {
+                pending_unlock?;
+                return Err(err);
+            }
+            if let Err(err) = pending_unlock {
+                let _ = Self::unlock_file(&self.shared_file);
+                return Err(err);
+            }
+            self.set_lock_held(LockLevel::Shared, true);
+            return Ok(());
+        }
+
+        if level == LockLevel::Exclusive {
+            // EXCLUSIVE conflicts with SHARED by upgrading the same shared
+            // sidecar from shared to exclusive. Locking a separate
+            // "exclusive" sidecar would only exclude other writers and would
+            // allow readers through.
+            let had_shared = self.lock_held(LockLevel::Shared);
+            if had_shared {
+                Self::unlock_file(&self.shared_file)?;
+                self.set_lock_held(LockLevel::Shared, false);
+            }
+            if let Err(err) = Self::try_lock_exclusive(&self.shared_file) {
+                if had_shared && Self::try_lock_shared(&self.shared_file).is_ok() {
+                    self.set_lock_held(LockLevel::Shared, true);
+                }
+                return Err(err);
+            }
+            self.set_lock_held(LockLevel::Exclusive, true);
+            return Ok(());
+        }
+
         let file = self
             .lock_file_for_level(level)
             .ok_or_else(|| FrankenError::internal("invalid lock level"))?;
-        if level == LockLevel::Shared {
-            Self::try_lock_shared(file)?;
-        } else {
-            Self::try_lock_exclusive(file)?;
-        }
+        Self::try_lock_exclusive(file)?;
         self.set_lock_held(level, true);
         Ok(())
     }
 
     fn unlock_to(&mut self, level: LockLevel) -> Result<()> {
-        for held_level in [
-            LockLevel::Exclusive,
-            LockLevel::Pending,
-            LockLevel::Reserved,
-            LockLevel::Shared,
-        ] {
+        if self.lock_held(LockLevel::Exclusive) && level < LockLevel::Exclusive {
+            Self::unlock_file(&self.shared_file)?;
+            self.set_lock_held(LockLevel::Exclusive, false);
+            if level >= LockLevel::Shared {
+                Self::try_lock_shared(&self.shared_file)?;
+                self.set_lock_held(LockLevel::Shared, true);
+            }
+        }
+
+        for held_level in [LockLevel::Pending, LockLevel::Reserved, LockLevel::Shared] {
             if level < held_level && self.lock_held(held_level) {
                 let file = self
                     .lock_file_for_level(held_level)
@@ -337,6 +364,33 @@ impl WindowsOsLockFiles {
             }
         }
         Ok(())
+    }
+
+    fn highest_held_level(&self) -> LockLevel {
+        [
+            LockLevel::Exclusive,
+            LockLevel::Pending,
+            LockLevel::Reserved,
+            LockLevel::Shared,
+        ]
+        .into_iter()
+        .find(|level| self.lock_held(*level))
+        .unwrap_or(LockLevel::None)
+    }
+
+    fn reserved_locked_by_other(&self) -> Result<bool> {
+        if self.lock_held(LockLevel::Reserved) {
+            return Ok(false);
+        }
+
+        match AdvisoryFileLock::try_lock(&self.reserved_file, FileLockMode::Exclusive) {
+            Ok(()) => {
+                Self::unlock_file(&self.reserved_file)?;
+                Ok(false)
+            }
+            Err(FileLockError::AlreadyLocked) => Ok(true),
+            Err(FileLockError::Io(err)) => Err(FrankenError::Io(err)),
+        }
     }
 }
 
@@ -408,11 +462,13 @@ impl Vfs for WindowsVfs {
         } else {
             flags
         };
+        let os_locks = WindowsOsLockFiles::open(&resolved)?;
 
         Ok((
             WindowsFile {
                 path: resolved,
                 file,
+                os_locks,
                 owner_id,
                 lock_level: LockLevel::None,
                 delete_on_close,
@@ -461,6 +517,7 @@ impl Vfs for WindowsVfs {
 pub struct WindowsFile {
     path: PathBuf,
     file: File,
+    os_locks: WindowsOsLockFiles,
     owner_id: u64,
     lock_level: LockLevel,
     delete_on_close: bool,
@@ -700,21 +757,38 @@ impl VfsFile for WindowsFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if self.lock_level < level {
-            self.lock_level = level;
+        if level <= self.lock_level {
+            return Ok(());
+        }
+
+        let prior_level = self.lock_level;
+        while self.lock_level < level {
+            let next = next_lock_level(self.lock_level)
+                .ok_or_else(|| FrankenError::internal("invalid lock escalation"))?;
+            if let Err(err) = self.os_locks.try_lock_level(next) {
+                let _ = self.os_locks.unlock_to(prior_level);
+                self.lock_level = self.os_locks.highest_held_level();
+                return Err(err);
+            }
+            self.lock_level = next;
         }
         Ok(())
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if self.lock_level > level {
-            self.lock_level = level;
+        if level >= self.lock_level {
+            return Ok(());
         }
+        if let Err(err) = self.os_locks.unlock_to(level) {
+            self.lock_level = self.os_locks.highest_held_level();
+            return Err(err);
+        }
+        self.lock_level = level;
         Ok(())
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        Ok(false)
+        self.os_locks.reserved_locked_by_other()
     }
 
     fn sector_size(&self) -> u32 {
@@ -1012,6 +1086,73 @@ mod tests {
             "resizing must preserve shared backing for existing mappings"
         );
         assert_eq!(region_large.read_u32_le(32).unwrap(), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn test_windowsvfs_reserved_lock_conflicts_across_handles() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("reserved_lock.db");
+        let vfs = WindowsVfs::new();
+        let (mut file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open A");
+        let (mut file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open B");
+
+        file_a.lock(&cx, LockLevel::Shared).expect("A shared");
+        file_a.lock(&cx, LockLevel::Reserved).expect("A reserved");
+        assert!(
+            !file_a.check_reserved_lock(&cx).unwrap(),
+            "a handle should not report its own RESERVED lock as external"
+        );
+        assert!(
+            file_b.check_reserved_lock(&cx).unwrap(),
+            "other handles must observe a RESERVED-or-higher sidecar lock"
+        );
+        assert!(
+            matches!(
+                file_b.lock(&cx, LockLevel::Reserved),
+                Err(FrankenError::Busy)
+            ),
+            "second RESERVED locker must be rejected"
+        );
+
+        file_a.unlock(&cx, LockLevel::None).expect("release A");
+        file_b.lock(&cx, LockLevel::Reserved).expect("B reserved");
+    }
+
+    #[test]
+    fn test_windowsvfs_exclusive_lock_conflicts_with_other_shared_handle() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("exclusive_vs_shared.db");
+        let vfs = WindowsVfs::new();
+        let (mut file_a, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open A");
+        let (mut file_b, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open B");
+
+        file_a.lock(&cx, LockLevel::Shared).expect("A shared");
+        file_b.lock(&cx, LockLevel::Shared).expect("B shared");
+        assert!(
+            matches!(
+                file_a.lock(&cx, LockLevel::Exclusive),
+                Err(FrankenError::Busy)
+            ),
+            "EXCLUSIVE must upgrade the shared sidecar and conflict with another SHARED holder"
+        );
+        assert_eq!(
+            file_a.lock_level,
+            LockLevel::Shared,
+            "failed EXCLUSIVE upgrade should roll back to the prior lock level"
+        );
+        file_a
+            .lock(&cx, LockLevel::Reserved)
+            .expect("failed exclusive upgrade must not strand RESERVED/PENDING sidecars");
     }
 
     #[test]
