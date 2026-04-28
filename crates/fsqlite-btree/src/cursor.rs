@@ -5543,7 +5543,6 @@ impl<P: PageWriter> BtCursor<P> {
             header_offset + usize::from(header.page_type.header_size()) + (ptrs.len() - 1) * 2;
 
         if compact_cell_area && cell_ptrs_are_descending(&ptrs) {
-            let page_bytes = page_data.as_bytes_mut();
             let deleted_ptr = usize::from(ptrs[delete_idx]);
             let deleted_upper = if delete_idx == 0 {
                 self.usable_size as usize
@@ -5576,6 +5575,8 @@ impl<P: PageWriter> BtCursor<P> {
                         .to_owned(),
                 });
             }
+
+            let page_bytes = page_data.as_bytes_mut();
             if old_content_offset < deleted_ptr {
                 page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
             }
@@ -5588,6 +5589,115 @@ impl<P: PageWriter> BtCursor<P> {
                         leaf_page_no.get()
                     ),
                 })?;
+            }
+            ptrs.remove(delete_idx);
+            if new_content_offset > ptr_array_end {
+                page_bytes[ptr_array_end..new_content_offset].fill(0);
+            }
+            header.first_freeblock = 0;
+            header.fragmented_free_bytes = 0;
+            header.cell_content_offset =
+                u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf cell content offset {} exceeds u32 range on page {}",
+                        new_content_offset,
+                        leaf_page_no.get()
+                    ),
+                })?;
+
+            header.cell_count =
+                u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table leaf page {} cell count exceeds u16 range during delete",
+                        leaf_page_no.get()
+                    ),
+                })?;
+
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        } else if compact_cell_area && self.usable_size <= 4096 {
+            let deleted_ptr = usize::from(ptrs[delete_idx]);
+
+            // Compact table leaves have a contiguous physical cell-content
+            // interval. The deleted cell's byte extent is bounded by the next
+            // higher physical cell pointer (or the usable page end), independent
+            // of logical/key pointer order. Updates often disturb pointer order,
+            // so use this linear physical-neighbor scan instead of sorting all
+            // cell pointers just to recover the same interval.
+            let mut seen_offsets = [0_u64; 64];
+            let mut deleted_upper = self.usable_size as usize;
+            for (idx, &off) in ptrs.iter().enumerate() {
+                let ptr = usize::from(off);
+                if ptr >= self.usable_size as usize {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "compact table leaf cell offset exceeds usable page size"
+                            .to_owned(),
+                    });
+                }
+                let seen_word = &mut seen_offsets[ptr / 64];
+                let seen_bit = 1_u64 << (ptr % 64);
+                if (*seen_word & seen_bit) != 0 {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail:
+                            "compact table leaf cell offsets are not monotone: duplicate offset"
+                                .to_owned(),
+                    });
+                }
+                *seen_word |= seen_bit;
+
+                if idx != delete_idx && ptr > deleted_ptr && ptr < deleted_upper {
+                    deleted_upper = ptr;
+                }
+            }
+
+            if deleted_ptr >= deleted_upper {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf cell offsets are not monotone".to_owned(),
+                });
+            }
+            let deleted_size = deleted_upper - deleted_ptr;
+            let old_content_offset = header.content_offset(self.usable_size);
+            if old_content_offset > deleted_ptr {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "compact table leaf content offset exceeds deleted cell".to_owned(),
+                });
+            }
+            let new_content_offset =
+                old_content_offset
+                    .checked_add(deleted_size)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "table leaf cell size overflow during delete defragmentation"
+                            .to_owned(),
+                    })?;
+            if new_content_offset > self.usable_size as usize || new_content_offset < ptr_array_end
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "table leaf cell content overlaps pointer array during delete defragmentation"
+                        .to_owned(),
+                });
+            }
+            for ptr_slot in &mut ptrs {
+                let ptr = usize::from(*ptr_slot);
+                if ptr < deleted_ptr {
+                    let adjusted = ptr.checked_add(deleted_size).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: "table leaf cell offset overflow during delete".to_owned(),
+                        }
+                    })?;
+                    *ptr_slot =
+                        u16::try_from(adjusted).map_err(|_| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table leaf cell offset {} exceeds u16 range on page {}",
+                                adjusted,
+                                leaf_page_no.get()
+                            ),
+                        })?;
+                }
+            }
+
+            let page_bytes = page_data.as_bytes_mut();
+            if old_content_offset < deleted_ptr {
+                page_bytes.copy_within(old_content_offset..deleted_ptr, new_content_offset);
             }
             ptrs.remove(delete_idx);
             if new_content_offset > ptr_array_end {
