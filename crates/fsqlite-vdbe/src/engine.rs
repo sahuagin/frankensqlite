@@ -19,7 +19,7 @@
 )]
 use hashbrown::{HashMap, HashSet};
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1710,9 +1710,6 @@ pub struct SharedTxnPageIo {
     /// MVCC concurrent context (bd-kivg / 5E.2). When present, enables
     /// page-level locking for write operations.
     concurrent: Rc<RefCell<Option<ConcurrentContext>>>,
-    /// Shared hint that page 1 may be tracked only as a synthetic conflict
-    /// surface and may need stale-surface cleanup after pager writes.
-    synthetic_page_one_maybe: Rc<Cell<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1733,11 +1730,9 @@ impl std::fmt::Debug for SharedTxnPageIo {
 
 impl SharedTxnPageIo {
     fn from_parts(txn: TransactionKind, concurrent: Option<ConcurrentContext>) -> Self {
-        let synthetic_page_one_maybe = concurrent.is_some();
         Self {
             txn: Rc::new(RefCell::new(txn)),
             concurrent: Rc::new(RefCell::new(concurrent)),
-            synthetic_page_one_maybe: Rc::new(Cell::new(synthetic_page_one_maybe)),
         }
     }
 
@@ -1787,7 +1782,6 @@ impl SharedTxnPageIo {
         txn: TransactionKind,
         concurrent: Option<ConcurrentContext>,
     ) -> TransactionKind {
-        self.synthetic_page_one_maybe.set(concurrent.is_some());
         self.concurrent.replace(concurrent);
         self.txn.replace(txn)
     }
@@ -1809,11 +1803,7 @@ impl SharedTxnPageIo {
         _cx: &Cx,
         operation: &str,
     ) -> Result<()> {
-        if !self.synthetic_page_one_maybe.get() {
-            return Ok(());
-        }
         let Some(ctx) = self.concurrent_context() else {
-            self.synthetic_page_one_maybe.set(false);
             return Ok(());
         };
         // The live engine only synthesizes conflict-only tracking for page 1.
@@ -1824,7 +1814,6 @@ impl SharedTxnPageIo {
             concurrent_page_is_synthetic_conflict_only(&handle, PageNumber::ONE)
         };
         if !page_one_is_synthetic {
-            self.synthetic_page_one_maybe.set(false);
             return Ok(());
         }
         if self.txn.borrow().page_one_in_pending_commit_surface()? {
@@ -1860,7 +1849,6 @@ impl SharedTxnPageIo {
                 );
             }
         }
-        self.synthetic_page_one_maybe.set(false);
 
         Ok(())
     }
@@ -2158,7 +2146,6 @@ impl SharedTxnPageIo {
 
         if page_one_state.is_some() {
             track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "write_page")?;
-            self.synthetic_page_one_maybe.set(true);
         }
         let started = Instant::now();
         let deadline = Duration::from_millis(ctx.busy_timeout_ms);
@@ -2816,7 +2803,6 @@ impl PageWriter for SharedTxnPageIo {
             && page_one_state.is_some()
         {
             track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "allocate_page")?;
-            self.synthetic_page_one_maybe.set(true);
         }
         let allocate_result = self.txn.borrow_mut().allocate_page(cx);
         if let Err(allocate_error) = &allocate_result {
@@ -2872,7 +2858,6 @@ impl PageWriter for SharedTxnPageIo {
         if let Some(ctx) = concurrent.as_ref() {
             if page_one_state.is_some() {
                 track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "free_page")?;
-                self.synthetic_page_one_maybe.set(true);
             }
             let concurrent_free_result = (|| -> Result<()> {
                 let started = Instant::now();
