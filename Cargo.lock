@@ -978,6 +978,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "hashbrown 0.14.5",
+ "itoa",
  "lazy_static",
  "lru",
  "proptest",

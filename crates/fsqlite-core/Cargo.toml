@@ -55,6 +55,7 @@ xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+itoa = { workspace = true }
 hashbrown = { workspace = true }
 lru = { workspace = true }
 smallvec = { workspace = true }
