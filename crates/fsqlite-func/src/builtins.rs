@@ -2612,6 +2612,48 @@ mod tests {
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("a,b")));
     }
 
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_concat_ws_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const TEXT_ARGS: usize = 24;
+        const INVOCATIONS: usize = 50_000;
+        const REPEATS: usize = 5;
+
+        let f = ConcatWsFunc;
+        let mut args = Vec::with_capacity(TEXT_ARGS + 1);
+        args.push(SqliteValue::Text(SmallText::from_string(",")));
+        for _ in 0..TEXT_ARGS {
+            args.push(SqliteValue::Text(SmallText::from_string("payload")));
+        }
+
+        let mut best_ns = u128::MAX;
+        let mut result_len = 0usize;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(args.as_slice()))
+                        .expect("concat_ws benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            best_ns = best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "concat_ws_text_args text_args={TEXT_ARGS} invocations={INVOCATIONS} repeats={REPEATS} best_ns={best_ns} result_len={result_len}"
+        );
+    }
+
     // ── hex ──────────────────────────────────────────────────────────────
 
     #[test]
