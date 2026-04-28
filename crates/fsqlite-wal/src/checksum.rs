@@ -135,22 +135,26 @@ impl WalChecksumTransform {
             });
         }
 
-        let mut transform = Self::identity();
+        Ok(Self::identity().then_aligned_bytes(data, big_endian_checksum_words))
+    }
+
+    #[inline]
+    fn then_aligned_bytes(mut self, data: &[u8], big_endian_checksum_words: bool) -> Self {
         for chunk in data.chunks_exact(8) {
             let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
             let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
             // Apply the fixed SQLite two-word checksum step directly:
             // (s1, s2) -> (s1 + s2 + x0, s1 + 2*s2 + x0 + x1).
-            let double_a21 = transform.a21.wrapping_add(transform.a21);
-            let double_a22 = transform.a22.wrapping_add(transform.a22);
-            let double_c2 = transform.c2.wrapping_add(transform.c2);
-            transform = Self {
-                a11: transform.a11.wrapping_add(transform.a21),
-                a12: transform.a12.wrapping_add(transform.a22),
-                a21: transform.a11.wrapping_add(double_a21),
-                a22: transform.a12.wrapping_add(double_a22),
-                c1: transform.c1.wrapping_add(transform.c2).wrapping_add(x0),
-                c2: transform
+            let double_a21 = self.a21.wrapping_add(self.a21);
+            let double_a22 = self.a22.wrapping_add(self.a22);
+            let double_c2 = self.c2.wrapping_add(self.c2);
+            self = Self {
+                a11: self.a11.wrapping_add(self.a21),
+                a12: self.a12.wrapping_add(self.a22),
+                a21: self.a11.wrapping_add(double_a21),
+                a22: self.a12.wrapping_add(double_a22),
+                c1: self.c1.wrapping_add(self.c2).wrapping_add(x0),
+                c2: self
                     .c1
                     .wrapping_add(double_c2)
                     .wrapping_add(x0)
@@ -158,7 +162,7 @@ impl WalChecksumTransform {
             };
         }
 
-        Ok(transform)
+        self
     }
 
     /// Build the transform for one WAL frame.
@@ -168,12 +172,12 @@ impl WalChecksumTransform {
         big_endian_checksum_words: bool,
     ) -> Result<Self> {
         ensure_frame_len(frame, page_size)?;
-        let header = Self::from_aligned_bytes(&frame[..8], big_endian_checksum_words)?;
-        let payload = Self::from_aligned_bytes(
-            &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size],
-            big_endian_checksum_words,
-        )?;
-        Ok(header.then(payload))
+        Ok(Self::identity()
+            .then_aligned_bytes(&frame[..8], big_endian_checksum_words)
+            .then_aligned_bytes(
+                &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size],
+                big_endian_checksum_words,
+            ))
     }
 }
 
