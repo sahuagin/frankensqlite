@@ -377,58 +377,50 @@ fn parse_time_part_with_tz(s: &str) -> Option<(i64, i64, i64, f64, i64)> {
 
 /// Parse "HH:MM:SS.SSS" or "HH:MM:SS" or "HH:MM".
 fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() < 2 {
+    let [h_tens, h_ones, b':', mi_tens, mi_ones, rest @ ..] = s.as_bytes() else {
         return None;
-    }
+    };
     // C SQLite's computeHMS uses getDigits with a "20" field width,
     // meaning exactly 2 bare decimal digits per time component.  Reject
     // fields that don't match that shape: wrong length, leading signs
     // (`+01`), or non-digit characters.
-    if parts[0].len() != 2
-        || parts[1].len() != 2
-        || !parts[0].bytes().all(|b| b.is_ascii_digit())
-        || !parts[1].bytes().all(|b| b.is_ascii_digit())
-    {
-        return None;
-    }
-    let h = parts[0].parse::<i64>().ok()?;
-    let mi = parts[1].parse::<i64>().ok()?;
+    let h = parse_two_ascii_digits(*h_tens, *h_ones)?;
+    let mi = parse_two_ascii_digits(*mi_tens, *mi_ones)?;
     if !(0..=23).contains(&h) || !(0..=59).contains(&mi) {
         return None;
-    }
-
-    if parts.len() == 2 {
-        return Some((h, mi, 0, 0.0));
     }
 
     // Third part may have fractional seconds: "SS" or "SS.SSS".
     // Apply the same 2-digit bare-digits constraint as hours/minutes:
     // C SQLite's computeHMS requires the seconds integer to be exactly
     // 2 decimal digits.
-    let sec_str = parts[2];
-    let sec_int_str = if let Some(dot_pos) = sec_str.find('.') {
-        &sec_str[..dot_pos]
-    } else {
-        sec_str
-    };
-    if sec_int_str.len() != 2 || !sec_int_str.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+    match rest {
+        [] => Some((h, mi, 0, 0.0)),
+        [b':', sec_tens, sec_ones] => {
+            let sec = parse_two_ascii_digits(*sec_tens, *sec_ones)?;
+            if !(0..=59).contains(&sec) {
+                return None;
+            }
+            Some((h, mi, sec, 0.0))
+        }
+        [b':', sec_tens, sec_ones, b'.', ..] => {
+            let sec = parse_two_ascii_digits(*sec_tens, *sec_ones)?;
+            if !(0..=59).contains(&sec) {
+                return None;
+            }
+            let frac = s.get(8..)?.parse::<f64>().ok()?;
+            Some((h, mi, sec, frac))
+        }
+        _ => None,
     }
-    if let Some(dot_pos) = sec_str.find('.') {
-        let sec = sec_str[..dot_pos].parse::<i64>().ok()?;
-        let frac_str = &sec_str[dot_pos..]; // ".SSS"
-        let frac = frac_str.parse::<f64>().ok()?;
-        if !(0..=59).contains(&sec) {
-            return None;
-        }
-        Some((h, mi, sec, frac))
+}
+
+#[inline]
+fn parse_two_ascii_digits(tens: u8, ones: u8) -> Option<i64> {
+    if tens.is_ascii_digit() && ones.is_ascii_digit() {
+        Some(i64::from((tens - b'0') * 10 + (ones - b'0')))
     } else {
-        let sec = sec_str.parse::<i64>().ok()?;
-        if !(0..=59).contains(&sec) {
-            return None;
-        }
-        Some((h, mi, sec, 0.0))
+        None
     }
 }
 

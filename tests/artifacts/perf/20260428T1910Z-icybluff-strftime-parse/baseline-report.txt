@@ -1,0 +1,5 @@
+running 1 test
+test datetime::tests::perf_strftime_timestamp_rows ... strftime_timestamp_rows rows=200000 repeats=5 best_ns=65013362 output_len=19
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 360 filtered out; finished in 0.33s
