@@ -1305,6 +1305,21 @@ pub fn concurrent_page_state(handle: &ConcurrentHandle, page: PageNumber) -> Con
     }
 }
 
+/// Return whether a page is tracked only as a synthetic conflict surface.
+///
+/// This is the predicate-only companion to [`concurrent_page_state`]. Hot
+/// cleanup paths use it when they only need the boolean answer, avoiding a
+/// full `ConcurrentPageState` construction and possible staged-page clone.
+#[must_use]
+pub fn concurrent_page_is_synthetic_conflict_only(
+    handle: &ConcurrentHandle,
+    page: PageNumber,
+) -> bool {
+    handle.page_state(page).is_some_and(|state| {
+        state.is_conflict_only && state.staged_data.is_none() && !state.is_freed
+    })
+}
+
 /// Restore a page's local concurrent tracking state after a failed pager write.
 pub fn concurrent_restore_page_state(
     handle: &mut ConcurrentHandle,
@@ -3522,8 +3537,9 @@ mod tests {
         ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
         concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
         concurrent_free_page, concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt,
-        concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
-        concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
+        concurrent_page_is_freed, concurrent_page_is_synthetic_conflict_only,
+        concurrent_page_state, concurrent_read_page, concurrent_restore_page_state,
+        concurrent_rollback_to_savepoint, concurrent_savepoint,
         concurrent_track_write_conflict_page, concurrent_write_metadata_page,
         concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
         prepare_concurrent_commit_with_ssi, summarize_witness_keys, validate_first_committer_wins,
@@ -3924,12 +3940,20 @@ mod tests {
 
         assert!(handle.tracks_write_conflict_page(PageNumber::ONE));
         assert!(handle.held_locks().contains(&PageNumber::ONE));
+        assert!(
+            concurrent_page_is_synthetic_conflict_only(&handle, PageNumber::ONE),
+            "a conflict-only page with no staged data or free marker is synthetic"
+        );
 
         concurrent_clear_page_state(&mut handle, &lock_table, s1, PageNumber::ONE).unwrap();
 
         assert!(
             !handle.tracks_write_conflict_page(PageNumber::ONE),
             "clearing the page state must remove the synthetic conflict surface"
+        );
+        assert!(
+            !concurrent_page_is_synthetic_conflict_only(&handle, PageNumber::ONE),
+            "clearing the page state must clear the synthetic predicate"
         );
         assert!(
             !handle.held_locks().contains(&PageNumber::ONE),

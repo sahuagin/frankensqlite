@@ -151,9 +151,10 @@ use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
     MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
     concurrent_clear_page_state, concurrent_free_page, concurrent_has_page_state,
-    concurrent_page_read_state, concurrent_page_state, concurrent_prepare_write_page,
-    concurrent_restore_page_state, concurrent_stage_prepared_write_page,
-    concurrent_track_write_conflict_page, create_time_travel_snapshot,
+    concurrent_page_is_synthetic_conflict_only, concurrent_page_read_state, concurrent_page_state,
+    concurrent_prepare_write_page, concurrent_restore_page_state,
+    concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
+    create_time_travel_snapshot,
 };
 #[cfg(test)]
 use fsqlite_mvcc::{concurrent_read_page, concurrent_write_page};
@@ -1810,7 +1811,7 @@ impl SharedTxnPageIo {
         // just to learn that page 1 is still (or is no longer) required.
         let page_one_is_synthetic = {
             let handle = ctx.handle.lock();
-            concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only()
+            concurrent_page_is_synthetic_conflict_only(&handle, PageNumber::ONE)
         };
         if !page_one_is_synthetic {
             return Ok(());
@@ -1822,7 +1823,7 @@ impl SharedTxnPageIo {
         let metrics_enabled = vdbe_metrics_enabled();
         let clear_started = metrics_enabled.then(Instant::now);
         let mut handle = ctx.handle.lock();
-        if concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only() {
+        if concurrent_page_is_synthetic_conflict_only(&handle, PageNumber::ONE) {
             concurrent_clear_page_state(
                 &mut handle,
                 &ctx.lock_table,
