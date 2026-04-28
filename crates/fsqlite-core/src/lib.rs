@@ -47,9 +47,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{
-    ObjectId, Oti, PayloadHash, Region, SymbolRecord, SymbolRecordFlags, gf256_mul_byte,
-};
+use fsqlite_types::{ObjectId, Oti, PayloadHash, Region, SymbolRecord, SymbolRecordFlags};
 use tracing::{debug, error};
 
 const MAX_BALANCED_BG_CPU: usize = 16;
@@ -580,6 +578,7 @@ mod tests {
     use asupersync::types::{ObjectId as AsObjectId, ObjectParams, Symbol};
     use asupersync::{Cx, RaptorQConfig};
     use fsqlite_btree::compare_key_bytes_contiguous;
+    use fsqlite_types::gf256_mul_byte;
 
     use super::*;
 
