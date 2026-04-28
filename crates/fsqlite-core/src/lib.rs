@@ -221,13 +221,61 @@ pub fn gf256_add_assign_chunked(dst: &mut [u8], src: &[u8]) -> Result<WideChunkL
     xor_patch_wide_chunks(dst, src)
 }
 
-#[inline]
-fn gf256_mul_table(coeff: u8) -> [u8; 256] {
-    let mut table = [0_u8; 256];
-    for (byte, product) in table.iter_mut().enumerate() {
-        *product = gf256_mul_byte(coeff, byte as u8);
+const GF256_FIELD_SIZE: usize = 256;
+
+const fn gf256_mul_byte_for_table(mut a: u8, mut b: u8) -> u8 {
+    let mut out = 0_u8;
+    while b != 0 {
+        if (b & 1) != 0 {
+            out ^= a;
+        }
+        let carry = (a & 0x80) != 0;
+        a <<= 1;
+        if carry {
+            a ^= 0x1D;
+        }
+        b >>= 1;
     }
-    table
+    out
+}
+
+const fn gf256_mul_row(coeff: u8) -> [u8; GF256_FIELD_SIZE] {
+    let mut row = [0_u8; GF256_FIELD_SIZE];
+    let mut byte = 0_u8;
+
+    loop {
+        row[byte as usize] = gf256_mul_byte_for_table(coeff, byte);
+        if byte == u8::MAX {
+            break;
+        }
+        byte = byte.wrapping_add(1);
+    }
+
+    row
+}
+
+// This builds `GF256_MUL_TABLES` at compile time; it is not a runtime stack allocation.
+#[allow(clippy::large_stack_arrays)]
+const fn gf256_mul_tables() -> [[u8; GF256_FIELD_SIZE]; GF256_FIELD_SIZE] {
+    let mut tables = [[0_u8; GF256_FIELD_SIZE]; GF256_FIELD_SIZE];
+    let mut coeff = 0_u8;
+
+    loop {
+        tables[coeff as usize] = gf256_mul_row(coeff);
+        if coeff == u8::MAX {
+            break;
+        }
+        coeff = coeff.wrapping_add(1);
+    }
+
+    tables
+}
+
+static GF256_MUL_TABLES: [[u8; GF256_FIELD_SIZE]; GF256_FIELD_SIZE] = gf256_mul_tables();
+
+#[inline]
+fn gf256_mul_table(coeff: u8) -> &'static [u8; GF256_FIELD_SIZE] {
+    &GF256_MUL_TABLES[usize::from(coeff)]
 }
 
 /// RaptorQ symbol add (`dst ^= src`) using chunked XOR.
