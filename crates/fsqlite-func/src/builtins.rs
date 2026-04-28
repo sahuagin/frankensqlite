@@ -332,13 +332,14 @@ impl ScalarFunction for HexFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Text(SmallText::new("")));
         }
-        let bytes = match &args[0] {
-            SqliteValue::Blob(b) => b.to_vec(),
-            // For non-blob: convert to text first, then hex-encode UTF-8 bytes
-            other => other.to_text().into_bytes(),
+        let bytes: Cow<'_, [u8]> = match &args[0] {
+            SqliteValue::Blob(b) => Cow::Borrowed(b.as_ref()),
+            SqliteValue::Text(text) => Cow::Borrowed(text.as_bytes_direct()),
+            // For non-blob: convert to text first, then hex-encode UTF-8 bytes.
+            other => Cow::Owned(other.to_text().into_bytes()),
         };
         let mut hex = String::with_capacity(bytes.len() * 2);
-        for b in &bytes {
+        for b in bytes.as_ref() {
             let _ = write!(hex, "{b:02X}");
         }
         Ok(SqliteValue::Text(SmallText::from_string(hex)))
@@ -2724,6 +2725,65 @@ mod tests {
         // hex(42) encodes '42' as UTF-8 hex, not raw bits
         let result = invoke1(&HexFunc, SqliteValue::Integer(42)).unwrap();
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("3432")));
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_hex_text_blob_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BYTES: usize = 24;
+        const INVOCATIONS: usize = 100_000;
+        const REPEATS: usize = 5;
+
+        let f = HexFunc;
+        let text_args = [SqliteValue::Text(SmallText::from_string(
+            "payload payload sentinel",
+        ))];
+        let blob_args = [SqliteValue::Blob(Arc::from([0xAB; BYTES].as_slice()))];
+
+        let mut text_best_ns = u128::MAX;
+        let mut blob_best_ns = u128::MAX;
+        let mut text_result_len = 0usize;
+        let mut blob_result_len = 0usize;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(text_args.as_slice()))
+                        .expect("hex text benchmark invocation must succeed"),
+                );
+                text_result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            text_best_ns = text_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(blob_args.as_slice()))
+                        .expect("hex blob benchmark invocation must succeed"),
+                );
+                blob_result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            blob_best_ns = blob_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "hex_text_blob_args bytes={BYTES} invocations={INVOCATIONS} repeats={REPEATS} text_best_ns={text_best_ns} blob_best_ns={blob_best_ns} text_result_len={text_result_len} blob_result_len={blob_result_len}"
+        );
     }
 
     // ── iif ──────────────────────────────────────────────────────────────
