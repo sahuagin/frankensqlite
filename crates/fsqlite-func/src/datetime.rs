@@ -675,6 +675,57 @@ fn push_format(result: &mut String, args: Arguments<'_>) {
     let _ = result.write_fmt(args);
 }
 
+#[inline]
+fn push_zero_padded_2(result: &mut String, value: i64) {
+    if (0..=99).contains(&value) {
+        let value = value as u8;
+        result.push(char::from(b'0' + value / 10));
+        result.push(char::from(b'0' + value % 10));
+    } else {
+        push_format(result, format_args!("{value:02}"));
+    }
+}
+
+#[inline]
+fn push_space_padded_2(result: &mut String, value: i64) {
+    if (0..=99).contains(&value) {
+        let value = value as u8;
+        if value >= 10 {
+            result.push(char::from(b'0' + value / 10));
+        } else {
+            result.push(' ');
+        }
+        result.push(char::from(b'0' + value % 10));
+    } else {
+        push_format(result, format_args!("{value:>2}"));
+    }
+}
+
+#[inline]
+fn push_zero_padded_3(result: &mut String, value: i64) {
+    if (0..=999).contains(&value) {
+        let value = value as u16;
+        result.push(char::from(b'0' + (value / 100) as u8));
+        result.push(char::from(b'0' + ((value / 10) % 10) as u8));
+        result.push(char::from(b'0' + (value % 10) as u8));
+    } else {
+        push_format(result, format_args!("{value:03}"));
+    }
+}
+
+#[inline]
+fn push_zero_padded_4(result: &mut String, value: i64) {
+    if (0..=9999).contains(&value) {
+        let value = value as u16;
+        result.push(char::from(b'0' + (value / 1000) as u8));
+        result.push(char::from(b'0' + ((value / 100) % 10) as u8));
+        result.push(char::from(b'0' + ((value / 10) % 10) as u8));
+        result.push(char::from(b'0' + (value % 10) as u8));
+    } else {
+        push_format(result, format_args!("{value:04}"));
+    }
+}
+
 /// strftime format engine.
 fn format_strftime(fmt: &str, jdn: f64) -> String {
     let (y, mo, d) = jdn_to_ymd(jdn);
@@ -705,14 +756,14 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
         literal_start = i;
 
         match spec {
-            'd' => push_format(&mut result, format_args!("{d:02}")),
-            'e' => push_format(&mut result, format_args!("{d:>2}")),
+            'd' => push_zero_padded_2(&mut result, d),
+            'e' => push_space_padded_2(&mut result, d),
             'f' => {
                 // Seconds with fractional part.
                 let total = s as f64 + frac;
                 push_format(&mut result, format_args!("{total:06.3}"));
             }
-            'H' => push_format(&mut result, format_args!("{h:02}")),
+            'H' => push_zero_padded_2(&mut result, h),
             'I' => {
                 // 12-hour clock.
                 let h12 = if h == 0 {
@@ -722,9 +773,9 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                 } else {
                     h
                 };
-                push_format(&mut result, format_args!("{h12:02}"));
+                push_zero_padded_2(&mut result, h12);
             }
-            'j' => push_format(&mut result, format_args!("{doy:03}")),
+            'j' => push_zero_padded_3(&mut result, doy),
             'J' => {
                 // C SQLite uses %.15g which strips trailing zeros.
                 push_format(&mut result, format_args!("{jdn:.15}"));
@@ -737,7 +788,7 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
             }
             'k' => {
                 // Space-padded 24-hour.
-                push_format(&mut result, format_args!("{h:>2}"));
+                push_space_padded_2(&mut result, h);
             }
             'l' => {
                 // Space-padded 12-hour.
@@ -748,24 +799,32 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                 } else {
                     h
                 };
-                push_format(&mut result, format_args!("{h12:>2}"));
+                push_space_padded_2(&mut result, h12);
             }
-            'm' => push_format(&mut result, format_args!("{mo:02}")),
-            'M' => push_format(&mut result, format_args!("{mi:02}")),
+            'm' => push_zero_padded_2(&mut result, mo),
+            'M' => push_zero_padded_2(&mut result, mi),
             'p' => {
                 result.push_str(if h < 12 { "AM" } else { "PM" });
             }
             'P' => {
                 result.push_str(if h < 12 { "am" } else { "pm" });
             }
-            'R' => push_format(&mut result, format_args!("{h:02}:{mi:02}")),
+            'R' => {
+                push_zero_padded_2(&mut result, h);
+                result.push(':');
+                push_zero_padded_2(&mut result, mi);
+            }
             's' => {
                 let unix = jdn_to_unix(jdn);
                 push_format(&mut result, format_args!("{unix}"));
             }
-            'S' => push_format(&mut result, format_args!("{s:02}")),
+            'S' => push_zero_padded_2(&mut result, s),
             'T' => {
-                push_format(&mut result, format_args!("{h:02}:{mi:02}:{s:02}"));
+                push_zero_padded_2(&mut result, h);
+                result.push(':');
+                push_zero_padded_2(&mut result, mi);
+                result.push(':');
+                push_zero_padded_2(&mut result, s);
             }
             'u' => {
                 // ISO 8601 day of week: 1=Monday, 7=Sunday.
@@ -776,16 +835,16 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
             'W' => {
                 // Week of year (Monday as first day of week, 00-53).
                 let w = (doy + 6 - ((dow + 6) % 7)) / 7;
-                push_format(&mut result, format_args!("{w:02}"));
+                push_zero_padded_2(&mut result, w);
             }
-            'Y' => push_format(&mut result, format_args!("{y:04}")),
+            'Y' => push_zero_padded_4(&mut result, y),
             'G' | 'g' | 'V' => {
                 // ISO 8601 week-based year/week.
                 let (iso_y, iso_w) = iso_week(y, mo, d);
                 match spec {
-                    'G' => push_format(&mut result, format_args!("{iso_y:04}")),
-                    'g' => push_format(&mut result, format_args!("{:02}", iso_y % 100)),
-                    'V' => push_format(&mut result, format_args!("{iso_w:02}")),
+                    'G' => push_zero_padded_4(&mut result, iso_y),
+                    'g' => push_zero_padded_2(&mut result, iso_y % 100),
+                    'V' => push_zero_padded_2(&mut result, iso_w),
                     _ => unreachable!(),
                 }
             }
