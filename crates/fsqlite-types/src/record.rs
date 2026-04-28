@@ -1425,6 +1425,74 @@ pub fn serialize_record_iter_with_precomputed_header_into<'a, I>(
 where
     I: Iterator<Item = &'a SqliteValue>,
 {
+    const STACK_PRECOMPUTED_RECORD_SLOTS: usize = 16;
+
+    if header.slots.len() > STACK_PRECOMPUTED_RECORD_SLOTS {
+        return serialize_record_iter_with_precomputed_header_append_into(values, header, buf);
+    }
+
+    let header_size = header.template.len();
+    let mut body_size = 0usize;
+    let mut value_iter = values;
+    let mut value_refs: [Option<&'a SqliteValue>; STACK_PRECOMPUTED_RECORD_SLOTS] =
+        [None; STACK_PRECOMPUTED_RECORD_SLOTS];
+    let mut serial_bytes = [0_u8; STACK_PRECOMPUTED_RECORD_SLOTS];
+    let mut payload_lens = [0_usize; STACK_PRECOMPUTED_RECORD_SLOTS];
+
+    for (idx, slot) in header.slots.iter().enumerate() {
+        let Some(value) = value_iter.next() else {
+            return false;
+        };
+        let Some((serial_byte, payload_len)) = slot.kind.serial_byte_and_payload_len(value) else {
+            return false;
+        };
+        let Some(next_body_size) = body_size.checked_add(payload_len) else {
+            return false;
+        };
+        body_size = next_body_size;
+        value_refs[idx] = Some(value);
+        serial_bytes[idx] = serial_byte;
+        payload_lens[idx] = payload_len;
+    }
+    if value_iter.next().is_some() {
+        return false;
+    }
+
+    let Some(total_size) = header_size.checked_add(body_size) else {
+        return false;
+    };
+
+    buf.clear();
+    buf.resize(total_size, 0);
+    buf[..header_size].copy_from_slice(&header.template);
+
+    let mut body_offset = header_size;
+    for (idx, slot) in header.slots.iter().enumerate() {
+        let Some(value) = value_refs[idx] else {
+            return false;
+        };
+        if slot.kind.needs_runtime_patch() {
+            debug_assert!(slot.header_offset < header_size);
+            buf[slot.header_offset] = serial_bytes[idx];
+        }
+        let payload_len = payload_lens[idx];
+        let body_end = body_offset + payload_len;
+        encode_serialized_value(value, payload_len, &mut buf[body_offset..body_end]);
+        body_offset = body_end;
+    }
+
+    debug_assert_eq!(body_offset, total_size);
+    true
+}
+
+fn serialize_record_iter_with_precomputed_header_append_into<'a, I>(
+    values: I,
+    header: &PrecomputedRecordHeader,
+    buf: &mut Vec<u8>,
+) -> bool
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
     let header_size = header.template.len();
     let total_capacity = header_size + header.max_body_size;
     buf.clear();
@@ -1450,6 +1518,31 @@ where
     }
 
     true
+}
+
+fn append_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut Vec<u8>) {
+    let start_len = buf.len();
+    match value {
+        SqliteValue::Null => {}
+        SqliteValue::Integer(i) => {
+            if payload_len != 0 {
+                let bytes = i.to_be_bytes();
+                buf.extend_from_slice(&bytes[8 - payload_len..]);
+            }
+        }
+        SqliteValue::Float(f) => {
+            if !f.is_nan() {
+                buf.extend_from_slice(&f.to_bits().to_be_bytes());
+            }
+        }
+        SqliteValue::Text(s) => {
+            buf.extend_from_slice(s.as_bytes());
+        }
+        SqliteValue::Blob(b) => {
+            buf.extend_from_slice(b);
+        }
+    }
+    debug_assert_eq!(buf.len() - start_len, payload_len);
 }
 
 /// Compute the exact total record size (header + body) for a value iterator
@@ -2351,31 +2444,6 @@ fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u
             buf.copy_from_slice(b);
         }
     }
-}
-
-fn append_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut Vec<u8>) {
-    let start_len = buf.len();
-    match value {
-        SqliteValue::Null => {} // serial type 0: no data
-        SqliteValue::Integer(i) => {
-            if payload_len != 0 {
-                let bytes = i.to_be_bytes();
-                buf.extend_from_slice(&bytes[8 - payload_len..]);
-            }
-        }
-        SqliteValue::Float(f) => {
-            if !f.is_nan() {
-                buf.extend_from_slice(&f.to_bits().to_be_bytes());
-            }
-        }
-        SqliteValue::Text(s) => {
-            buf.extend_from_slice(s.as_bytes());
-        }
-        SqliteValue::Blob(b) => {
-            buf.extend_from_slice(b);
-        }
-    }
-    debug_assert_eq!(buf.len() - start_len, payload_len);
 }
 
 #[cfg(test)]
