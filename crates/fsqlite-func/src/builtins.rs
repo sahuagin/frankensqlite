@@ -736,23 +736,25 @@ impl ScalarFunction for ReplaceFunc {
         if let Some(null) = null_propagate(args) {
             return Ok(null);
         }
-        let x = args[0].to_text();
-        let y = args[1].to_text();
-        let z = args[2].to_text();
+        let x = text_arg(&args[0]);
+        let y = text_arg(&args[1]);
+        let z = text_arg(&args[2]);
         if y.is_empty() {
             return Ok(SqliteValue::Text(SmallText::from_string(x)));
         }
 
         // Prevent OOM from massive string expansion
         if z.len() > y.len() {
-            let occurrences = x.matches(&y).count();
+            let occurrences = x.matches(y.as_ref()).count();
             let final_len = x.len() + occurrences * (z.len() - y.len());
             if final_len > 1_000_000_000 {
                 return Err(FrankenError::TooBig);
             }
         }
 
-        Ok(SqliteValue::Text(SmallText::from_string(x.replace(&y, &z))))
+        Ok(SqliteValue::Text(SmallText::from_string(
+            x.replace(y.as_ref(), z.as_ref()),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -3047,6 +3049,47 @@ mod tests {
             ])
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("hello"))
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_replace_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 100_000;
+        const REPEATS: usize = 5;
+
+        let f = ReplaceFunc;
+        let args = [
+            SqliteValue::Text(SmallText::from_string("payload payload payload")),
+            SqliteValue::Text(SmallText::from_string("zz")),
+            SqliteValue::Text(SmallText::from_string("replacement")),
+        ];
+
+        let mut best_ns = u128::MAX;
+        let mut result_len = 0usize;
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(args.as_slice()))
+                        .expect("replace benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            best_ns = best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "replace_text_args invocations={INVOCATIONS} repeats={REPEATS} best_ns={best_ns} result_len={result_len}"
         );
     }
 
