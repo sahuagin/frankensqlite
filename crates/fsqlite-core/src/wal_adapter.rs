@@ -902,25 +902,18 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             return Ok(None);
         }
 
-        let wal_frames: Vec<_> = frames
-            .iter()
-            .map(|frame| WalAppendFrameRef {
+        let mut frame_bytes = Vec::new();
+        let mut checksum_transforms = Vec::new();
+        let last_commit_frame_offset = self.wal.prepare_frame_bytes_with_transforms_into(
+            frames.len(),
+            frames.iter().map(|frame| WalAppendFrameRef {
                 page_number: frame.page_number,
                 page_data: frame.page_data,
                 db_size_if_commit: frame.db_size_if_commit,
-            })
-            .collect();
-        let frame_bytes = self.wal.prepare_frame_bytes(&wal_frames)?;
-        let checksum_transforms = frame_bytes
-            .chunks_exact(self.wal.frame_size())
-            .map(|frame| {
-                WalChecksumTransform::for_wal_frame(
-                    frame,
-                    self.wal.page_size(),
-                    self.wal.big_endian_checksum(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }),
+            &mut frame_bytes,
+            &mut checksum_transforms,
+        )?;
         let frame_metas = frames
             .iter()
             .map(|frame| PreparedWalFrameMeta {
@@ -928,11 +921,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 db_size_if_commit: frame.db_size_if_commit,
             })
             .collect();
-        let last_commit_frame_offset = frames
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(offset, frame)| (frame.db_size_if_commit != 0).then_some(offset));
 
         Ok(Some(PreparedWalFrameBatch {
             frame_size: self.wal.frame_size(),
