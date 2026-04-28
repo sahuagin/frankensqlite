@@ -1027,6 +1027,7 @@ impl PrecomputedSerialTypeKind {
         }
     }
 
+    #[inline]
     fn serial_byte_and_payload_len(self, value: &SqliteValue) -> Option<(u8, usize)> {
         match self {
             Self::NullPlaceholder => Some((0, 0)),
@@ -2418,6 +2419,7 @@ fn decode_big_endian_signed(bytes: &[u8]) -> i64 {
 }
 
 /// Encode a `SqliteValue` into its serial type byte representation.
+#[inline(always)]
 fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u8]) {
     debug_assert_eq!(buf.len(), payload_len);
     match value {
