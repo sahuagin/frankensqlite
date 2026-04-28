@@ -593,14 +593,14 @@ impl ScalarFunction for TrimFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let s = args[0].to_text();
+        let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_text()
+            text_arg(&args[1])
         } else {
-            " ".to_owned()
+            Cow::Borrowed(" ")
         };
         Ok(SqliteValue::Text(SmallText::new(
-            trim_chars(&s, &chars).as_str(),
+            trim_chars(s.as_ref(), chars.as_ref()).as_str(),
         )))
     }
 
@@ -618,14 +618,14 @@ impl ScalarFunction for LtrimFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let s = args[0].to_text();
+        let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_text()
+            text_arg(&args[1])
         } else {
-            " ".to_owned()
+            Cow::Borrowed(" ")
         };
         Ok(SqliteValue::Text(SmallText::new(
-            ltrim_chars(&s, &chars).as_str(),
+            ltrim_chars(s.as_ref(), chars.as_ref()).as_str(),
         )))
     }
 
@@ -643,14 +643,14 @@ impl ScalarFunction for RtrimFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let s = args[0].to_text();
+        let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
-            args[1].to_text()
+            text_arg(&args[1])
         } else {
-            " ".to_owned()
+            Cow::Borrowed(" ")
         };
         Ok(SqliteValue::Text(SmallText::new(
-            rtrim_chars(&s, &chars).as_str(),
+            rtrim_chars(s.as_ref(), chars.as_ref()).as_str(),
         )))
     }
 
@@ -3057,6 +3057,103 @@ mod tests {
             ])
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("hello"))
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_trim_text_args() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 100_000;
+        const REPEATS: usize = 5;
+
+        let trim = TrimFunc;
+        let ltrim = LtrimFunc;
+        let rtrim = RtrimFunc;
+        let default_args = [SqliteValue::Text(SmallText::from_string("   payload   "))];
+        let custom_args = [
+            SqliteValue::Text(SmallText::from_string("xxxpayloadxxx")),
+            SqliteValue::Text(SmallText::from_string("x")),
+        ];
+
+        let mut trim_best_ns = u128::MAX;
+        let mut ltrim_best_ns = u128::MAX;
+        let mut rtrim_best_ns = u128::MAX;
+        let mut custom_best_ns = u128::MAX;
+        let mut result_len = 0usize;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    trim.invoke(black_box(default_args.as_slice()))
+                        .expect("trim benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            trim_best_ns = trim_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    ltrim
+                        .invoke(black_box(default_args.as_slice()))
+                        .expect("ltrim benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            ltrim_best_ns = ltrim_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    rtrim
+                        .invoke(black_box(default_args.as_slice()))
+                        .expect("rtrim benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            rtrim_best_ns = rtrim_best_ns.min(started.elapsed().as_nanos());
+
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    trim.invoke(black_box(custom_args.as_slice()))
+                        .expect("custom trim benchmark invocation must succeed"),
+                );
+                result_len = match result {
+                    SqliteValue::Text(text) => text.len(),
+                    SqliteValue::Null
+                    | SqliteValue::Integer(_)
+                    | SqliteValue::Float(_)
+                    | SqliteValue::Blob(_) => 0,
+                };
+            }
+            custom_best_ns = custom_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "trim_text_args invocations={INVOCATIONS} repeats={REPEATS} trim_best_ns={trim_best_ns} ltrim_best_ns={ltrim_best_ns} rtrim_best_ns={rtrim_best_ns} custom_best_ns={custom_best_ns} result_len={result_len}"
         );
     }
 
