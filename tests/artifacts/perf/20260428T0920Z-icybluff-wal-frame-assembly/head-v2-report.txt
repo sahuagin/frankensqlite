@@ -1,0 +1,203 @@
+
+running 1 test
+BEGIN_BD_DB300_3_4_3_REPORT
+{
+  "schema_version": "fsqlite.track_c.wal_scratch_benchmark.v1",
+  "bead_id": "bd-db300.3.4.3",
+  "parent_bead_id": "bd-db300.3.4",
+  "measured_operation": "wal_frame_assembly_and_append",
+  "warmup_iterations": 4,
+  "measurement_iterations": 12,
+  "vfs": "memory",
+  "baseline_variant": "fresh_frame_buffer_per_operation",
+  "candidate_variant": "reusable_wal_handle_frame_scratch",
+  "cases": [
+    {
+      "scenario_id": "single_frame_256_ops",
+      "frames_per_operation": 1,
+      "operations_per_sample": 256,
+      "fresh_alloc_baseline": {
+        "samples_ns": [
+          285194,
+          285485,
+          285595,
+          286156,
+          286176,
+          288160,
+          294050,
+          304661,
+          309209,
+          436427,
+          436868,
+          491481
+        ],
+        "min_ns": 285194,
+        "median_ns": 294050,
+        "max_ns": 491481,
+        "mean_ns": 332455.1666666667,
+        "explicit_fresh_buffer_allocations_per_sample": 256,
+        "scratch_capacity_growth_events_per_sample": 0,
+        "peak_scratch_capacity_bytes": 0,
+        "frame_buffer_bytes_per_operation": 4120,
+        "operations_per_sample": 256,
+        "frame_buffer_bytes_requested_per_sample": 1054720
+      },
+      "scratch_reuse_candidate": {
+        "samples_ns": [
+          153487,
+          153899,
+          155200,
+          158436,
+          165009,
+          175048,
+          178063,
+          215334,
+          219972,
+          242073,
+          273122,
+          280415
+        ],
+        "min_ns": 153487,
+        "median_ns": 178063,
+        "max_ns": 280415,
+        "mean_ns": 197504.83333333334,
+        "explicit_fresh_buffer_allocations_per_sample": 0,
+        "scratch_capacity_growth_events_per_sample": 1,
+        "peak_scratch_capacity_bytes": 4120,
+        "frame_buffer_bytes_per_operation": 4120,
+        "operations_per_sample": 256,
+        "frame_buffer_bytes_requested_per_sample": 0
+      },
+      "fresh_buffer_allocations_avoided_per_sample": 255,
+      "buffer_bytes_saved_vs_fresh_requested_per_sample": 1050600,
+      "speedup_vs_baseline_median": 1.6513818143016799,
+      "faster_variant_by_median": "scratch_reuse_candidate"
+    },
+    {
+      "scenario_id": "batch_8_frames_64_ops",
+      "frames_per_operation": 8,
+      "operations_per_sample": 64,
+      "fresh_alloc_baseline": {
+        "samples_ns": [
+          1341443,
+          1355730,
+          1371669,
+          1374845,
+          1383621,
+          1385194,
+          1405453,
+          1437853,
+          1439887,
+          1530747,
+          1659338,
+          1998663
+        ],
+        "min_ns": 1341443,
+        "median_ns": 1405453,
+        "max_ns": 1998663,
+        "mean_ns": 1473703.5833333333,
+        "explicit_fresh_buffer_allocations_per_sample": 64,
+        "scratch_capacity_growth_events_per_sample": 0,
+        "peak_scratch_capacity_bytes": 0,
+        "frame_buffer_bytes_per_operation": 32960,
+        "operations_per_sample": 64,
+        "frame_buffer_bytes_requested_per_sample": 2109440
+      },
+      "scratch_reuse_candidate": {
+        "samples_ns": [
+          1153862,
+          1166094,
+          1187394,
+          1230445,
+          1234041,
+          1239431,
+          1245964,
+          1251444,
+          1258277,
+          1266221,
+          1276101,
+          1280288
+        ],
+        "min_ns": 1153862,
+        "median_ns": 1245964,
+        "max_ns": 1280288,
+        "mean_ns": 1232463.5,
+        "explicit_fresh_buffer_allocations_per_sample": 0,
+        "scratch_capacity_growth_events_per_sample": 1,
+        "peak_scratch_capacity_bytes": 32960,
+        "frame_buffer_bytes_per_operation": 32960,
+        "operations_per_sample": 64,
+        "frame_buffer_bytes_requested_per_sample": 0
+      },
+      "fresh_buffer_allocations_avoided_per_sample": 63,
+      "buffer_bytes_saved_vs_fresh_requested_per_sample": 2076480,
+      "speedup_vs_baseline_median": 1.1280045009326112,
+      "faster_variant_by_median": "scratch_reuse_candidate"
+    },
+    {
+      "scenario_id": "batch_32_frames_16_ops",
+      "frames_per_operation": 32,
+      "operations_per_sample": 16,
+      "fresh_alloc_baseline": {
+        "samples_ns": [
+          1343316,
+          1344529,
+          1358064,
+          1368312,
+          1368734,
+          1376078,
+          1385174,
+          1391326,
+          1468761,
+          1528442,
+          1541758,
+          1568257
+        ],
+        "min_ns": 1343316,
+        "median_ns": 1385174,
+        "max_ns": 1568257,
+        "mean_ns": 1420229.25,
+        "explicit_fresh_buffer_allocations_per_sample": 16,
+        "scratch_capacity_growth_events_per_sample": 0,
+        "peak_scratch_capacity_bytes": 0,
+        "frame_buffer_bytes_per_operation": 131840,
+        "operations_per_sample": 16,
+        "frame_buffer_bytes_requested_per_sample": 2109440
+      },
+      "scratch_reuse_candidate": {
+        "samples_ns": [
+          1131820,
+          1139715,
+          1146427,
+          1149774,
+          1158790,
+          1185430,
+          1199316,
+          1220476,
+          1225705,
+          1236356,
+          1238299,
+          1242177
+        ],
+        "min_ns": 1131820,
+        "median_ns": 1199316,
+        "max_ns": 1242177,
+        "mean_ns": 1189523.75,
+        "explicit_fresh_buffer_allocations_per_sample": 0,
+        "scratch_capacity_growth_events_per_sample": 1,
+        "peak_scratch_capacity_bytes": 131840,
+        "frame_buffer_bytes_per_operation": 131840,
+        "operations_per_sample": 16,
+        "frame_buffer_bytes_requested_per_sample": 0
+      },
+      "fresh_buffer_allocations_avoided_per_sample": 15,
+      "buffer_bytes_saved_vs_fresh_requested_per_sample": 1977600,
+      "speedup_vs_baseline_median": 1.1549699995664195,
+      "faster_variant_by_median": "scratch_reuse_candidate"
+    }
+  ]
+}
+END_BD_DB300_3_4_3_REPORT
+test wal::tests::wal_frame_scratch_benchmark_report ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 386 filtered out; finished in 0.32s
