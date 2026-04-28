@@ -1853,7 +1853,6 @@ impl SharedTxnPageIo {
     }
 
     fn classify_concurrent_write_tier(
-        &self,
         ctx: &ConcurrentContext,
         page_no: PageNumber,
     ) -> ConcurrentWriteTier {
@@ -2339,7 +2338,7 @@ impl SharedTxnPageIo {
                 .write_page_data(cx, page_no, page_data_base);
         };
 
-        match self.classify_concurrent_write_tier(&ctx, page_no) {
+        match Self::classify_concurrent_write_tier(&ctx, page_no) {
             ConcurrentWriteTier::Tier0AlreadyOwned => {
                 self.write_page_tier0_already_owned(cx, &ctx, page_no, page_data_base)
             }
