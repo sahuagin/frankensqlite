@@ -221,6 +221,15 @@ pub fn gf256_add_assign_chunked(dst: &mut [u8], src: &[u8]) -> Result<WideChunkL
     xor_patch_wide_chunks(dst, src)
 }
 
+#[inline]
+fn gf256_mul_table(coeff: u8) -> [u8; 256] {
+    let mut table = [0_u8; 256];
+    for (byte, product) in table.iter_mut().enumerate() {
+        *product = gf256_mul_byte(coeff, byte as u8);
+    }
+    table
+}
+
 /// RaptorQ symbol add (`dst ^= src`) using chunked XOR.
 ///
 /// This is the core symbol-add primitive from §3.2.2.
@@ -273,20 +282,9 @@ pub fn symbol_mul_into(coeff: u8, src: &[u8], out: &mut [u8]) -> Result<()> {
             Ok(())
         }
         _ => {
-            let mut out_chunks = out.chunks_exact_mut(16);
-            let mut src_chunks = src.chunks_exact(16);
-
-            for (dst_chunk, src_chunk) in out_chunks.by_ref().zip(src_chunks.by_ref()) {
-                for (dst_byte, src_byte) in dst_chunk.iter_mut().zip(src_chunk.iter()) {
-                    *dst_byte = gf256_mul_byte(coeff, *src_byte);
-                }
-            }
-            for (dst_byte, src_byte) in out_chunks
-                .into_remainder()
-                .iter_mut()
-                .zip(src_chunks.remainder().iter())
-            {
-                *dst_byte = gf256_mul_byte(coeff, *src_byte);
+            let table = gf256_mul_table(coeff);
+            for (dst_byte, src_byte) in out.iter_mut().zip(src.iter()) {
+                *dst_byte = table[usize::from(*src_byte)];
             }
             Ok(())
         }
@@ -326,20 +324,9 @@ pub fn symbol_addmul_assign(dst: &mut [u8], coeff: u8, src: &[u8]) -> Result<Wid
         0 => Ok(WideChunkLayout::for_len(dst.len())),
         1 => symbol_add_assign(dst, src),
         _ => {
-            let mut dst_chunks = dst.chunks_exact_mut(16);
-            let mut src_chunks = src.chunks_exact(16);
-
-            for (dst_chunk, src_chunk) in dst_chunks.by_ref().zip(src_chunks.by_ref()) {
-                for (dst_byte, src_byte) in dst_chunk.iter_mut().zip(src_chunk.iter()) {
-                    *dst_byte ^= gf256_mul_byte(coeff, *src_byte);
-                }
-            }
-            for (dst_byte, src_byte) in dst_chunks
-                .into_remainder()
-                .iter_mut()
-                .zip(src_chunks.remainder().iter())
-            {
-                *dst_byte ^= gf256_mul_byte(coeff, *src_byte);
+            let table = gf256_mul_table(coeff);
+            for (dst_byte, src_byte) in dst.iter_mut().zip(src.iter()) {
+                *dst_byte ^= table[usize::from(*src_byte)];
             }
             Ok(WideChunkLayout::for_len(dst.len()))
         }

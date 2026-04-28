@@ -1,0 +1,42 @@
+Benchmarking symbol_ops/symbol_addmul_c53/4096
+Benchmarking symbol_ops/symbol_addmul_c53/4096: Warming up for 3.0000 s
+Benchmarking symbol_ops/symbol_addmul_c53/4096: Collecting 100 samples in estimated 5.0071 s (1.6M iterations)
+Benchmarking symbol_ops/symbol_addmul_c53/4096: Analyzing
+symbol_ops/symbol_addmul_c53/4096
+                        time:   [3.1096 µs 3.1199 µs 3.1318 µs]
+                        thrpt:  [1.2181 GiB/s 1.2227 GiB/s 1.2267 GiB/s]
+                 change:
+                        time:   [-88.292% -88.224% -88.151%] (p = 0.00 < 0.05)
+                        thrpt:  [+743.92% +749.22% +754.13%]
+                        Performance has improved.
+Found 7 outliers among 100 measurements (7.00%)
+  4 (4.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking symbol_ops/symbol_addmul_c53/512
+Benchmarking symbol_ops/symbol_addmul_c53/512: Warming up for 3.0000 s
+Benchmarking symbol_ops/symbol_addmul_c53/512: Collecting 100 samples in estimated 5.0069 s (2.9M iterations)
+Benchmarking symbol_ops/symbol_addmul_c53/512: Analyzing
+symbol_ops/symbol_addmul_c53/512
+                        time:   [1.7052 µs 1.7101 µs 1.7153 µs]
+                        thrpt:  [284.66 MiB/s 285.52 MiB/s 286.35 MiB/s]
+                 change:
+                        time:   [-47.860% -47.616% -47.369%] (p = 0.00 < 0.05)
+                        thrpt:  [+90.003% +90.899% +91.791%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high severe
+
+Benchmarking raptorq_paths/decode_fallback_addmul
+Benchmarking raptorq_paths/decode_fallback_addmul: Warming up for 3.0000 s
+Benchmarking raptorq_paths/decode_fallback_addmul: Collecting 100 samples in estimated 5.1063 s (237k iterations)
+Benchmarking raptorq_paths/decode_fallback_addmul: Analyzing
+raptorq_paths/decode_fallback_addmul
+                        time:   [21.511 µs 21.595 µs 21.682 µs]
+                        thrpt:  [1.4075 GiB/s 1.4132 GiB/s 1.4187 GiB/s]
+                 change:
+                        time:   [-88.751% -88.696% -88.648%] (p = 0.00 < 0.05)
+                        thrpt:  [+780.91% +784.65% +788.94%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
