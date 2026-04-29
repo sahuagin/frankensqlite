@@ -11472,6 +11472,7 @@ pub fn codegen_update(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let update_index_mask = update_index_maintenance_mask(table, &assignment_cols);
 
     // OpenWrite for table.
     let table_cursor = cursor;
@@ -11634,7 +11635,7 @@ pub fn codegen_update(
 
     // Index maintenance (bd-2f9t): Delete OLD index entries BEFORE updating values.
     // col_regs currently contains OLD column values.
-    emit_index_deletes(b, table, table_cursor);
+    emit_index_deletes_for_update(b, table, table_cursor, &update_index_mask);
 
     // Evaluate new values from AST expressions and overwrite changed columns.
     // A ScanCtx is required so that column references in SET expressions
@@ -11748,7 +11749,15 @@ pub fn codegen_update(
 
     // Index maintenance (bd-2f9t): Insert NEW index entries after table insert.
     // col_regs now contains NEW column values.
-    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, oe_flag);
+    emit_index_inserts_for_update(
+        b,
+        table,
+        table_cursor,
+        col_regs,
+        rowid_reg,
+        oe_flag,
+        &update_index_mask,
+    );
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
@@ -11779,6 +11788,45 @@ pub fn codegen_update(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+fn update_index_maintenance_mask(table: &TableSchema, assignment_cols: &[usize]) -> Vec<bool> {
+    table
+        .indexes
+        .iter()
+        .map(|index| update_must_maintain_index(table, index, assignment_cols))
+        .collect()
+}
+
+fn update_must_maintain_index(
+    table: &TableSchema,
+    index: &IndexSchema,
+    assignment_cols: &[usize],
+) -> bool {
+    if assignment_cols
+        .iter()
+        .any(|col_idx| table.columns.get(*col_idx).is_some_and(|col| col.is_ipk))
+    {
+        return true;
+    }
+
+    if !index.supports_direct_column_lookup() {
+        return true;
+    }
+
+    if table
+        .columns
+        .iter()
+        .any(|col| col.generated_stored.is_some())
+    {
+        return true;
+    }
+
+    index.columns.iter().any(|column| {
+        table
+            .column_index(column)
+            .is_none_or(|col_idx| assignment_cols.contains(&col_idx))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -12674,7 +12722,44 @@ fn emit_index_inserts(
     rowid_reg: i32,
     oe_flag: u16,
 ) {
+    emit_index_inserts_filtered(b, table, table_cursor, col_regs, rowid_reg, oe_flag, None);
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_inserts_for_update(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    col_regs: i32,
+    rowid_reg: i32,
+    oe_flag: u16,
+    update_index_mask: &[bool],
+) {
+    emit_index_inserts_filtered(
+        b,
+        table,
+        table_cursor,
+        col_regs,
+        rowid_reg,
+        oe_flag,
+        Some(update_index_mask),
+    );
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_inserts_filtered(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    col_regs: i32,
+    rowid_reg: i32,
+    oe_flag: u16,
+    update_index_mask: Option<&[bool]>,
+) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
+        if update_index_mask.is_some_and(|mask| !mask.get(idx_offset).copied().unwrap_or(true)) {
+            continue;
+        }
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
@@ -12754,7 +12839,30 @@ fn emit_index_inserts(
 /// * `table_cursor` - Cursor ID for the table (index cursors are table_cursor + 1, +2, etc.)
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
+    emit_index_deletes_filtered(b, table, table_cursor, None);
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_deletes_for_update(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    update_index_mask: &[bool],
+) {
+    emit_index_deletes_filtered(b, table, table_cursor, Some(update_index_mask));
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_deletes_filtered(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    update_index_mask: Option<&[bool]>,
+) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
+        if update_index_mask.is_some_and(|mask| !mask.get(idx_offset).copied().unwrap_or(true)) {
+            continue;
+        }
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
@@ -21151,6 +21259,53 @@ mod tests {
         assert!(
             idx_delete.p3 > 0,
             "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_skips_unchanged_simple_index_maintenance() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("a".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::IdxDelete | Opcode::IdxInsert)),
+            "UPDATE of non-indexed columns should leave unchanged simple indexes in place"
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Delete | Opcode::Insert)),
+            "table row rewrite should remain unchanged"
         );
     }
 
