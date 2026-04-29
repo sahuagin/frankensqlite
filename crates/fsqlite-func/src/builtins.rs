@@ -1170,32 +1170,24 @@ impl ScalarFunction for UnhexFunc {
             Vec::new()
         };
 
-        // Filter out ignored characters
-        let filtered: String = input
-            .as_ref()
-            .chars()
-            .filter(|c| !ignore_chars.contains(c))
-            .collect();
-
-        // Must have even number of hex digits
-        if filtered.len() % 2 != 0 {
-            return Ok(SqliteValue::Null);
+        let mut bytes = Vec::with_capacity(input.len() / 2);
+        let mut hi_nibble = None;
+        for c in input.as_ref().chars() {
+            if ignore_chars.contains(&c) {
+                continue;
+            }
+            let digit = match hex_digit(c) {
+                Some(v) => v,
+                None => return Ok(SqliteValue::Null),
+            };
+            if let Some(hi) = hi_nibble.take() {
+                bytes.push(hi << 4 | digit);
+            } else {
+                hi_nibble = Some(digit);
+            }
         }
-
-        let mut bytes = Vec::with_capacity(filtered.len() / 2);
-        let chars: Vec<char> = filtered.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let hi = match hex_digit(chars[i]) {
-                Some(v) => v,
-                None => return Ok(SqliteValue::Null),
-            };
-            let lo = match hex_digit(chars[i + 1]) {
-                Some(v) => v,
-                None => return Ok(SqliteValue::Null),
-            };
-            bytes.push(hi << 4 | lo);
-            i += 2;
+        if hi_nibble.is_some() {
+            return Ok(SqliteValue::Null);
         }
         Ok(SqliteValue::Blob(Arc::from(bytes.as_slice())))
     }
