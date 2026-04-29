@@ -401,13 +401,19 @@ fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
     .ok();
 }
 
+const FSQLITE_BENCHMARK_PRAGMAS: &[&str] = &[
+    "PRAGMA page_size = 4096;",
+    "PRAGMA journal_mode = WAL;",
+    "PRAGMA synchronous = NORMAL;",
+    "PRAGMA cache_size = -64000;",
+    // Comprehensive benchmark workloads compare SQLite-compatible query and
+    // write paths. They never issue `FOR SYSTEM_TIME` queries, so keep the
+    // optional in-memory snapshot ring out of the hot path.
+    "PRAGMA fsqlite_capture_time_travel_snapshots=false;",
+];
+
 fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
-    for pragma in [
-        "PRAGMA page_size = 4096;",
-        "PRAGMA journal_mode = WAL;",
-        "PRAGMA synchronous = NORMAL;",
-        "PRAGMA cache_size = -64000;",
-    ] {
+    for pragma in FSQLITE_BENCHMARK_PRAGMAS {
         let _ = conn.execute(pragma);
     }
     // Opt-in LAB_UNSAFE write-merge mode for A/B perf measurement of the
@@ -2276,10 +2282,6 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
             measure(&format!("fs_batch_{count}"), count, || {
                 let conn = fsqlite::Connection::open(":memory:").unwrap();
                 apply_pragmas_fsqlite(&conn);
-                // Workload never issues a time-travel query, so suppress the
-                // O(existing_rows) MemDatabase clone that would otherwise run
-                // at every COMMIT (bd-batched-commit-cliff).
-                let _ = conn.execute("PRAGMA fsqlite_capture_time_travel_snapshots=false");
                 fs_execute(&conn, create_sql);
                 let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 let num_batches = count.div_ceil(batch_size);
@@ -2686,6 +2688,15 @@ mod tests {
             Some(sample_measurement("frankensqlite", 100, &[2, 2, 3])),
         );
         report
+    }
+
+    #[test]
+    fn benchmark_pragmas_disable_time_travel_capture() {
+        assert!(
+            FSQLITE_BENCHMARK_PRAGMAS.iter().any(|pragma| pragma
+                .eq_ignore_ascii_case("PRAGMA fsqlite_capture_time_travel_snapshots=false;")),
+            "comprehensive-bench should profile benchmark workloads, not optional time-travel snapshot cloning"
+        );
     }
 
     #[test]
