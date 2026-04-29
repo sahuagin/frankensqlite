@@ -1400,8 +1400,10 @@ impl ScalarFunction for SoundexFunc {
             // SQLite returns "?000" for SOUNDEX(NULL), not NULL.
             return Ok(SqliteValue::Text(SmallText::new("?000")));
         }
-        let s = args[0].to_text();
-        Ok(SqliteValue::Text(SmallText::from_string(soundex(&s))))
+        let s = text_arg(&args[0]);
+        Ok(SqliteValue::Text(SmallText::from_string(soundex(
+            s.as_ref(),
+        ))))
     }
 
     fn num_args(&self) -> i32 {
@@ -3746,6 +3748,39 @@ mod tests {
             )
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("R163"))
+        );
+    }
+
+    #[test]
+    #[ignore = "perf-only benchmark"]
+    fn perf_soundex_text_arg() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const INVOCATIONS: usize = 1_000_000;
+        const REPEATS: usize = 7;
+
+        let f = SoundexFunc;
+        let args = [SqliteValue::Text(SmallText::from_string("Robert"))];
+        let mut text_best_ns = u128::MAX;
+        let mut checksum = 0usize;
+
+        for _ in 0..REPEATS {
+            let started = Instant::now();
+            for _ in 0..INVOCATIONS {
+                let result = black_box(
+                    f.invoke(black_box(args.as_slice()))
+                        .expect("soundex benchmark invocation must succeed"),
+                );
+                if let SqliteValue::Text(text) = result {
+                    checksum = checksum.wrapping_add(text.len());
+                }
+            }
+            text_best_ns = text_best_ns.min(started.elapsed().as_nanos());
+        }
+
+        println!(
+            "soundex_text_arg invocations={INVOCATIONS} repeats={REPEATS} text_best_ns={text_best_ns} checksum={checksum}"
         );
     }
 
