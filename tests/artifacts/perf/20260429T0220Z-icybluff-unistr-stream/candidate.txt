@@ -49,4 +49,3 @@ unistr_text_args invocations=500000 repeats=7 plain_best_ns=59928118 escaped_bes
 test builtins::tests::perf_unistr_text_args ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 373 filtered out; finished in 1.23s
-
