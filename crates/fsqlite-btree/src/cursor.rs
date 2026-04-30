@@ -1929,15 +1929,14 @@ impl<P: PageReader> BtCursor<P> {
     /// child page numbers directly from raw cell bytes (4-byte BE at cell
     /// offset) to avoid full parse_cell_at overhead.
     fn count_all_rows_iterative(&mut self, cx: &Cx) -> Result<i64> {
-        // Stack: (page_no, next_cell_idx, cell_count, right_child, header_size).
-        // Zero-allocation hot path: reads page data + header only, no Vec<u16>
-        // cell_pointers per page.
-        let mut visit_stack: Vec<(PageNumber, u16, u16, Option<PageNumber>, usize)> =
-            Vec::with_capacity(8);
+        // Pending child pages for a depth-first walk. Interior pages are read
+        // once: all child page numbers are extracted from their cell-pointer
+        // array up front instead of rereading the parent for each child.
+        let mut pending_pages: SmallVec<[PageNumber; 16]> = SmallVec::new();
+        pending_pages.push(self.root_page);
         let mut total: i64 = 0;
-        let mut current_page = self.root_page;
 
-        loop {
+        while let Some(current_page) = pending_pages.pop() {
             observe_cursor_cancellation(cx)?;
             self.note_page_visit(current_page);
 
@@ -1947,33 +1946,6 @@ impl<P: PageReader> BtCursor<P> {
 
             if header.page_type.is_leaf() {
                 total = total.saturating_add(i64::from(header.cell_count));
-
-                loop {
-                    let Some((parent_page, cell_idx, cell_count, right_child, hdr_size)) =
-                        visit_stack.last_mut()
-                    else {
-                        return Ok(total);
-                    };
-
-                    if *cell_idx < *cell_count {
-                        let parent_data = self.pager.read_page_data(cx, *parent_page)?;
-                        let parent_bytes = parent_data.as_bytes();
-                        let cell_ptr = Self::read_cell_pointer_inline(
-                            parent_bytes,
-                            *parent_page,
-                            *hdr_size,
-                            *cell_idx,
-                        )?;
-                        let child = Self::read_child_at_offset(parent_bytes, cell_ptr as usize)?;
-                        *cell_idx += 1;
-                        current_page = child;
-                        break;
-                    } else if let Some(rc) = right_child.take() {
-                        current_page = rc;
-                        break;
-                    }
-                    visit_stack.pop();
-                }
             } else {
                 let cell_count = header.cell_count;
                 let hdr_size = header.page_type.header_size() as usize;
@@ -1991,18 +1963,21 @@ impl<P: PageReader> BtCursor<P> {
                     total = total.saturating_add(i64::from(cell_count));
                 }
 
-                if cell_count == 0 {
-                    visit_stack.push((current_page, 0, 0, None, hdr_size));
-                    current_page = right_child;
-                } else {
-                    let cell_ptr =
-                        Self::read_cell_pointer_inline(page_bytes, current_page, hdr_size, 0)?;
-                    let first_child = Self::read_child_at_offset(page_bytes, cell_ptr as usize)?;
-                    visit_stack.push((current_page, 1, cell_count, Some(right_child), hdr_size));
-                    current_page = first_child;
+                pending_pages.push(right_child);
+                for cell_idx in (0..cell_count).rev() {
+                    let cell_ptr = Self::read_cell_pointer_inline(
+                        page_bytes,
+                        current_page,
+                        hdr_size,
+                        cell_idx,
+                    )?;
+                    let child = Self::read_child_at_offset(page_bytes, cell_ptr as usize)?;
+                    pending_pages.push(child);
                 }
             }
         }
+
+        Ok(total)
     }
 
     /// bd-wwqen.1: Read a 4-byte BE child page number directly from raw page
