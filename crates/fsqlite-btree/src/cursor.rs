@@ -7646,14 +7646,16 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(())
         })?;
 
-        // The uniqueness probe already positioned the cursor at the insertion
-        // successor/EOF. Reuse that position only when it is still a leaf; a
-        // probe can restore to an interior separator in deeper index trees, and
-        // inserting from that state was the historical 10k undercount failure.
-        if self
-            .stack
-            .last()
-            .is_some_and(|top| top.header.page_type.is_leaf())
+        // Rightmost probes leave the cursor at EOF/right edge, which is the
+        // hot monotonic stream this helper is meant to accelerate. Non-rightmost
+        // probes fall back to the canonical insert path: the additional safety
+        // seek is cheaper than holding a fragile interior/leaf reuse contract
+        // across mixed append workloads.
+        if inserted_after_existing_rightmost
+            && self
+                .stack
+                .last()
+                .is_some_and(|top| top.header.page_type.is_leaf())
         {
             self.index_insert_prechecked_absent(cx, key)?;
         } else {
