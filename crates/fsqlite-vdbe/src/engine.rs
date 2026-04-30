@@ -789,7 +789,18 @@ impl MemTable {
 
     /// Find a row by rowid. Returns the index.
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
+        if let Some(idx) = self.dense_rowid_offset(rowid) {
+            return Some(idx);
+        }
         self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()
+    }
+
+    fn dense_rowid_offset(&self, rowid: i64) -> Option<usize> {
+        let first_rowid = self.rows.first()?.rowid;
+        let offset = rowid.checked_sub(first_rowid)?;
+        let idx = usize::try_from(offset).ok()?;
+        let row = self.rows.get(idx)?;
+        (row.rowid == rowid).then_some(idx)
     }
 
     /// Return the values for a rowid, if present.
@@ -23569,6 +23580,28 @@ mod tests {
                 .next_rowid_hint(),
             12,
             "next_rowid should advance from the visible max"
+        );
+    }
+
+    #[test]
+    fn test_memtable_rowid_lookup_uses_dense_offset_without_breaking_sparse_rows() {
+        let mut table = MemTable::new(1);
+        table.insert(10, vec![SqliteValue::Integer(10)]);
+        table.insert(11, vec![SqliteValue::Integer(11)]);
+        table.insert(12, vec![SqliteValue::Integer(12)]);
+
+        assert_eq!(table.find_by_rowid(11), Some(1));
+        assert_eq!(
+            table.row_values_by_rowid(11),
+            Some(&[SqliteValue::Integer(11)][..])
+        );
+
+        assert!(table.delete_by_rowid(11), "middle row should be removed");
+        assert_eq!(table.find_by_rowid(11), None);
+        assert_eq!(
+            table.row_values_by_rowid(12),
+            Some(&[SqliteValue::Integer(12)][..]),
+            "sparse tables must still fall back to binary search"
         );
     }
 
