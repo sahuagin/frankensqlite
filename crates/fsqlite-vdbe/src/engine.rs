@@ -803,6 +803,15 @@ impl MemTable {
         (row.rowid == rowid).then_some(idx)
     }
 
+    fn rowid_lower_bound(&self, rowid: i64) -> usize {
+        if let Some(idx) = self.dense_rowid_offset(rowid) {
+            return idx;
+        }
+        match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
+            Ok(idx) | Err(idx) => idx,
+        }
+    }
+
     /// Return the values for a rowid, if present.
     pub fn row_values_by_rowid(&self, rowid: i64) -> Option<&[SqliteValue]> {
         self.find_by_rowid(rowid)
@@ -812,18 +821,8 @@ impl MemTable {
 
     /// Count rows whose rowid is in `[lower_inclusive, upper_exclusive)`.
     pub fn count_rowid_range(&self, lower_inclusive: i64, upper_exclusive: i64) -> usize {
-        let start = match self
-            .rows
-            .binary_search_by_key(&lower_inclusive, |r| r.rowid)
-        {
-            Ok(idx) | Err(idx) => idx,
-        };
-        let end = match self
-            .rows
-            .binary_search_by_key(&upper_exclusive, |r| r.rowid)
-        {
-            Ok(idx) | Err(idx) => idx,
-        };
+        let start = self.rowid_lower_bound(lower_inclusive);
+        let end = self.rowid_lower_bound(upper_exclusive);
         end.saturating_sub(start)
     }
 
@@ -833,18 +832,8 @@ impl MemTable {
         lower_inclusive: i64,
         upper_exclusive: i64,
     ) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
-        let start = match self
-            .rows
-            .binary_search_by_key(&lower_inclusive, |r| r.rowid)
-        {
-            Ok(idx) | Err(idx) => idx,
-        };
-        let end = match self
-            .rows
-            .binary_search_by_key(&upper_exclusive, |r| r.rowid)
-        {
-            Ok(idx) | Err(idx) => idx,
-        };
+        let start = self.rowid_lower_bound(lower_inclusive);
+        let end = self.rowid_lower_bound(upper_exclusive);
         let end = end.max(start);
         self.rows[start..end]
             .iter()
@@ -23602,6 +23591,42 @@ mod tests {
             table.row_values_by_rowid(12),
             Some(&[SqliteValue::Integer(12)][..]),
             "sparse tables must still fall back to binary search"
+        );
+    }
+
+    #[test]
+    fn test_memtable_rowid_range_bounds_use_dense_offset_with_sparse_fallback() {
+        let mut table = MemTable::new(1);
+        for rowid in 10..15 {
+            table.insert(rowid, vec![SqliteValue::Integer(rowid)]);
+        }
+
+        assert_eq!(table.count_rowid_range(11, 14), 3);
+        let dense_values = table
+            .iter_rows_in_rowid_range(11, 14)
+            .map(|(rowid, values)| (rowid, values[0].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dense_values,
+            vec![
+                (11, SqliteValue::Integer(11)),
+                (12, SqliteValue::Integer(12)),
+                (13, SqliteValue::Integer(13)),
+            ]
+        );
+
+        assert!(table.delete_by_rowid(12), "middle row should be removed");
+        assert_eq!(table.count_rowid_range(11, 14), 2);
+        let sparse_values = table
+            .iter_rows_in_rowid_range(11, 14)
+            .map(|(rowid, values)| (rowid, values[0].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sparse_values,
+            vec![
+                (11, SqliteValue::Integer(11)),
+                (13, SqliteValue::Integer(13)),
+            ]
         );
     }
 
