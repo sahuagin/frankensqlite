@@ -5518,6 +5518,16 @@ struct AggregateContext {
     distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
 
+struct AggStepCall<'a> {
+    accum_reg: i32,
+    is_distinct: bool,
+    func: &'a Arc<ErasedAggregateFunction>,
+    func_name: &'a str,
+    agg_collation: Option<&'a str>,
+    execution_cx: &'a Cx,
+    args: &'a [SqliteValue],
+}
+
 /// Original-row state captured for UPDATE's delete+insert rewrite so the old
 /// row can be restored if the replacement later hits a conflict.
 #[derive(Debug, Clone)]
@@ -10803,26 +10813,30 @@ impl VdbeEngine {
                         Self::agg_step_with_args(
                             &mut self.cold_state,
                             &mut self.statement_cold_state,
-                            accum_reg,
-                            is_distinct,
-                            &func,
-                            func_name,
-                            agg_collation,
-                            &execution_cx,
-                            args,
+                            AggStepCall {
+                                accum_reg,
+                                is_distinct,
+                                func: &func,
+                                func_name,
+                                agg_collation,
+                                execution_cx: &execution_cx,
+                                args,
+                            },
                         )?;
                     } else {
                         let args = self.collect_reg_range(op.p2, arg_count);
                         Self::agg_step_with_args(
                             &mut self.cold_state,
                             &mut self.statement_cold_state,
-                            accum_reg,
-                            is_distinct,
-                            &func,
-                            func_name,
-                            agg_collation,
-                            &execution_cx,
-                            &args,
+                            AggStepCall {
+                                accum_reg,
+                                is_distinct,
+                                func: &func,
+                                func_name,
+                                agg_collation,
+                                execution_cx: &execution_cx,
+                                args: &args,
+                            },
                         )?;
                     }
                     pc += 1;
@@ -13032,24 +13046,18 @@ impl VdbeEngine {
     fn agg_step_with_args(
         cold_state: &mut Option<Box<ColdVdbeState>>,
         statement_cold_state: &mut StatementColdState,
-        accum_reg: i32,
-        is_distinct: bool,
-        func: &Arc<ErasedAggregateFunction>,
-        func_name: &str,
-        agg_collation: Option<&str>,
-        execution_cx: &Cx,
-        args: &[SqliteValue],
+        step: AggStepCall<'_>,
     ) -> Result<()> {
         statement_cold_state.insert(StatementColdState::AGGREGATES);
         let ctx = cold_state
             .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
             .aggregates
-            .entry_or_insert_with(accum_reg, || {
-                let state = func.initial_state();
+            .entry_or_insert_with(step.accum_reg, || {
+                let state = step.func.initial_state();
                 AggregateContext {
-                    func: func.clone(),
+                    func: step.func.clone(),
                     state,
-                    distinct_seen: if is_distinct {
+                    distinct_seen: if step.is_distinct {
                         Some(std::collections::HashSet::new())
                     } else {
                         None
@@ -13057,7 +13065,7 @@ impl VdbeEngine {
                 }
             });
 
-        if !Arc::ptr_eq(&ctx.func, func) {
+        if !Arc::ptr_eq(&ctx.func, step.func) {
             return Err(FrankenError::Internal(
                 "AggStep accumulator reused for a different aggregate".to_owned(),
             ));
@@ -13066,33 +13074,34 @@ impl VdbeEngine {
         // For DISTINCT aggregates, skip if we've already seen these args.
         // NULL values are always skipped for DISTINCT (SQL semantics).
         let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
-            if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
+            if step.args.iter().any(|a| matches!(a, SqliteValue::Null)) {
                 false
             } else {
-                seen.insert(distinct_key_collated(args, agg_collation))
+                seen.insert(distinct_key_collated(step.args, step.agg_collation))
             }
         } else {
             true
         };
 
-        observe_execution_cancellation(execution_cx)?;
+        observe_execution_cancellation(step.execution_cx)?;
         if should_step {
-            if let Some(collation) = agg_collation
-                && (func_name.eq_ignore_ascii_case("min") || func_name.eq_ignore_ascii_case("max"))
-                && !args.is_empty()
-                && !args[0].is_null()
+            if let Some(collation) = step.agg_collation
+                && (step.func_name.eq_ignore_ascii_case("min")
+                    || step.func_name.eq_ignore_ascii_case("max"))
+                && !step.args.is_empty()
+                && !step.args[0].is_null()
             {
                 agg_step_min_max_collated(
                     &mut ctx.state,
-                    &args[0],
-                    func_name.eq_ignore_ascii_case("max"),
+                    &step.args[0],
+                    step.func_name.eq_ignore_ascii_case("max"),
                     collation,
                 );
             } else {
-                ctx.func.step(&mut ctx.state, args)?;
+                ctx.func.step(&mut ctx.state, step.args)?;
             }
         }
-        observe_execution_cancellation(execution_cx)
+        observe_execution_cancellation(step.execution_cx)
     }
 
     #[allow(dead_code)]
