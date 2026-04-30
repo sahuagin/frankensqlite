@@ -23604,14 +23604,14 @@ mod tests {
         assert_eq!(table.count_rowid_range(11, 14), 3);
         let dense_values = table
             .iter_rows_in_rowid_range(11, 14)
-            .map(|(rowid, values)| (rowid, values[0].clone()))
+            .map(|(rowid, values)| (rowid, values.first().cloned()))
             .collect::<Vec<_>>();
         assert_eq!(
             dense_values,
             vec![
-                (11, SqliteValue::Integer(11)),
-                (12, SqliteValue::Integer(12)),
-                (13, SqliteValue::Integer(13)),
+                (11, Some(SqliteValue::Integer(11))),
+                (12, Some(SqliteValue::Integer(12))),
+                (13, Some(SqliteValue::Integer(13))),
             ]
         );
 
@@ -23619,13 +23619,13 @@ mod tests {
         assert_eq!(table.count_rowid_range(11, 14), 2);
         let sparse_values = table
             .iter_rows_in_rowid_range(11, 14)
-            .map(|(rowid, values)| (rowid, values[0].clone()))
+            .map(|(rowid, values)| (rowid, values.first().cloned()))
             .collect::<Vec<_>>();
         assert_eq!(
             sparse_values,
             vec![
-                (11, SqliteValue::Integer(11)),
-                (13, SqliteValue::Integer(13)),
+                (11, Some(SqliteValue::Integer(11))),
+                (13, Some(SqliteValue::Integer(13))),
             ]
         );
     }
