@@ -1875,6 +1875,10 @@ document.querySelectorAll('[id^="section-"]').forEach(el => observer.observe(el)
             summary.csqlite_faster,
         ));
 
+        if !ensure_report_parent_dir(path, "HTML") {
+            return;
+        }
+
         let Ok(mut file) = std::fs::File::create(path) else {
             eprintln!("ERROR: Could not create HTML file at {path}");
             return;
@@ -2949,6 +2953,54 @@ mod tests {
                 .average_ratio
                 .expect("average ratio should exist for comparable row")
                 > 1.0
+        );
+    }
+
+    #[test]
+    fn write_json_report_creates_parent_directories() {
+        let report = sample_report();
+        let json = build_json_report(
+            &report,
+            Duration::from_secs(1),
+            JsonRunConfig {
+                quick: true,
+                filter: Some("insert".to_owned()),
+                warmup_iterations: WARMUP_ITERS,
+                min_iterations: MIN_ITERS,
+                max_iterations: MAX_ITERS,
+                target_duration_secs: TARGET_DURATION.as_secs(),
+                row_counts: vec![100],
+                html_output_path: None,
+                json_output_path: None,
+                json_stdout: false,
+            },
+            DetectedEnvironment {
+                os: Some("TestOS".to_owned()),
+                arch: "x86_64".to_owned(),
+                kernel_release: None,
+                cpu_model: None,
+                cpu_cores: Some(8),
+                ram_gb: None,
+                active_toolchain: None,
+                rust_version: None,
+                cargo_version: None,
+                git_commit_sha: None,
+                git_branch: Some("main".to_owned()),
+                build_profile: "release-perf".to_owned(),
+            },
+        );
+        let temp = tempfile::tempdir().expect("temp directory should be created");
+        let report_path = temp.path().join("nested").join("bench.json");
+        let report_path = report_path
+            .to_str()
+            .expect("temp report path should be valid UTF-8");
+
+        write_json_report(&json, report_path);
+
+        let written = std::fs::read_to_string(report_path).expect("JSON report should be written");
+        assert!(
+            written.contains(JSON_REPORT_SCHEMA_V3),
+            "written JSON should include the benchmark schema version"
         );
     }
 
@@ -4258,9 +4310,34 @@ fn write_json_report(report: &JsonBenchmarkReport, path: &str) {
         return;
     };
 
+    if !ensure_report_parent_dir(path, "JSON") {
+        return;
+    }
+
     match std::fs::write(path, format!("{json}\n")) {
         Ok(()) => eprintln!("JSON report written to: {path}"),
         Err(e) => eprintln!("ERROR: Could not write JSON report: {e}"),
+    }
+}
+
+fn ensure_report_parent_dir(path: &str, report_kind: &str) -> bool {
+    let path = std::path::Path::new(path);
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return true;
+    };
+
+    match std::fs::create_dir_all(parent) {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "ERROR: Could not create {report_kind} report parent directory {}: {err}",
+                parent.display()
+            );
+            false
+        }
     }
 }
 
