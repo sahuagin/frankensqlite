@@ -5080,6 +5080,51 @@ where
         Ok(self.published.snapshot())
     }
 
+    /// Refresh the publication plane for a clean WAL-mode read boundary.
+    ///
+    /// Clean prepared-read fast paths only need to learn whether the visible
+    /// WAL/header horizon changed. When the pager is already in WAL mode and
+    /// rollback-journal recovery is clean, the WAL refresh itself supplies the
+    /// required cross-process visibility probe; taking the database-file shared
+    /// lock and probing the rollback journal only adds work to the hot read
+    /// path.
+    pub fn refresh_published_snapshot_for_clean_wal_read(
+        &self,
+        cx: &Cx,
+    ) -> Result<PagerPublishedSnapshot> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+        if inner.active_transactions > 0 || inner.checkpoint_active {
+            return Ok(self.published.snapshot());
+        }
+
+        if inner.journal_mode != JournalMode::Wal
+            || inner.rollback_journal_recovery_state.is_pending()
+        {
+            drop(inner);
+            return self.refresh_published_snapshot(cx);
+        }
+
+        let commit_seq_before_refresh = inner.commit_seq;
+        inner.refresh_committed_state(cx, &self.cache, &self.wal_backend)?;
+        self.published.publish_clear_if(
+            cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: inner.commit_seq,
+                db_size: inner.db_size,
+                journal_mode: inner.journal_mode,
+                freelist_count: inner.freelist.len(),
+                checkpoint_active: inner.checkpoint_active,
+            },
+            inner.commit_seq != commit_seq_before_refresh,
+        );
+
+        Ok(self.published.snapshot())
+    }
+
     /// Number of snapshot retries steady-state readers have taken.
     #[must_use]
     pub fn published_read_retry_count(&self) -> u64 {
