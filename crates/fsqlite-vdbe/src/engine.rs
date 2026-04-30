@@ -193,6 +193,8 @@ const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// this engine, so the UPDATE marker must live above them.
 const OPFLAG_ISUPDATE: u16 = 0x10;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
+static BUILTIN_COLLATION_REGISTRY: LazyLock<CollationRegistry> =
+    LazyLock::new(CollationRegistry::default);
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct StatementColdState(u16);
@@ -3480,19 +3482,39 @@ impl CursorBackend {
         }
     }
 
-    /// Insert a key into a UNIQUE index B-tree, checking for duplicates.
-    fn index_insert_unique(
+    /// Insert a key into a UNIQUE index B-tree and report whether the key
+    /// landed after the previously-existing rightmost key.
+    fn index_insert_unique_with_rightmost_report(
         &mut self,
         cx: &Cx,
         key: &[u8],
         n_unique_cols: usize,
         columns_label: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self {
-            Self::Mem(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
-            Self::Txn(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
+            Self::Mem(c) => {
+                c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+            }
+            Self::Txn(c) => {
+                c.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+            }
             Self::TimeTravel(_) => Err(FrankenError::Internal(
                 "time-travel cursors are read-only: index_insert_unique not permitted".to_owned(),
+            )),
+        }
+    }
+
+    /// Append an index key from the current rightmost cursor position.
+    fn index_append_after_current_rightmost_position(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+    ) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.index_append_after_current_rightmost_position(cx, key),
+            Self::Txn(c) => c.index_append_after_current_rightmost_position(cx, key),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: index_insert not permitted".to_owned(),
             )),
         }
     }
@@ -3563,6 +3585,13 @@ struct StorageCursor {
     /// it when the caller proved the insert landed at EOF/rightmost, because
     /// only then can a strictly larger next rowid safely reuse the append path.
     last_successful_insert_rowid: Option<i64>,
+    /// Last UNIQUE index prefix known to have been inserted at the right edge.
+    ///
+    /// For monotonic composite UNIQUE streams, this lets `IdxInsert` skip the
+    /// duplicate-probe seek and append from the current right-edge position.
+    last_rightmost_unique_index_prefix: Option<Vec<SqliteValue>>,
+    /// Cursor position that produced `last_rightmost_unique_index_prefix`.
+    last_rightmost_unique_index_position: Option<CursorPositionStamp>,
     /// Cached rowid for the current cursor position (avoids repeated B-tree lookups).
     cached_rowid: Option<i64>,
     /// Cached result of payload_includes_rowid_alias check for the current row.
@@ -8152,6 +8181,8 @@ impl VdbeEngine {
                                 row_decode: RowDecodeScratch::default(),
                                 last_position_stamp: None,
                                 last_successful_insert_rowid: None,
+                                last_rightmost_unique_index_prefix: None,
+                                last_rightmost_unique_index_position: None,
                                 cached_rowid: None,
                                 payload_includes_rowid_alias: None,
                             },
@@ -9628,7 +9659,11 @@ impl VdbeEngine {
                                     P4::Table(s) => s.as_str(),
                                     _ => "",
                                 };
+                                let mut rightmost_prefix_after_insert: Option<Vec<SqliteValue>> =
+                                    None;
                                 let unique_insert_result = if uses_collated_unique_probe {
+                                    sc.last_rightmost_unique_index_prefix = None;
+                                    sc.last_rightmost_unique_index_position = None;
                                     let Some(collation_registry) =
                                         collated_unique_registry.as_ref()
                                     else {
@@ -9656,21 +9691,97 @@ impl VdbeEngine {
                                         Ok(())
                                     }
                                 } else {
-                                    match sc.cursor.index_insert_unique(
-                                        &sc.cx,
-                                        key_bytes,
-                                        n_idx_cols,
-                                        columns_label,
-                                    ) {
-                                        Ok(()) => Ok(()),
-                                        Err(FrankenError::UniqueViolation { columns }) => {
-                                            Err((FrankenError::UniqueViolation { columns }, None))
+                                    let fast_append_prefix =
+                                        if let (Some(last_prefix), Some(last_position)) = (
+                                            sc.last_rightmost_unique_index_prefix.as_ref(),
+                                            sc.last_rightmost_unique_index_position,
+                                        ) {
+                                            if sc.cursor.position_stamp() == Some(last_position) {
+                                                parse_non_null_index_prefix(key_bytes, n_idx_cols)
+                                                    .and_then(|new_prefix| {
+                                                        (compare_index_prefix_keys(
+                                                            last_prefix,
+                                                            &new_prefix,
+                                                            n_idx_cols,
+                                                            &index_desc_flags,
+                                                            &index_collations,
+                                                            &BUILTIN_COLLATION_REGISTRY,
+                                                        ) == Ordering::Less)
+                                                            .then_some(new_prefix)
+                                                    })
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                    if let Some(prefix) = fast_append_prefix {
+                                        if sc.cursor.index_append_after_current_rightmost_position(
+                                            &sc.cx, key_bytes,
+                                        )? {
+                                            rightmost_prefix_after_insert = Some(prefix);
+                                            Ok(())
+                                        } else {
+                                            match sc
+                                                .cursor
+                                                .index_insert_unique_with_rightmost_report(
+                                                    &sc.cx,
+                                                    key_bytes,
+                                                    n_idx_cols,
+                                                    columns_label,
+                                                ) {
+                                                Ok(inserted_after_rightmost) => {
+                                                    if inserted_after_rightmost {
+                                                        rightmost_prefix_after_insert =
+                                                            Some(prefix);
+                                                    }
+                                                    Ok(())
+                                                }
+                                                Err(FrankenError::UniqueViolation { columns }) => {
+                                                    Err((
+                                                        FrankenError::UniqueViolation { columns },
+                                                        None,
+                                                    ))
+                                                }
+                                                Err(err) => return Err(err),
+                                            }
                                         }
-                                        Err(err) => return Err(err),
+                                    } else {
+                                        match sc.cursor.index_insert_unique_with_rightmost_report(
+                                            &sc.cx,
+                                            key_bytes,
+                                            n_idx_cols,
+                                            columns_label,
+                                        ) {
+                                            Ok(inserted_after_rightmost) => {
+                                                if inserted_after_rightmost {
+                                                    rightmost_prefix_after_insert =
+                                                        parse_non_null_index_prefix(
+                                                            key_bytes, n_idx_cols,
+                                                        );
+                                                }
+                                                Ok(())
+                                            }
+                                            Err(FrankenError::UniqueViolation { columns }) => Err(
+                                                (FrankenError::UniqueViolation { columns }, None),
+                                            ),
+                                            Err(err) => return Err(err),
+                                        }
                                     }
                                 };
                                 match unique_insert_result {
                                     Ok(()) => {
+                                        if let (Some(prefix), Some(position)) = (
+                                            rightmost_prefix_after_insert,
+                                            sc.cursor.position_stamp(),
+                                        ) {
+                                            sc.last_rightmost_unique_index_prefix = Some(prefix);
+                                            sc.last_rightmost_unique_index_position =
+                                                Some(position);
+                                        } else {
+                                            sc.last_rightmost_unique_index_prefix = None;
+                                            sc.last_rightmost_unique_index_position = None;
+                                        }
                                         invalidate_storage_cursor_row_cache_with_reason(
                                             sc,
                                             self.collect_vdbe_metrics,
@@ -9679,6 +9790,8 @@ impl VdbeEngine {
                                         self.push_pending_idx_entry(cursor_id, key_bytes.to_vec());
                                     }
                                     Err((FrankenError::UniqueViolation { .. }, conflict_rowid)) => {
+                                        sc.last_rightmost_unique_index_prefix = None;
+                                        sc.last_rightmost_unique_index_position = None;
                                         match oe_flag {
                                             // OE_IGNORE (4): Undo the table
                                             // insert, roll back any already-inserted
@@ -9725,6 +9838,8 @@ impl VdbeEngine {
                                                     .ok_or_else(|| {
                                                         FrankenError::internal("cursor must exist")
                                                     })?;
+                                                sc2.last_rightmost_unique_index_prefix = None;
+                                                sc2.last_rightmost_unique_index_position = None;
                                                 sc2.cursor.index_insert(&sc2.cx, key_bytes)?;
                                                 invalidate_storage_cursor_row_cache_with_reason(
                                                     sc2,
@@ -9750,6 +9865,8 @@ impl VdbeEngine {
                                     Err((error, _)) => return Err(error),
                                 }
                             } else {
+                                sc.last_rightmost_unique_index_prefix = None;
+                                sc.last_rightmost_unique_index_position = None;
                                 sc.cursor.index_insert(&sc.cx, key_bytes)?;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
@@ -9827,6 +9944,8 @@ impl VdbeEngine {
                             )?
                         {
                             if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                                sc.last_rightmost_unique_index_prefix = None;
+                                sc.last_rightmost_unique_index_position = None;
                                 sc.cursor.delete(&sc.cx)?;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
@@ -9838,6 +9957,8 @@ impl VdbeEngine {
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
                             // Delete at current position.
+                            sc.last_rightmost_unique_index_prefix = None;
+                            sc.last_rightmost_unique_index_position = None;
                             sc.cursor.delete(&sc.cx)?;
                             invalidate_storage_cursor_row_cache_with_reason(
                                 sc,
@@ -12797,6 +12918,8 @@ impl VdbeEngine {
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
+                last_rightmost_unique_index_prefix: None,
+                last_rightmost_unique_index_position: None,
             },
         );
         tracing::info!(
@@ -13762,6 +13885,8 @@ impl VdbeEngine {
                             autoincrement_high_water,
                             last_alloc_rowid: 0,
                             last_successful_insert_rowid: None,
+                            last_rightmost_unique_index_prefix: None,
+                            last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
@@ -13874,6 +13999,8 @@ impl VdbeEngine {
                             autoincrement_high_water,
                             last_alloc_rowid: 0,
                             last_successful_insert_rowid: None,
+                            last_rightmost_unique_index_prefix: None,
+                            last_rightmost_unique_index_position: None,
                             payload_buf: Vec::new(),
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
@@ -14008,6 +14135,8 @@ impl VdbeEngine {
                 autoincrement_high_water,
                 last_alloc_rowid: 0,
                 last_successful_insert_rowid: None,
+                last_rightmost_unique_index_prefix: None,
+                last_rightmost_unique_index_position: None,
                 payload_buf: Vec::new(),
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
@@ -15593,6 +15722,14 @@ fn compare_sorter_keys(
         }
     }
     Ordering::Equal
+}
+
+fn parse_non_null_index_prefix(key_bytes: &[u8], key_columns: usize) -> Option<Vec<SqliteValue>> {
+    let fields = parse_record(key_bytes)?;
+    if fields.len() < key_columns || fields.iter().take(key_columns).any(SqliteValue::is_null) {
+        return None;
+    }
+    Some(fields.into_iter().take(key_columns).collect())
 }
 
 fn compare_index_prefix_keys(

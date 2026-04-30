@@ -7568,6 +7568,127 @@ impl<P: PageWriter> BtCursor<P> {
     }
 }
 
+#[allow(clippy::missing_errors_doc)]
+impl<P: PageWriter> BtCursor<P> {
+    /// Insert a UNIQUE index key and report whether the key was proven to be
+    /// strictly after the pre-existing rightmost key.
+    ///
+    /// The report is intentionally conservative. It is used by VDBE callers to
+    /// seed a same-statement monotonic append hint; correctness never depends
+    /// on receiving `true`.
+    #[doc(hidden)]
+    pub fn index_insert_unique_with_rightmost_report(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+        n_unique_cols: usize,
+        columns_label: &str,
+    ) -> Result<bool> {
+        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+        // Parse the new key to extract the indexed column values.
+        let new_fields = match parse_record(key) {
+            Some(f) => f,
+            None => {
+                self.index_insert(cx, key)?;
+                return Ok(false);
+            }
+        };
+        // Check that all indexed columns are non-NULL — if any is NULL,
+        // SQLite allows the insert regardless of uniqueness.
+        let any_null = new_fields
+            .iter()
+            .take(n_unique_cols)
+            .any(|v| matches!(v, fsqlite_types::SqliteValue::Null));
+        if any_null {
+            self.index_insert(cx, key)?;
+            return Ok(false);
+        }
+
+        let new_prefix = &new_fields[..n_unique_cols.min(new_fields.len())];
+        let mut inserted_after_existing_rightmost = false;
+
+        // Use index_seek to position cursor, then scan adjacent entries for
+        // prefix matches. We check the current entry and the predecessor.
+        // Because the full key includes the rowid suffix, two records with the
+        // same indexed columns but different rowids sort adjacently.
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
+            let _seek = cursor.index_seek(cx, key)?;
+            let restore_eof = cursor.at_eof;
+            inserted_after_existing_rightmost = restore_eof;
+
+            let mut to_check = Vec::with_capacity(2);
+
+            if !cursor.at_eof {
+                to_check.push(cursor.payload(cx)?);
+            }
+
+            if cursor.prev(cx)? {
+                to_check.push(cursor.payload(cx)?);
+            }
+
+            for existing_key in to_check {
+                if let Some(existing_fields) = parse_record(&existing_key) {
+                    if existing_fields.len() >= n_unique_cols
+                        && new_prefix == &existing_fields[..n_unique_cols]
+                    {
+                        return Err(FrankenError::UniqueViolation {
+                            columns: columns_label.to_owned(),
+                        });
+                    }
+                }
+            }
+
+            if restore_eof {
+                cursor.at_eof = true;
+            } else {
+                cursor.next(cx)?;
+            }
+            Ok(())
+        })?;
+
+        // The uniqueness probe already positioned the cursor at the insertion
+        // successor/EOF. Reuse that position only when it is still a leaf; a
+        // probe can restore to an interior separator in deeper index trees, and
+        // inserting from that state was the historical 10k undercount failure.
+        if self
+            .stack
+            .last()
+            .is_some_and(|top| top.header.page_type.is_leaf())
+        {
+            self.index_insert_prechecked_absent(cx, key)?;
+        } else {
+            self.index_insert(cx, key)?;
+        }
+        Ok(inserted_after_existing_rightmost)
+    }
+
+    /// Append an index key using the current right-edge cursor position.
+    ///
+    /// The caller must already have proved both uniqueness and monotonicity.
+    /// This function only verifies that the cursor is still positioned on the
+    /// rightmost insert edge; if not, it returns `Ok(false)` and leaves the
+    /// canonical insert path to the caller.
+    #[doc(hidden)]
+    pub fn index_append_after_current_rightmost_position(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+    ) -> Result<bool> {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if !cursor.is_on_rightmost_insert_edge() {
+                return Ok(false);
+            }
+            cursor.at_eof = true;
+            cursor.index_insert_from_current_position(cx, key)?;
+            Ok(true)
+        });
+        if matches!(result, Ok(true)) {
+            self.bump_row_image_epoch();
+        }
+        result
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BtreeCursorOps implementation
 // ---------------------------------------------------------------------------
@@ -7707,68 +7828,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         n_unique_cols: usize,
         columns_label: &str,
     ) -> Result<()> {
-        let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-        // Parse the new key to extract the indexed column values.
-        let new_fields = match parse_record(key) {
-            Some(f) => f,
-            None => return self.index_insert(cx, key),
-        };
-        // Check that all indexed columns are non-NULL — if any is NULL,
-        // SQLite allows the insert regardless of uniqueness.
-        let any_null = new_fields
-            .iter()
-            .take(n_unique_cols)
-            .any(|v| matches!(v, fsqlite_types::SqliteValue::Null));
-        if any_null {
-            return self.index_insert(cx, key);
-        }
-
-        let new_prefix = &new_fields[..n_unique_cols.min(new_fields.len())];
-
-        // Use index_seek to position cursor, then scan adjacent entries for
-        // prefix matches. We check the current entry and the predecessor.
-        // Because the full key includes the rowid suffix, two records with the
-        // same indexed columns but different rowids sort adjacently.
-        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
-            let _seek = cursor.index_seek(cx, key)?;
-            let restore_eof = cursor.at_eof;
-
-            let mut to_check = Vec::with_capacity(2);
-
-            if !cursor.at_eof {
-                to_check.push(cursor.payload(cx)?);
-            }
-
-            if cursor.prev(cx)? {
-                to_check.push(cursor.payload(cx)?);
-            }
-
-            for existing_key in to_check {
-                if let Some(existing_fields) = parse_record(&existing_key) {
-                    if existing_fields.len() >= n_unique_cols
-                        && new_prefix == &existing_fields[..n_unique_cols]
-                    {
-                        return Err(FrankenError::UniqueViolation {
-                            columns: columns_label.to_owned(),
-                        });
-                    }
-                }
-            }
-
-            if restore_eof {
-                cursor.at_eof = true;
-            } else {
-                cursor.next(cx)?;
-            }
-            Ok(())
-        })?;
-
-        // bd-wwqen.3: the post-probe successor/EOF state from index_insert_unique()
-        // is not reliable enough for deep monotonic unique-key streams. Reuse here
-        // undercounts the index on the exact 10k unique-email workload, so route
-        // unique inserts back through the canonical full insert path until a
-        // stronger reuse contract is proven.
-        self.index_insert(cx, key)
+        self.index_insert_unique_with_rightmost_report(cx, key, n_unique_cols, columns_label)
+            .map(|_| ())
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
@@ -10494,6 +10555,64 @@ mod tests {
         let seek = cursor.index_move_to(&cx, &last_key).unwrap();
         assert_eq!(seek, SeekResult::Found);
         assert_eq!(cursor.payload(&cx).unwrap(), last_key);
+    }
+
+    #[test]
+    fn test_index_unique_rightmost_append_helper_preserves_count_and_conflicts() {
+        let root = pn(2);
+        let store = MemPageStore::with_empty_index(root, USABLE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root, USABLE, false);
+        let key = |idx: i64, rowid: i64| {
+            serialize_record(&[
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(idx),
+                SqliteValue::Integer(rowid),
+            ])
+        };
+
+        let first = key(0, 100);
+        assert!(
+            cursor
+                .index_insert_unique_with_rightmost_report(&cx, &first, 2, "messages.conv_idx")
+                .unwrap(),
+            "empty-tree insert should report a rightmost insertion"
+        );
+
+        let second = key(1, 101);
+        assert!(
+            cursor
+                .index_append_after_current_rightmost_position(&cx, &second)
+                .unwrap(),
+            "cursor should still be on the right edge after the reported insert"
+        );
+
+        cursor.first(&cx).unwrap();
+        let third = key(2, 102);
+        assert!(
+            !cursor
+                .index_append_after_current_rightmost_position(&cx, &third)
+                .unwrap(),
+            "append helper must reject a cursor no longer positioned at the right edge"
+        );
+        assert!(
+            cursor
+                .index_insert_unique_with_rightmost_report(&cx, &third, 2, "messages.conv_idx")
+                .unwrap(),
+            "canonical fallback should reseed the rightmost hint"
+        );
+
+        let duplicate = key(1, 201);
+        let err = cursor
+            .index_insert_unique_with_rightmost_report(&cx, &duplicate, 2, "messages.conv_idx")
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::UniqueViolation { .. }));
+
+        assert_eq!(cursor.count_all_rows(&cx).unwrap(), 3);
+        assert_eq!(
+            scan_all_index_keys(&mut cursor, &cx).unwrap(),
+            vec![first, second, third]
+        );
     }
 
     #[test]
