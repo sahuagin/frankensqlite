@@ -15544,13 +15544,6 @@ fn ensure_storage_cursor_row_layout(
         refreshed = true;
     }
 
-    if !refreshed && !cursor.row_decode.is_empty() && cursor.payload_buf.len() >= min_payload_bytes {
-        return Ok(DecodeCacheRefreshState {
-            refreshed: false,
-            eager_values_ready: false,
-        });
-    }
-
     let required_bytes = min_payload_bytes;
     let mut requested_bytes = min_payload_bytes.max(STORAGE_CURSOR_LAYOUT_PREFIX_BYTES);
 
