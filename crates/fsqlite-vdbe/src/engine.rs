@@ -13243,6 +13243,7 @@ impl VdbeEngine {
                 let ipk_refresh =
                     ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
                 refresh_state.refreshed |= ipk_refresh.refreshed;
+                refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
             }
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
@@ -13291,6 +13292,7 @@ impl VdbeEngine {
                 let col_refresh =
                     ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics)?;
                 refresh_state.refreshed |= col_refresh.refreshed;
+                refresh_state.eager_values_ready |= col_refresh.eager_values_ready;
             }
             // Already decoded? Write from cache to register with buffer reuse.
             let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
@@ -13419,6 +13421,7 @@ impl VdbeEngine {
                     let ipk_refresh =
                         ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
                     refresh_state.refreshed |= ipk_refresh.refreshed;
+                    refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
                 }
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
@@ -13465,6 +13468,7 @@ impl VdbeEngine {
                     let col_refresh =
                         ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics)?;
                     refresh_state.refreshed |= col_refresh.refreshed;
+                    refresh_state.eager_values_ready |= col_refresh.eager_values_ready;
                 }
                 // Check if already decoded via bitmask.
                 let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
@@ -15486,6 +15490,14 @@ fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
     start.checked_add(len)
 }
 
+fn row_decode_payload_end(row_decode: &RowDecodeScratch) -> Option<usize> {
+    let mut end = 0_usize;
+    for idx in 0..row_decode.column_count() {
+        end = end.max(column_payload_end(row_decode.column_offset(idx)?)?);
+    }
+    Some(end)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct DecodeCacheRefreshState {
     refreshed: bool,
@@ -15590,9 +15602,24 @@ fn ensure_storage_cursor_row_layout(
             continue;
         }
 
+        let eager_values_ready = if cursor.row_decode.column_count() > 64
+            && !cursor.row_decode.cached_value_ready(64)
+            && row_decode_payload_end(&cursor.row_decode)
+                .is_some_and(|record_len| cursor.payload_buf.len() >= record_len)
+        {
+            cursor
+                .row_decode
+                .prepare_for_record(&cursor.payload_buf)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "malformed wide record in cursor payload".to_owned(),
+                })?
+        } else {
+            false
+        };
+
         return Ok(DecodeCacheRefreshState {
             refreshed,
-            eager_values_ready: false,
+            eager_values_ready,
         });
     }
 }
@@ -26727,9 +26754,10 @@ mod tests {
         let before = vdbe_metrics_snapshot();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let eof = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, eof, P4::None, 0);
 
             let body = b.current_addr();
             b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
@@ -26739,6 +26767,7 @@ mod tests {
             let next_target =
                 i32::try_from(body).expect("program counter should fit into i32 for tests");
             b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+            b.resolve_label(eof);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -26954,12 +26983,14 @@ mod tests {
         let before = vdbe_metrics_snapshot();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let eof = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(65), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, eof, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 64, 1, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 64, 2, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.resolve_label(eof);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
@@ -27052,12 +27083,14 @@ mod tests {
         let before_record_profile = fsqlite_types::record::record_profile_snapshot();
         let rows = run_with_storage_cursors(db, |b| {
             let end = b.emit_label();
+            let eof = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(65), 0);
-            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, eof, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 64, 1, P4::None, 0);
             b.emit_op(Opcode::Column, 0, 64, 2, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 1, 2, 0, P4::None, 0);
+            b.resolve_label(eof);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
