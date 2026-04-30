@@ -10827,17 +10827,17 @@ impl VdbeEngine {
 
                     observe_execution_cancellation(&execution_cx)?;
                     if should_step {
-                        let fn_lower = func_name.to_ascii_lowercase();
-                        if agg_collation.is_some()
-                            && (fn_lower == "min" || fn_lower == "max")
+                        if let Some(collation) = agg_collation
+                            && (func_name.eq_ignore_ascii_case("min")
+                                || func_name.eq_ignore_ascii_case("max"))
                             && !args.is_empty()
                             && !args[0].is_null()
                         {
                             agg_step_min_max_collated(
                                 &mut ctx.state,
                                 &args[0],
-                                fn_lower == "max",
-                                agg_collation.unwrap_or("BINARY"),
+                                func_name.eq_ignore_ascii_case("max"),
+                                collation,
                             );
                         } else {
                             ctx.func.step(&mut ctx.state, &args)?;
