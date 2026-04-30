@@ -29,7 +29,9 @@ use fsqlite_func::collation::CollationRegistry;
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
-use fsqlite_types::record::{RecordProfileScope, enter_record_profile_scope, parse_record};
+use fsqlite_types::record::{
+    RecordProfileScope, enter_record_profile_scope, parse_record, parse_record_prefix,
+};
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
 };
@@ -7585,14 +7587,19 @@ impl<P: PageWriter> BtCursor<P> {
         columns_label: &str,
     ) -> Result<bool> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-        // Parse the new key to extract the indexed column values.
-        let new_fields = match parse_record(key) {
+        // Parse only the indexed column prefix. The trailing rowid suffix is
+        // irrelevant to UNIQUE checks and can dominate hot ingest probes.
+        let new_fields = match parse_record_prefix(key, n_unique_cols) {
             Some(f) => f,
             None => {
                 self.index_insert(cx, key)?;
                 return Ok(false);
             }
         };
+        if new_fields.len() < n_unique_cols {
+            self.index_insert(cx, key)?;
+            return Ok(false);
+        }
         // Check that all indexed columns are non-NULL — if any is NULL,
         // SQLite allows the insert regardless of uniqueness.
         let any_null = new_fields
@@ -7604,7 +7611,7 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
 
-        let new_prefix = &new_fields[..n_unique_cols.min(new_fields.len())];
+        let new_prefix = &new_fields[..n_unique_cols];
         let mut inserted_after_existing_rightmost = false;
 
         // Use index_seek to position cursor, then scan adjacent entries for
@@ -7627,10 +7634,8 @@ impl<P: PageWriter> BtCursor<P> {
             }
 
             for existing_key in to_check {
-                if let Some(existing_fields) = parse_record(&existing_key) {
-                    if existing_fields.len() >= n_unique_cols
-                        && new_prefix == &existing_fields[..n_unique_cols]
-                    {
+                if let Some(existing_fields) = parse_record_prefix(&existing_key, n_unique_cols) {
+                    if existing_fields.len() >= n_unique_cols && new_prefix == existing_fields {
                         return Err(FrankenError::UniqueViolation {
                             columns: columns_label.to_owned(),
                         });
@@ -7646,16 +7651,14 @@ impl<P: PageWriter> BtCursor<P> {
             Ok(())
         })?;
 
-        // Rightmost probes leave the cursor at EOF/right edge, which is the
-        // hot monotonic stream this helper is meant to accelerate. Non-rightmost
-        // probes fall back to the canonical insert path: the additional safety
-        // seek is cheaper than holding a fragile interior/leaf reuse contract
-        // across mixed append workloads.
-        if inserted_after_existing_rightmost
-            && self
-                .stack
-                .last()
-                .is_some_and(|top| top.header.page_type.is_leaf())
+        // The uniqueness probe already positioned the cursor at the insertion
+        // successor/EOF. Reuse that position only when it is still a leaf; a
+        // probe can restore to an interior separator in deeper index trees, and
+        // inserting from that state was the historical 10k undercount failure.
+        if self
+            .stack
+            .last()
+            .is_some_and(|top| top.header.page_type.is_leaf())
         {
             self.index_insert_prechecked_absent(cx, key)?;
         } else {
