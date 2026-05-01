@@ -10522,6 +10522,9 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let probe_val = self.clone_reg_materialized(op.p3);
 
+                    let desc_flags = self.index_desc_flags_for_cursor(cursor_id);
+                    let collations = self.index_collations_for_cursor(cursor_id);
+
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.cursor.eof() {
@@ -10557,27 +10560,20 @@ impl VdbeEngine {
                         } else {
                             sc.target_vals_buf.len()
                         };
-                        let desc_flags = sc.cursor.index_desc_flags();
-                        let collations = sc.cursor.index_collations();
-                        let cmp = if index_prefix_uses_non_binary_collation(collations, n_compare) {
-                            let coll_arc = sc.cursor.collation_registry();
-                            let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
-                            compare_index_prefix_keys(
-                                &sc.cur_vals_buf,
-                                &sc.target_vals_buf,
-                                n_compare,
-                                desc_flags,
-                                collations,
-                                &coll_guard,
-                            )
-                        } else {
-                            compare_index_prefix_keys_binary(
-                                &sc.cur_vals_buf,
-                                &sc.target_vals_buf,
-                                n_compare,
-                                desc_flags,
-                            )
-                        };
+                        // Lock collation via a separately-owned Arc clone
+                        // so the mutable borrow on `sc` is not conflicted.
+                        // Avoids cloning cur/tgt vals into SmallVecs per cmp.
+                        let coll_arc = Arc::clone(&self.collation_registry);
+                        let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let cmp = compare_index_prefix_keys(
+                            &sc.cur_vals_buf,
+                            &sc.target_vals_buf,
+                            n_compare,
+                            &desc_flags,
+                            &collations,
+                            &coll_guard,
+                        );
+                        drop(coll_guard);
 
                         let condition_met = match op.opcode {
                             Opcode::IdxLE => cmp != Ordering::Greater,
@@ -10608,25 +10604,16 @@ impl VdbeEngine {
                             };
                             let desc_flags = self.index_desc_flags_for_root(cursor.root_page);
                             let collations = self.index_collations_for_root(cursor.root_page);
-                            let cmp =
-                                if index_prefix_uses_non_binary_collation(&collations, n_compare) {
-                                    let coll_guard = self.lock_collation();
-                                    compare_index_prefix_keys(
-                                        &row.values,
-                                        &probe_fields,
-                                        n_compare,
-                                        &desc_flags,
-                                        &collations,
-                                        &coll_guard,
-                                    )
-                                } else {
-                                    compare_index_prefix_keys_binary(
-                                        &row.values,
-                                        &probe_fields,
-                                        n_compare,
-                                        &desc_flags,
-                                    )
-                                };
+                            let coll_guard = self.lock_collation();
+                            let cmp = compare_index_prefix_keys(
+                                &row.values,
+                                &probe_fields,
+                                n_compare,
+                                &desc_flags,
+                                &collations,
+                                &coll_guard,
+                            );
+                            drop(coll_guard);
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
                                 Opcode::IdxGT => cmp == Ordering::Greater,
@@ -15866,47 +15853,6 @@ fn compare_index_prefix_keys(
         }
     }
     Ordering::Equal
-}
-
-fn compare_index_prefix_keys_binary(
-    lhs: &[SqliteValue],
-    rhs: &[SqliteValue],
-    key_columns: usize,
-    desc_flags: &[bool],
-) -> Ordering {
-    let key_count = key_columns.max(1);
-    for idx in 0..key_count {
-        let Some(lhs_value) = lhs.get(idx) else {
-            return if rhs.get(idx).is_some() {
-                Ordering::Less
-            } else {
-                break;
-            };
-        };
-        let Some(rhs_value) = rhs.get(idx) else {
-            return Ordering::Greater;
-        };
-
-        let mut ord = lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal);
-        if desc_flags.get(idx).copied().unwrap_or(false) {
-            ord = ord.reverse();
-        }
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
-fn index_prefix_uses_non_binary_collation(
-    collations: &[Option<String>],
-    key_columns: usize,
-) -> bool {
-    collations.iter().take(key_columns.max(1)).any(|collation| {
-        collation
-            .as_deref()
-            .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
-    })
 }
 
 /// Compare two `SqliteValue`s with an optional collation sequence.
@@ -26240,19 +26186,6 @@ mod tests {
             compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &coll_guard),
             Ordering::Less,
             "zero key_columns should still compare the leading term"
-        );
-        assert_eq!(
-            compare_index_prefix_keys_binary(&lhs, &rhs, 0, &[true]),
-            Ordering::Less,
-            "binary fast path should preserve descending prefix semantics"
-        );
-        assert!(
-            !index_prefix_uses_non_binary_collation(&[Some("BINARY".to_owned())], 1),
-            "BINARY collation should use the registry-free comparison path"
-        );
-        assert!(
-            index_prefix_uses_non_binary_collation(&[Some("NOCASE".to_owned())], 1),
-            "non-BINARY collation must keep the registry-backed path"
         );
     }
 
