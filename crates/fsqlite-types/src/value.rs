@@ -411,7 +411,7 @@ impl fmt::Display for SmallText {
 impl PartialEq for SmallText {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes_direct() == other.as_bytes_direct()
     }
 }
 
@@ -427,14 +427,15 @@ impl PartialOrd for SmallText {
 impl Ord for SmallText {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(other.as_str())
+        self.as_bytes_direct().cmp(other.as_bytes_direct())
     }
 }
 
 impl Hash for SmallText {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
+        state.write(self.as_bytes_direct());
+        state.write_u8(0xff);
     }
 }
 
@@ -2089,6 +2090,36 @@ mod tests {
             "cloned text should use the shared Arc representation"
         );
         assert_eq!(text.as_str(), cloned.as_str());
+    }
+
+    #[test]
+    fn test_small_text_byte_fast_paths_match_str_semantics() {
+        fn hash_of<T: Hash + ?Sized>(value: &T) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        for text in [
+            "",
+            "user_12345",
+            "snowman \u{2603}",
+            "this string is definitely longer than twenty three bytes",
+        ] {
+            let small = SmallText::new(text);
+            assert_eq!(small, SmallText::new(text));
+            assert_eq!(small.cmp(&SmallText::new(text)), text.cmp(text));
+            assert_eq!(
+                hash_of(&small),
+                hash_of(text),
+                "SmallText must preserve the Borrow<str> hash contract",
+            );
+        }
+
+        assert_eq!(
+            SmallText::new("user_100").cmp(&SmallText::new("user_20")),
+            "user_100".cmp("user_20"),
+        );
     }
 
     #[test]
