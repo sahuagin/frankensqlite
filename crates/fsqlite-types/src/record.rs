@@ -1503,7 +1503,10 @@ where
     I: Iterator<Item = &'a SqliteValue>,
 {
     let header_size = header.template.len();
-    let total_capacity = header_size + header.max_body_size;
+    let Some(total_capacity) = header_size.checked_add(header.max_body_size) else {
+        buf.clear();
+        return false;
+    };
     buf.clear();
     buf.reserve(total_capacity);
     buf.extend_from_slice(&header.template);
@@ -1511,9 +1514,11 @@ where
     let mut value_iter = values;
     for slot in &header.slots {
         let Some(value) = value_iter.next() else {
+            buf.clear();
             return false;
         };
         let Some((serial_byte, payload_len)) = slot.kind.serial_byte_and_payload_len(value) else {
+            buf.clear();
             return false;
         };
         if slot.kind.needs_runtime_patch() {
@@ -1523,6 +1528,7 @@ where
         append_serialized_value(value, payload_len, buf);
     }
     if value_iter.next().is_some() {
+        buf.clear();
         return false;
     }
 
@@ -2596,6 +2602,43 @@ mod tests {
         assert_eq!(buf.len(), exact);
         assert_eq!(buf.capacity(), capacity);
         assert_eq!(parse_record(&buf).unwrap(), values);
+    }
+
+    #[test]
+    fn opt_a2_precomputed_header_append_serializer_clears_partial_buffer_on_reject() {
+        let kinds = vec![PrecomputedSerialTypeKind::IntegerOrNull; 17];
+        let header = PrecomputedRecordHeader::new(&kinds);
+        let mut mismatched_values = vec![SqliteValue::Integer(1); 16];
+        mismatched_values.push(SqliteValue::Text(SmallText::new("not an integer")));
+        let mut buf = vec![0xA5; 64];
+
+        assert!(
+            !serialize_record_iter_with_precomputed_header_into(
+                mismatched_values.iter(),
+                &header,
+                &mut buf,
+            ),
+            "append fallback should reject values that do not match the header contract"
+        );
+        assert!(
+            buf.is_empty(),
+            "failed append fallback must not leave a partial record in the caller buffer"
+        );
+
+        let extra_values = vec![SqliteValue::Integer(1); 18];
+        buf.extend_from_slice(b"stale");
+        assert!(
+            !serialize_record_iter_with_precomputed_header_into(
+                extra_values.iter(),
+                &header,
+                &mut buf,
+            ),
+            "append fallback should reject extra values after serializing all header slots"
+        );
+        assert!(
+            buf.is_empty(),
+            "extra-value rejection must also clear the partially serialized record"
+        );
     }
 
     #[test]
