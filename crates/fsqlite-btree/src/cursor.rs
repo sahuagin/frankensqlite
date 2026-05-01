@@ -6507,7 +6507,14 @@ impl<P: PageWriter> BtCursor<P> {
 
         self.at_eof = true;
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        {
+            Ok(head) => head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                return Err(error);
+            }
+        };
 
         match self.try_append_on_current_leaf(cx, &cell_data) {
             Ok(true) => {
@@ -6690,7 +6697,14 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        {
+            Ok(head) => head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                return Err(error);
+            }
+        };
         let append_result = self.try_append_leaf_page_in_place(
             cx,
             hinted_leaf_page,
@@ -6922,7 +6936,14 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(true);
         }
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        {
+            Ok(head) => head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                return Err(error);
+            }
+        };
         let append_result = self.try_append_leaf_page_in_place(
             cx,
             hint.leaf_page,
@@ -12634,6 +12655,46 @@ mod tests {
             }
         }
         assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_cached_rightmost_hint_overflow_encode_error_retains_cell_buffer() {
+        const SMALL_USABLE: u32 = 256;
+        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
+            pn(2),
+            SMALL_USABLE,
+        )));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(
+            FailingOverflowStore::new(inner, usize::MAX),
+            pn(2),
+            SMALL_USABLE,
+            true,
+        );
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, b"seed")
+            .expect("seed insert should succeed");
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed insert should capture a retained rightmost-leaf hint");
+
+        cursor.cell_buf = Vec::with_capacity(4096);
+        let expected_capacity = cursor.cell_buf.capacity();
+        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+
+        let overflow_payload = vec![b'X'; 512];
+        let error = cursor
+            .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &overflow_payload)
+            .expect_err("injected overflow write failure should abort append");
+
+        assert!(
+            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+            "expected injected write failure, got {error:?}"
+        );
+        assert!(
+            cursor.cell_buf.capacity() >= expected_capacity,
+            "retained-hint overflow encode failure should return the reusable cell buffer"
+        );
     }
 
     #[test]
