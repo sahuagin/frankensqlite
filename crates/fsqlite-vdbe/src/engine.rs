@@ -12306,7 +12306,7 @@ impl VdbeEngine {
         borrowed_bindings: Option<&[SqliteValue]>,
         collect_vdbe_metrics: bool,
         affinity: Option<&str>,
-    ) -> Vec<SqliteValue> {
+    ) -> smallvec::SmallVec<[SqliteValue; 16]> {
         let binding_source = borrowed_bindings.unwrap_or(self.bindings.as_slice());
         let mut values = value_sources
             .iter()
@@ -12317,7 +12317,7 @@ impl VdbeEngine {
                     .unwrap_or(SqliteValue::Null),
                 InsertValueSource::Constant(value) => value.clone(),
             })
-            .collect::<Vec<_>>();
+            .collect::<smallvec::SmallVec<[_; 16]>>();
 
         if let Some(affinity) = affinity {
             for (value, ch) in values.iter_mut().zip(affinity.chars()) {
@@ -12368,7 +12368,8 @@ impl VdbeEngine {
             collect_vdbe_metrics,
             template.affinity.as_deref(),
         );
-        let payload = encode_record(&values);
+        let mut payload_buf = self.make_record_lookaside.take_buf();
+        fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
         let concurrent_allocator = self.concurrent_rowid_allocator.clone();
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let previous_last_insert_rowid = self.last_insert_rowid;
@@ -12404,10 +12405,12 @@ impl VdbeEngine {
                 )?
             };
             sc.cursor
-                .table_append_after_last_position(&sc.cx, rowid, &payload)?;
+                .table_append_after_last_position(&sc.cx, rowid, &payload_buf)?;
             sc.last_successful_insert_rowid = Some(rowid);
             rowid
         };
+        payload_buf.clear();
+        self.make_record_lookaside.replace_buf(payload_buf);
 
         self.changes += 1;
         self.last_insert_rowid = rowid;
