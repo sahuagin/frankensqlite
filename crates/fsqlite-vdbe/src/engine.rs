@@ -9637,6 +9637,17 @@ impl VdbeEngine {
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
+
+                    // If a previous IdxInsert for the same row triggered IGNORE,
+                    // skip all remaining index inserts for this row before touching
+                    // the MakeRecord sideband. Otherwise a skipped index entry drops
+                    // the reusable sideband buffer and forces the next row to
+                    // reallocate it.
+                    if self.conflict_skip_idx() {
+                        pc += 1;
+                        continue;
+                    }
+
                     let key_val = self.get_reg(key_reg).clone();
                     let sideband_active = self.make_record_lookaside.sideband_is_armed_for(key_reg);
                     let key_blob = if sideband_active {
@@ -9645,13 +9656,6 @@ impl VdbeEngine {
                     } else {
                         record_blob_bytes(&key_val).to_vec()
                     };
-
-                    // If a previous IdxInsert for the same row triggered IGNORE,
-                    // skip all remaining index inserts for this row.
-                    if self.conflict_skip_idx() {
-                        pc += 1;
-                        continue;
-                    }
 
                     let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
                     let index_collations = self.index_collations_for_cursor(cursor_id);
@@ -16683,6 +16687,61 @@ mod tests {
         let program = b.finish().expect("program should build");
         let rows = execute_program_with_engine(&mut engine, &program);
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_idxinsert_conflict_skip_preserves_make_record_sideband_buffer() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_value = builder.alloc_reg();
+        let r_record = builder.alloc_reg();
+        builder.emit_op(
+            Opcode::String8,
+            0,
+            r_value,
+            0,
+            P4::Str("idx-skip-sideband".repeat(32)),
+            0,
+        );
+        builder.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+        builder.emit_op(Opcode::IdxInsert, 0, r_record, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+
+        let program = builder.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&program, PageSize::DEFAULT);
+        let mut engine = VdbeEngine::new(program.register_count());
+        engine.set_conflict_skip_idx(true);
+
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let outcome = engine.execute(&program).expect("program should execute");
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            after - before,
+            0,
+            "skipped IdxInsert should not materialize a sideband-backed key"
+        );
+        assert!(
+            engine.make_record_lookaside.sideband_is_armed_for(r_record),
+            "skipped IdxInsert should leave the MakeRecord sideband attached to its register"
+        );
+        assert!(
+            !engine.make_record_lookaside.is_empty(),
+            "skipped IdxInsert should retain the sideband bytes for reuse/materialization"
+        );
+        assert!(
+            engine.make_record_lookaside.capacity() >= expected_capacity,
+            "skipped IdxInsert should not drop the reusable sideband allocation"
+        );
     }
 
     #[test]
