@@ -12122,16 +12122,25 @@ impl VdbeEngine {
                         }
 
                         // 3. Append to B-tree (prechecked absent — sequential rowid)
-                        let sc = self.storage_cursors.get_mut(&cursor_id).ok_or_else(|| {
-                            FrankenError::internal("cursor disappeared in FusedAppendInsert")
-                        })?;
-                        sc.cursor
-                            .table_append_after_last_position(&sc.cx, rowid, &rec_buf)?;
-                        sc.last_successful_insert_rowid = Some(rowid);
+                        let append_result =
+                            if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                                let result = sc
+                                    .cursor
+                                    .table_append_after_last_position(&sc.cx, rowid, &rec_buf);
+                                if result.is_ok() {
+                                    sc.last_successful_insert_rowid = Some(rowid);
+                                }
+                                result
+                            } else {
+                                Err(FrankenError::internal(
+                                    "cursor disappeared in FusedAppendInsert",
+                                ))
+                            };
 
                         // Return buffer for reuse
                         rec_buf.clear();
                         self.make_record_lookaside.replace_buf(rec_buf);
+                        append_result?;
 
                         // 4. Bookkeeping (same as Insert opcode)
                         self.changes += 1;
@@ -12368,8 +12377,6 @@ impl VdbeEngine {
             collect_vdbe_metrics,
             template.affinity.as_deref(),
         );
-        let mut payload_buf = self.make_record_lookaside.take_buf();
-        fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
         let concurrent_allocator = self.concurrent_rowid_allocator.clone();
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let previous_last_insert_rowid = self.last_insert_rowid;
@@ -12404,13 +12411,26 @@ impl VdbeEngine {
                     "rowid overflow in compiled simple INSERT",
                 )?
             };
-            sc.cursor
-                .table_append_after_last_position(&sc.cx, rowid, &payload_buf)?;
-            sc.last_successful_insert_rowid = Some(rowid);
             rowid
+        };
+        let mut payload_buf = self.make_record_lookaside.take_buf();
+        fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
+        let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id) {
+            let result = sc
+                .cursor
+                .table_append_after_last_position(&sc.cx, rowid, &payload_buf);
+            if result.is_ok() {
+                sc.last_successful_insert_rowid = Some(rowid);
+            }
+            result
+        } else {
+            Err(FrankenError::internal(
+                "compiled simple INSERT lost its cursor",
+            ))
         };
         payload_buf.clear();
         self.make_record_lookaside.replace_buf(payload_buf);
+        append_result?;
 
         self.changes += 1;
         self.last_insert_rowid = rowid;
@@ -17617,7 +17637,7 @@ mod tests {
         let root = db.create_table(5);
         let start = Instant::now();
 
-        let (_, final_db) = track_r_run_write_with_memdb(db, |b| {
+        let (observed_rows, _) = track_r_run_write_with_memdb(db, |b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(5), 0);
@@ -17633,21 +17653,27 @@ mod tests {
                 b.emit_op(Opcode::Insert, 0, 7, 1, P4::None, 0);
             }
 
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+            let body = b.emit_label();
+            b.resolve_label(body);
+            for column in 0_i32..5 {
+                let target_reg = column + 1;
+                b.emit_op(Opcode::Column, 0, column, target_reg, P4::None, 0);
+            }
+            b.emit_op(Opcode::ResultRow, 1, 5, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Next, 0, 0, body, P4::None, 0);
+
+            b.resolve_label(done);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
 
-        let table = final_db.get_table(root).expect("table should exist");
         assert_eq!(
-            table.rows.len(),
+            observed_rows.len(),
             row_count,
             "MakeRecord INSERT path should persist every generated row",
         );
-        let observed_rows = table
-            .rows
-            .iter()
-            .map(|row| row.values.clone())
-            .collect::<Vec<_>>();
 
         let oracle = rusqlite::Connection::open_in_memory().expect("oracle should open");
         oracle
@@ -22685,10 +22711,15 @@ mod tests {
             "MakeRecord scratch should retain its pre-sized capacity across the statement"
         );
         assert!(
-            engine.make_record_lookaside.is_empty(),
-            "statement scratch should be length-reset after the final MakeRecord"
+            !engine.make_record_lookaside.is_empty(),
+            "final MakeRecord should keep record bytes in the sideband until consumed"
         );
-        let decoded = decode_record(engine.get_reg(r_record)).expect("record should decode");
+        let materialized = engine.clone_reg_materialized(r_record);
+        assert!(
+            engine.make_record_lookaside.is_empty(),
+            "statement scratch should be length-reset after sideband materialization"
+        );
+        let decoded = decode_record(&materialized).expect("record should decode");
         assert_eq!(decoded, vec![SqliteValue::Text("tiny".into())]);
     }
 
