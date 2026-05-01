@@ -1813,27 +1813,24 @@ where
     let header_size = compute_header_size(header_content_size);
     let total_size = header_size + body_size;
     buf.clear();
-    buf.resize(total_size, 0);
+    if buf.capacity() < total_size {
+        buf.reserve(total_size - buf.capacity());
+    }
+    buf.resize(header_size, 0);
 
     let mut header_offset = write_varint(
         buf.as_mut_slice(),
         u64::try_from(header_size).unwrap_or(u64::MAX),
     );
-    let mut body_offset = header_size;
 
     for value in values {
         let (serial_type, payload_len) = serialized_value_layout(value);
         header_offset += write_varint(&mut buf[header_offset..], serial_type);
-        encode_serialized_value(
-            value,
-            payload_len,
-            &mut buf[body_offset..body_offset + payload_len],
-        );
-        body_offset += payload_len;
+        append_serialized_value(value, payload_len, buf);
     }
 
     debug_assert_eq!(header_offset, header_size);
-    debug_assert_eq!(body_offset, total_size);
+    debug_assert_eq!(buf.len(), total_size);
 }
 
 /// Vectorized two-pass batch encoder for the SQLite record format.
