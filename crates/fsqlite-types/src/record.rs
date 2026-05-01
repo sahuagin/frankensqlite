@@ -835,6 +835,14 @@ fn recycle_values_from(values: &mut Vec<SqliteValue>, start: usize) {
     }
 }
 
+#[inline]
+fn clear_value_slots(values: &mut [SqliteValue]) {
+    for value in values {
+        let old_value = std::mem::replace(value, SqliteValue::Null);
+        pool_return_reusable(old_value);
+    }
+}
+
 impl RecordDecodeScratch {
     /// Prepare the scratch for a new serialized record.
     ///
@@ -892,10 +900,10 @@ impl RecordDecodeScratch {
         Some(col_count)
     }
 
-    /// Drop the cached layout and decoded values while preserving capacity for reuse.
+    /// Drop the cached layout and decoded values while preserving value slots.
     pub fn invalidate(&mut self) {
         self.header_offsets.clear();
-        recycle_values_from(&mut self.values, 0);
+        clear_value_slots(&mut self.values);
         self.decoded_mask = 0;
     }
 
@@ -2704,15 +2712,19 @@ mod tests {
     fn decode_value_reuses_unique_blob_buffer_for_same_length_payload() {
         let mut slot = SqliteValue::Blob(Arc::from([1_u8, 2, 3, 4].as_slice()));
         let SqliteValue::Blob(existing) = &slot else {
-            panic!("expected blob slot");
+            assert!(matches!(&slot, SqliteValue::Blob(_)));
+            return;
         };
         let original_ptr = Arc::as_ptr(existing);
 
         decode_value_into(serial_type_for_blob(4), &[9_u8, 8, 7, 6], &mut slot, false)
             .expect("decode succeeds");
 
-        let SqliteValue::Blob(updated) = &slot else {
-            panic!("slot should remain blob");
+        assert!(matches!(&slot, SqliteValue::Blob(_)));
+        let updated = if let SqliteValue::Blob(updated) = &slot {
+            updated
+        } else {
+            return;
         };
         assert_eq!(Arc::as_ptr(updated), original_ptr);
         assert_eq!(updated.as_ref(), &[9_u8, 8, 7, 6]);
@@ -2727,14 +2739,18 @@ mod tests {
 
         let hint = SqliteValue::Text(SmallText::from_arc(Arc::<str>::from(text)));
         let SqliteValue::Text(existing) = &hint else {
-            panic!("expected text hint");
+            assert!(matches!(&hint, SqliteValue::Text(_)));
+            return;
         };
         let original_ptr = existing.as_str().as_ptr();
 
         let decoded = decode_column_from_offset_reuse(&record, &offsets[0], Some(&hint), false)
             .expect("decode succeeds");
-        let SqliteValue::Text(reused) = decoded else {
-            panic!("decoded value should remain text");
+        assert!(matches!(&decoded, SqliteValue::Text(_)));
+        let reused = if let SqliteValue::Text(reused) = decoded {
+            reused
+        } else {
+            return;
         };
         assert_eq!(reused.as_str().as_ptr(), original_ptr);
         assert_eq!(reused.as_str(), text);
@@ -2749,14 +2765,18 @@ mod tests {
 
         let hint = SqliteValue::Blob(Arc::from(blob.as_slice()));
         let SqliteValue::Blob(existing) = &hint else {
-            panic!("expected blob hint");
+            assert!(matches!(&hint, SqliteValue::Blob(_)));
+            return;
         };
         let original_ptr = Arc::as_ptr(existing);
 
         let decoded = decode_column_from_offset_reuse(&record, &offsets[0], Some(&hint), false)
             .expect("decode succeeds");
-        let SqliteValue::Blob(reused) = decoded else {
-            panic!("decoded value should remain blob");
+        assert!(matches!(&decoded, SqliteValue::Blob(_)));
+        let reused = if let SqliteValue::Blob(reused) = decoded {
+            reused
+        } else {
+            return;
         };
         assert_eq!(Arc::as_ptr(&reused), original_ptr);
         assert_eq!(reused.as_ref(), blob.as_slice());
@@ -2855,7 +2875,12 @@ mod tests {
         scratch.invalidate();
         assert!(scratch.is_empty());
         assert!(!scratch.cached_value_ready(1));
-        assert!(scratch.cached_value(1).is_none());
+        assert!(scratch.cached_value(1).is_some_and(SqliteValue::is_null));
+        assert_eq!(
+            scratch.values.len(),
+            2,
+            "invalidate should preserve narrow-record value slots for reuse"
+        );
     }
 
     #[test]
@@ -4310,7 +4335,12 @@ mod tests {
                 "trial {trial}: generator must produce homogeneous rows"
             );
             let fast = encode_batch_homogeneous(&row_refs).unwrap_or_else(|| {
-                panic!("trial {trial}: homogeneous encode must succeed (N={n_rows})")
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "trial {trial}: homogeneous encode must succeed (N={n_rows})"
+                );
+                Vec::new()
             });
             let slow = encode_batch_as_vec(&rows);
             assert_eq!(
