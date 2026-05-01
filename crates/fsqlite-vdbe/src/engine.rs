@@ -5155,6 +5155,11 @@ impl MakeRecordStatementLookaside {
         self.buf = buf;
     }
 
+    fn replace_cleared_buf(&mut self, mut buf: Vec<u8>) {
+        buf.clear();
+        self.buf = buf;
+    }
+
     fn arm_sideband(&mut self, register: i32) {
         self.sideband_reg = register;
     }
@@ -9823,6 +9828,10 @@ impl VdbeEngine {
                                                 self.rollback_pending_insert_after_index_conflict(
                                                 )?;
                                                 self.set_conflict_skip_idx(true);
+                                                if sideband_active {
+                                                    self.make_record_lookaside
+                                                        .replace_cleared_buf(key_blob);
+                                                }
                                                 pc += 1;
                                                 continue;
                                             }
@@ -9902,6 +9911,9 @@ impl VdbeEngine {
                     }
                     // No MemDatabase fallback: Phase 4 in-memory backend doesn't
                     // support indexes (they're a no-op there).
+                    if sideband_active {
+                        self.make_record_lookaside.replace_cleared_buf(key_blob);
+                    }
                     pc += 1;
                 }
 
@@ -16741,6 +16753,74 @@ mod tests {
         assert!(
             engine.make_record_lookaside.capacity() >= expected_capacity,
             "skipped IdxInsert should not drop the reusable sideband allocation"
+        );
+    }
+
+    #[test]
+    fn test_idxinsert_returns_make_record_sideband_buffer_after_storage_insert() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let index_value = "idx-insert-sideband".repeat(32);
+        let expected_key = encode_record(&[SqliteValue::Text(index_value.clone().into())]);
+
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_value = builder.alloc_reg();
+        let r_record = builder.alloc_reg();
+        builder.emit_op(Opcode::String8, 0, r_value, 0, P4::Str(index_value), 0);
+        builder.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+        builder.emit_op(Opcode::IdxInsert, 0, r_record, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+
+        let program = builder.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&program, PageSize::DEFAULT);
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let outcome = engine.execute(&program).expect("program should execute");
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            after - before,
+            0,
+            "IdxInsert should consume MakeRecord sideband bytes without materializing"
+        );
+        assert!(
+            engine.make_record_lookaside.is_empty(),
+            "successful IdxInsert should return a cleared scratch buffer"
+        );
+        assert!(
+            engine.make_record_lookaside.capacity() >= expected_capacity,
+            "successful IdxInsert should keep the reusable sideband allocation"
+        );
+
+        let index_cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("index cursor should remain available");
+        assert!(
+            index_cursor
+                .cursor
+                .index_move_to(&index_cursor.cx, &expected_key)
+                .expect("index seek should succeed")
+                .is_found(),
+            "IdxInsert should still insert the key while recycling the sideband buffer"
         );
     }
 
