@@ -804,6 +804,15 @@ impl MemTable {
     }
 
     fn rowid_lower_bound(&self, rowid: i64) -> usize {
+        let Some(first) = self.rows.first() else {
+            return 0;
+        };
+        if rowid <= first.rowid {
+            return 0;
+        }
+        if self.rows.last().is_some_and(|last| rowid > last.rowid) {
+            return self.rows.len();
+        }
         if let Some(idx) = self.dense_rowid_offset(rowid) {
             return idx;
         }
@@ -23601,6 +23610,8 @@ mod tests {
         }
 
         assert_eq!(table.count_rowid_range(11, 14), 3);
+        assert_eq!(table.count_rowid_range(i64::MIN, 12), 2);
+        assert_eq!(table.count_rowid_range(13, i64::MAX), 8);
         let dense_values = table
             .iter_rows_in_rowid_range(11, 14)
             .map(|(rowid, values)| (rowid, values.first().cloned()))
@@ -23616,6 +23627,8 @@ mod tests {
 
         assert!(table.delete_by_rowid(12), "middle row should be removed");
         assert_eq!(table.count_rowid_range(11, 14), 2);
+        assert_eq!(table.count_rowid_range(i64::MIN, 12), 1);
+        assert_eq!(table.count_rowid_range(13, i64::MAX), 8);
         let sparse_values = table
             .iter_rows_in_rowid_range(11, 14)
             .map(|(rowid, values)| (rowid, values.first().cloned()))
