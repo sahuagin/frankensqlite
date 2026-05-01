@@ -851,6 +851,20 @@ impl CellSlotCache {
         self.entries.clear();
     }
 
+    fn promote_existing_entry_to_front(&mut self, entry_idx: usize) {
+        if entry_idx != 0 {
+            self.entries[..=entry_idx].rotate_right(1);
+        }
+    }
+
+    fn push_slot(entry: &mut CellSlotCacheEntry, cell_idx: u16, slot: CachedCellSlot) {
+        if let Some((_, existing)) = entry.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
+            *existing = slot;
+        } else {
+            entry.slots.push((cell_idx, slot));
+        }
+    }
+
     fn get(
         &mut self,
         page_no: PageNumber,
@@ -927,10 +941,7 @@ impl CellSlotCache {
                 if crate::instrumentation::copy_profile_enabled() {
                     CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
                 }
-                if entry_idx != 0 {
-                    let entry = self.entries.remove(entry_idx);
-                    self.entries.insert(0, entry);
-                }
+                self.promote_existing_entry_to_front(entry_idx);
                 Some(found)
             }
             None => {
@@ -982,7 +993,10 @@ impl CellSlotCache {
         let mut entry = if let Some(existing_idx) = self.entries.iter().position(|entry| {
             entry.page_no == page_no && entry.mutation_counter == mutation_counter
         }) {
-            self.entries.remove(existing_idx)
+            self.promote_existing_entry_to_front(existing_idx);
+            let entry = &mut self.entries[0];
+            Self::push_slot(entry, cell_idx, slot);
+            return;
         } else {
             CellSlotCacheEntry {
                 page_no,
@@ -991,14 +1005,11 @@ impl CellSlotCache {
             }
         };
 
-        if let Some((_, existing)) = entry.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
-            *existing = slot;
-        } else {
-            entry.slots.push((cell_idx, slot));
+        Self::push_slot(&mut entry, cell_idx, slot);
+        if self.entries.len() == CELL_SLOT_CACHE_ENTRIES {
+            self.entries.pop();
         }
-
         self.entries.insert(0, entry);
-        self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
     }
 }
 
@@ -9392,6 +9403,60 @@ mod tests {
         let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
         assert_eq!(mutated_cell.rowid, Some(10));
         assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
+    }
+
+    #[test]
+    fn test_cell_slot_cache_promotes_existing_entries_preserving_lru_order() {
+        fn sample_slot(rowid: i64) -> CachedCellSlot {
+            CachedCellSlot {
+                left_child: None,
+                rowid: Some(rowid),
+                payload_size: 8,
+                local_size: 8,
+                payload_offset: 128,
+                overflow_page: None,
+            }
+        }
+
+        let mut cache = CellSlotCache::default();
+        for page in 1..=4 {
+            cache.insert(pn(page), 7, 0, sample_slot(i64::from(page)));
+        }
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.page_no)
+                .collect::<Vec<_>>(),
+            vec![pn(4), pn(3), pn(2), pn(1)]
+        );
+
+        let found = cache.get(pn(2), 7, 0).expect("cached slot should exist");
+        assert_eq!(found.rowid, Some(2));
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.page_no)
+                .collect::<Vec<_>>(),
+            vec![pn(2), pn(4), pn(3), pn(1)]
+        );
+
+        cache.insert(pn(3), 7, 1, sample_slot(30));
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.page_no)
+                .collect::<Vec<_>>(),
+            vec![pn(3), pn(2), pn(4), pn(1)]
+        );
+        assert!(
+            cache.entries[0]
+                .slots
+                .iter()
+                .any(|(idx, slot)| *idx == 1 && slot.rowid == Some(30))
+        );
     }
 
     #[test]
