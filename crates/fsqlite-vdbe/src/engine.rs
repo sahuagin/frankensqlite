@@ -9692,31 +9692,38 @@ impl VdbeEngine {
                                 let unique_insert_result = if uses_collated_unique_probe {
                                     sc.last_rightmost_unique_index_prefix = None;
                                     sc.last_rightmost_unique_index_position = None;
-                                    let Some(collation_registry) =
+                                    if let Some(collation_registry) =
                                         collated_unique_registry.as_ref()
-                                    else {
-                                        return Err(FrankenError::internal(
-                                            "IdxInsert: missing collation registry for collated unique probe",
-                                        ));
-                                    };
-                                    let conflict_rowid = find_conflicting_rowid_in_index_collated(
-                                        sc,
-                                        key_bytes,
-                                        n_idx_cols,
-                                        &index_desc_flags,
-                                        &index_collations,
-                                        collation_registry,
-                                    )?;
-                                    if let Some(conflict_rowid) = conflict_rowid {
-                                        Err((
-                                            FrankenError::UniqueViolation {
-                                                columns: columns_label.to_owned(),
-                                            },
-                                            Some(conflict_rowid),
-                                        ))
+                                    {
+                                        match find_conflicting_rowid_in_index_collated(
+                                            sc,
+                                            key_bytes,
+                                            n_idx_cols,
+                                            &index_desc_flags,
+                                            &index_collations,
+                                            collation_registry,
+                                        ) {
+                                            Ok(Some(conflict_rowid)) => Err((
+                                                FrankenError::UniqueViolation {
+                                                    columns: columns_label.to_owned(),
+                                                },
+                                                Some(conflict_rowid),
+                                            )),
+                                            Ok(None) => {
+                                                match sc.cursor.index_insert(&sc.cx, key_bytes) {
+                                                    Ok(()) => Ok(()),
+                                                    Err(err) => Err((err, None)),
+                                                }
+                                            }
+                                            Err(err) => Err((err, None)),
+                                        }
                                     } else {
-                                        sc.cursor.index_insert(&sc.cx, key_bytes)?;
-                                        Ok(())
+                                        Err((
+                                            FrankenError::internal(
+                                                "IdxInsert: missing collation registry for collated unique probe",
+                                            ),
+                                            None,
+                                        ))
                                     }
                                 } else {
                                     let fast_append_prefix =
@@ -9744,35 +9751,41 @@ impl VdbeEngine {
                                             None
                                         };
                                     if let Some(prefix) = fast_append_prefix {
-                                        if sc.cursor.index_append_after_current_rightmost_position(
-                                            &sc.cx, key_bytes,
-                                        )? {
-                                            rightmost_prefix_after_insert = Some(prefix);
-                                            Ok(())
-                                        } else {
-                                            match sc
-                                                .cursor
-                                                .index_insert_unique_with_rightmost_report(
-                                                    &sc.cx,
-                                                    key_bytes,
-                                                    n_idx_cols,
-                                                    columns_label,
-                                                ) {
-                                                Ok(inserted_after_rightmost) => {
-                                                    if inserted_after_rightmost {
-                                                        rightmost_prefix_after_insert =
-                                                            Some(prefix);
+                                        match sc
+                                            .cursor
+                                            .index_append_after_current_rightmost_position(
+                                                &sc.cx, key_bytes,
+                                            ) {
+                                            Ok(true) => {
+                                                rightmost_prefix_after_insert = Some(prefix);
+                                                Ok(())
+                                            }
+                                            Ok(false) => {
+                                                match sc
+                                                    .cursor
+                                                    .index_insert_unique_with_rightmost_report(
+                                                        &sc.cx,
+                                                        key_bytes,
+                                                        n_idx_cols,
+                                                        columns_label,
+                                                    ) {
+                                                    Ok(inserted_after_rightmost) => {
+                                                        if inserted_after_rightmost {
+                                                            rightmost_prefix_after_insert =
+                                                                Some(prefix);
+                                                        }
+                                                        Ok(())
                                                     }
-                                                    Ok(())
-                                                }
-                                                Err(FrankenError::UniqueViolation { columns }) => {
-                                                    Err((
+                                                    Err(FrankenError::UniqueViolation {
+                                                        columns,
+                                                    }) => Err((
                                                         FrankenError::UniqueViolation { columns },
                                                         None,
-                                                    ))
+                                                    )),
+                                                    Err(err) => Err((err, None)),
                                                 }
-                                                Err(err) => return Err(err),
                                             }
+                                            Err(err) => Err((err, None)),
                                         }
                                     } else {
                                         match sc.cursor.index_insert_unique_with_rightmost_report(
@@ -9793,7 +9806,7 @@ impl VdbeEngine {
                                             Err(FrankenError::UniqueViolation { columns }) => Err(
                                                 (FrankenError::UniqueViolation { columns }, None),
                                             ),
-                                            Err(err) => return Err(err),
+                                            Err(err) => Err((err, None)),
                                         }
                                     }
                                 };
@@ -9886,15 +9899,32 @@ impl VdbeEngine {
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
                                             _ => {
-                                                self.rollback_pending_insert_after_index_conflict(
-                                                )?;
+                                                if let Err(error) = self
+                                                    .rollback_pending_insert_after_index_conflict()
+                                                {
+                                                    if sideband_active {
+                                                        self.make_record_lookaside
+                                                            .replace_cleared_buf(key_blob);
+                                                    }
+                                                    return Err(error);
+                                                }
+                                                if sideband_active {
+                                                    self.make_record_lookaside
+                                                        .replace_cleared_buf(key_blob);
+                                                }
                                                 return Err(FrankenError::UniqueViolation {
                                                     columns: columns_label.to_owned(),
                                                 });
                                             }
                                         }
                                     }
-                                    Err((error, _)) => return Err(error),
+                                    Err((error, _)) => {
+                                        if sideband_active {
+                                            self.make_record_lookaside
+                                                .replace_cleared_buf(key_blob);
+                                        }
+                                        return Err(error);
+                                    }
                                 }
                             } else {
                                 sc.last_rightmost_unique_index_prefix = None;
@@ -16821,6 +16851,106 @@ mod tests {
                 .expect("index seek should succeed")
                 .is_found(),
             "IdxInsert should still insert the key while recycling the sideband buffer"
+        );
+    }
+
+    #[test]
+    fn test_idxinsert_unique_abort_returns_make_record_sideband_buffer_on_error() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let conflict_value = "idx-abort-sideband".repeat(32);
+        let existing_key = encode_record(&[
+            SqliteValue::Text(conflict_value.clone().into()),
+            SqliteValue::Integer(1),
+        ]);
+
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        let table_root = db.create_table(1);
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, index_root, true));
+        assert!(engine.open_storage_cursor(1, table_root, true));
+
+        {
+            let index_cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("index cursor should exist");
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &existing_key)
+                .expect("existing unique index key should insert");
+        }
+
+        let provisional_payload = encode_record(&[SqliteValue::Integer(99)]);
+        {
+            let table_cursor = engine
+                .storage_cursors
+                .get_mut(&1)
+                .expect("table cursor should exist");
+            table_cursor
+                .cursor
+                .table_insert(&table_cursor.cx, 2, &provisional_payload)
+                .expect("provisional table row should insert");
+        }
+        engine.changes = 1;
+        engine.set_pending_insert_rollback(Some(PendingInsertRollback {
+            cursor_id: 1,
+            rowid: 2,
+            previous_last_insert_rowid: 0,
+            previous_last_insert_rowid_valid: false,
+            update_restore: None,
+        }));
+
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_value = builder.alloc_reg();
+        let r_record = builder.alloc_reg();
+        builder.emit_op(Opcode::String8, 0, r_value, 0, P4::Str(conflict_value), 0);
+        builder.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+        builder.emit_op(
+            Opcode::IdxInsert,
+            0,
+            r_record,
+            1,
+            P4::Table("idx_col".to_owned()),
+            1,
+        );
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+
+        let program = builder.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&program, PageSize::DEFAULT);
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let error = engine
+            .execute(&program)
+            .expect_err("unique conflict should abort the statement");
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert!(
+            matches!(error, FrankenError::UniqueViolation { .. }),
+            "expected unique violation, got {error:?}"
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "unique abort should not materialize a sideband-backed key"
+        );
+        assert!(
+            engine.make_record_lookaside.is_empty(),
+            "aborted IdxInsert should return a cleared scratch buffer"
+        );
+        assert!(
+            engine.make_record_lookaside.capacity() >= expected_capacity,
+            "aborted IdxInsert should keep the reusable sideband allocation"
         );
     }
 
