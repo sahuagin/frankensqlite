@@ -867,6 +867,7 @@ impl ScalarFunction for SignFunc {
             return Ok(SqliteValue::Null);
         }
         match &args[0] {
+            SqliteValue::Null => Ok(SqliteValue::Null),
             SqliteValue::Integer(i) => Ok(SqliteValue::Integer(i.signum())),
             SqliteValue::Float(f) => {
                 if f.is_nan() {
@@ -881,7 +882,7 @@ impl ScalarFunction for SignFunc {
             }
             SqliteValue::Text(s) => {
                 // C SQLite sign() uses sqlite3AtoF — returns NULL for non-numeric text.
-                let trimmed = s.trim();
+                let trimmed = s.trim_matches(|ch: char| ch.is_ascii_whitespace());
                 if trimmed.is_empty() {
                     return Ok(SqliteValue::Null);
                 }
@@ -910,24 +911,14 @@ impl ScalarFunction for SignFunc {
                     } else {
                         Ok(SqliteValue::Integer(0))
                     }
-                } else if trimmed.parse::<i64>().is_ok() {
+                } else if let Ok(i) = trimmed.parse::<i64>() {
                     // Handles integers that f64 can't represent exactly but i64 can.
-                    let i: i64 = trimmed.parse().unwrap();
                     Ok(SqliteValue::Integer(i.signum()))
                 } else {
                     Ok(SqliteValue::Null)
                 }
             }
-            other => {
-                let f = other.to_float();
-                if f > 0.0 {
-                    Ok(SqliteValue::Integer(1))
-                } else if f < 0.0 {
-                    Ok(SqliteValue::Integer(-1))
-                } else {
-                    Ok(SqliteValue::Integer(0))
-                }
-            }
+            SqliteValue::Blob(_) => Ok(SqliteValue::Null),
         }
     }
 
@@ -3429,7 +3420,7 @@ mod tests {
     #[test]
     fn test_sign_whitespace_padded_text() {
         // Regression: SIGN('  5  ') must return 1, not NULL.
-        // SQLite trims text before numeric parsing.
+        // SQLite trims ASCII whitespace before numeric parsing.
         assert_eq!(
             invoke1(
                 &SignFunc,
@@ -3445,6 +3436,22 @@ mod tests {
             )
             .unwrap(),
             SqliteValue::Integer(-1)
+        );
+    }
+
+    #[test]
+    fn test_sign_unicode_space_and_blob_return_null() {
+        assert_eq!(
+            invoke1(
+                &SignFunc,
+                SqliteValue::Text(SmallText::from_string("\u{00a0}123"))
+            )
+            .unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Blob(Arc::from(b"123".as_slice()))).unwrap(),
+            SqliteValue::Null
         );
     }
 
