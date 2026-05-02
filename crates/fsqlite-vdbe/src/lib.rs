@@ -2353,7 +2353,10 @@ mod tests {
                 assert!(message.contains("Goto"));
                 assert!(message.contains("p2"));
             }
-            other => panic!("expected internal verifier error, got {other:?}"),
+            other => assert!(
+                matches!(other, FrankenError::Internal(_)),
+                "expected internal verifier error, got {other:?}"
+            ),
         }
     }
 
@@ -2371,16 +2374,19 @@ mod tests {
                 assert!(message.contains("Jump"));
                 assert!(message.contains("p3"));
             }
-            other => panic!("expected internal verifier error, got {other:?}"),
+            other => assert!(
+                matches!(other, FrankenError::Internal(_)),
+                "expected internal verifier error, got {other:?}"
+            ),
         }
     }
 
     // ── test_all_opcode_dispatch_coverage ────────────────────────────────
     #[test]
     fn test_all_opcode_dispatch_coverage() {
-        // Every Opcode enum variant (1..=191) has a valid name and can be
+        // Every assigned Opcode enum byte has a valid name and can be
         // constructed from its byte value. This ensures no gaps in the enum.
-        for byte in 1..=191u8 {
+        for byte in 1..Opcode::COUNT as u8 {
             let opcode = Opcode::from_byte(byte);
             assert!(
                 opcode.is_some(),
@@ -2390,7 +2396,7 @@ mod tests {
             let name = opcode.name();
             assert!(!name.is_empty(), "opcode {byte} has empty name");
         }
-        assert_eq!(Opcode::COUNT, 192);
+        assert_eq!(Opcode::from_byte(Opcode::COUNT as u8), None);
     }
 
     // ── test_p5_flags_u16_range ─────────────────────────────────────────

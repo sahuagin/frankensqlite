@@ -756,10 +756,10 @@ impl Opcode {
     /// Try to convert a u8 to an Opcode.
     #[allow(clippy::too_many_lines)]
     pub const fn from_byte(byte: u8) -> Option<Self> {
-        if byte == 0 || byte > 193 {
+        if byte == 0 || byte as usize >= Self::COUNT {
             return None;
         }
-        // SAFETY: All values 1..=191 are valid discriminants.
+        // SAFETY: All values 1..Opcode::COUNT are valid discriminants.
         // We verified byte is in range above.
         // Since the enum is repr(u8) with consecutive values, this is safe.
         // However, since unsafe is forbidden, we use a match instead.
@@ -958,6 +958,9 @@ impl Opcode {
             191 => Some(Self::Noop),
             192 => Some(Self::LikeConstFast),
             193 => Some(Self::CountIndexEqRun),
+            194 => Some(Self::FusedAppendInsert),
+            195 => Some(Self::FusedOpenWriteLast),
+            196 => Some(Self::FusedLiteralResultRow),
             _ => None,
         }
     }
@@ -1583,14 +1586,16 @@ mod tests {
         assert_eq!(Opcode::from_byte(8), Some(Opcode::Halt));
         assert_eq!(Opcode::from_byte(190), Some(Opcode::SetSnapshot));
         assert_eq!(Opcode::from_byte(191), Some(Opcode::Noop));
-        assert_eq!(Opcode::from_byte(192), None);
+        assert_eq!(Opcode::from_byte(192), Some(Opcode::LikeConstFast));
+        assert_eq!(Opcode::from_byte(196), Some(Opcode::FusedLiteralResultRow));
+        assert_eq!(Opcode::from_byte(197), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 
     #[test]
     fn opcode_from_byte_exhaustive() {
-        // Every value 1..=191 should produce Some
-        for i in 1..=191u8 {
+        // Every assigned opcode byte should produce Some.
+        for i in 1..Opcode::COUNT as u8 {
             assert!(
                 Opcode::from_byte(i).is_some(),
                 "from_byte({i}) returned None"
@@ -1601,13 +1606,17 @@ mod tests {
     #[test]
     fn test_opcode_distinct_u8_values() {
         let mut encoded = HashSet::new();
-        for byte in 1..=191_u8 {
+        for byte in 1..Opcode::COUNT as u8 {
             let opcode = Opcode::from_byte(byte).expect("opcode byte must decode");
             let inserted = encoded.insert(opcode as u8);
             assert!(inserted, "duplicate opcode byte value for {:?}", opcode);
         }
 
-        assert_eq!(encoded.len(), 191, "every opcode must map to a unique byte");
+        assert_eq!(
+            encoded.len(),
+            Opcode::COUNT - 1,
+            "every opcode must map to a unique byte"
+        );
     }
 
     #[test]
