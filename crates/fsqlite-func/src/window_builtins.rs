@@ -427,6 +427,7 @@ impl WindowFunction for NtileFunc {
 pub struct LagState {
     buffer: VecDeque<SqliteValue>,
     offset: i64,
+    offset_is_null: bool,
     default_val: SqliteValue,
     row_number: i64,
 }
@@ -440,6 +441,7 @@ impl WindowFunction for LagFunc {
         LagState {
             buffer: VecDeque::new(),
             offset: 1,
+            offset_is_null: false,
             default_val: SqliteValue::Null,
             row_number: 0,
         }
@@ -450,7 +452,11 @@ impl WindowFunction for LagFunc {
         // Capture offset and default on first call.
         if state.row_number == 0 {
             if let Some(off) = args.get(1) {
-                state.offset = off.to_integer().max(0);
+                if off.is_null() {
+                    state.offset_is_null = true;
+                } else {
+                    state.offset = off.to_integer().max(0);
+                }
             }
             if let Some(def) = args.get(2) {
                 state.default_val = def.clone();
@@ -466,6 +472,9 @@ impl WindowFunction for LagFunc {
     }
 
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        if state.offset_is_null {
+            return Ok(state.default_val.clone());
+        }
         let idx = state.row_number - state.offset;
         if idx < 1 || idx > state.buffer.len() as i64 {
             return Ok(state.default_val.clone());
@@ -494,6 +503,7 @@ impl WindowFunction for LagFunc {
 pub struct LeadState {
     buffer: Vec<SqliteValue>,
     offset: i64,
+    offset_is_null: bool,
     default_val: SqliteValue,
     current_row: i64,
 }
@@ -507,6 +517,7 @@ impl WindowFunction for LeadFunc {
         LeadState {
             buffer: Vec::new(),
             offset: 1,
+            offset_is_null: false,
             default_val: SqliteValue::Null,
             current_row: 0,
         }
@@ -516,7 +527,11 @@ impl WindowFunction for LeadFunc {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
         if state.buffer.is_empty() {
             if let Some(off) = args.get(1) {
-                state.offset = off.to_integer().max(0);
+                if off.is_null() {
+                    state.offset_is_null = true;
+                } else {
+                    state.offset = off.to_integer().max(0);
+                }
             }
             if let Some(def) = args.get(2) {
                 state.default_val = def.clone();
@@ -532,6 +547,9 @@ impl WindowFunction for LeadFunc {
     }
 
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        if state.offset_is_null {
+            return Ok(state.default_val.clone());
+        }
         let target = state.current_row + state.offset;
         if target < 0 || target >= state.buffer.len() as i64 {
             return Ok(state.default_val.clone());
@@ -1256,10 +1274,10 @@ mod tests {
     }
 
     fn assert_function_error(err: FrankenError, expected: &str) {
-        match err {
-            FrankenError::FunctionError(message) => assert_eq!(message, expected),
-            other => panic!("expected function error {expected:?}, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == expected),
+            "expected function error {expected:?}, got {err:?}"
+        );
     }
 
     /// Simulate a partition by calling step() for each row, collecting
@@ -1529,6 +1547,18 @@ mod tests {
         assert_eq!(results, vec![int(-1), int(10)]);
     }
 
+    #[test]
+    fn test_lag_null_offset_returns_default_for_each_row() {
+        let results = run_window_partition(
+            &LagFunc,
+            &[
+                vec![int(10), null(), text("N/A")],
+                vec![int(20), null(), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![text("N/A"), text("N/A")]);
+    }
+
     // ── lead ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1589,6 +1619,25 @@ mod tests {
             func.inverse(&mut state, &[]).unwrap();
         }
         assert_eq!(results, vec![int(20), text("N/A")]);
+    }
+
+    #[test]
+    fn test_lead_null_offset_returns_default_for_each_row() {
+        let func = LeadFunc;
+        let mut state = func.initial_state();
+        let rows = [int(10), int(20)];
+
+        for row in &rows {
+            func.step(&mut state, &[row.clone(), null(), text("N/A")])
+                .unwrap();
+        }
+
+        let mut results = Vec::new();
+        for _ in &rows {
+            results.push(func.value(&state).unwrap());
+            func.inverse(&mut state, &[]).unwrap();
+        }
+        assert_eq!(results, vec![text("N/A"), text("N/A")]);
     }
 
     // ── first_value ──────────────────────────────────────────────────
