@@ -677,6 +677,8 @@ pub fn register_math_builtins(registry: &mut FunctionRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use fsqlite_error::FrankenError;
+
     use super::*;
 
     // Tolerance for floating-point comparisons.
@@ -701,6 +703,17 @@ mod tests {
 
     fn int(v: i64) -> SqliteValue {
         SqliteValue::Integer(v)
+    }
+
+    fn assert_wrong_arg_count(function: &dyn ScalarFunction, args: &[SqliteValue], name: &str) {
+        let err = function
+            .invoke(args)
+            .expect_err("wrong arity should return function error");
+        let expected = format!("wrong number of arguments to function {name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "expected {expected:?}, got {err:?}"
+        );
     }
 
     fn null() -> SqliteValue {
@@ -1147,10 +1160,20 @@ mod tests {
         }
 
         // log is variadic (-1), test lookup with 1 and 2 args
-        assert!(reg.find_scalar("log", 0).is_none(), "log/0 rejected");
+        let log0 = reg
+            .find_scalar("log", 0)
+            .expect("log/0 returns erroring scalar");
+        assert_wrong_arg_count(log0.as_ref(), &[], "log");
         assert!(reg.find_scalar("log", 1).is_some(), "log/1 via variadic");
         assert!(reg.find_scalar("log", 2).is_some(), "log/2 via variadic");
-        assert!(reg.find_scalar("log", 3).is_none(), "log/3 rejected");
+        let log3 = reg
+            .find_scalar("log", 3)
+            .expect("log/3 returns erroring scalar");
+        assert_wrong_arg_count(
+            log3.as_ref(),
+            &[SqliteValue::Null, SqliteValue::Null, SqliteValue::Null],
+            "log",
+        );
     }
 
     #[test]

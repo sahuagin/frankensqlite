@@ -2590,6 +2590,21 @@ mod tests {
         f.invoke(&[a, b])
     }
 
+    fn assert_wrong_arg_count(registry: &FunctionRegistry, name: &str, arity: i32) {
+        let function = registry
+            .find_scalar(name, arity)
+            .expect("known scalar name with bad arity returns erroring scalar");
+        let args = vec![SqliteValue::Null; arity.max(0) as usize];
+        let err = function
+            .invoke(&args)
+            .expect_err("wrong arity should return function error");
+        let expected = format!("wrong number of arguments to function {name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "expected {expected:?}, got {err:?}"
+        );
+    }
+
     #[test]
     fn test_get_change_tracking_state_returns_thread_local_snapshot() {
         let original = get_change_tracking_state();
@@ -4620,19 +4635,13 @@ mod tests {
             ("max", 0, 1, None),
             ("min", 0, 1, None),
         ] {
-            assert!(
-                registry.find_scalar(name, too_few).is_none(),
-                "{name}/{too_few} should not resolve"
-            );
+            assert_wrong_arg_count(&registry, name, too_few);
             assert!(
                 registry.find_scalar(name, valid).is_some(),
                 "{name}/{valid} should resolve"
             );
             if let Some(arity) = too_many {
-                assert!(
-                    registry.find_scalar(name, arity).is_none(),
-                    "{name}/{arity} should not resolve"
-                );
+                assert_wrong_arg_count(&registry, name, arity);
             }
         }
 

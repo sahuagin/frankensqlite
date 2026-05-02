@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use fsqlite_error::FrankenError;
+use fsqlite_types::SqliteValue;
 use tracing::debug;
 
 // ── Function evaluation metrics (bd-2wt.1) ─────────────────────────────────
@@ -257,12 +259,47 @@ impl FunctionKey {
 /// Lookup strategy (§9.5):
 /// 1. Exact match on `(UPPERCASE_NAME, num_args)`.
 /// 2. Fallback to an arity-compatible variadic version `(UPPERCASE_NAME, -1)`.
-/// 3. `None` if neither found (caller should raise "no such function").
+/// 3. Known scalar name with incompatible arity returns a function that raises
+///    SQLite's "wrong number of arguments" error when invoked.
+/// 4. `None` if neither found (caller should raise "no such function").
 #[derive(Default)]
 pub struct FunctionRegistry {
     scalars: HashMap<FunctionKey, Arc<dyn ScalarFunction>>,
     aggregates: HashMap<FunctionKey, Arc<ErasedAggregateFunction>>,
     windows: HashMap<FunctionKey, Arc<ErasedWindowFunction>>,
+}
+
+struct WrongArgCountScalarFunction {
+    display_name: String,
+}
+
+impl WrongArgCountScalarFunction {
+    fn new(canonical: &str) -> Self {
+        Self {
+            display_name: canonical.to_ascii_lowercase(),
+        }
+    }
+
+    fn message(&self) -> String {
+        format!(
+            "wrong number of arguments to function {}()",
+            self.display_name
+        )
+    }
+}
+
+impl ScalarFunction for WrongArgCountScalarFunction {
+    fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &str {
+        &self.display_name
+    }
 }
 
 impl FunctionRegistry {
@@ -351,24 +388,30 @@ impl FunctionRegistry {
             debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "exact", "registry lookup");
             return Some(Arc::clone(f));
         }
-        // Variadic fallback
         let variadic = FunctionKey {
             name: canonical.to_owned(),
             num_args: -1,
         };
-        let result = self
-            .scalars
-            .get(&variadic)
-            .filter(|function| function.accepts_arg_count(num_args))
-            .map(Arc::clone);
+        if let Some(function) = self.scalars.get(&variadic) {
+            if function.accepts_arg_count(num_args) {
+                debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "variadic", "registry lookup");
+                return Some(Arc::clone(function));
+            }
+            debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(WrongArgCountScalarFunction::new(canonical)));
+        }
+        if self.scalars.keys().any(|key| key.name == canonical) {
+            debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(WrongArgCountScalarFunction::new(canonical)));
+        }
         debug!(
             name = %canonical,
             arity = num_args,
             kind = "scalar",
-            hit = if result.is_some() { "variadic" } else { "miss" },
+            hit = "miss",
             "registry lookup"
         );
-        result
+        None
     }
 
     /// Look up an aggregate function by `(name, num_args)`.
@@ -789,6 +832,19 @@ mod tests {
         }
     }
 
+    fn assert_wrong_arg_count(
+        function: &dyn ScalarFunction,
+        args: &[SqliteValue],
+        expected_name: &str,
+    ) {
+        let err = function.invoke(args).expect_err("wrong arity should fail");
+        let expected = format!("wrong number of arguments to function {expected_name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "expected {expected:?}, got {err:?}"
+        );
+    }
+
     struct Product;
 
     impl AggregateFunction for Product {
@@ -911,10 +967,10 @@ mod tests {
         // Register only the variadic version (num_args = -1)
         registry.register_scalar(VariadicConcat);
 
-        assert!(
-            registry.find_scalar("my_func", 0).is_none(),
-            "below variadic minimum should not resolve"
-        );
+        let too_few = registry
+            .find_scalar("my_func", 0)
+            .expect("known function with bad arity returns erroring scalar");
+        assert_wrong_arg_count(too_few.as_ref(), &[], "my_func");
 
         // Look up with specific arg count — no exact match, falls back to variadic
         let f = registry
@@ -929,9 +985,33 @@ mod tests {
             .unwrap(),
             SqliteValue::Text("abc".into())
         );
-        assert!(
-            registry.find_scalar("my_func", 4).is_none(),
-            "above variadic maximum should not resolve"
+        let too_many = registry
+            .find_scalar("my_func", 4)
+            .expect("known function with bad arity returns erroring scalar");
+        assert_wrong_arg_count(
+            too_many.as_ref(),
+            &[
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Null,
+            ],
+            "my_func",
+        );
+    }
+
+    #[test]
+    fn test_registry_exact_wrong_arity_returns_function_error() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_scalar(Double);
+
+        let f = registry
+            .find_scalar("double", 2)
+            .expect("known function with wrong arity returns erroring scalar");
+        assert_wrong_arg_count(
+            f.as_ref(),
+            &[SqliteValue::Integer(1), SqliteValue::Integer(2)],
+            "double",
         );
     }
 
