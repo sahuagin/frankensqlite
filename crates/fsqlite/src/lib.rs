@@ -6017,6 +6017,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_nth_value_uses_current_row_n_for_full_frame() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x TEXT, n INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES('a',1),('b',2),('c',3);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT x, n, nth_value(x,n) OVER (\
+                 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                 ) FROM t ORDER BY x;",
+            )
+            .unwrap();
+        let results: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert_eq!(
+            results,
+            vec![
+                vec![
+                    SqliteValue::Text("a".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("a".into()),
+                ],
+                vec![
+                    SqliteValue::Text("b".into()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("b".into()),
+                ],
+                vec![
+                    SqliteValue::Text("c".into()),
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text("c".into()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_nth_value_uses_current_row_n_for_sliding_frame() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x TEXT, n INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES('a',1),('b',2),('c',1);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT x, n, nth_value(x,n) OVER (\
+                 ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW\
+                 ) FROM t ORDER BY x;",
+            )
+            .unwrap();
+        let results: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert_eq!(
+            results,
+            vec![
+                vec![
+                    SqliteValue::Text("a".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("a".into()),
+                ],
+                vec![
+                    SqliteValue::Text("b".into()),
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("b".into()),
+                ],
+                vec![
+                    SqliteValue::Text("c".into()),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("b".into()),
+                ],
+            ]
+        );
+    }
+
     // ── CTE (WITH) probe ─────────────────────────────────────────────────
 
     #[test]
