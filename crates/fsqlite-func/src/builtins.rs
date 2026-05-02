@@ -1810,19 +1810,24 @@ fn glob_match_inner(pat: &[char], txt: &[char], mut pi: usize, mut ti: usize) ->
 
 pub struct UnistrFunc;
 
-fn peek_unistr_escape(chars: &std::str::Chars<'_>, digits: usize) -> Option<char> {
+const INVALID_UNISTR_ESCAPE: &str = "invalid Unicode escape";
+
+fn decode_unistr_escape(chars: &mut std::str::Chars<'_>, digits: usize) -> Result<char> {
     let mut lookahead = chars.clone();
     let mut codepoint = 0u32;
     for _ in 0..digits {
-        codepoint = (codepoint << 4) | u32::from(hex_digit(lookahead.next()?)?);
+        let Some(ch) = lookahead.next() else {
+            return Err(FrankenError::function_error(INVALID_UNISTR_ESCAPE));
+        };
+        let Some(digit) = hex_digit(ch) else {
+            return Err(FrankenError::function_error(INVALID_UNISTR_ESCAPE));
+        };
+        codepoint = (codepoint << 4) | u32::from(digit);
     }
-    char::from_u32(codepoint)
-}
-
-fn consume_unistr_escape(chars: &mut std::str::Chars<'_>, digits: usize) {
     for _ in 0..digits {
         let _digit = chars.next();
     }
+    char::from_u32(codepoint).ok_or_else(|| FrankenError::function_error(INVALID_UNISTR_ESCAPE))
 }
 
 impl ScalarFunction for UnistrFunc {
@@ -1840,42 +1845,25 @@ impl ScalarFunction for UnistrFunc {
                     let _ = chars.next();
                     result.push('\\');
                     continue;
-                } else if chars.as_str().starts_with('+') {
+                }
+                let digits = if chars.as_str().starts_with('+') {
                     // \+XXXXXX
-                    let mut escape = chars.clone();
-                    let _plus = escape.next();
-                    if let Some(c) = peek_unistr_escape(&escape, 6) {
-                        let _plus = chars.next();
-                        consume_unistr_escape(&mut chars, 6);
-                        result.push(c);
-                        continue;
-                    }
+                    let _plus = chars.next();
+                    6
                 } else if chars.as_str().starts_with('u') {
                     // \uXXXX
-                    let mut escape = chars.clone();
-                    let _marker = escape.next();
-                    if let Some(c) = peek_unistr_escape(&escape, 4) {
-                        let _marker = chars.next();
-                        consume_unistr_escape(&mut chars, 4);
-                        result.push(c);
-                        continue;
-                    }
+                    let _marker = chars.next();
+                    4
                 } else if chars.as_str().starts_with('U') {
                     // \UXXXXXXXX
-                    let mut escape = chars.clone();
-                    let _marker = escape.next();
-                    if let Some(c) = peek_unistr_escape(&escape, 8) {
-                        let _marker = chars.next();
-                        consume_unistr_escape(&mut chars, 8);
-                        result.push(c);
-                        continue;
-                    }
-                } else if let Some(c) = peek_unistr_escape(&chars, 4) {
+                    let _marker = chars.next();
+                    8
+                } else {
                     // \XXXX
-                    consume_unistr_escape(&mut chars, 4);
-                    result.push(c);
-                    continue;
-                }
+                    4
+                };
+                result.push(decode_unistr_escape(&mut chars, digits)?);
+                continue;
             }
             result.push(ch);
         }
@@ -3654,15 +3642,23 @@ mod tests {
     }
 
     #[test]
-    fn test_unistr_invalid_escape_falls_back_to_literal_backslash() {
-        assert_eq!(
-            invoke1(
+    fn test_unistr_invalid_escape_returns_error() {
+        for input in [
+            "\\u12xz",
+            "\\12xz",
+            "\\+00xz",
+            "\\",
+            "\\x",
+            "\\U00110000",
+            "\\D800",
+        ] {
+            let err = invoke1(
                 &UnistrFunc,
-                SqliteValue::Text(SmallText::from_string("\\u12xz\\12xz\\+00xz"))
+                SqliteValue::Text(SmallText::from_string(input)),
             )
-            .unwrap(),
-            SqliteValue::Text(SmallText::from_string("\\u12xz\\12xz\\+00xz"))
-        );
+            .unwrap_err();
+            assert_eq!(err.to_string(), INVALID_UNISTR_ESCAPE);
+        }
     }
 
     #[test]
