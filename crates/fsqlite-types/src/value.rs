@@ -872,6 +872,30 @@ impl SqliteValue {
         }
     }
 
+    /// Coerce a value for SQLite `sum()` accumulation.
+    ///
+    /// `sum()` keeps integer accumulation only for INTEGER values and text that
+    /// is entirely a signed 64-bit integer literal after trimming whitespace.
+    /// Other text and all blobs participate through the REAL accumulator, even
+    /// when their numeric prefix is integer-looking.
+    #[must_use]
+    pub fn to_sum_numeric_value(&self) -> Self {
+        match self {
+            Self::Null => Self::Null,
+            Self::Integer(i) => Self::Integer(*i),
+            Self::Float(f) => Self::Float(*f),
+            Self::Text(s) => {
+                let trimmed = s.as_str().trim();
+                if let Ok(integer) = trimmed.parse::<i64>() {
+                    Self::Integer(integer)
+                } else {
+                    Self::Float(parse_float_prefix(s))
+                }
+            }
+            Self::Blob(b) => Self::Float(parse_float_prefix_bytes(b)),
+        }
+    }
+
     /// Borrow the inner text string without allocating.
     ///
     /// Returns `Some(&str)` for `Text` values, `None` otherwise.
@@ -2321,6 +2345,30 @@ mod tests {
         let v = SqliteValue::Blob(Arc::from(b"0x10".as_slice()));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
+    }
+
+    #[test]
+    fn sum_numeric_value_preserves_sqlite_integer_text_boundary() {
+        assert_eq!(
+            SqliteValue::Text(SmallText::new(" +123 ")).to_sum_numeric_value(),
+            SqliteValue::Integer(123)
+        );
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("1.0")).to_sum_numeric_value(),
+            SqliteValue::Float(1.0)
+        );
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("123abc")).to_sum_numeric_value(),
+            SqliteValue::Float(123.0)
+        );
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("")).to_sum_numeric_value(),
+            SqliteValue::Float(0.0)
+        );
+        assert_eq!(
+            SqliteValue::Blob(Arc::from(b"123".as_slice())).to_sum_numeric_value(),
+            SqliteValue::Float(123.0)
+        );
     }
 
     #[test]

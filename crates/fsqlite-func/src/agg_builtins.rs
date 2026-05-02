@@ -341,14 +341,15 @@ impl AggregateFunction for SumFunc {
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        if args[0].is_null() {
+        let value = args[0].to_sum_numeric_value();
+        if value.is_null() {
             return Ok(());
         }
         state.has_values = true;
-        match &args[0] {
+        match value {
             SqliteValue::Integer(i) => {
                 if state.all_integer && !state.overflowed {
-                    match state.int_sum.checked_add(*i) {
+                    match state.int_sum.checked_add(i) {
                         Some(s) => state.int_sum = s,
                         None => state.overflowed = true,
                     }
@@ -356,17 +357,14 @@ impl AggregateFunction for SumFunc {
                 kahan_add(
                     &mut state.float_sum,
                     &mut state.float_compensation,
-                    *i as f64,
+                    i as f64,
                 );
             }
-            other => {
+            SqliteValue::Float(f) => {
                 state.all_integer = false;
-                kahan_add(
-                    &mut state.float_sum,
-                    &mut state.float_compensation,
-                    other.to_float(),
-                );
+                kahan_add(&mut state.float_sum, &mut state.float_compensation, f);
             }
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
         }
         Ok(())
     }
@@ -375,7 +373,7 @@ impl AggregateFunction for SumFunc {
         if !state.has_values {
             return Ok(SqliteValue::Null);
         }
-        if state.overflowed {
+        if state.all_integer && state.overflowed {
             return Err(FrankenError::IntegerOverflow);
         }
         if state.all_integer {
@@ -966,6 +964,37 @@ mod tests {
         SumFunc.step(&mut state, &[int(1)]).unwrap();
         let err = SumFunc.finalize(state);
         assert!(err.is_err(), "sum should raise overflow error");
+    }
+
+    #[test]
+    fn test_sum_later_real_value_clears_integer_overflow_error() {
+        let r = run_agg(&SumFunc, &[int(i64::MAX), int(1), float(0.5)]);
+        assert_float_eq(&r, 9_223_372_036_854_776_000.0);
+    }
+
+    #[test]
+    fn test_sum_integer_text_preserves_overflow_error() -> Result<()> {
+        let mut state = SumFunc.initial_state();
+        SumFunc.step(&mut state, &[text("9223372036854775807")])?;
+        SumFunc.step(&mut state, &[text("1")])?;
+        let err = SumFunc.finalize(state);
+        assert!(err.is_err(), "integer-text sum should raise overflow");
+        Ok(())
+    }
+
+    #[test]
+    fn test_sum_integer_text_later_real_clears_overflow_error() {
+        let r = run_agg(
+            &SumFunc,
+            &[text("9223372036854775807"), text("1"), text("0.5")],
+        );
+        assert_float_eq(&r, 9_223_372_036_854_776_000.0);
+    }
+
+    #[test]
+    fn test_sum_prefix_text_uses_real_accumulator() {
+        let r = run_agg(&SumFunc, &[text("123abc"), int(1)]);
+        assert_float_eq(&r, 124.0);
     }
 
     #[test]
