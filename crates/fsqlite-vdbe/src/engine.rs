@@ -17054,7 +17054,7 @@ mod tests {
         let after = vdbe_test_sideband_materialization_count_snapshot();
 
         assert!(
-            matches!(error, FrankenError::Internal(message) if message.contains("secondary-index conflict without pending table insert")),
+            matches!(&error, FrankenError::Internal(message) if message.contains("secondary-index conflict without pending table insert")),
             "expected rollback bookkeeping error, got {error:?}"
         );
         assert_eq!(
