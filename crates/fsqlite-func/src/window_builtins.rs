@@ -753,28 +753,26 @@ impl WindowFunction for WindowSumFunc {
         if args.is_empty() || args[0].is_null() {
             return Ok(());
         }
+        let value = args[0].to_sum_numeric_value();
+        if value.is_null() {
+            return Ok(());
+        }
         state.has_value = true;
-        match &args[0] {
+        match value {
             SqliteValue::Integer(i) => {
                 if state.is_int && !state.overflowed {
-                    match state.int_sum.checked_add(*i) {
+                    match state.int_sum.checked_add(i) {
                         Some(s) => state.int_sum = s,
                         None => state.overflowed = true,
                     }
                 }
-                kbn_step(&mut state.sum, &mut state.err, *i as f64);
+                kbn_step(&mut state.sum, &mut state.err, i as f64);
             }
             SqliteValue::Float(f) => {
                 state.is_int = false;
-                kbn_step(&mut state.sum, &mut state.err, *f);
+                kbn_step(&mut state.sum, &mut state.err, f);
             }
-            other => {
-                let f = other.to_float();
-                if f != 0.0 || other.to_text() == "0" {
-                    state.is_int = false;
-                    kbn_step(&mut state.sum, &mut state.err, f);
-                }
-            }
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
         }
         Ok(())
     }
@@ -783,19 +781,22 @@ impl WindowFunction for WindowSumFunc {
         if args.is_empty() || args[0].is_null() {
             return Ok(());
         }
-        match &args[0] {
+        let value = args[0].to_sum_numeric_value();
+        match value {
             SqliteValue::Integer(i) => {
                 if state.is_int && !state.overflowed {
-                    match state.int_sum.checked_sub(*i) {
+                    match state.int_sum.checked_sub(i) {
                         Some(s) => state.int_sum = s,
                         None => state.overflowed = true,
                     }
                 }
-                kbn_step(&mut state.sum, &mut state.err, -(*i as f64));
+                kbn_step(&mut state.sum, &mut state.err, -(i as f64));
             }
-            _ => {
-                kbn_step(&mut state.sum, &mut state.err, -args[0].to_float());
+            SqliteValue::Float(f) => {
+                state.is_int = false;
+                kbn_step(&mut state.sum, &mut state.err, -f);
             }
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
         }
         Ok(())
     }
@@ -804,7 +805,7 @@ impl WindowFunction for WindowSumFunc {
         if !state.has_value {
             return Ok(SqliteValue::Null);
         }
-        if state.overflowed {
+        if state.is_int && state.overflowed {
             return Err(FrankenError::IntegerOverflow);
         }
         if state.is_int {
@@ -1245,6 +1246,10 @@ mod tests {
         SqliteValue::Integer(v)
     }
 
+    fn float(v: f64) -> SqliteValue {
+        SqliteValue::Float(v)
+    }
+
     fn text(s: &str) -> SqliteValue {
         SqliteValue::Text(s.into())
     }
@@ -1643,6 +1648,36 @@ mod tests {
         let mut state = func.initial_state();
         func.step(&mut state, &[int(10), int(0)]).unwrap();
         assert_eq!(func.value(&state).unwrap(), null());
+    }
+
+    // ── sum / total / avg ────────────────────────────────────────────
+
+    #[test]
+    fn test_window_sum_text_integer_literals_stay_integer() {
+        let results = run_window_partition(&WindowSumFunc, &[vec![text("1")], vec![text("2")]]);
+        assert_eq!(results, vec![int(1), int(3)]);
+    }
+
+    #[test]
+    fn test_window_sum_non_numeric_text_returns_real_zero() {
+        let results = run_window_partition(&WindowSumFunc, &[vec![text("abc")]]);
+        assert_eq!(results, vec![float(0.0)]);
+    }
+
+    #[test]
+    fn test_window_sum_overflow_suppressed_after_float_input() {
+        let func = WindowSumFunc;
+        let mut state = func.initial_state();
+
+        func.step(&mut state, &[int(i64::MAX)]).unwrap();
+        func.step(&mut state, &[int(1)]).unwrap();
+        assert_eq!(
+            func.value(&state).unwrap_err().to_string(),
+            "integer overflow"
+        );
+
+        func.step(&mut state, &[float(0.5)]).unwrap();
+        assert!(matches!(func.value(&state).unwrap(), SqliteValue::Float(_)));
     }
 
     // ── group_concat / string_agg ────────────────────────────────────
