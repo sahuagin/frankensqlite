@@ -549,8 +549,10 @@ mod vdbe_tests {
         let ctx = DiagContext::new(BEAD_ID)
             .case("opcode_name")
             .invariant("Every opcode has a non-empty name");
-        for byte in 1..=191u8 {
+        let mut named_count = 0_usize;
+        for byte in 1..=u8::MAX {
             if let Some(op) = Opcode::from_byte(byte) {
+                named_count += 1;
                 diag_assert!(
                     ctx.clone(),
                     !op.name().is_empty(),
@@ -558,6 +560,7 @@ mod vdbe_tests {
                 );
             }
         }
+        diag_assert_eq!(ctx, named_count, Opcode::COUNT - 1);
     }
 
     #[test]
