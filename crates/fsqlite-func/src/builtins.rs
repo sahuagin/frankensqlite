@@ -1163,9 +1163,15 @@ impl ScalarFunction for UnhexFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        if args.len() > 1 && args[1].is_null() {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(&args[0]);
-        let ignore_chars: Vec<char> = if args.len() > 1 && !args[1].is_null() {
-            text_arg(&args[1]).chars().collect()
+        let ignore_chars: Vec<char> = if args.len() > 1 {
+            text_arg(&args[1])
+                .chars()
+                .filter(|&c| hex_digit(c).is_none())
+                .collect()
         } else {
             Vec::new()
         };
@@ -1806,7 +1812,6 @@ pub struct UnistrFunc;
 
 fn peek_unistr_escape(chars: &std::str::Chars<'_>, digits: usize) -> Option<char> {
     let mut lookahead = chars.clone();
-    let _marker = lookahead.next()?;
     let mut codepoint = 0u32;
     for _ in 0..digits {
         codepoint = (codepoint << 4) | u32::from(hex_digit(lookahead.next()?)?);
@@ -1815,7 +1820,6 @@ fn peek_unistr_escape(chars: &std::str::Chars<'_>, digits: usize) -> Option<char
 }
 
 fn consume_unistr_escape(chars: &mut std::str::Chars<'_>, digits: usize) {
-    let _marker = chars.next();
     for _ in 0..digits {
         let _digit = chars.next();
     }
@@ -1836,20 +1840,41 @@ impl ScalarFunction for UnistrFunc {
                     let _ = chars.next();
                     result.push('\\');
                     continue;
+                } else if chars.as_str().starts_with('+') {
+                    // \+XXXXXX
+                    let mut escape = chars.clone();
+                    let _plus = escape.next();
+                    if let Some(c) = peek_unistr_escape(&escape, 6) {
+                        let _plus = chars.next();
+                        consume_unistr_escape(&mut chars, 6);
+                        result.push(c);
+                        continue;
+                    }
                 } else if chars.as_str().starts_with('u') {
                     // \uXXXX
-                    if let Some(c) = peek_unistr_escape(&chars, 4) {
+                    let mut escape = chars.clone();
+                    let _marker = escape.next();
+                    if let Some(c) = peek_unistr_escape(&escape, 4) {
+                        let _marker = chars.next();
                         consume_unistr_escape(&mut chars, 4);
                         result.push(c);
                         continue;
                     }
                 } else if chars.as_str().starts_with('U') {
                     // \UXXXXXXXX
-                    if let Some(c) = peek_unistr_escape(&chars, 8) {
+                    let mut escape = chars.clone();
+                    let _marker = escape.next();
+                    if let Some(c) = peek_unistr_escape(&escape, 8) {
+                        let _marker = chars.next();
                         consume_unistr_escape(&mut chars, 8);
                         result.push(c);
                         continue;
                     }
+                } else if let Some(c) = peek_unistr_escape(&chars, 4) {
+                    // \XXXX
+                    consume_unistr_escape(&mut chars, 4);
+                    result.push(c);
+                    continue;
                 }
             }
             result.push(ch);
@@ -3619,10 +3644,12 @@ mod tests {
         assert_eq!(
             invoke1(
                 &UnistrFunc,
-                SqliteValue::Text(SmallText::from_string("a\\\\b\\u0020\\U0001f600"))
+                SqliteValue::Text(SmallText::from_string(
+                    "a\\\\b\\u0020\\U0001f600\\0041\\+000042"
+                ))
             )
             .unwrap(),
-            SqliteValue::Text(SmallText::from_string("a\\b \u{1f600}"))
+            SqliteValue::Text(SmallText::from_string("a\\b \u{1f600}AB"))
         );
     }
 
@@ -3631,10 +3658,10 @@ mod tests {
         assert_eq!(
             invoke1(
                 &UnistrFunc,
-                SqliteValue::Text(SmallText::from_string("\\u12xz"))
+                SqliteValue::Text(SmallText::from_string("\\u12xz\\12xz\\+00xz"))
             )
             .unwrap(),
-            SqliteValue::Text(SmallText::from_string("\\u12xz"))
+            SqliteValue::Text(SmallText::from_string("\\u12xz\\12xz\\+00xz"))
         );
     }
 
@@ -3770,6 +3797,30 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Blob(Arc::from(b"Hel".as_slice())));
+    }
+
+    #[test]
+    fn test_unhex_null_ignore_argument_returns_null() {
+        let f = UnhexFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("41")),
+                SqliteValue::Null,
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_unhex_hex_digits_in_ignore_argument_do_not_ignore_digits() {
+        let f = UnhexFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("41")),
+                SqliteValue::Text(SmallText::from_string("4")),
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Blob(Arc::from(b"A".as_slice())));
     }
 
     #[test]
