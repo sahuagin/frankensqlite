@@ -2475,7 +2475,31 @@ fn prepare_group_commit_batch_for_lane(
 }
 
 fn merge_prepared_group_commit_batches(
-    prepared_batches: &[LaneStagedPreparedBatch],
+    prepared_batches: Vec<LaneStagedPreparedBatch>,
+    final_db_size: u32,
+) -> Result<traits::PreparedWalFrameBatch> {
+    if prepared_batches.is_empty() {
+        return Err(FrankenError::internal(
+            "cannot merge empty prepared group-commit batch set",
+        ));
+    }
+
+    if prepared_batches.len() == 1 {
+        let mut iter = prepared_batches.into_iter();
+        let staged = iter
+            .next()
+            .ok_or_else(|| FrankenError::internal("missing prepared group-commit batch"))?;
+        if prepared_batch_is_canonical_single_commit(&staged.payload, final_db_size) {
+            return Ok(staged.payload);
+        }
+        return merge_prepared_group_commit_batches_uncanonicalized(vec![staged], final_db_size);
+    }
+
+    merge_prepared_group_commit_batches_uncanonicalized(prepared_batches, final_db_size)
+}
+
+fn merge_prepared_group_commit_batches_uncanonicalized(
+    prepared_batches: Vec<LaneStagedPreparedBatch>,
     final_db_size: u32,
 ) -> Result<traits::PreparedWalFrameBatch> {
     let Some(first) = prepared_batches.first() else {
@@ -2484,10 +2508,20 @@ fn merge_prepared_group_commit_batches(
         ));
     };
 
-    if prepared_batches.len() == 1 {
-        let prepared = &first.payload;
-        if prepared_batch_is_canonical_single_commit(prepared, final_db_size) {
-            return Ok(prepared.clone());
+    let frame_size = first.payload.frame_size;
+    let page_data_offset = first.payload.page_data_offset;
+    let big_endian_checksum = first.payload.big_endian_checksum;
+
+    for staged in &prepared_batches {
+        let prepared = &staged.payload;
+        if prepared.frame_size != frame_size
+            || prepared.page_data_offset != page_data_offset
+            || prepared.big_endian_checksum != big_endian_checksum
+        {
+            return Err(FrankenError::internal(format!(
+                "incompatible prepared WAL batch merge for lane {} batch {}",
+                staged.lane_id, staged.batch_id
+            )));
         }
     }
 
@@ -2500,40 +2534,39 @@ fn merge_prepared_group_commit_batches(
         .map(|batch| batch.payload.frame_bytes.len())
         .sum::<usize>();
 
-    let mut merged = traits::PreparedWalFrameBatch {
-        frame_size: first.payload.frame_size,
-        page_data_offset: first.payload.page_data_offset,
-        big_endian_checksum: first.payload.big_endian_checksum,
-        frame_metas: Vec::with_capacity(total_frames),
-        checksum_transforms: Vec::with_capacity(total_frames),
-        frame_bytes: Vec::with_capacity(total_bytes),
-        last_commit_frame_offset: None,
-        finalized_for: None,
-        finalized_running_checksum: None,
-    };
+    let mut iter = prepared_batches.into_iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| FrankenError::internal("missing prepared group-commit batch"))?;
+    let mut merged = first.payload;
+    merged
+        .frame_metas
+        .reserve(total_frames.saturating_sub(merged.frame_metas.len()));
+    merged
+        .frame_bytes
+        .reserve(total_bytes.saturating_sub(merged.frame_bytes.len()));
 
     let mut saw_commit = false;
-    for staged in prepared_batches {
-        let prepared = &staged.payload;
-        if prepared.frame_size != merged.frame_size
-            || prepared.page_data_offset != merged.page_data_offset
-            || prepared.big_endian_checksum != merged.big_endian_checksum
-        {
-            return Err(FrankenError::internal(format!(
-                "incompatible prepared WAL batch merge for lane {} batch {}",
-                staged.lane_id, staged.batch_id
-            )));
-        }
-
+    for meta in &mut merged.frame_metas {
+        saw_commit |= meta.db_size_if_commit != 0;
+        meta.db_size_if_commit = 0;
+    }
+    for staged in iter {
+        let prepared = staged.payload;
         merged
             .frame_metas
-            .extend(prepared.frame_metas.iter().copied().map(|mut meta| {
+            .extend(prepared.frame_metas.into_iter().map(|mut meta| {
                 saw_commit |= meta.db_size_if_commit != 0;
                 meta.db_size_if_commit = 0;
                 meta
             }));
         merged.frame_bytes.extend_from_slice(&prepared.frame_bytes);
     }
+
+    merged.checksum_transforms.clear();
+    merged.last_commit_frame_offset = None;
+    merged.finalized_for = None;
+    merged.finalized_running_checksum = None;
 
     for frame_index in 0..merged.frame_count() {
         merged.set_db_size_if_commit(frame_index, 0);
@@ -7342,9 +7375,11 @@ where
                                     .map(|batch| staged_by_batch_id.remove(&batch.context.batch_id))
                                     .collect::<Option<Vec<_>>>()
                                 {
-                                    Some(mut ordered_staged_batches) => {
+                                    Some(ordered_staged_batches) => {
+                                        let staged_shadow_verdict =
+                                            aggregate_shadow_verdict(&ordered_staged_batches);
                                         match merge_prepared_group_commit_batches(
-                                            &ordered_staged_batches,
+                                            ordered_staged_batches,
                                             final_db_size,
                                         ) {
                                             Ok(merged) => {
@@ -7358,31 +7393,17 @@ where
                                                     ) {
                                                         shadow_verdict =
                                                             ParallelWalShadowVerdict::Clean;
-                                                        for staged_batch in
-                                                            &mut ordered_staged_batches
-                                                        {
-                                                            staged_batch.shadow_verdict =
-                                                                ParallelWalShadowVerdict::Clean;
-                                                        }
                                                         Some(merged)
                                                     } else {
                                                         shadow_verdict =
                                                             ParallelWalShadowVerdict::Diverged;
-                                                        for staged_batch in
-                                                            &mut ordered_staged_batches
-                                                        {
-                                                            staged_batch.shadow_verdict =
-                                                                ParallelWalShadowVerdict::Diverged;
-                                                        }
                                                         fallback_reason = Some(
                                                             ParallelWalFallbackReason::PublicationMismatch,
                                                         );
                                                         None
                                                     }
                                                 } else {
-                                                    shadow_verdict = aggregate_shadow_verdict(
-                                                        &ordered_staged_batches,
-                                                    );
+                                                    shadow_verdict = staged_shadow_verdict;
                                                     Some(merged)
                                                 }
                                             }
@@ -16140,7 +16161,7 @@ mod tests {
             lane_staged_batch_for_test(11, 1, &frame_refs_b),
         ];
 
-        let merged = merge_prepared_group_commit_batches(&staged, 3).unwrap();
+        let merged = merge_prepared_group_commit_batches(staged, 3).unwrap();
         let db_size_headers = (0..merged.frame_count())
             .map(|index| {
                 let frame = merged.frame_slice(index);
@@ -16197,7 +16218,7 @@ mod tests {
             Some(crate::traits::PreparedWalChecksumSeed { s1: 55, s2: 66 });
         let staged = vec![staged_batch.clone()];
 
-        let merged = merge_prepared_group_commit_batches(&staged, 3).unwrap();
+        let merged = merge_prepared_group_commit_batches(staged, 3).unwrap();
 
         assert_eq!(
             merged, staged_batch.payload,
@@ -16236,7 +16257,7 @@ mod tests {
         });
         let staged = vec![staged_batch];
 
-        let merged = merge_prepared_group_commit_batches(&staged, 3).unwrap();
+        let merged = merge_prepared_group_commit_batches(staged, 3).unwrap();
         let first_frame = merged.frame_slice(0);
 
         assert_eq!(
