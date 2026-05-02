@@ -12886,19 +12886,25 @@ impl VdbeEngine {
                 }
                 P4::Affinity(aff) => {
                     let null_placeholder = SqliteValue::Null;
-                    let iter = aff.chars().enumerate().map(|(i, ch)| {
-                        if ch == 'X' {
-                            &null_placeholder
-                        } else {
-                            #[allow(clippy::cast_possible_wrap)]
-                            let reg = op.p1 + i as i32;
-                            this.get_reg(reg)
-                        }
-                    });
-                    if n_cols >= 4 && simd_serialize_integer_record(iter.clone(), &mut rec_buf) {
+                    let affinity = aff.as_bytes();
+                    let make_iter = || {
+                        (0..n_cols).map(|i| {
+                            if affinity.get(i) == Some(&b'X') {
+                                &null_placeholder
+                            } else {
+                                #[allow(clippy::cast_possible_wrap)]
+                                let reg = op.p1 + i as i32;
+                                this.get_reg(reg)
+                            }
+                        })
+                    };
+                    if n_cols >= 4 && simd_serialize_integer_record(make_iter(), &mut rec_buf) {
                         // Integer-only row used the SIMD/scalar fixed-width fast path.
                     } else {
-                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                        fsqlite_types::record::serialize_record_iter_into(
+                            make_iter(),
+                            &mut rec_buf,
+                        );
                     }
                 }
                 _ => {
@@ -20696,14 +20702,7 @@ mod tests {
         }
 
         #[test]
-        fn test_codegen_insert_literal_values_skip_make_record_metrics() {
-            let _guard = VDBE_OBSERVABILITY_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev_metrics_enabled = vdbe_metrics_enabled();
-            reset_vdbe_metrics();
-            set_vdbe_metrics_enabled(true);
-
+        fn test_codegen_insert_literal_values_execute_without_make_record_opcode() {
             let schema = test_schema();
             let ctx = CodegenContext::default();
             let stmt = InsertStatement {
@@ -20726,10 +20725,13 @@ mod tests {
             let mut b = ProgramBuilder::new();
             codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
             let prog = b.finish().expect("program should build");
+            assert!(
+                !prog.ops().iter().any(|op| op.opcode == Opcode::MakeRecord),
+                "preformatted INSERT should skip table-row MakeRecord execution"
+            );
 
             let mut db = MemDatabase::new();
             let _root = db.create_table(2);
-            let before = vdbe_metrics_snapshot();
 
             let mut engine = VdbeEngine::new(prog.register_count());
             engine.enable_storage_cursors(true);
@@ -20738,7 +20740,6 @@ mod tests {
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
 
-            let after = vdbe_metrics_snapshot();
             let rows: Vec<_> = engine
                 .take_results()
                 .into_iter()
@@ -20746,19 +20747,12 @@ mod tests {
                 .collect();
 
             assert_eq!(
-                after.make_record_calls_total - before.make_record_calls_total,
-                0,
-                "preformatted INSERT should skip table-row MakeRecord execution"
-            );
-            assert_eq!(
                 rows,
                 vec![vec![
                     SqliteValue::Integer(99),
                     SqliteValue::Text("test".into())
                 ]]
             );
-
-            set_vdbe_metrics_enabled(prev_metrics_enabled);
         }
 
         #[test]
@@ -23130,6 +23124,66 @@ mod tests {
             decoded,
             vec![SqliteValue::Integer(11), SqliteValue::Integer(22)],
             "stale precomputed headers must not widen the record shape",
+        );
+    }
+
+    #[test]
+    fn test_make_record_affinity_shape_follows_p2_column_count() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_a = b.alloc_reg();
+            let r_b = b.alloc_reg();
+            let r_c = b.alloc_reg();
+            let r_record_short_affinity = b.alloc_reg();
+            let r_record_long_affinity = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 11, r_a, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 22, r_b, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 33, r_c, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_a,
+                2,
+                r_record_short_affinity,
+                P4::Affinity("X".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_a,
+                1,
+                r_record_long_affinity,
+                P4::Affinity("XDE".to_owned()),
+                0,
+            );
+            b.emit_op(
+                Opcode::ResultRow,
+                r_record_short_affinity,
+                2,
+                0,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let short_affinity =
+            decode_record(&rows[0][0]).expect("short-affinity record should decode");
+        assert_eq!(
+            short_affinity,
+            vec![SqliteValue::Null, SqliteValue::Integer(22)],
+            "a short affinity string must not shrink the P2 register range",
+        );
+        let long_affinity = decode_record(&rows[0][1]).expect("long-affinity record should decode");
+        assert_eq!(
+            long_affinity,
+            vec![SqliteValue::Null],
+            "a long affinity string must not widen the P2 register range",
         );
     }
 
