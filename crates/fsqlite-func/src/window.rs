@@ -54,6 +54,26 @@ pub trait WindowFunction: Send + Sync {
     /// The number of arguments this function accepts (`-1` = variadic).
     fn num_args(&self) -> i32;
 
+    /// Minimum accepted SQL argument count for variadic functions.
+    ///
+    /// Some built-in window functions receive ORDER BY values internally even
+    /// when their SQL call syntax accepts no visible arguments. These bounds
+    /// describe SQL-visible arity, not the runtime step argument slice.
+    fn min_args(&self) -> i32 {
+        self.num_args().max(0)
+    }
+
+    /// Maximum accepted SQL argument count, or `None` for unbounded variadic
+    /// functions.
+    fn max_args(&self) -> Option<i32> {
+        (self.num_args() >= 0).then(|| self.num_args())
+    }
+
+    /// Return whether this function accepts `num_args` SQL arguments.
+    fn accepts_arg_count(&self, num_args: i32) -> bool {
+        num_args >= self.min_args() && self.max_args().is_none_or(|max| num_args <= max)
+    }
+
     /// The function name, used in error messages and EXPLAIN output.
     fn name(&self) -> &str;
 }
@@ -112,6 +132,14 @@ where
 
     fn num_args(&self) -> i32 {
         self.inner.num_args()
+    }
+
+    fn min_args(&self) -> i32 {
+        self.inner.min_args()
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        self.inner.max_args()
     }
 
     fn name(&self) -> &str {

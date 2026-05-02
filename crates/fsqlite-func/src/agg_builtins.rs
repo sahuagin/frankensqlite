@@ -219,6 +219,14 @@ impl AggregateFunction for GroupConcatFunc {
         -1 // 1 or 2 args
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
+    }
+
     fn name(&self) -> &str {
         "group_concat"
     }
@@ -1217,6 +1225,16 @@ mod tests {
         // group_concat is variadic
         assert!(reg.find_aggregate("group_concat", 1).is_some());
         assert!(reg.find_aggregate("group_concat", 2).is_some());
+
+        let group_concat_zero = reg.find_aggregate("group_concat", 0).unwrap();
+        let err = group_concat_zero
+            .finalize(group_concat_zero.initial_state())
+            .expect_err("group_concat() should reject zero arguments");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message)
+                if message == "wrong number of arguments to function group_concat()"),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ── E2E: full lifecycle through registry ──────────────────────────

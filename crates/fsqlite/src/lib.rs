@@ -7708,6 +7708,49 @@ mod tests {
         );
     }
 
+    fn assert_wrong_function_arity(conn: &Connection, sql: &str, name: &str) {
+        let err = conn
+            .query(sql)
+            .expect_err("known function with wrong arity should fail");
+        let expected = format!("wrong number of arguments to function {name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "unexpected error for {sql}: {err:?}"
+        );
+    }
+
+    #[test]
+    fn regression_aggregate_wrong_arity_surfaces_function_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER, s TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        assert_wrong_function_arity(&conn, "SELECT sum() FROM t;", "sum");
+        assert_wrong_function_arity(&conn, "SELECT group_concat() FROM t;", "group_concat");
+        assert_wrong_function_arity(
+            &conn,
+            "SELECT group_concat(s, '-', '!') FROM t;",
+            "group_concat",
+        );
+    }
+
+    #[test]
+    fn regression_window_wrong_arity_surfaces_function_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        assert_wrong_function_arity(&conn, "SELECT rank(1) OVER (ORDER BY v) FROM t;", "rank");
+        assert_wrong_function_arity(&conn, "SELECT lag() OVER (ORDER BY v) FROM t;", "lag");
+        assert_wrong_function_arity(
+            &conn,
+            "SELECT lag(v, 1, 0, 0) OVER (ORDER BY v) FROM t;",
+            "lag",
+        );
+        assert_wrong_function_arity(&conn, "SELECT count(1, 2) OVER () FROM t;", "count");
+    }
+
     #[test]
     fn conformance_033_join_with_where() {
         let conn = Connection::open(":memory:").unwrap();

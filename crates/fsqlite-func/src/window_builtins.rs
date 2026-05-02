@@ -135,6 +135,14 @@ impl WindowFunction for RankFunc {
         -1
     }
 
+    fn min_args(&self) -> i32 {
+        0
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(0)
+    }
+
     fn name(&self) -> &str {
         "rank"
     }
@@ -188,6 +196,14 @@ impl WindowFunction for DenseRankFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        0
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(0)
     }
 
     fn name(&self) -> &str {
@@ -267,6 +283,14 @@ impl WindowFunction for PercentRankFunc {
         -1
     }
 
+    fn min_args(&self) -> i32 {
+        0
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(0)
+    }
+
     fn name(&self) -> &str {
         "percent_rank"
     }
@@ -321,6 +345,14 @@ impl WindowFunction for CumeDistFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        0
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(0)
     }
 
     fn name(&self) -> &str {
@@ -492,6 +524,14 @@ impl WindowFunction for LagFunc {
         -1 // 1, 2, or 3 args
     }
 
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(3)
+    }
+
     fn name(&self) -> &str {
         "lag"
     }
@@ -564,6 +604,14 @@ impl WindowFunction for LeadFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(3)
     }
 
     fn name(&self) -> &str {
@@ -931,6 +979,14 @@ impl WindowFunction for WindowCountFunc {
         -1 // variadic: COUNT(*) = 0 args, COUNT(x) = 1 arg
     }
 
+    fn min_args(&self) -> i32 {
+        0
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(1)
+    }
+
     fn name(&self) -> &str {
         "COUNT"
     }
@@ -1171,6 +1227,14 @@ impl WindowFunction for WindowGroupConcatFunc {
 
     fn num_args(&self) -> i32 {
         -1
+    }
+
+    fn min_args(&self) -> i32 {
+        1
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        Some(2)
     }
 
     fn name(&self) -> &str {
@@ -1962,6 +2026,33 @@ mod tests {
             reg.find_window("string_agg", 2).is_some(),
             "string_agg(2) not registered"
         );
+
+        for (name, arity) in [
+            ("rank", 1),
+            ("dense_rank", 1),
+            ("percent_rank", 1),
+            ("cume_dist", 1),
+            ("lag", 0),
+            ("lag", 4),
+            ("lead", 0),
+            ("lead", 4),
+            ("count", 2),
+            ("group_concat", 0),
+            ("group_concat", 3),
+        ] {
+            let f = reg
+                .find_window(name, arity)
+                .expect("known window with wrong arity returns erroring window");
+            let mut state = f.initial_state();
+            let err = f
+                .step(&mut state, &[])
+                .expect_err("invalid window arity should fail");
+            let expected = format!("wrong number of arguments to function {name}()");
+            assert!(
+                matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+                "unexpected error for {name}/{arity}: {err:?}"
+            );
+        }
     }
 
     // ── E2E: full lifecycle through registry ─────────────────────────
@@ -1986,7 +2077,7 @@ mod tests {
         let mut reg = FunctionRegistry::new();
         register_window_builtins(&mut reg);
 
-        let rank = reg.find_window("rank", 1).unwrap();
+        let rank = reg.find_window("rank", 0).unwrap();
         let mut state = rank.initial_state();
         // [1, 2, 2, 3] -> [1, 2, 2, 4]
         rank.step(&mut state, &[int(1)]).unwrap();

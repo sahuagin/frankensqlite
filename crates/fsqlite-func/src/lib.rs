@@ -273,23 +273,116 @@ struct WrongArgCountScalarFunction {
     display_name: String,
 }
 
+fn wrong_arg_count_message(display_name: &str) -> String {
+    format!("wrong number of arguments to function {display_name}()")
+}
+
+fn wrong_arg_display_name(canonical: &str) -> String {
+    canonical.to_ascii_lowercase()
+}
+
 impl WrongArgCountScalarFunction {
     fn new(canonical: &str) -> Self {
         Self {
-            display_name: canonical.to_ascii_lowercase(),
+            display_name: wrong_arg_display_name(canonical),
         }
     }
 
     fn message(&self) -> String {
-        format!(
-            "wrong number of arguments to function {}()",
-            self.display_name
-        )
+        wrong_arg_count_message(&self.display_name)
     }
 }
 
 impl ScalarFunction for WrongArgCountScalarFunction {
     fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+}
+
+struct WrongArgCountAggregateFunction {
+    display_name: String,
+}
+
+impl WrongArgCountAggregateFunction {
+    fn new(canonical: &str) -> Self {
+        Self {
+            display_name: wrong_arg_display_name(canonical),
+        }
+    }
+
+    fn message(&self) -> String {
+        wrong_arg_count_message(&self.display_name)
+    }
+}
+
+impl AggregateFunction for WrongArgCountAggregateFunction {
+    type State = ();
+
+    fn initial_state(&self) -> Self::State {}
+
+    fn step(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> fsqlite_error::Result<()> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &str {
+        &self.display_name
+    }
+}
+
+struct WrongArgCountWindowFunction {
+    display_name: String,
+}
+
+impl WrongArgCountWindowFunction {
+    fn new(canonical: &str) -> Self {
+        Self {
+            display_name: wrong_arg_display_name(canonical),
+        }
+    }
+
+    fn message(&self) -> String {
+        wrong_arg_count_message(&self.display_name)
+    }
+}
+
+impl WindowFunction for WrongArgCountWindowFunction {
+    type State = ();
+
+    fn initial_state(&self) -> Self::State {}
+
+    fn step(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> fsqlite_error::Result<()> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn inverse(
+        &self,
+        _state: &mut Self::State,
+        _args: &[SqliteValue],
+    ) -> fsqlite_error::Result<()> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn value(&self, _state: &Self::State) -> fsqlite_error::Result<SqliteValue> {
+        Err(FrankenError::function_error(self.message()))
+    }
+
+    fn finalize(&self, _state: Self::State) -> fsqlite_error::Result<SqliteValue> {
         Err(FrankenError::function_error(self.message()))
     }
 
@@ -446,15 +539,30 @@ impl FunctionRegistry {
             name: canonical.to_owned(),
             num_args: -1,
         };
-        let result = self.aggregates.get(&variadic).map(Arc::clone);
+        if let Some(function) = self.aggregates.get(&variadic) {
+            if function.accepts_arg_count(num_args) {
+                debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "variadic", "registry lookup");
+                return Some(Arc::clone(function));
+            }
+            debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(AggregateAdapter::new(
+                WrongArgCountAggregateFunction::new(canonical),
+            )));
+        }
+        if self.aggregates.keys().any(|key| key.name == canonical) {
+            debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(AggregateAdapter::new(
+                WrongArgCountAggregateFunction::new(canonical),
+            )));
+        }
         debug!(
             name = %canonical,
             arity = num_args,
             kind = "aggregate",
-            hit = if result.is_some() { "variadic" } else { "miss" },
+            hit = "miss",
             "registry lookup"
         );
-        result
+        None
     }
 
     /// Look up a window function by `(name, num_args)`.
@@ -475,15 +583,30 @@ impl FunctionRegistry {
             name: canon.clone(),
             num_args: -1,
         };
-        let result = self.windows.get(&variadic).map(Arc::clone);
+        if let Some(function) = self.windows.get(&variadic) {
+            if function.accepts_arg_count(num_args) {
+                debug!(name = %canon, arity = num_args, kind = "window", hit = "variadic", "registry lookup");
+                return Some(Arc::clone(function));
+            }
+            debug!(name = %canon, arity = num_args, kind = "window", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(WindowAdapter::new(
+                WrongArgCountWindowFunction::new(&canon),
+            )));
+        }
+        if self.windows.keys().any(|key| key.name == canon) {
+            debug!(name = %canon, arity = num_args, kind = "window", hit = "wrong_arity", "registry lookup");
+            return Some(Arc::new(WindowAdapter::new(
+                WrongArgCountWindowFunction::new(&canon),
+            )));
+        }
         debug!(
             name = %canon,
             arity = num_args,
             kind = "window",
-            hit = if result.is_some() { "variadic" } else { "miss" },
+            hit = "miss",
             "registry lookup"
         );
-        result
+        None
     }
 
     /// Whether the registry contains any scalar function with this name
@@ -845,6 +968,38 @@ mod tests {
         );
     }
 
+    fn assert_wrong_arg_count_aggregate(
+        function: &ErasedAggregateFunction,
+        args: &[SqliteValue],
+        expected_name: &str,
+    ) {
+        let mut state = function.initial_state();
+        let err = function
+            .step(&mut state, args)
+            .expect_err("wrong aggregate arity should fail");
+        let expected = format!("wrong number of arguments to function {expected_name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "expected {expected:?}, got {err:?}"
+        );
+    }
+
+    fn assert_wrong_arg_count_window(
+        function: &ErasedWindowFunction,
+        args: &[SqliteValue],
+        expected_name: &str,
+    ) {
+        let mut state = function.initial_state();
+        let err = function
+            .step(&mut state, args)
+            .expect_err("wrong window arity should fail");
+        let expected = format!("wrong number of arguments to function {expected_name}()");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == &expected),
+            "expected {expected:?}, got {err:?}"
+        );
+    }
+
     struct Product;
 
     impl AggregateFunction for Product {
@@ -1089,6 +1244,17 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_aggregate_wrong_arity_returns_function_error() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_aggregate(Product);
+
+        let f = registry
+            .find_aggregate("product", 0)
+            .expect("known aggregate with wrong arity returns erroring aggregate");
+        assert_wrong_arg_count_aggregate(f.as_ref(), &[], "product");
+    }
+
+    #[test]
     fn test_registry_register_and_resolve_window() {
         let mut registry = FunctionRegistry::new();
         let previous = registry.register_window(MovingSum);
@@ -1112,6 +1278,17 @@ mod tests {
         f.step(&mut state, &[SqliteValue::Integer(40)])
             .expect("step 4");
         assert_eq!(f.value(&state).expect("value"), SqliteValue::Integer(90));
+    }
+
+    #[test]
+    fn test_registry_window_wrong_arity_returns_function_error() {
+        let mut registry = FunctionRegistry::new();
+        registry.register_window(MovingSum);
+
+        let f = registry
+            .find_window("moving_sum", 0)
+            .expect("known window with wrong arity returns erroring window");
+        assert_wrong_arg_count_window(f.as_ref(), &[], "moving_sum");
     }
 
     #[test]
