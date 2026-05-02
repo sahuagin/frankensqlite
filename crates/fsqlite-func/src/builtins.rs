@@ -468,6 +468,10 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+fn sqlite_text_until_nul(text: &str) -> &str {
+    text.split_once('\0').map_or(text, |(prefix, _)| prefix)
+}
+
 // ── length(X) ────────────────────────────────────────────────────────────
 
 pub struct LengthFunc;
@@ -479,10 +483,13 @@ impl ScalarFunction for LengthFunc {
             return Ok(SqliteValue::Null);
         }
         let len = match &args[0] {
-            SqliteValue::Text(s) => s.chars().count(),
+            SqliteValue::Text(s) => sqlite_text_until_nul(s.as_str()).chars().count(),
             SqliteValue::Blob(b) => b.len(),
-            // Numbers: length of text representation
-            other => other.to_text().chars().count(),
+            other => {
+                // Numbers: length of text representation.
+                let text = other.to_text();
+                sqlite_text_until_nul(&text).chars().count()
+            }
         };
         Ok(SqliteValue::Integer(len as i64))
     }
@@ -1102,7 +1109,7 @@ fn quote_sql_value(value: &SqliteValue, use_unistr_quote: bool) -> String {
 }
 
 fn quote_sql_text_literal(text: &str, use_unistr_quote: bool) -> String {
-    let text = text.split_once('\0').map_or(text, |(prefix, _)| prefix);
+    let text = sqlite_text_until_nul(text);
     if use_unistr_quote && text.chars().any(is_unistr_control_char) {
         return unistr_quote_sql_text_literal(text);
     }
@@ -1219,8 +1226,13 @@ impl ScalarFunction for UnicodeFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        if let SqliteValue::Blob(bytes) = &args[0] {
+            return Ok(
+                sqlite_blob_first_codepoint(bytes).map_or(SqliteValue::Null, SqliteValue::Integer)
+            );
+        }
         let s = text_arg(&args[0]);
-        match s.as_ref().chars().next() {
+        match sqlite_text_until_nul(s.as_ref()).chars().next() {
             Some(c) => Ok(SqliteValue::Integer(i64::from(c as u32))),
             None => Ok(SqliteValue::Null),
         }
@@ -1233,6 +1245,41 @@ impl ScalarFunction for UnicodeFunc {
     fn name(&self) -> &str {
         "unicode"
     }
+}
+
+fn sqlite_blob_first_codepoint(bytes: &[u8]) -> Option<i64> {
+    let first = *bytes.first()?;
+    if first == 0 {
+        return None;
+    }
+    let mut codepoint = match first {
+        0x00..=0xBF => u32::from(first),
+        0xC0..=0xDF => u32::from(first & 0x1F),
+        0xE0..=0xEF => u32::from(first & 0x0F),
+        0xF0..=0xF7 => u32::from(first & 0x07),
+        _ => 0xFFFD,
+    };
+
+    if first >= 0xC0 && first <= 0xF7 {
+        for byte in bytes
+            .iter()
+            .copied()
+            .skip(1)
+            .take_while(|byte| byte & 0xC0 == 0x80)
+        {
+            codepoint = codepoint
+                .wrapping_shl(6)
+                .wrapping_add(u32::from(byte & 0x3F));
+        }
+        if codepoint < 0x80
+            || (codepoint & 0xFFFF_F800) == 0xD800
+            || (codepoint & 0xFFFF_FFFE) == 0xFFFE
+        {
+            codepoint = 0xFFFD;
+        }
+    }
+
+    Some(i64::from(codepoint))
 }
 
 // ── substr(X, START [, LENGTH]) / substring() ───────────────────────────
@@ -3005,6 +3052,26 @@ mod tests {
     }
 
     #[test]
+    fn test_length_text_stops_at_nul() {
+        assert_eq!(
+            invoke1(
+                &LengthFunc,
+                SqliteValue::Text(SmallText::from_string("A\0B"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(
+                &LengthFunc,
+                SqliteValue::Text(SmallText::from_string("\0A"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
     fn test_length_blob_bytes() {
         assert_eq!(
             invoke1(&LengthFunc, SqliteValue::Blob(Arc::from([1, 2].as_slice()))).unwrap(),
@@ -3925,6 +3992,45 @@ mod tests {
             invoke1(&UnicodeFunc, SqliteValue::Text(SmallText::from_string("A"))).unwrap(),
             SqliteValue::Integer(65)
         );
+    }
+
+    #[test]
+    fn test_unicode_text_stops_at_nul() {
+        assert_eq!(
+            invoke1(
+                &UnicodeFunc,
+                SqliteValue::Text(SmallText::from_string("\0A"))
+            )
+            .unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            invoke1(
+                &UnicodeFunc,
+                SqliteValue::Text(SmallText::from_string("A\0"))
+            )
+            .unwrap(),
+            SqliteValue::Integer(65)
+        );
+    }
+
+    #[test]
+    fn test_unicode_blob_uses_sqlite_utf8_reader() {
+        let cases: &[(&[u8], SqliteValue)] = &[
+            (&[0x00, 0x41], SqliteValue::Null),
+            (&[0x80], SqliteValue::Integer(128)),
+            (&[0xC2, 0x80], SqliteValue::Integer(128)),
+            (&[0xC2, 0x80, 0x80], SqliteValue::Integer(8192)),
+            (&[0xED, 0xA0, 0x80], SqliteValue::Integer(65_533)),
+            (&[0xF4, 0x90, 0x80, 0x80], SqliteValue::Integer(1_114_112)),
+        ];
+
+        for (bytes, expected) in cases {
+            assert_eq!(
+                invoke1(&UnicodeFunc, SqliteValue::Blob(Arc::from(*bytes))).unwrap(),
+                expected.clone()
+            );
+        }
     }
 
     #[test]
