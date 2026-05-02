@@ -5147,6 +5147,11 @@ impl MakeRecordStatementLookaside {
         self.sideband_reg == register && !self.buf.is_empty()
     }
 
+    #[must_use]
+    fn armed_register(&self) -> Option<i32> {
+        (self.sideband_reg != 0 && !self.buf.is_empty()).then_some(self.sideband_reg)
+    }
+
     fn disarm(&mut self) {
         self.sideband_reg = 0;
     }
@@ -12811,6 +12816,11 @@ impl VdbeEngine {
     fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
         let target = op.p3;
         let n_cols = usize::try_from(op.p2).unwrap_or(0);
+        if let Some(armed_reg) = self.make_record_lookaside.armed_register()
+            && armed_reg != target
+        {
+            self.materialize_make_record_sideband(armed_reg);
+        }
         let mut rec_buf = self.make_record_lookaside.take_buf();
         {
             let this = &*self;
@@ -18401,6 +18411,55 @@ mod tests {
                 SqliteValue::Integer(44),
                 SqliteValue::Text("scopy-sideband".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_second_make_record_preserves_unconsumed_prior_sideband() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_first_value = b.alloc_reg();
+            let r_first_record = b.alloc_reg();
+            let r_second_value = b.alloc_reg();
+            let r_second_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 11, r_first_value, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_first_value,
+                1,
+                r_first_record,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::Integer, 22, r_second_value, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                r_second_value,
+                1,
+                r_second_record,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_first_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_second_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(vdbe_test_sideband_materialization_count_snapshot(), 2);
+        assert_eq!(
+            decode_record(&rows[0][0]).expect("first pending record should decode"),
+            vec![SqliteValue::Integer(11)]
+        );
+        assert_eq!(
+            decode_record(&rows[1][0]).expect("second pending record should decode"),
+            vec![SqliteValue::Integer(22)]
         );
     }
 
