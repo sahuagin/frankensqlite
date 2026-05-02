@@ -1417,18 +1417,21 @@ fn ascii_ci_contains(text: &str, needle: &str) -> bool {
 /// Accumulator for SQL `sum()` aggregate with SQLite overflow semantics.
 ///
 /// Unlike expression arithmetic (which promotes to REAL on overflow), `sum()`
-/// raises an error on integer overflow. This matches C sqlite3 behavior.
+/// raises an error on integer overflow only if all non-NULL inputs remain in
+/// the integer accumulator. A later REAL input suppresses the overflow error
+/// and returns the approximate REAL sum, matching C sqlite3 behavior.
 #[derive(Debug, Clone)]
 pub struct SumAccumulator {
     /// Running integer sum (if still in integer mode).
     int_sum: i64,
-    /// Running float sum (if promoted to float mode).
+    /// Running float sum retained in parallel so a later REAL input can fall
+    /// back without losing an integer that overflowed the exact accumulator.
     float_sum: f64,
     /// KBN compensation error term.
     float_err: f64,
     /// Whether we've seen any non-NULL value.
     has_value: bool,
-    /// Whether we're in float mode (any REAL input or integer overflow).
+    /// Whether we're in float mode (any REAL-like input).
     is_float: bool,
     /// Whether an integer overflow occurred (error condition).
     overflow: bool,
@@ -1469,46 +1472,31 @@ impl SumAccumulator {
     /// Add a value to the running sum.
     #[allow(clippy::cast_precision_loss)]
     pub fn accumulate(&mut self, val: &SqliteValue) {
-        match val {
-            SqliteValue::Null => {}
+        match val.to_sum_numeric_value() {
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
             SqliteValue::Integer(i) => {
                 self.has_value = true;
-                if self.is_float {
-                    kbn_step(&mut self.float_sum, &mut self.float_err, *i as f64);
-                } else {
-                    match self.int_sum.checked_add(*i) {
+                if !self.is_float && !self.overflow {
+                    match self.int_sum.checked_add(i) {
                         Some(result) => self.int_sum = result,
                         None => self.overflow = true,
                     }
                 }
+                kbn_step(&mut self.float_sum, &mut self.float_err, i as f64);
             }
             SqliteValue::Float(f) => {
                 self.has_value = true;
-                if !self.is_float {
-                    self.float_sum = self.int_sum as f64;
-                    self.float_err = 0.0;
-                    self.is_float = true;
-                }
-                kbn_step(&mut self.float_sum, &mut self.float_err, *f);
-            }
-            other => {
-                // TEXT/BLOB coerced to numeric.
-                self.has_value = true;
-                let n = other.to_float();
-                if !self.is_float {
-                    self.float_sum = self.int_sum as f64;
-                    self.float_err = 0.0;
-                    self.is_float = true;
-                }
-                kbn_step(&mut self.float_sum, &mut self.float_err, n);
+                self.is_float = true;
+                kbn_step(&mut self.float_sum, &mut self.float_err, f);
             }
         }
     }
 
-    /// Finalize the sum. Returns `Err` if integer overflow occurred,
-    /// `Ok(NULL)` if no non-NULL values were seen, or the sum value.
+    /// Finalize the sum. Returns `Err` if integer overflow occurred while the
+    /// accumulator stayed integer, `Ok(NULL)` if no non-NULL values were seen,
+    /// or the sum value.
     pub fn finish(&self) -> Result<SqliteValue, SumOverflowError> {
-        if self.overflow {
+        if !self.is_float && self.overflow {
             return Err(SumOverflowError);
         }
         if !self.has_value {
@@ -2899,6 +2887,33 @@ mod tests {
         acc.accumulate(&SqliteValue::Integer(1));
         let result = acc.finish();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sum_overflow_then_float_returns_real() {
+        let mut acc = SumAccumulator::new();
+        acc.accumulate(&SqliteValue::Integer(i64::MAX));
+        acc.accumulate(&SqliteValue::Integer(1));
+        acc.accumulate(&SqliteValue::Float(0.5));
+        let result = acc.finish().unwrap();
+        assert!(matches!(result, SqliteValue::Float(_)));
+    }
+
+    #[test]
+    fn test_sum_text_integer_literals_stay_integer() {
+        let mut acc = SumAccumulator::new();
+        acc.accumulate(&SqliteValue::Text(SmallText::new("1")));
+        acc.accumulate(&SqliteValue::Text(SmallText::new("2")));
+        let result = acc.finish().unwrap();
+        assert_eq!(result.as_integer(), Some(3));
+    }
+
+    #[test]
+    fn test_sum_non_numeric_text_returns_real_zero() {
+        let mut acc = SumAccumulator::new();
+        acc.accumulate(&SqliteValue::Text(SmallText::new("abc")));
+        let result = acc.finish().unwrap();
+        assert_eq!(result.as_float(), Some(0.0));
     }
 
     #[test]
