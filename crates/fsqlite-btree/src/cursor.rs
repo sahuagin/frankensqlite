@@ -6255,7 +6255,14 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+        let overflow_head = match self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
+        {
+            Ok(head) => head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                return Err(error);
+            }
+        };
         if self.at_eof {
             match self.try_append_on_current_leaf(cx, &cell_data) {
                 Ok(true) => {
@@ -6319,7 +6326,13 @@ impl<P: PageWriter> BtCursor<P> {
         };
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
-        let overflow_head = self.encode_index_leaf_cell_into(cx, key, &mut cell_data)?;
+        let overflow_head = match self.encode_index_leaf_cell_into(cx, key, &mut cell_data) {
+            Ok(head) => head,
+            Err(error) => {
+                self.cell_buf = cell_data;
+                return Err(error);
+            }
+        };
 
         match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
             Ok(true) => {
@@ -7788,7 +7801,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
             // Take cell_buf for reuse — same pattern as table_insert.
             let mut cell_data = std::mem::take(&mut cursor.cell_buf);
-            let overflow_head = cursor.encode_index_leaf_cell_into(cx, key, &mut cell_data)?;
+            let overflow_head = match cursor.encode_index_leaf_cell_into(cx, key, &mut cell_data) {
+                Ok(head) => head,
+                Err(error) => {
+                    cursor.cell_buf = cell_data;
+                    return Err(error);
+                }
+            };
 
             match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
                 Ok(true) => {
@@ -13350,6 +13369,48 @@ mod tests {
     }
 
     #[test]
+    fn test_table_insert_from_current_position_overflow_encode_error_retains_cell_buffer() {
+        const SMALL_USABLE: u32 = 256;
+        let root = pn(2);
+        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_table(
+            root,
+            SMALL_USABLE,
+        )));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(
+            FailingOverflowStore::new(inner, usize::MAX),
+            root,
+            SMALL_USABLE,
+            true,
+        );
+        assert!(
+            !cursor
+                .table_move_to(&cx, 1)
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "test rowid should be absent before insertion"
+        );
+
+        cursor.cell_buf = Vec::with_capacity(4096);
+        let expected_capacity = cursor.cell_buf.capacity();
+        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+
+        let overflow_payload = vec![b'X'; 512];
+        let error = cursor
+            .table_insert_from_current_position(&cx, 1, &overflow_payload)
+            .expect_err("injected overflow write failure should abort insert");
+
+        assert!(
+            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+            "expected injected write failure, got {error:?}"
+        );
+        assert!(
+            cursor.cell_buf.capacity() >= expected_capacity,
+            "table current-position encode failure should return the reusable cell buffer"
+        );
+    }
+
+    #[test]
     fn test_index_insert_from_current_position_reuses_leaf_state_without_reload() {
         let _guard = LEAF_REUSE_CURSOR_TEST_LOCK
             .lock()
@@ -13409,6 +13470,85 @@ mod tests {
         ];
         expected.sort_by(|lhs, rhs| compare_index_test_keys(&cursor, lhs, rhs));
         assert_eq!(scanned, expected);
+    }
+
+    #[test]
+    fn test_index_insert_from_current_position_overflow_encode_error_retains_cell_buffer() {
+        const SMALL_USABLE: u32 = 256;
+        let root = pn(2);
+        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
+            root,
+            SMALL_USABLE,
+        )));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(
+            FailingOverflowStore::new(inner, usize::MAX),
+            root,
+            SMALL_USABLE,
+            false,
+        );
+        assert!(
+            !cursor
+                .index_move_to(&cx, b"probe")
+                .expect("seek to insertion point should succeed")
+                .is_found(),
+            "test key should be absent before insertion"
+        );
+
+        cursor.cell_buf = Vec::with_capacity(4096);
+        let expected_capacity = cursor.cell_buf.capacity();
+        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+
+        let overflow_key = vec![b'K'; 512];
+        let error = cursor
+            .index_insert_from_current_position(&cx, &overflow_key)
+            .expect_err(
+                "injected overflow write failure should abort current-position index insert",
+            );
+
+        assert!(
+            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+            "expected injected write failure, got {error:?}"
+        );
+        assert!(
+            cursor.cell_buf.capacity() >= expected_capacity,
+            "index current-position encode failure should return the reusable cell buffer"
+        );
+    }
+
+    #[test]
+    fn test_index_insert_overflow_encode_error_retains_cell_buffer() {
+        const SMALL_USABLE: u32 = 256;
+        let root = pn(2);
+        let inner = Rc::new(RefCell::new(MemPageStore::with_empty_index(
+            root,
+            SMALL_USABLE,
+        )));
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(
+            FailingOverflowStore::new(inner, usize::MAX),
+            root,
+            SMALL_USABLE,
+            false,
+        );
+
+        cursor.cell_buf = Vec::with_capacity(4096);
+        let expected_capacity = cursor.cell_buf.capacity();
+        cursor.pager.fail_on_write = cursor.pager.write_count.saturating_add(1);
+
+        let overflow_key = vec![b'K'; 512];
+        let error = cursor
+            .index_insert(&cx, &overflow_key)
+            .expect_err("injected overflow write failure should abort generic index insert");
+
+        assert!(
+            matches!(&error, FrankenError::Internal(msg) if msg == "injected write failure"),
+            "expected injected write failure, got {error:?}"
+        );
+        assert!(
+            cursor.cell_buf.capacity() >= expected_capacity,
+            "generic index encode failure should return the reusable cell buffer"
+        );
     }
 
     #[test]
