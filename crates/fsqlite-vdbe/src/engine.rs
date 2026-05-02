@@ -7575,7 +7575,7 @@ impl VdbeEngine {
 
                 Opcode::SCopy => {
                     // Shallow copy register p1 to p2.
-                    let val = self.get_reg(op.p1).clone();
+                    let val = self.clone_reg_materialized(op.p1);
                     self.set_reg_fast(op.p2, val);
                     pc += 1;
                 }
@@ -12026,16 +12026,11 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
-            // SCopy is the shallow single-register copy — used whenever
-            // codegen needs to shuttle a value between two registers without
-            // the range semantics of Copy. The body is `clone + set_reg_fast`,
-            // same shape as Copy with p3=0, so the dispatch-shortening benefit
-            // carries over. Mirrors the existing main-match arm exactly (no
-            // sideband materialization — preserved to avoid behaviour drift
-            // from the pre-existing SCopy semantics; fix that in a separate
-            // commit if/when oracle tests expose the gap).
+            // SCopy is the shallow single-register copy. A MakeRecord sideband
+            // is still the source register's logical value, so materialize it
+            // before cloning just like single-register Copy.
             Opcode::SCopy => {
-                let val = self.get_reg(op.p1).clone();
+                let val = self.clone_reg_materialized(op.p1);
                 self.set_reg_fast(op.p2, val);
                 *pc += 1;
                 Ok(true)
@@ -18369,6 +18364,42 @@ mod tests {
             vec![
                 SqliteValue::Integer(33),
                 SqliteValue::Text("copy-sideband".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scopy_materializes_make_record_sideband_before_copying() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Integer, 44, 1, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::String8,
+                0,
+                2,
+                0,
+                P4::Str("scopy-sideband".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::MakeRecord, 1, 2, 3, P4::None, 0);
+            b.emit_op(Opcode::SCopy, 3, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(vdbe_test_sideband_materialization_count_snapshot(), 1);
+        assert_eq!(
+            decode_record(&rows[0][0]).expect("shallow-copied record blob should decode"),
+            vec![
+                SqliteValue::Integer(44),
+                SqliteValue::Text("scopy-sideband".into()),
             ]
         );
     }
