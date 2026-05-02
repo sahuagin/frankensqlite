@@ -11896,6 +11896,18 @@ impl VdbeEngine {
             .and_then(|delta| start.checked_add(delta))
     }
 
+    fn register_range_contains(start: i32, count: usize, register: i32) -> bool {
+        if count == 0 {
+            return false;
+        }
+        let Ok(count) = i64::try_from(count) else {
+            return true;
+        };
+        let start = i64::from(start);
+        let register = i64::from(register);
+        register >= start && register < start + count
+    }
+
     #[inline]
     fn invalidate_make_record_sideband_if_overwritten(&mut self, r: i32) {
         self.make_record_lookaside.clear_sideband_for_register(r);
@@ -12817,7 +12829,7 @@ impl VdbeEngine {
         let target = op.p3;
         let n_cols = usize::try_from(op.p2).unwrap_or(0);
         if let Some(armed_reg) = self.make_record_lookaside.armed_register()
-            && armed_reg != target
+            && (armed_reg != target || Self::register_range_contains(op.p1, n_cols, armed_reg))
         {
             self.materialize_make_record_sideband(armed_reg);
         }
@@ -18461,6 +18473,33 @@ mod tests {
             decode_record(&rows[1][0]).expect("second pending record should decode"),
             vec![SqliteValue::Integer(22)]
         );
+    }
+
+    #[test]
+    fn test_make_record_materializes_sideband_when_source_overlaps_target() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 33, r_value, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_record, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(vdbe_test_sideband_materialization_count_snapshot(), 2);
+        let outer = decode_record(&rows[0][0]).expect("outer record should decode");
+        assert_eq!(outer.len(), 1);
+        let inner = decode_record(&outer[0]).expect("nested record should decode");
+        assert_eq!(inner, vec![SqliteValue::Integer(33)]);
     }
 
     #[test]
