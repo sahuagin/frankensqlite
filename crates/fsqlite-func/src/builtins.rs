@@ -1180,6 +1180,9 @@ impl ScalarFunction for UnhexFunc {
         let mut hi_nibble = None;
         for c in input.as_ref().chars() {
             if ignore_chars.contains(&c) {
+                if hi_nibble.is_some() {
+                    return Ok(SqliteValue::Null);
+                }
                 continue;
             }
             let digit = match hex_digit(c) {
@@ -3793,6 +3796,26 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Blob(Arc::from(b"Hel".as_slice())));
+    }
+
+    #[test]
+    fn test_unhex_ignore_chars_only_between_byte_pairs() {
+        let f = UnhexFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("AB CD")),
+                SqliteValue::Text(SmallText::from_string(" ")),
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Blob(Arc::from([0xAB, 0xCD])));
+
+        let result = f
+            .invoke(&[
+                SqliteValue::Text(SmallText::from_string("A BCD")),
+                SqliteValue::Text(SmallText::from_string(" ")),
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
     }
 
     #[test]
