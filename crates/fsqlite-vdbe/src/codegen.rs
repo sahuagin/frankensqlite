@@ -1251,6 +1251,8 @@ pub enum CodegenError {
     TableNotFound(String),
     /// Column not found in table.
     ColumnNotFound { table: String, column: String },
+    /// Ambiguous unqualified column reference.
+    AmbiguousColumn(String),
     /// Unsupported AST construct for this codegen pass.
     Unsupported(String),
 }
@@ -1262,6 +1264,7 @@ impl std::fmt::Display for CodegenError {
             Self::ColumnNotFound { table, column } => {
                 write!(f, "column {column} not found in table {table}")
             }
+            Self::AmbiguousColumn(name) => write!(f, "ambiguous column name: {name}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
@@ -7638,7 +7641,7 @@ enum JoinColumnResolution {
 }
 
 fn ambiguous_join_column(name: &str) -> CodegenError {
-    CodegenError::Unsupported(format!("ambiguous column name: {name}"))
+    CodegenError::AmbiguousColumn(name.to_owned())
 }
 
 fn join_qualified_column_name(qualifier: Option<&str>, name: &str) -> String {
@@ -28911,7 +28914,7 @@ mod tests {
         let err = codegen_select(&mut b, &ambiguous_join_on_stmt("x"), &schema, &ctx)
             .expect_err("unqualified duplicate JOIN column should be ambiguous");
         assert!(
-            matches!(err, CodegenError::Unsupported(ref msg) if msg == "ambiguous column name: x"),
+            matches!(err, CodegenError::AmbiguousColumn(ref name) if name == "x"),
             "unexpected error: {err:?}"
         );
     }
@@ -28947,7 +28950,7 @@ mod tests {
         let err = codegen_select(&mut b, &ambiguous_join_on_stmt("rowid"), &schema, &ctx)
             .expect_err("unqualified JOIN rowid should be ambiguous");
         assert!(
-            matches!(err, CodegenError::Unsupported(ref msg) if msg == "ambiguous column name: rowid"),
+            matches!(err, CodegenError::AmbiguousColumn(ref name) if name == "rowid"),
             "unexpected error: {err:?}"
         );
     }

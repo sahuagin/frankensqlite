@@ -7694,6 +7694,21 @@ mod tests {
     }
 
     #[test]
+    fn regression_join_ambiguous_column_surfaces_typed_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE b(x INTEGER)").unwrap();
+
+        let err = conn
+            .query("SELECT a.x FROM a JOIN b ON x = 1;")
+            .expect_err("unqualified duplicate JOIN column should fail");
+        assert!(
+            matches!(err, FrankenError::AmbiguousColumn { ref name } if name == "x"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn conformance_033_join_with_where() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE dept(id INTEGER PRIMARY KEY, name TEXT)")
