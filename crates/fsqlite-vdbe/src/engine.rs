@@ -9838,8 +9838,15 @@ impl VdbeEngine {
                                             // insert, roll back any already-inserted
                                             // index entries, and skip remaining indexes.
                                             4 => {
-                                                self.rollback_pending_insert_after_index_conflict(
-                                                )?;
+                                                if let Err(error) = self
+                                                    .rollback_pending_insert_after_index_conflict()
+                                                {
+                                                    if sideband_active {
+                                                        self.make_record_lookaside
+                                                            .replace_cleared_buf(key_blob);
+                                                    }
+                                                    return Err(error);
+                                                }
                                                 self.set_conflict_skip_idx(true);
                                                 if sideband_active {
                                                     self.make_record_lookaside
@@ -9858,18 +9865,33 @@ impl VdbeEngine {
                                                 let conflict_rowid = if uses_collated_unique_probe {
                                                     conflict_rowid
                                                 } else {
-                                                    find_conflicting_rowid_in_index(
+                                                    match find_conflicting_rowid_in_index(
                                                         sc, key_bytes, n_idx_cols,
-                                                    )?
+                                                    ) {
+                                                        Ok(rowid) => rowid,
+                                                        Err(error) => {
+                                                            if sideband_active {
+                                                                self.make_record_lookaside
+                                                                    .replace_cleared_buf(key_blob);
+                                                            }
+                                                            return Err(error);
+                                                        }
+                                                    }
                                                 };
 
                                                 if let Some(old_rowid) = conflict_rowid {
                                                     if let Some(tbl_cid) =
                                                         self.last_insert_cursor_id
                                                     {
-                                                        self.native_replace_row(
-                                                            tbl_cid, old_rowid,
-                                                        )?;
+                                                        if let Err(error) = self
+                                                            .native_replace_row(tbl_cid, old_rowid)
+                                                        {
+                                                            if sideband_active {
+                                                                self.make_record_lookaside
+                                                                    .replace_cleared_buf(key_blob);
+                                                            }
+                                                            return Err(error);
+                                                        }
                                                     }
                                                 }
 
@@ -9877,15 +9899,28 @@ impl VdbeEngine {
                                                 // (the conflicting one was already
                                                 // deleted by
                                                 // find_conflicting_rowid_in_index).
-                                                let sc2 = self
-                                                    .storage_cursors
-                                                    .get_mut(&cursor_id)
-                                                    .ok_or_else(|| {
-                                                        FrankenError::internal("cursor must exist")
-                                                    })?;
+                                                let Some(sc2) =
+                                                    self.storage_cursors.get_mut(&cursor_id)
+                                                else {
+                                                    if sideband_active {
+                                                        self.make_record_lookaside
+                                                            .replace_cleared_buf(key_blob);
+                                                    }
+                                                    return Err(FrankenError::internal(
+                                                        "cursor must exist",
+                                                    ));
+                                                };
                                                 sc2.last_rightmost_unique_index_prefix = None;
                                                 sc2.last_rightmost_unique_index_position = None;
-                                                sc2.cursor.index_insert(&sc2.cx, key_bytes)?;
+                                                if let Err(error) =
+                                                    sc2.cursor.index_insert(&sc2.cx, key_bytes)
+                                                {
+                                                    if sideband_active {
+                                                        self.make_record_lookaside
+                                                            .replace_cleared_buf(key_blob);
+                                                    }
+                                                    return Err(error);
+                                                }
                                                 invalidate_storage_cursor_row_cache_with_reason(
                                                     sc2,
                                                     self.collect_vdbe_metrics,
@@ -9929,7 +9964,12 @@ impl VdbeEngine {
                             } else {
                                 sc.last_rightmost_unique_index_prefix = None;
                                 sc.last_rightmost_unique_index_position = None;
-                                sc.cursor.index_insert(&sc.cx, key_bytes)?;
+                                if let Err(error) = sc.cursor.index_insert(&sc.cx, key_bytes) {
+                                    if sideband_active {
+                                        self.make_record_lookaside.replace_cleared_buf(key_blob);
+                                    }
+                                    return Err(error);
+                                }
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
                                     self.collect_vdbe_metrics,
@@ -16951,6 +16991,84 @@ mod tests {
         assert!(
             engine.make_record_lookaside.capacity() >= expected_capacity,
             "aborted IdxInsert should keep the reusable sideband allocation"
+        );
+    }
+
+    #[test]
+    fn test_idxinsert_ignore_restores_sideband_when_rollback_errors() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
+        let conflict_value = "idx-ignore-rollback-error-sideband".repeat(16);
+        let existing_key = encode_record(&[
+            SqliteValue::Text(conflict_value.clone().into()),
+            SqliteValue::Integer(1),
+        ]);
+
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        let mut engine = VdbeEngine::new(8);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, index_root, true));
+
+        {
+            let index_cursor = engine
+                .storage_cursors
+                .get_mut(&0)
+                .expect("index cursor should exist");
+            index_cursor
+                .cursor
+                .index_insert(&index_cursor.cx, &existing_key)
+                .expect("existing unique index key should insert");
+        }
+
+        let mut builder = ProgramBuilder::new();
+        let end = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_value = builder.alloc_reg();
+        let r_record = builder.alloc_reg();
+        builder.emit_op(Opcode::String8, 0, r_value, 0, P4::Str(conflict_value), 0);
+        builder.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+        builder.emit_op(
+            Opcode::IdxInsert,
+            0,
+            r_record,
+            1,
+            P4::Table("idx_col".to_owned()),
+            1 | (4 << 1),
+        );
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        builder.resolve_label(end);
+
+        let program = builder.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&program, PageSize::DEFAULT);
+        let before = vdbe_test_sideband_materialization_count_snapshot();
+        let error = engine
+            .execute(&program)
+            .expect_err("missing provisional insert rollback should error");
+        let after = vdbe_test_sideband_materialization_count_snapshot();
+
+        assert!(
+            matches!(error, FrankenError::Internal(message) if message.contains("secondary-index conflict without pending table insert")),
+            "expected rollback bookkeeping error, got {error:?}"
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "rollback error path should not materialize a sideband-backed key"
+        );
+        assert!(
+            engine.make_record_lookaside.is_empty(),
+            "failed IGNORE rollback should return a cleared scratch buffer"
+        );
+        assert!(
+            engine.make_record_lookaside.capacity() >= expected_capacity,
+            "failed IGNORE rollback should keep the reusable sideband allocation"
         );
     }
 
