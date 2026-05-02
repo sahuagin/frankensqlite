@@ -6834,6 +6834,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.last_insert_rowid = Some(rowid);
             self.last_known_depth = Some(hint.tree_depth);
             hint.last_rowid = rowid;
+            hint.clear_page_data();
             self.clear_rightmost_leaf_cache();
             return Ok(true);
         }
@@ -8436,6 +8437,74 @@ mod tests {
     impl PageWriter for SeekProbeStore {
         fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
             self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
+        }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
+    #[derive(Debug, Clone)]
+    struct StagedMutationStore {
+        inner: MemPageStore,
+    }
+
+    impl StagedMutationStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl PageReader for StagedMutationStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.read_page(cx, page_no)
+        }
+    }
+
+    impl PageWriter for StagedMutationStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+            self.inner.write_page_data(cx, page_no, data)
+        }
+
+        fn try_take_staged_page_data(&mut self, page_no: PageNumber) -> Option<PageData> {
+            self.inner
+                .pages
+                .remove(&page_no.get())
+                .map(PageData::from_vec)
+        }
+
+        fn try_mutate_staged_page_data(
+            &mut self,
+            page_no: PageNumber,
+            f: &mut dyn FnMut(&mut PageData),
+        ) -> bool {
+            let Some(page) = self.inner.pages.get(&page_no.get()).cloned() else {
+                return false;
+            };
+            let mut data = PageData::from_vec(page);
+            f(&mut data);
+            self.inner.pages.insert(page_no.get(), data.into_vec());
+            self.inner.set_page_slot_present(page_no, true);
+            true
+        }
+
+        fn restore_staged_page_data(
+            &mut self,
+            cx: &Cx,
+            page_no: PageNumber,
+            data: PageData,
+        ) -> Result<()> {
+            self.inner.write_page_data(cx, page_no, data)
         }
 
         fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
@@ -12670,6 +12739,58 @@ mod tests {
         for expected_rowid in 1..=256_i64 {
             assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
             if expected_rowid < 256 {
+                assert!(cursor.next(&cx).unwrap());
+            }
+        }
+        assert!(!cursor.next(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_cached_rightmost_hint_drops_page_data_after_staged_mutation() {
+        const SMALL_USABLE: u32 = 256;
+
+        let cx = Cx::new();
+        let root = pn(2);
+        let payload = vec![b'S'; 120];
+        let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, SMALL_USABLE));
+        let mut cursor = BtCursor::new(store, root, SMALL_USABLE, true);
+        cursor
+            .table_insert_rightmost_hint(&cx, 1, &payload)
+            .expect("seed insert should succeed");
+
+        let mut hint = cursor
+            .table_cached_rightmost_leaf_hint()
+            .expect("seed insert should capture a retained rightmost-leaf image");
+        assert!(
+            hint.retains_page_data(),
+            "seed hint should start with a retained page image"
+        );
+
+        assert!(
+            cursor
+                .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 2, &payload)
+                .expect("staged-page mutation append should succeed"),
+            "second row should append through the staged-page mutation path"
+        );
+        assert_eq!(hint.last_rowid(), 2);
+        assert!(
+            !hint.retains_page_data(),
+            "a staged-page mutation must drop the stale retained page image"
+        );
+
+        if !cursor
+            .table_try_append_cached_rightmost_leaf_hint(&cx, &mut hint, 3, &payload)
+            .expect("fallback probe after staged-page mutation should not corrupt state")
+        {
+            cursor
+                .table_insert_rightmost_hint(&cx, 3, &payload)
+                .expect("caller fallback should preserve rows after stale hint bytes are dropped");
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        for expected_rowid in 1..=3_i64 {
+            assert_eq!(cursor.rowid(&cx).unwrap(), expected_rowid);
+            if expected_rowid < 3 {
                 assert!(cursor.next(&cx).unwrap());
             }
         }
