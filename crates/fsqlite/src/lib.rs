@@ -7525,6 +7525,51 @@ mod tests {
     }
 
     #[test]
+    fn regression_join_literal_text_numeric_comparison_uses_storage_class_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE b(y INTEGER)").unwrap();
+        conn.execute("INSERT INTO a VALUES (1)").unwrap();
+        conn.execute("INSERT INTO b VALUES (2)").unwrap();
+
+        let rows = conn
+            .query("SELECT a.x FROM a JOIN b ON '123' = 123;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        let rows = conn
+            .query("SELECT a.x FROM a JOIN b ON '123' < 124;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        let rows = conn
+            .query("SELECT a.x FROM (SELECT 1 AS x) a JOIN (SELECT 2 AS y) b ON '123' = 123;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        let rows = conn
+            .query("SELECT a.x FROM (SELECT 1 AS x) a JOIN (SELECT 2 AS y) b ON '123' < 124;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        conn.execute("CREATE TABLE txt(v TEXT)").unwrap();
+        conn.execute("CREATE TABLE num(v NUMERIC)").unwrap();
+        conn.execute("INSERT INTO txt VALUES ('9')").unwrap();
+        conn.execute("INSERT INTO num VALUES (CAST('9' AS TEXT))")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT v FROM (SELECT v FROM txt) a JOIN (SELECT 10 AS n) b ON v < n;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+
+        let rows = conn
+            .query("SELECT v FROM (SELECT v FROM num) a JOIN (SELECT 10 AS n) b ON v < n;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
     fn conformance_033_join_with_where() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE dept(id INTEGER PRIMARY KEY, name TEXT)")
