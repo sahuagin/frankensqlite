@@ -9254,7 +9254,7 @@ impl VdbeEngine {
                         // Blob/Text records.
                         self.take_reg(record_reg)
                     };
-                    let sideband_buf = if sideband_active {
+                    let mut sideband_buf = if sideband_active {
                         self.make_record_lookaside.disarm();
                         self.make_record_lookaside.take_buf()
                     } else {
@@ -9263,68 +9263,136 @@ impl VdbeEngine {
                     let mut actually_inserted = false;
                     let mut inserted_via_storage = false;
                     let mut inserted_root_page = None;
-                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
-                        if sc.writable {
-                            let root_page = sc.root_page;
-                            let autoinc_max = sc.autoincrement_high_water;
-                            let rowid_mode = sc.rowid_mode;
-                            let blob = if let Some(record) = preformatted_record {
-                                record
-                            } else if sideband_active {
-                                &sideband_buf[..]
-                            } else {
-                                record_blob_bytes(&record_val)
-                            };
-                            // bd-p666i: Append fast-path — if the new rowid
-                            // is strictly greater than the last successfully
-                            // inserted rowid on this cursor, the row cannot
-                            // already exist (B-tree keys are unique) and we
-                            // can skip the full B-tree seek.  This matches
-                            // C SQLite's BTREE_APPEND optimization.
-                            //
-                            // bd-0zxi6: Safe in concurrent mode because:
-                            // 1. last_successful_insert_rowid is per-StorageCursor (per-txn)
-                            // 2. Each concurrent txn has its own COW page copies
-                            // 3. SSI conflict detection happens at commit time
-                            let append_eligible = !is_update
-                                && sc
-                                    .last_successful_insert_rowid
-                                    .is_some_and(|last| rowid > last);
-                            let mut insert_seek_result = None;
-                            let exists = if append_eligible {
-                                FSQLITE_VDBE_INSERT_APPEND_COUNT
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                                false // Append: key is larger than anything in the table
-                            } else {
-                                FSQLITE_VDBE_INSERT_SEEK_COUNT
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                                let seek_result = sc.cursor.table_move_to(&sc.cx, rowid)?;
-                                insert_seek_result = Some(seek_result);
-                                seek_result.is_found()
-                            };
-
-                            if exists {
-                                if sc.last_successful_insert_rowid.take().is_some() {
-                                    FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                    let insert_result = (|| -> Result<Option<ExecOutcome>> {
+                        if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                            if sc.writable {
+                                let root_page = sc.root_page;
+                                let autoinc_max = sc.autoincrement_high_water;
+                                let rowid_mode = sc.rowid_mode;
+                                let blob = if let Some(record) = preformatted_record {
+                                    record
+                                } else if sideband_active {
+                                    &sideband_buf[..]
+                                } else {
+                                    record_blob_bytes(&record_val)
+                                };
+                                // bd-p666i: Append fast-path — if the new rowid
+                                // is strictly greater than the last successfully
+                                // inserted rowid on this cursor, the row cannot
+                                // already exist (B-tree keys are unique) and we
+                                // can skip the full B-tree seek.  This matches
+                                // C SQLite's BTREE_APPEND optimization.
+                                //
+                                // bd-0zxi6: Safe in concurrent mode because:
+                                // 1. last_successful_insert_rowid is per-StorageCursor (per-txn)
+                                // 2. Each concurrent txn has its own COW page copies
+                                // 3. SSI conflict detection happens at commit time
+                                let append_eligible = !is_update
+                                    && sc
+                                        .last_successful_insert_rowid
+                                        .is_some_and(|last| rowid > last);
+                                let mut insert_seek_result = None;
+                                let exists = if append_eligible {
+                                    FSQLITE_VDBE_INSERT_APPEND_COUNT
                                         .fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-                                // Match on the low OE_* bits directly — p5 is
-                                // not a plain bitfield in this engine because
-                                // it also carries the custom OPFLAG_ISUPDATE
-                                // bit above the conflict-mode nibble.
-                                if oe_flag == 5 {
-                                    // OE_REPLACE: Delete old, insert new
-                                    self.native_replace_row(cursor_id, rowid)?;
-                                    let sc2 = self.storage_cursors.get_mut(&cursor_id).ok_or_else(
-                                        || {
-                                            FrankenError::internal(
-                                                "cursor disappeared during REPLACE",
-                                            )
-                                        },
-                                    )?;
-                                    sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
+                                    false // Append: key is larger than anything in the table
+                                } else {
+                                    FSQLITE_VDBE_INSERT_SEEK_COUNT
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    let seek_result = sc.cursor.table_move_to(&sc.cx, rowid)?;
+                                    insert_seek_result = Some(seek_result);
+                                    seek_result.is_found()
+                                };
+
+                                if exists {
+                                    if sc.last_successful_insert_rowid.take().is_some() {
+                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                            .fetch_add(1, AtomicOrdering::Relaxed);
+                                    }
+                                    // Match on the low OE_* bits directly — p5 is
+                                    // not a plain bitfield in this engine because
+                                    // it also carries the custom OPFLAG_ISUPDATE
+                                    // bit above the conflict-mode nibble.
+                                    if oe_flag == 5 {
+                                        // OE_REPLACE: Delete old, insert new
+                                        self.native_replace_row(cursor_id, rowid)?;
+                                        let sc2 = self
+                                            .storage_cursors
+                                            .get_mut(&cursor_id)
+                                            .ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "cursor disappeared during REPLACE",
+                                                )
+                                            })?;
+                                        sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
+                                        invalidate_storage_cursor_row_cache_with_reason(
+                                            sc2,
+                                            self.collect_vdbe_metrics,
+                                            DecodeCacheInvalidationReason::WriteMutation,
+                                        );
+                                        if let Some(allocator) = concurrent_allocator.as_ref() {
+                                            Self::bump_concurrent_storage_rowid_floor(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                root_page,
+                                                rowid_mode,
+                                                autoinc_max,
+                                                sc2,
+                                                rowid,
+                                            )?;
+                                        }
+                                        inserted_via_storage = true;
+                                        inserted_root_page = Some(root_page);
+                                        actually_inserted = true;
+                                    } else if oe_flag == 4 {
+                                        // OE_IGNORE: Skip insert for conflicting row
+                                        if let Some(update_restore) = pending_update_restore.clone()
+                                        {
+                                            self.restore_pending_update_after_conflict(
+                                                update_restore,
+                                            )?;
+                                        }
+                                    } else {
+                                        // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                        if let Some(update_restore) = pending_update_restore.clone()
+                                        {
+                                            self.restore_pending_update_after_conflict(
+                                                update_restore,
+                                            )?;
+                                        }
+                                        return Ok(Some(ExecOutcome::Error {
+                                            code: ErrorCode::Constraint as i32,
+                                            message: "PRIMARY KEY constraint failed".to_owned(),
+                                        }));
+                                    }
+                                } else {
+                                    // No conflict — reuse the successor/EOF position from the
+                                    // existence probe when it already proved the row is absent.
+                                    if insert_seek_result == Some(SeekResult::NotFound) {
+                                        let rightmost_insert = sc.cursor.eof();
+                                        sc.cursor
+                                            .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
+                                        if rightmost_insert {
+                                            sc.cursor
+                                                .table_refresh_rightmost_leaf_cache_after_insert(
+                                                    &sc.cx, rowid,
+                                                )?;
+                                            sc.last_successful_insert_rowid = Some(rowid);
+                                        } else if sc.last_successful_insert_rowid.take().is_some() {
+                                            FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                                .fetch_add(1, AtomicOrdering::Relaxed);
+                                        }
+                                    } else {
+                                        sc.cursor.table_insert(&sc.cx, rowid, blob)?;
+                                        if append_eligible {
+                                            sc.last_successful_insert_rowid = Some(rowid);
+                                        } else if sc.last_successful_insert_rowid.take().is_some() {
+                                            FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
+                                                .fetch_add(1, AtomicOrdering::Relaxed);
+                                        }
+                                    }
                                     invalidate_storage_cursor_row_cache_with_reason(
-                                        sc2,
+                                        sc,
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
@@ -9335,167 +9403,122 @@ impl VdbeEngine {
                                             root_page,
                                             rowid_mode,
                                             autoinc_max,
-                                            sc2,
+                                            sc,
                                             rowid,
                                         )?;
                                     }
                                     inserted_via_storage = true;
                                     inserted_root_page = Some(root_page);
                                     actually_inserted = true;
-                                } else if oe_flag == 4 {
-                                    // OE_IGNORE: Skip insert for conflicting row
-                                    if let Some(update_restore) = pending_update_restore.clone() {
-                                        self.restore_pending_update_after_conflict(update_restore)?;
-                                    }
-                                } else {
-                                    // Default (ABORT/FAIL/ROLLBACK): constraint error.
-                                    if let Some(update_restore) = pending_update_restore.clone() {
-                                        self.restore_pending_update_after_conflict(update_restore)?;
-                                    }
-                                    break ExecOutcome::Error {
-                                        code: ErrorCode::Constraint as i32,
-                                        message: "PRIMARY KEY constraint failed".to_owned(),
-                                    };
                                 }
+                            }
+                        } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page)
+                        {
+                            // MemDatabase fallback (Phase 4 in-memory cursors).
+                            let values = if let Some(record) = preformatted_record {
+                                let values = parse_record(record).ok_or_else(|| {
+                                    FrankenError::internal("malformed SQLite record blob")
+                                })?;
+                                if self.collect_vdbe_metrics {
+                                    FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    for value in &values {
+                                        record_decoded_value_metrics(value);
+                                    }
+                                }
+                                values
+                            } else if sideband_active {
+                                let values = parse_record(&sideband_buf).ok_or_else(|| {
+                                    FrankenError::internal("malformed SQLite record blob")
+                                })?;
+                                if self.collect_vdbe_metrics {
+                                    FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
+                                        .fetch_add(1, AtomicOrdering::Relaxed);
+                                    for value in &values {
+                                        record_decoded_value_metrics(value);
+                                    }
+                                }
+                                values
                             } else {
-                                // No conflict — reuse the successor/EOF position from the
-                                // existence probe when it already proved the row is absent.
-                                if insert_seek_result == Some(SeekResult::NotFound) {
-                                    let rightmost_insert = sc.cursor.eof();
-                                    sc.cursor
-                                        .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
-                                    if rightmost_insert {
-                                        sc.cursor.table_refresh_rightmost_leaf_cache_after_insert(
-                                            &sc.cx, rowid,
-                                        )?;
-                                        sc.last_successful_insert_rowid = Some(rowid);
-                                    } else if sc.last_successful_insert_rowid.take().is_some() {
-                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
-                                            .fetch_add(1, AtomicOrdering::Relaxed);
-                                    }
-                                } else {
-                                    sc.cursor.table_insert(&sc.cx, rowid, blob)?;
-                                    if append_eligible {
-                                        sc.last_successful_insert_rowid = Some(rowid);
-                                    } else if sc.last_successful_insert_rowid.take().is_some() {
-                                        FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
-                                            .fetch_add(1, AtomicOrdering::Relaxed);
-                                    }
-                                }
-                                invalidate_storage_cursor_row_cache_with_reason(
-                                    sc,
-                                    self.collect_vdbe_metrics,
-                                    DecodeCacheInvalidationReason::WriteMutation,
-                                );
-                                if let Some(allocator) = concurrent_allocator.as_ref() {
-                                    Self::bump_concurrent_storage_rowid_floor(
-                                        allocator,
-                                        concurrent_schema_epoch,
-                                        root_page,
-                                        rowid_mode,
-                                        autoinc_max,
-                                        sc,
-                                        rowid,
-                                    )?;
-                                }
-                                inserted_via_storage = true;
-                                inserted_root_page = Some(root_page);
-                                actually_inserted = true;
-                            }
-                        }
-                    } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
-                        // MemDatabase fallback (Phase 4 in-memory cursors).
-                        let values = if let Some(record) = preformatted_record {
-                            let values = parse_record(record).ok_or_else(|| {
-                                FrankenError::internal("malformed SQLite record blob")
-                            })?;
-                            if self.collect_vdbe_metrics {
-                                FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                                for value in &values {
-                                    record_decoded_value_metrics(value);
-                                }
-                            }
-                            values
-                        } else if sideband_active {
-                            let values = parse_record(&sideband_buf).ok_or_else(|| {
-                                FrankenError::internal("malformed SQLite record blob")
-                            })?;
-                            if self.collect_vdbe_metrics {
-                                FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                                for value in &values {
-                                    record_decoded_value_metrics(value);
-                                }
-                            }
-                            values
-                        } else {
-                            decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?
-                        };
-                        if let Some(db) = self.db.as_mut() {
-                            // Check rowid conflict first.
-                            let rowid_conflict = db
-                                .get_table(root)
-                                .and_then(|t| t.find_by_rowid(rowid))
-                                .is_some();
+                                decode_record_with_metrics(&record_val, self.collect_vdbe_metrics)?
+                            };
+                            if let Some(db) = self.db.as_mut() {
+                                // Check rowid conflict first.
+                                let rowid_conflict = db
+                                    .get_table(root)
+                                    .and_then(|t| t.find_by_rowid(rowid))
+                                    .is_some();
 
-                            // Check UNIQUE column constraint conflicts (non-IPK).
-                            // We check even if rowid_conflict is true, because
-                            // the new values might conflict with a DIFFERENT
-                            // row on a UNIQUE column.
-                            let unique_conflicts = db
-                                .get_table(root)
-                                .map(|t| t.find_unique_conflicts(&values))
-                                .unwrap_or_default();
+                                // Check UNIQUE column constraint conflicts (non-IPK).
+                                // We check even if rowid_conflict is true, because
+                                // the new values might conflict with a DIFFERENT
+                                // row on a UNIQUE column.
+                                let unique_conflicts = db
+                                    .get_table(root)
+                                    .map(|t| t.find_unique_conflicts(&values))
+                                    .unwrap_or_default();
 
-                            let has_conflict = rowid_conflict || !unique_conflicts.is_empty();
+                                let has_conflict = rowid_conflict || !unique_conflicts.is_empty();
 
-                            if has_conflict {
-                                match oe_flag {
-                                    4 => {
-                                        // OE_IGNORE: Skip insert for conflicting row
-                                        if let Some(update_restore) = pending_update_restore.clone()
-                                        {
-                                            self.restore_pending_update_after_conflict(
-                                                update_restore,
-                                            )?;
-                                        }
-                                    }
-                                    5 => {
-                                        // OE_REPLACE: Delete conflicting row(s),
-                                        // then insert new.
-                                        if let Some(table) = db.get_table_mut(root) {
-                                            for conflict_rid in unique_conflicts {
-                                                // Delete conflicting rows that are not the new rowid
-                                                // (which will be replaced by upsert_row).
-                                                if conflict_rid != rowid {
-                                                    table.delete_by_rowid(conflict_rid);
-                                                }
+                                if has_conflict {
+                                    match oe_flag {
+                                        4 => {
+                                            // OE_IGNORE: Skip insert for conflicting row
+                                            if let Some(update_restore) =
+                                                pending_update_restore.clone()
+                                            {
+                                                self.restore_pending_update_after_conflict(
+                                                    update_restore,
+                                                )?;
                                             }
                                         }
-                                        db.upsert_row(root, rowid, values);
-                                        actually_inserted = true;
-                                    }
-                                    _ => {
-                                        // Default (ABORT/FAIL/ROLLBACK): constraint error.
-                                        if let Some(update_restore) = pending_update_restore.clone()
-                                        {
-                                            self.restore_pending_update_after_conflict(
-                                                update_restore,
-                                            )?;
+                                        5 => {
+                                            // OE_REPLACE: Delete conflicting row(s),
+                                            // then insert new.
+                                            if let Some(table) = db.get_table_mut(root) {
+                                                for conflict_rid in unique_conflicts {
+                                                    // Delete conflicting rows that are not the new rowid
+                                                    // (which will be replaced by upsert_row).
+                                                    if conflict_rid != rowid {
+                                                        table.delete_by_rowid(conflict_rid);
+                                                    }
+                                                }
+                                            }
+                                            db.upsert_row(root, rowid, values);
+                                            actually_inserted = true;
                                         }
-                                        break ExecOutcome::Error {
-                                            code: ErrorCode::Constraint as i32,
-                                            message: "PRIMARY KEY constraint failed".to_owned(),
-                                        };
+                                        _ => {
+                                            // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                            if let Some(update_restore) =
+                                                pending_update_restore.clone()
+                                            {
+                                                self.restore_pending_update_after_conflict(
+                                                    update_restore,
+                                                )?;
+                                            }
+                                            return Ok(Some(ExecOutcome::Error {
+                                                code: ErrorCode::Constraint as i32,
+                                                message: "PRIMARY KEY constraint failed".to_owned(),
+                                            }));
+                                        }
                                     }
+                                } else {
+                                    // No conflict — insert normally
+                                    db.upsert_row(root, rowid, values);
+                                    actually_inserted = true;
                                 }
-                            } else {
-                                // No conflict — insert normally
-                                db.upsert_row(root, rowid, values);
-                                actually_inserted = true;
                             }
                         }
+                        Ok(None)
+                    })();
+                    // bd-perf: Return sideband buffer for reuse (keeps capacity)
+                    // before propagating every fallible Insert path.
+                    if sideband_active {
+                        sideband_buf.clear();
+                        self.make_record_lookaside.replace_buf(sideband_buf);
+                    }
+                    if let Some(outcome) = insert_result? {
+                        break outcome;
                     }
                     if inserted_via_storage && let Some(root_page) = inserted_root_page {
                         // Hot INSERT path already knows the table root page, so
@@ -9538,13 +9561,6 @@ impl VdbeEngine {
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
                     // infinite loops when the rowid doesn't change.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    // bd-perf: Return sideband buffer for reuse (keeps capacity).
-                    if sideband_active {
-                        let mut buf = sideband_buf;
-                        buf.clear();
-                        self.make_record_lookaside.replace_buf(buf);
-                    }
-
                     pc += 1;
                 }
 
@@ -24971,6 +24987,11 @@ mod tests {
 
     #[test]
     fn test_insert_default_conflict_errors_via_btree() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_vdbe_test_sideband_materialization_count();
+
         // Default conflict mode (OE_ABORT) must raise constraint error.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
@@ -24992,18 +25013,34 @@ mod tests {
         b.resolve_label(end);
 
         let prog = b.finish().expect("program should build");
+        let expected_capacity = estimate_make_record_buffer_capacity(&prog, PageSize::DEFAULT);
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_cursors(true);
         engine.set_database(db);
         engine.set_reject_mem_fallback(false);
 
+        let before = vdbe_test_sideband_materialization_count_snapshot();
         let outcome = engine.execute(&prog).expect("execution should succeed");
+        let after = vdbe_test_sideband_materialization_count_snapshot();
         assert_eq!(
             outcome,
             ExecOutcome::Error {
                 code: ErrorCode::Constraint as i32,
                 message: "PRIMARY KEY constraint failed".to_owned(),
             }
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "duplicate Insert should consume MakeRecord sideband bytes without materializing"
+        );
+        assert!(
+            engine.make_record_lookaside.is_empty(),
+            "duplicate Insert should return a cleared scratch buffer"
+        );
+        assert!(
+            engine.make_record_lookaside.capacity() >= expected_capacity,
+            "duplicate Insert should keep the reusable sideband allocation"
         );
 
         let db = engine.take_database().expect("database should exist");
