@@ -7462,19 +7462,14 @@ fn emit_join_expr(
 ) -> Result<(), CodegenError> {
     match expr {
         Expr::Column(col_ref, _) => {
-            // `rowid` / `_rowid_` / `oid` on a table that doesn't have a
-            // column of that name must resolve to the implicit rowid of the
-            // matching cursor instead of failing column lookup.
-            if let Some(cursor) =
-                resolve_join_hidden_rowid_cursor(col_ref.table.as_deref(), &col_ref.column, tables)
-            {
-                b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
-                return Ok(());
+            match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables)? {
+                JoinColumnResolution::HiddenRowid(cursor) => {
+                    b.emit_op(Opcode::Rowid, cursor, target, 0, P4::None, 0);
+                }
+                JoinColumnResolution::Column(cursor, col_idx) => {
+                    b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
+                }
             }
-            // Resolve which table+cursor and column index.
-            let (cursor, col_idx) =
-                resolve_join_column(col_ref.table.as_deref(), &col_ref.column, tables)?;
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
             Ok(())
         }
         Expr::Literal(lit, _) => {
@@ -7637,30 +7632,63 @@ fn emit_join_expr(
     }
 }
 
-/// If `name` is an unshadowed rowid alias (`rowid` / `_rowid_` / `oid`),
-/// return the cursor index of the table (optionally matching `qualifier`)
-/// whose implicit rowid should be read. Returns `None` if the name doesn't
-/// resolve to a hidden rowid on any matching table.
-fn resolve_join_hidden_rowid_cursor(
+enum JoinColumnResolution {
+    HiddenRowid(i32),
+    Column(i32, usize),
+}
+
+fn ambiguous_join_column(name: &str) -> CodegenError {
+    CodegenError::Unsupported(format!("ambiguous column name: {name}"))
+}
+
+fn join_qualified_column_name(qualifier: Option<&str>, name: &str) -> String {
+    qualifier.map_or_else(|| name.to_owned(), |q| format!("{q}.{name}"))
+}
+
+fn join_qualifier_matches(
+    qualifier: Option<&str>,
+    table: &TableSchema,
+    alias: Option<&str>,
+) -> bool {
+    qualifier.is_none_or(|q| {
+        alias.is_some_and(|a| a.eq_ignore_ascii_case(q)) || table.name.eq_ignore_ascii_case(q)
+    })
+}
+
+fn resolve_join_column_ref(
     qualifier: Option<&str>,
     name: &str,
     tables: &[(&TableSchema, Option<&str>)],
-) -> Option<i32> {
-    if !is_hidden_rowid_alias_name(name) {
-        return None;
-    }
+) -> Result<JoinColumnResolution, CodegenError> {
+    let name_lower = name.to_ascii_lowercase();
+    let mut found = None;
     for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
-        let matches_qualifier = qualifier.is_none_or(|q| {
-            alias.is_some_and(|a| a.eq_ignore_ascii_case(q)) || table.name.eq_ignore_ascii_case(q)
-        });
-        if !matches_qualifier {
+        if !join_qualifier_matches(qualifier, table, *alias) {
             continue;
         }
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if col.name.eq_ignore_ascii_case(&name_lower) {
+                let resolution = JoinColumnResolution::Column(cursor_idx as i32, col_idx);
+                if found.replace(resolution).is_some() {
+                    return Err(ambiguous_join_column(&join_qualified_column_name(
+                        qualifier, name,
+                    )));
+                }
+            }
+        }
         if table.resolves_to_hidden_rowid(name) {
-            return Some(cursor_idx as i32);
+            let resolution = JoinColumnResolution::HiddenRowid(cursor_idx as i32);
+            if found.replace(resolution).is_some() {
+                return Err(ambiguous_join_column(&join_qualified_column_name(
+                    qualifier, name,
+                )));
+            }
         }
     }
-    None
+    found.ok_or_else(|| CodegenError::ColumnNotFound {
+        table: qualifier.unwrap_or_default().to_owned(),
+        column: name.to_owned(),
+    })
 }
 
 /// Resolve a column reference to (cursor_id, column_index) across multiple tables.
@@ -7670,23 +7698,24 @@ fn resolve_join_column(
     tables: &[(&TableSchema, Option<&str>)],
 ) -> Result<(i32, usize), CodegenError> {
     let name_lower = name.to_ascii_lowercase();
+    let mut found = None;
     for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
         // Check if qualifier matches table name or alias.
-        let matches_qualifier = qualifier.is_none_or(|q| {
-            let q_lower = q.to_ascii_lowercase();
-            alias.is_some_and(|a| a.eq_ignore_ascii_case(&q_lower))
-                || table.name.eq_ignore_ascii_case(&q_lower)
-        });
-        if !matches_qualifier {
+        if !join_qualifier_matches(qualifier, table, *alias) {
             continue;
         }
         for (col_idx, col) in table.columns.iter().enumerate() {
             if col.name.eq_ignore_ascii_case(&name_lower) {
-                return Ok((cursor_idx as i32, col_idx));
+                let resolution = (cursor_idx as i32, col_idx);
+                if found.replace(resolution).is_some() {
+                    return Err(ambiguous_join_column(&join_qualified_column_name(
+                        qualifier, name,
+                    )));
+                }
             }
         }
     }
-    Err(CodegenError::ColumnNotFound {
+    found.ok_or_else(|| CodegenError::ColumnNotFound {
         table: String::new(),
         column: name.to_owned(),
     })
@@ -25211,7 +25240,7 @@ mod tests {
             ..
         } = &stmt.body.select
         else {
-            panic!("fixture should include a WHERE clause");
+            unreachable!("fixture should include a WHERE clause");
         };
 
         let extracted =
@@ -25224,12 +25253,12 @@ mod tests {
                 assert!(matches!(probe_source.value, InProbeValue::Rowid));
             }
             CountIndexedInTarget::MaterializedProbeSource(_) => {
-                panic!(
+                unreachable!(
                     "bounded IPK-projected IN target should lower to a direct rowid probe source"
                 );
             }
             CountIndexedInTarget::List(_) => {
-                panic!("IPK-projected IN target should lower to a rowid probe source");
+                unreachable!("IPK-projected IN target should lower to a rowid probe source");
             }
         }
     }
@@ -26104,7 +26133,7 @@ mod tests {
                 // connection-level interpreter.
             }
             Err(other) => {
-                panic!(
+                unreachable!(
                     "non-terminal LEFT JOIN must be rejected via \
                      Unsupported, got {other:?}"
                 );
@@ -27233,13 +27262,13 @@ mod tests {
             ..
         } = &mut stmt.body.select
         else {
-            panic!("fixture should include a FROM clause");
+            unreachable!("fixture should include a FROM clause");
         };
         let joins = &mut from_clause.joins;
         let Some(fsqlite_ast::JoinConstraint::On(Expr::BinaryOp { left, .. })) =
             joins[1].constraint.as_mut()
         else {
-            panic!("fixture should include the second ON equality");
+            unreachable!("fixture should include the second ON equality");
         };
         let original_left =
             std::mem::replace(left, Box::new(Expr::Literal(Literal::Null, Span::ZERO)));
@@ -27276,7 +27305,7 @@ mod tests {
                 // fallback JOIN codegen still refuses explicit COLLATE in the
                 // ON clause and lets the connection-level interpreter handle it.
             }
-            Err(other) => panic!(
+            Err(other) => unreachable!(
                 "collation-mismatched join should reject the unique-index fast path, got {other:?}"
             ),
         }
@@ -27470,17 +27499,17 @@ mod tests {
             from, where_clause, ..
         } = &stmt.body.select
         else {
-            panic!("expected SELECT core");
+            unreachable!("expected SELECT core");
         };
         let FromClause { source, .. } = from.as_ref().expect("outer FROM should exist");
         let TableOrSubquery::Table { alias, .. } = source else {
-            panic!("expected plain outer table");
+            unreachable!("expected plain outer table");
         };
         let table = find_table(&schema, "t").expect("outer table should exist");
         let Expr::Exists { subquery, .. } =
             where_clause.as_deref().expect("outer WHERE should exist")
         else {
-            panic!("expected EXISTS predicate");
+            unreachable!("expected EXISTS predicate");
         };
         let SelectCore::Select {
             from: Some(sub_from),
@@ -27488,7 +27517,7 @@ mod tests {
             ..
         } = &subquery.body.select
         else {
-            panic!("expected simple subquery shape");
+            unreachable!("expected simple subquery shape");
         };
         let TableOrSubquery::Table {
             name: sub_name,
@@ -27496,7 +27525,7 @@ mod tests {
             ..
         } = &sub_from.source
         else {
-            panic!("expected plain inner table");
+            unreachable!("expected plain inner table");
         };
         let sub_table = find_table(&schema, &sub_name.name).expect("inner table should exist");
         let (probe_expr, residual_terms) =
@@ -27532,10 +27561,10 @@ mod tests {
                 assert!(matches!(probe_source.value, InProbeValue::Rowid));
             }
             CountIndexedInTarget::MaterializedProbeSource(_) => {
-                panic!("EXISTS target should lower to a direct probe source");
+                unreachable!("EXISTS target should lower to a direct probe source");
             }
             CountIndexedInTarget::List(_) => {
-                panic!("EXISTS target should lower to a probe source");
+                unreachable!("EXISTS target should lower to a probe source");
             }
         }
     }
@@ -28468,7 +28497,7 @@ mod tests {
     fn test_codegen_parsed_group_by_rowid_bucket_sum_skips_sorter() {
         let sql = "SELECT (id / 3), SUM(value) FROM bench GROUP BY (id / 3)";
         let Some((statement, tail)) = parse_first_statement_with_tail(sql).unwrap() else {
-            panic!("expected parsed statement");
+            unreachable!("expected parsed statement");
         };
         assert_eq!(
             tail,
@@ -28477,7 +28506,7 @@ mod tests {
         );
         let stmt = match statement {
             Statement::Select(stmt) => stmt,
-            other => panic!("expected SELECT statement, got {other:?}"),
+            other => unreachable!("expected SELECT statement, got {other:?}"),
         };
 
         let schema = test_small_bench_schema();
@@ -28801,6 +28830,126 @@ mod tests {
             .find(|op| op.opcode == Opcode::Eq && op.p5 == 0x20)
             .expect("JOIN ON equality should emit an Eq STOREP2 opcode");
         assert_eq!(join_cmp.p4, P4::Collation("NOCASE".to_owned()));
+    }
+
+    fn ambiguous_join_on_stmt(column: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::qualified("a", "x"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("a"),
+                            alias: None,
+                            index_hint: None,
+                            time_travel: None,
+                        },
+                        joins: vec![JoinClause {
+                            join_type: JoinType {
+                                natural: false,
+                                kind: JoinKind::Inner,
+                            },
+                            table: TableOrSubquery::Table {
+                                name: QualifiedName::bare("b"),
+                                alias: None,
+                                index_hint: None,
+                                time_travel: None,
+                            },
+                            constraint: Some(JoinConstraint::On(Expr::BinaryOp {
+                                left: Box::new(Expr::Column(ColumnRef::bare(column), Span::ZERO)),
+                                op: AstBinaryOp::Eq,
+                                right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                                span: Span::ZERO,
+                            })),
+                        }],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn test_codegen_join_on_unqualified_duplicate_column_is_ambiguous() {
+        let schema = vec![
+            TableSchema {
+                name: "a".to_owned(),
+                root_page: 2,
+                columns: vec![ColumnInfo::basic("x", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+            TableSchema {
+                name: "b".to_owned(),
+                root_page: 3,
+                columns: vec![ColumnInfo::basic("x", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+        ];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &ambiguous_join_on_stmt("x"), &schema, &ctx)
+            .expect_err("unqualified duplicate JOIN column should be ambiguous");
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg == "ambiguous column name: x"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_join_on_unqualified_rowid_is_ambiguous() {
+        let schema = vec![
+            TableSchema {
+                name: "a".to_owned(),
+                root_page: 2,
+                columns: vec![ColumnInfo::basic("x", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+            TableSchema {
+                name: "b".to_owned(),
+                root_page: 3,
+                columns: vec![ColumnInfo::basic("y", 'D', false)],
+                indexes: vec![],
+                strict: false,
+                without_rowid: false,
+                primary_key_constraints: vec![],
+                foreign_keys: vec![],
+                check_constraints: vec![],
+            },
+        ];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &ambiguous_join_on_stmt("rowid"), &schema, &ctx)
+            .expect_err("unqualified JOIN rowid should be ambiguous");
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg == "ambiguous column name: rowid"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
