@@ -998,6 +998,15 @@ mod tests {
     }
 
     #[test]
+    fn test_sum_unicode_whitespace_text_uses_sqlite_ascii_space_rules() {
+        let leading = run_agg(&SumFunc, &[text("\u{00a0}123"), int(1)]);
+        assert_float_eq(&leading, 1.0);
+
+        let trailing = run_agg(&SumFunc, &[text("123\u{00a0}"), int(1)]);
+        assert_float_eq(&trailing, 124.0);
+    }
+
+    #[test]
     fn test_sum_null_skipped() {
         let r = run_agg(&SumFunc, &[int(1), null(), int(3)]);
         assert_eq!(r, int(4));

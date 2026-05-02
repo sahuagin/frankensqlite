@@ -607,8 +607,12 @@ fn parse_float_prefix(s: &str) -> f64 {
     parse_float_prefix_bytes(s.as_bytes())
 }
 
+fn trim_sqlite_ascii_whitespace(s: &str) -> &str {
+    s.trim_matches(|ch: char| ch.is_ascii_whitespace())
+}
+
 fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
-    let trimmed = s.trim();
+    let trimmed = trim_sqlite_ascii_whitespace(s);
     let end = scan_numeric_prefix(trimmed.as_bytes());
     if end == 0 {
         return SqliteValue::Integer(0);
@@ -875,9 +879,9 @@ impl SqliteValue {
     /// Coerce a value for SQLite `sum()` accumulation.
     ///
     /// `sum()` keeps integer accumulation only for INTEGER values and text that
-    /// is entirely a signed 64-bit integer literal after trimming whitespace.
-    /// Other text and all blobs participate through the REAL accumulator, even
-    /// when their numeric prefix is integer-looking.
+    /// is entirely a signed 64-bit integer literal after trimming SQLite ASCII
+    /// whitespace. Other text and all blobs participate through the REAL
+    /// accumulator, even when their numeric prefix is integer-looking.
     #[must_use]
     pub fn to_sum_numeric_value(&self) -> Self {
         match self {
@@ -885,7 +889,7 @@ impl SqliteValue {
             Self::Integer(i) => Self::Integer(*i),
             Self::Float(f) => Self::Float(*f),
             Self::Text(s) => {
-                let trimmed = s.as_str().trim();
+                let trimmed = trim_sqlite_ascii_whitespace(s.as_str());
                 if let Ok(integer) = trimmed.parse::<i64>() {
                     Self::Integer(integer)
                 } else {
@@ -1661,7 +1665,7 @@ impl<T: Into<Self>> From<Option<T>> for SqliteValue {
     clippy::float_cmp
 )]
 fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
-    let trimmed = s.trim();
+    let trimmed = trim_sqlite_ascii_whitespace(s);
     if trimmed.is_empty() {
         return None;
     }
@@ -2352,6 +2356,14 @@ mod tests {
         assert_eq!(
             SqliteValue::Text(SmallText::new(" +123 ")).to_sum_numeric_value(),
             SqliteValue::Integer(123)
+        );
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("\u{00a0}123")).to_sum_numeric_value(),
+            SqliteValue::Float(0.0)
+        );
+        assert_eq!(
+            SqliteValue::Text(SmallText::new("123\u{00a0}")).to_sum_numeric_value(),
+            SqliteValue::Float(123.0)
         );
         assert_eq!(
             SqliteValue::Text(SmallText::new("1.0")).to_sum_numeric_value(),
