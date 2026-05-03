@@ -17,7 +17,7 @@ linux-uring-fs = ["native", "dep:uring-fs", "dep:pollster"]
 
 [dependencies]
 smallvec = "1.11"
-fsqlite-types = { version = "0.1.2", path = "../fsqlite-types", default-features = false }
+fsqlite-types = { version = "0.1.3", path = "../fsqlite-types", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 asupersync = { workspace = true, optional = true, features = ["io-uring"] }
