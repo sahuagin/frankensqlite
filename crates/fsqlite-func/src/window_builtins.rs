@@ -511,7 +511,7 @@ fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
         .unwrap_or(bytes.len());
-    &bytes[start..]
+    bytes.get(start..).unwrap_or(&[])
 }
 
 fn lag_lead_bytes_offset(bytes: &[u8]) -> Option<i64> {
