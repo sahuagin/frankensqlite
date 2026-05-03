@@ -6089,6 +6089,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_nth_value_rejects_fractional_n() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .query(
+                "WITH t(x,n) AS (VALUES ('a',1.5),('b',1.5)) \
+                 SELECT nth_value(x,n) OVER (\
+                 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                 ) FROM t;",
+            )
+            .expect_err("fractional nth_value offset should fail");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == "second argument to nth_value must be a positive integer"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn window_nth_value_rejects_text_numeric_prefix_n() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .query(
+                "WITH t(x,n) AS (VALUES ('a','2x'),('b','2x')) \
+                 SELECT nth_value(x,n) OVER (\
+                 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                 ) FROM t;",
+            )
+            .expect_err("numeric-prefix nth_value offset should fail");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == "second argument to nth_value must be a positive integer"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn window_nth_value_rejects_blob_integer_n() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .query(
+                "WITH t(x,n) AS (VALUES ('a',x'32'),('b',x'32')) \
+                 SELECT nth_value(x,n) OVER (\
+                 ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                 ) FROM t;",
+            )
+            .expect_err("blob nth_value offset should fail");
+        assert!(
+            matches!(&err, FrankenError::FunctionError(message) if message == "second argument to nth_value must be a positive integer"),
+            "unexpected error: {err:?}"
+        );
+    }
+
     // ── CTE (WITH) probe ─────────────────────────────────────────────────
 
     #[test]

@@ -730,6 +730,46 @@ pub struct NthValueFunc;
 
 const INVALID_NTH_VALUE_ARGUMENT: &str = "second argument to nth_value must be a positive integer";
 
+fn integral_f64_to_i64(value: f64) -> Option<i64> {
+    const I64_MIN_AS_F64: f64 = -9_223_372_036_854_775_808.0;
+    const I64_MAX_EXCLUSIVE_AS_F64: f64 = 9_223_372_036_854_775_808.0;
+
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || !(I64_MIN_AS_F64..I64_MAX_EXCLUSIVE_AS_F64).contains(&value)
+    {
+        return None;
+    }
+    Some(value as i64)
+}
+
+fn parse_integral_text(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse()
+        .ok()
+        .or_else(|| trimmed.parse().ok().and_then(integral_f64_to_i64))
+}
+
+fn nth_value_positive_integer_arg(value: Option<&SqliteValue>) -> Result<i64> {
+    let Some(value) = value else {
+        return Err(FrankenError::function_error(INVALID_NTH_VALUE_ARGUMENT));
+    };
+    let n = match value {
+        SqliteValue::Integer(n) => Some(*n),
+        SqliteValue::Float(n) => integral_f64_to_i64(*n),
+        SqliteValue::Text(text) => parse_integral_text(text),
+        SqliteValue::Null | SqliteValue::Blob(_) => None,
+    };
+    match n {
+        Some(n) if n > 0 => Ok(n),
+        _ => Err(FrankenError::function_error(INVALID_NTH_VALUE_ARGUMENT)),
+    }
+}
+
 impl WindowFunction for NthValueFunc {
     type State = NthValueState;
 
@@ -742,10 +782,7 @@ impl WindowFunction for NthValueFunc {
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
-        let n = args.get(1).map_or(0, SqliteValue::to_integer);
-        if n <= 0 {
-            return Err(FrankenError::function_error(INVALID_NTH_VALUE_ARGUMENT));
-        }
+        let n = nth_value_positive_integer_arg(args.get(1))?;
         // Capture N from second arg on first call.
         if state.frame.is_empty() {
             state.n = n;
@@ -1851,6 +1888,56 @@ mod tests {
         let func = NthValueFunc;
         let mut state = func.initial_state();
         let err = func.step(&mut state, &[int(10), int(-1)]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_accepts_integral_real_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        func.step(&mut state, &[int(10), float(2.0)]).unwrap();
+        func.step(&mut state, &[int(20), float(2.0)]).unwrap();
+        assert_eq!(func.value(&state).unwrap(), int(20));
+    }
+
+    #[test]
+    fn test_nth_value_accepts_integral_text_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        func.step(&mut state, &[int(10), text("2e0")]).unwrap();
+        func.step(&mut state, &[int(20), text("2.0")]).unwrap();
+        assert_eq!(func.value(&state).unwrap(), int(20));
+    }
+
+    #[test]
+    fn test_nth_value_rejects_fractional_real_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        let err = func.step(&mut state, &[int(10), float(1.5)]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_rejects_fractional_text_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        let err = func.step(&mut state, &[int(10), text("1.5")]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_rejects_text_numeric_prefix_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        let err = func.step(&mut state, &[int(10), text("2x")]).unwrap_err();
+        assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
+    }
+
+    #[test]
+    fn test_nth_value_rejects_blob_integer_n() {
+        let func = NthValueFunc;
+        let mut state = func.initial_state();
+        let err = func.step(&mut state, &[int(10), blob(b"2")]).unwrap_err();
         assert_function_error(err, INVALID_NTH_VALUE_ARGUMENT);
     }
 
