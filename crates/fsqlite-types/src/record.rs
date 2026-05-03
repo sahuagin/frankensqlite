@@ -782,7 +782,7 @@ pub fn decode_column_from_offset_reuse(
     // Fast path: if the hint's raw bytes match, reuse its Arc allocation.
     if let Some(hint) = hint {
         match (classify_serial_type(col.serial_type), hint) {
-            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes() == bytes => {
+            (SerialTypeClass::Text, SqliteValue::Text(arc)) if arc.as_bytes_direct() == bytes => {
                 if profile_enabled {
                     note_decoded_value(hint);
                 }
@@ -1591,7 +1591,7 @@ fn append_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut Ve
             }
         }
         SqliteValue::Text(s) => {
-            buf.extend_from_slice(s.as_bytes());
+            buf.extend_from_slice(s.as_bytes_direct());
         }
         SqliteValue::Blob(b) => {
             buf.extend_from_slice(b);
@@ -2491,7 +2491,7 @@ fn encode_serialized_value(value: &SqliteValue, payload_len: usize, buf: &mut [u
             buf.copy_from_slice(&bits.to_be_bytes());
         }
         SqliteValue::Text(s) => {
-            buf.copy_from_slice(s.as_bytes());
+            buf.copy_from_slice(s.as_bytes_direct());
         }
         SqliteValue::Blob(b) => {
             buf.copy_from_slice(b);
