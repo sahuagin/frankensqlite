@@ -4,7 +4,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use memchr::{memchr, memchr2};
+use memchr::{memchr, memchr2, memmem};
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 
@@ -1355,6 +1355,9 @@ fn ascii_ci_eq_bytes(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
+    if left == right {
+        return true;
+    }
     let mut idx = 0;
     while idx < left.len() {
         if !ascii_ci_eq_byte(left[idx], right[idx]) {
@@ -1385,6 +1388,9 @@ fn ascii_ci_contains(text: &str, needle: &str) -> bool {
     }
     if needle.len() > text.len() {
         return false;
+    }
+    if memmem::find(text, needle).is_some() {
+        return true;
     }
 
     let max_start = text.len() - needle.len();
