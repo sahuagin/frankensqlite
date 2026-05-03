@@ -2420,14 +2420,27 @@ fn codegen_select_index_equality_scan(
     );
 
     let idx_loop_top = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::IdxGT,
-        idx_cursor,
-        probe_record_reg,
-        duplicate_run_done,
-        P4::None,
-        1,
-    );
+    if idx_schema.key_term_count() == 1 && !idx_schema.key_term_descending(0) {
+        let idx_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_key_regs,
+            idx_key_reg,
+            duplicate_run_done,
+            direct_lookup_index_comparison_p4(idx_schema),
+            0x10,
+        );
+    } else {
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_record_reg,
+            duplicate_run_done,
+            P4::None,
+            1,
+        );
+    }
 
     let rowid_reg = b.alloc_reg();
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -22150,24 +22163,36 @@ mod tests {
             .expect("index equality path must iterate duplicates");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
 
-        let idx_gt = prog
+        let boundary_column = prog
             .ops()
             .iter()
-            .find(|op| op.opcode == Opcode::IdxGT)
-            .expect("duplicate-run boundary should compare the index cursor against the probe key");
+            .find(|op| op.opcode == Opcode::Column && op.p1 == 1 && op.p2 == 0)
+            .expect("single-column duplicate-run boundary should read the index key");
+        let boundary_ne = prog
+            .ops()
+            .iter()
+            .find(|op| {
+                op.opcode == Opcode::Ne && op.p1 == make_record.p1 && op.p3 == boundary_column.p3
+            })
+            .expect("single-column duplicate-run boundary should compare against the probe value");
         let if_addr = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::If)
             .expect("normal duplicate-run exit should branch through a match gate");
         assert_eq!(
-            usize::try_from(idx_gt.p2).unwrap(),
+            usize::try_from(boundary_ne.p2).unwrap(),
             if_addr,
             "duplicate-run boundary must not jump directly into the full-scan fallback"
         );
         assert_eq!(
-            idx_gt.p5, 1,
-            "duplicate-run boundary should compare only the leading equality key"
+            boundary_ne.p5 & 0x10,
+            0x10,
+            "duplicate-run boundary should jump when the index cursor reaches EOF"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::IdxGT),
+            "single-column equality should not need the generic record-prefix boundary"
         );
     }
 
