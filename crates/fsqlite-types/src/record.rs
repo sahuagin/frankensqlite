@@ -1847,54 +1847,6 @@ fn serialize_record_iter_into_impl<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    const STACK_RECORD_LAYOUT_SLOTS: usize = 16;
-
-    if values
-        .size_hint()
-        .1
-        .is_some_and(|len| len <= STACK_RECORD_LAYOUT_SLOTS)
-    {
-        let mut value_refs: [Option<&'a SqliteValue>; STACK_RECORD_LAYOUT_SLOTS] =
-            [None; STACK_RECORD_LAYOUT_SLOTS];
-        let mut serial_types = [0_u64; STACK_RECORD_LAYOUT_SLOTS];
-        let mut payload_lens = [0_usize; STACK_RECORD_LAYOUT_SLOTS];
-        let mut len = 0usize;
-        let mut header_content_size = 0usize;
-        let mut body_size = 0usize;
-
-        for value in values {
-            let (serial_type, payload_len) = serialized_value_layout(value);
-            value_refs[len] = Some(value);
-            serial_types[len] = serial_type;
-            payload_lens[len] = payload_len;
-            len += 1;
-            header_content_size += varint_len(serial_type);
-            body_size += payload_len;
-        }
-
-        let header_size = compute_header_size(header_content_size);
-        let total_size = header_size + body_size;
-        buf.clear();
-        if buf.capacity() < total_size {
-            buf.reserve(total_size - buf.capacity());
-        }
-        buf.resize(header_size, 0);
-
-        let mut header_offset = write_varint(
-            buf.as_mut_slice(),
-            u64::try_from(header_size).unwrap_or(u64::MAX),
-        );
-        for idx in 0..len {
-            header_offset += write_varint(&mut buf[header_offset..], serial_types[idx]);
-            let value = value_refs[idx].expect("layout pass stored value ref");
-            append_serialized_value(value, payload_lens[idx], buf);
-        }
-
-        debug_assert_eq!(header_offset, header_size);
-        debug_assert_eq!(buf.len(), total_size);
-        return;
-    }
-
     let mut header_content_size = 0usize;
     let mut body_size = 0usize;
 
