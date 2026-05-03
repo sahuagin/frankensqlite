@@ -316,7 +316,14 @@ pub fn codegen_select(
         );
 
         let loop_start = b.current_addr();
-        b.emit_jump_to_label(Opcode::IdxGT, idx_cursor, probe_key_reg, done_label, P4::None, 1);
+        b.emit_jump_to_label(
+            Opcode::IdxGT,
+            idx_cursor,
+            probe_key_reg,
+            done_label,
+            P4::None,
+            1,
+        );
 
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
