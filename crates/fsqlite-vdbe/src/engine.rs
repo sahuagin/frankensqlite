@@ -10665,6 +10665,32 @@ impl VdbeEngine {
                             })?;
                         }
 
+                        if op.p5 == 1
+                            && let Some(probe_first) = sc.target_vals_buf.first().cloned()
+                        {
+                            let coll_arc = Arc::clone(&self.collation_registry);
+                            let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+                            let cmp = storage_cursor_current_first_index_key_compare(
+                                sc,
+                                &probe_first,
+                                self.collect_vdbe_metrics,
+                                "IdxCmp: malformed index record at cursor position",
+                                desc_flags.first().copied().unwrap_or(false),
+                                collations
+                                    .first()
+                                    .and_then(|collation| collation.as_deref()),
+                                &coll_guard,
+                            )?;
+                            drop(coll_guard);
+
+                            if idx_compare_condition_met(op.opcode, cmp) {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
+                            }
+                            continue;
+                        }
+
                         if !try_decode_storage_cursor_current_index_record(cursor_id, sc)? {
                             return Err(FrankenError::internal(
                                 "IdxCmp: malformed index record at cursor position",
@@ -10691,13 +10717,7 @@ impl VdbeEngine {
                         );
                         drop(coll_guard);
 
-                        let condition_met = match op.opcode {
-                            Opcode::IdxLE => cmp != Ordering::Greater,
-                            Opcode::IdxGT => cmp == Ordering::Greater,
-                            Opcode::IdxLT => cmp == Ordering::Less,
-                            Opcode::IdxGE => cmp != Ordering::Less,
-                            _ => unreachable!(),
-                        };
+                        let condition_met = idx_compare_condition_met(op.opcode, cmp);
 
                         if condition_met {
                             pc = op.p2 as usize;
@@ -10730,13 +10750,7 @@ impl VdbeEngine {
                                 &coll_guard,
                             );
                             drop(coll_guard);
-                            let condition_met = match op.opcode {
-                                Opcode::IdxLE => cmp != Ordering::Greater,
-                                Opcode::IdxGT => cmp == Ordering::Greater,
-                                Opcode::IdxLT => cmp == Ordering::Less,
-                                Opcode::IdxGE => cmp != Ordering::Less,
-                                _ => unreachable!(),
-                            };
+                            let condition_met = idx_compare_condition_met(op.opcode, cmp);
                             if condition_met {
                                 pc = op.p2 as usize;
                             } else {
@@ -15004,6 +15018,91 @@ fn storage_cursor_current_first_index_key_equals_at_current_row(
     )
 }
 
+fn storage_cursor_current_first_index_key_compare(
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
+    malformed_detail: &'static str,
+    desc: bool,
+    collation: Option<&str>,
+    collation_registry: &CollationRegistry,
+) -> Result<Ordering> {
+    refresh_storage_cursor_first_key_state(cursor, collect_vdbe_metrics);
+    storage_cursor_current_first_index_key_compare_at_current_row(
+        cursor,
+        probe_value,
+        collect_vdbe_metrics,
+        malformed_detail,
+        desc,
+        collation,
+        collation_registry,
+    )
+}
+
+fn storage_cursor_current_first_index_key_compare_at_current_row(
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
+    malformed_detail: &'static str,
+    desc: bool,
+    collation: Option<&str>,
+    collation_registry: &CollationRegistry,
+) -> Result<Ordering> {
+    let compare_ctx = FirstIndexKeyCompareContext {
+        desc,
+        collation,
+        collation_registry,
+    };
+    if cursor.row_decode.cached_value_ready(0) {
+        note_decode_cache_hit(collect_vdbe_metrics);
+        let cached = cursor
+            .row_decode
+            .cached_value(0)
+            .ok_or_else(|| FrankenError::internal(malformed_detail))?;
+        if collect_vdbe_metrics {
+            record_decoded_value_metrics(cached);
+        }
+        return Ok(compare_first_index_key_values(
+            cached,
+            probe_value,
+            compare_ctx,
+        ));
+    }
+
+    note_decode_cache_miss(collect_vdbe_metrics);
+    if let SqliteValue::Integer(probe_int) = probe_value {
+        match storage_cursor_probe_first_index_key_integer(cursor, *probe_int, malformed_detail)? {
+            FirstIndexKeyIntegerProbe::Match => return Ok(Ordering::Equal),
+            FirstIndexKeyIntegerProbe::Mismatch(current_value) => {
+                let current_value = SqliteValue::Integer(current_value);
+                let cmp = compare_first_index_key_values(&current_value, probe_value, compare_ctx);
+                cursor.row_decode.cache_decoded(0, current_value);
+                return Ok(cmp);
+            }
+            FirstIndexKeyIntegerProbe::NeedsGenericCompare(fallback_col) => {
+                return storage_cursor_current_first_index_key_compare_generic_fallback(
+                    cursor,
+                    probe_value,
+                    collect_vdbe_metrics,
+                    malformed_detail,
+                    fallback_col,
+                    compare_ctx,
+                );
+            }
+        }
+    }
+
+    let col = storage_cursor_first_index_key_column_offset(cursor, malformed_detail)?;
+    storage_cursor_current_first_index_key_compare_generic_fallback(
+        cursor,
+        probe_value,
+        collect_vdbe_metrics,
+        malformed_detail,
+        col,
+        compare_ctx,
+    )
+}
+
 fn refresh_storage_cursor_first_key_state(cursor: &mut StorageCursor, collect_vdbe_metrics: bool) {
     let position_stamp = cursor.cursor.position_stamp();
     if cursor.last_position_stamp == position_stamp {
@@ -15138,6 +15237,30 @@ fn storage_cursor_current_first_index_key_equals_generic_fallback(
     Ok(matches)
 }
 
+fn storage_cursor_current_first_index_key_compare_generic_fallback(
+    cursor: &mut StorageCursor,
+    probe_value: &SqliteValue,
+    collect_vdbe_metrics: bool,
+    malformed_detail: &'static str,
+    col: ColumnOffset,
+    compare_ctx: FirstIndexKeyCompareContext<'_>,
+) -> Result<Ordering> {
+    let hint = cursor.row_decode.cached_value(0);
+    let value = fsqlite_types::record::decode_column_from_offset_reuse(
+        &cursor.payload_buf,
+        &col,
+        hint,
+        collect_vdbe_metrics,
+    )
+    .ok_or_else(|| FrankenError::internal(malformed_detail))?;
+    if collect_vdbe_metrics {
+        record_decoded_value_metrics(&value);
+    }
+    let cmp = compare_first_index_key_values(&value, probe_value, compare_ctx);
+    cursor.row_decode.cache_decoded(0, value);
+    Ok(cmp)
+}
+
 fn storage_cursor_first_index_key_collation(cursor: &StorageCursor) -> Option<&str> {
     cursor
         .cursor
@@ -15165,6 +15288,30 @@ fn storage_cursor_first_index_key_equals_probe(
     let registry = cursor.cursor.collation_registry();
     let guard = registry.lock().unwrap_or_else(|err| err.into_inner());
     cmp_values_collated(current_value, probe_value, Some(collation), &guard) == Ordering::Equal
+}
+
+#[derive(Clone, Copy)]
+struct FirstIndexKeyCompareContext<'a> {
+    desc: bool,
+    collation: Option<&'a str>,
+    collation_registry: &'a CollationRegistry,
+}
+
+fn compare_first_index_key_values(
+    current_value: &SqliteValue,
+    probe_value: &SqliteValue,
+    compare_ctx: FirstIndexKeyCompareContext<'_>,
+) -> Ordering {
+    let mut cmp = cmp_values_collated(
+        current_value,
+        probe_value,
+        compare_ctx.collation,
+        compare_ctx.collation_registry,
+    );
+    if compare_ctx.desc {
+        cmp = cmp.reverse();
+    }
+    cmp
 }
 
 enum FirstIndexKeyIntegerProbe {
@@ -16096,6 +16243,16 @@ fn compare_index_prefix_keys(
         }
     }
     Ordering::Equal
+}
+
+fn idx_compare_condition_met(opcode: Opcode, cmp: Ordering) -> bool {
+    match opcode {
+        Opcode::IdxLE => cmp != Ordering::Greater,
+        Opcode::IdxGT => cmp == Ordering::Greater,
+        Opcode::IdxLT => cmp == Ordering::Less,
+        Opcode::IdxGE => cmp != Ordering::Less,
+        _ => unreachable!("idx_compare_condition_met called with non-Idx comparison opcode"),
+    }
 }
 
 /// Compare two `SqliteValue`s with an optional collation sequence.
@@ -27043,6 +27200,129 @@ mod tests {
             compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &coll_guard),
             Ordering::Less,
             "zero key_columns should still compare the leading term"
+        );
+    }
+
+    #[test]
+    fn test_storage_cursor_first_index_key_compare_honors_desc_flag() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.set_index_desc_flags_by_root_page(HashMap::from([(index_root, vec![true])]));
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "descending index storage cursor should open"
+        );
+
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        for key in [
+            encode_record(&[SqliteValue::Integer(10), SqliteValue::Integer(1)]),
+            encode_record(&[SqliteValue::Integer(20), SqliteValue::Integer(2)]),
+        ] {
+            cursor
+                .cursor
+                .index_insert(&cursor.cx, &key)
+                .expect("descending index key should insert");
+        }
+        assert!(
+            cursor.cursor.first(&cursor.cx).expect("first should work"),
+            "descending index should contain entries"
+        );
+
+        let registry = Arc::clone(&engine.collation_registry);
+        let coll_guard = registry.lock().unwrap_or_else(|err| err.into_inner());
+        let cmp = storage_cursor_current_first_index_key_compare(
+            cursor,
+            &SqliteValue::Integer(10),
+            false,
+            "IdxCmp: malformed index record at cursor position",
+            true,
+            None,
+            &coll_guard,
+        )
+        .expect("first-key compare should succeed");
+
+        assert_eq!(
+            cmp,
+            Ordering::Less,
+            "larger integer keys sort before smaller keys in a DESC index"
+        );
+    }
+
+    #[test]
+    fn test_idxgt_single_column_prefix_ignores_trailing_rowid() {
+        let mut engine = VdbeEngine::new(8);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(
+            engine.open_storage_cursor(0, index_root, true),
+            "index storage cursor should open"
+        );
+
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("storage cursor should exist");
+        for key in [
+            encode_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1)]),
+            encode_record(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(2)]),
+            encode_record(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]),
+        ] {
+            cursor
+                .cursor
+                .index_insert(&cursor.cx, &key)
+                .expect("index key should insert");
+        }
+
+        let mut b = ProgramBuilder::new();
+        let done = b.emit_label();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        let r_probe = b.alloc_reg();
+        let r_low_rowid = b.alloc_reg();
+        let r_seek_key = b.alloc_reg();
+        let r_out = b.alloc_reg();
+
+        b.emit_op(
+            Opcode::String8,
+            0,
+            r_probe,
+            0,
+            P4::Str("alpha".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Int64, 0, r_low_rowid, 0, P4::Int64(i64::MIN), 0);
+        b.emit_op(Opcode::MakeRecord, r_probe, 2, r_seek_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekGE, 0, r_seek_key, done, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IdxGT, 0, r_seek_key, done, P4::None, 1);
+        b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let program = b.finish().expect("program should build");
+        let rows = execute_program_with_engine(&mut engine, &program);
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)]],
+            "IdxGT with p5=1 must compare only the equality prefix, not the rowid suffix"
         );
     }
 
