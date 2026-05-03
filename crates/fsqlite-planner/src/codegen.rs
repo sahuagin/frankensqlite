@@ -316,16 +316,7 @@ pub fn codegen_select(
         );
 
         let loop_start = b.current_addr();
-        let idx_key_reg = b.alloc_reg();
-        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-        b.emit_jump_to_label(
-            Opcode::Ne,
-            param_reg,
-            idx_key_reg,
-            done_label,
-            P4::None,
-            0x10,
-        );
+        b.emit_jump_to_label(Opcode::IdxGT, idx_cursor, probe_key_reg, done_label, P4::None, 1);
 
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -2929,7 +2920,7 @@ mod tests {
             .count();
         assert_eq!(open_reads, 2, "should open both table and index");
 
-        // Should have SeekGE + IdxRowid + SeekRowid pattern.
+        // Should have SeekGE + IdxGT + IdxRowid + SeekRowid pattern.
         assert!(has_opcodes(
             &prog,
             &[
@@ -2937,8 +2928,7 @@ mod tests {
                 Opcode::OpenRead,
                 Opcode::OpenRead,
                 Opcode::SeekGE,
-                Opcode::Column,
-                Opcode::Ne,
+                Opcode::IdxGT,
                 Opcode::IdxRowid,
                 Opcode::SeekRowid,
                 Opcode::Column,
@@ -2983,6 +2973,19 @@ mod tests {
         assert_eq!(
             seek_ge.p3, make_record.p3,
             "SeekGE must read probe key from MakeRecord destination register"
+        );
+        let idx_gt = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::IdxGT)
+            .expect("IdxGT should bound index equality duplicates");
+        assert_eq!(
+            idx_gt.p3, make_record.p3,
+            "IdxGT must compare against the same probe key as SeekGE"
+        );
+        assert_eq!(
+            idx_gt.p5, 1,
+            "IdxGT should compare only the indexed value prefix, not the synthetic low rowid"
         );
 
         let is_null_count = prog
