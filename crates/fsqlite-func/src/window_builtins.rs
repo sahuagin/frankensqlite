@@ -303,10 +303,13 @@ impl WindowFunction for PercentRankFunc {
 /// State for `cume_dist()`.
 ///
 /// The VDBE must step() all rows first, then iterate with value()+inverse().
-/// cume_dist = (current_position) / partition_size.
+/// cume_dist = (last peer position) / partition_size.
 pub struct CumeDistState {
     partition_size: i64,
-    current_row: i64,
+    current_row: usize,
+    cume_positions: Vec<i64>,
+    peer_start: usize,
+    last_order_value: Option<SqliteValue>,
 }
 
 pub struct CumeDistFunc;
@@ -318,11 +321,30 @@ impl WindowFunction for CumeDistFunc {
         CumeDistState {
             partition_size: 0,
             current_row: 0,
+            cume_positions: Vec::new(),
+            peer_start: 0,
+            last_order_value: None,
         }
     }
 
-    fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        let current = args.first().cloned().unwrap_or(SqliteValue::Null);
+        let is_new_peer = match &state.last_order_value {
+            None => true,
+            Some(last) => &current != last,
+        };
+        if is_new_peer {
+            let peer_end = state.partition_size;
+            if let Some(slots) = state.cume_positions.get_mut(state.peer_start..) {
+                for slot in slots {
+                    *slot = peer_end;
+                }
+            }
+            state.peer_start = state.cume_positions.len();
+            state.last_order_value = Some(current);
+        }
         state.partition_size += 1;
+        state.cume_positions.push(0);
         Ok(())
     }
 
@@ -335,7 +357,13 @@ impl WindowFunction for CumeDistFunc {
         if state.partition_size == 0 {
             return Ok(SqliteValue::Float(0.0));
         }
-        let cd = (state.current_row + 1) as f64 / state.partition_size as f64;
+        let peer_end = state
+            .cume_positions
+            .get(state.current_row)
+            .copied()
+            .filter(|position| *position != 0)
+            .unwrap_or(state.partition_size);
+        let cd = peer_end as f64 / state.partition_size as f64;
         Ok(SqliteValue::Float(cd))
     }
 
@@ -1473,6 +1501,19 @@ mod tests {
         );
     }
 
+    fn assert_float_near(value: &SqliteValue, expected: f64) {
+        assert!(
+            matches!(value, SqliteValue::Float(_)),
+            "expected Float, got {value:?}"
+        );
+        if let SqliteValue::Float(actual) = value {
+            assert!(
+                (*actual - expected).abs() < 1e-10,
+                "expected {expected}, got {actual}"
+            );
+        }
+    }
+
     /// Simulate a partition by calling step() for each row, collecting
     /// value() after each step.  Returns the vector of per-row results.
     /// Suitable for progressive functions (row_number, rank, dense_rank).
@@ -1600,22 +1641,10 @@ mod tests {
         // Row 2: (2-1)/3 = 0.333...
         // Row 3: (2-1)/3 = 0.333... (same rank as row 2)
         // Row 4: (4-1)/3 = 1.0
-        match &results[0] {
-            SqliteValue::Float(v) => assert!((*v - 0.0).abs() < 1e-10),
-            other => panic!("expected Float, got {other:?}"),
-        }
-        match &results[1] {
-            SqliteValue::Float(v) => assert!((*v - 1.0 / 3.0).abs() < 1e-10),
-            other => panic!("expected Float, got {other:?}"),
-        }
-        match &results[2] {
-            SqliteValue::Float(v) => assert!((*v - 1.0 / 3.0).abs() < 1e-10),
-            other => panic!("expected Float, got {other:?}"),
-        }
-        match &results[3] {
-            SqliteValue::Float(v) => assert!((*v - 1.0).abs() < 1e-10),
-            other => panic!("expected Float, got {other:?}"),
-        }
+        assert_float_near(&results[0], 0.0);
+        assert_float_near(&results[1], 1.0 / 3.0);
+        assert_float_near(&results[2], 1.0 / 3.0);
+        assert_float_near(&results[3], 1.0);
     }
 
     // ── cume_dist ────────────────────────────────────────────────────
@@ -1628,15 +1657,27 @@ mod tests {
             &[vec![int(1)], vec![int(2)], vec![int(3)], vec![int(4)]],
         );
         for (i, expected) in [0.25, 0.5, 0.75, 1.0].iter().enumerate() {
-            match &results[i] {
-                SqliteValue::Float(v) => {
-                    assert!(
-                        (*v - expected).abs() < 1e-10,
-                        "row {i}: expected {expected}, got {v}"
-                    );
-                }
-                other => panic!("expected Float, got {other:?}"),
-            }
+            assert_float_near(&results[i], *expected);
+        }
+    }
+
+    #[test]
+    fn test_cume_dist_with_ties() {
+        // Values [1, 2, 2, 3] -> last peer positions [1, 3, 3, 4].
+        let results = run_window_two_pass(
+            &CumeDistFunc,
+            &[vec![int(1)], vec![int(2)], vec![int(2)], vec![int(3)]],
+        );
+        for (i, expected) in [0.25, 0.75, 0.75, 1.0].iter().enumerate() {
+            assert_float_near(&results[i], *expected);
+        }
+    }
+
+    #[test]
+    fn test_cume_dist_without_order_treats_partition_as_one_peer_group() {
+        let results = run_window_two_pass(&CumeDistFunc, &[vec![], vec![], vec![]]);
+        for value in results {
+            assert_float_near(&value, 1.0);
         }
     }
 
