@@ -455,6 +455,103 @@ impl WindowFunction for NtileFunc {
 // lag(X [, offset [, default]])
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn numeric_prefix_len(bytes: &[u8]) -> usize {
+    let mut idx = 0;
+    if bytes
+        .get(idx)
+        .is_some_and(|byte| matches!(*byte, b'+' | b'-'))
+    {
+        idx += 1;
+    }
+
+    let mut saw_digit = false;
+    while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+        idx += 1;
+        saw_digit = true;
+    }
+
+    if bytes.get(idx) == Some(&b'.') {
+        idx += 1;
+        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+            idx += 1;
+            saw_digit = true;
+        }
+    }
+
+    if !saw_digit {
+        return 0;
+    }
+
+    let mantissa_end = idx;
+    if bytes
+        .get(idx)
+        .is_some_and(|byte| matches!(*byte, b'e' | b'E'))
+    {
+        idx += 1;
+        if bytes
+            .get(idx)
+            .is_some_and(|byte| matches!(*byte, b'+' | b'-'))
+        {
+            idx += 1;
+        }
+        let exp_start = idx;
+        while bytes.get(idx).is_some_and(u8::is_ascii_digit) {
+            idx += 1;
+        }
+        if idx == exp_start {
+            return mantissa_end;
+        }
+    }
+
+    idx
+}
+
+fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+fn lag_lead_bytes_offset(bytes: &[u8]) -> Option<i64> {
+    let trimmed = trim_ascii_start(bytes);
+    let prefix_len = numeric_prefix_len(trimmed);
+    if prefix_len == 0 {
+        return Some(0);
+    }
+    let prefix = trimmed
+        .get(..prefix_len)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())?;
+    if prefix
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+    {
+        prefix.parse().ok().and_then(integral_f64_to_i64)
+    } else {
+        prefix
+            .parse()
+            .ok()
+            .or_else(|| prefix.parse().ok().and_then(integral_f64_to_i64))
+    }
+}
+
+fn lag_lead_text_offset(text: &str) -> Option<i64> {
+    lag_lead_bytes_offset(text.as_bytes())
+}
+
+fn lag_lead_offset_arg(value: Option<&SqliteValue>) -> Option<i64> {
+    match value {
+        None => Some(1),
+        Some(SqliteValue::Null) => None,
+        Some(SqliteValue::Integer(offset)) => Some(*offset),
+        Some(SqliteValue::Float(offset)) => integral_f64_to_i64(*offset),
+        Some(SqliteValue::Text(text)) => lag_lead_text_offset(text),
+        Some(SqliteValue::Blob(bytes)) => lag_lead_bytes_offset(bytes),
+    }
+}
+
 /// State for `lag()`: maintains a buffer of previous values.
 pub struct LagState {
     buffer: Vec<SqliteValue>,
@@ -479,10 +576,7 @@ impl WindowFunction for LagFunc {
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
-        let offset = args
-            .get(1)
-            .map(|off| (!off.is_null()).then(|| off.to_integer()))
-            .unwrap_or(Some(1));
+        let offset = lag_lead_offset_arg(args.get(1));
         let default_val = args.get(2).cloned().unwrap_or(SqliteValue::Null);
         state.buffer.push(val);
         state.offsets.push(offset);
@@ -565,10 +659,7 @@ impl WindowFunction for LeadFunc {
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         let val = args.first().cloned().unwrap_or(SqliteValue::Null);
-        let offset = args
-            .get(1)
-            .map(|off| (!off.is_null()).then(|| off.to_integer()))
-            .unwrap_or(Some(1));
+        let offset = lag_lead_offset_arg(args.get(1));
         let default_val = args.get(2).cloned().unwrap_or(SqliteValue::Null);
         state.buffer.push(val);
         state.offsets.push(offset);
@@ -1690,6 +1781,45 @@ mod tests {
         assert_eq!(results, vec![int(20), int(30), text("N/A")]);
     }
 
+    #[test]
+    fn test_lag_fractional_offset_uses_default() {
+        let results = run_window_two_pass(
+            &LagFunc,
+            &[
+                vec![int(10), float(1.5), text("N/A")],
+                vec![int(20), float(1.5), text("N/A")],
+                vec![int(30), float(1.5), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![text("N/A"), text("N/A"), text("N/A")]);
+    }
+
+    #[test]
+    fn test_lag_nonnumeric_text_offset_reads_current_row() {
+        let results = run_window_two_pass(
+            &LagFunc,
+            &[
+                vec![int(10), text("abc"), text("N/A")],
+                vec![int(20), text("abc"), text("N/A")],
+                vec![int(30), text("abc"), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![int(10), int(20), int(30)]);
+    }
+
+    #[test]
+    fn test_lag_integral_text_prefix_offset() {
+        let results = run_window_two_pass(
+            &LagFunc,
+            &[
+                vec![int(10), text("2.0x"), text("N/A")],
+                vec![int(20), text("2e0x"), text("N/A")],
+                vec![int(30), text("2x"), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![text("N/A"), text("N/A"), int(10)]);
+    }
+
     // ── lead ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1810,6 +1940,32 @@ mod tests {
             func.inverse(&mut state, &[]).unwrap();
         }
         assert_eq!(results, vec![text("N/A"), int(10), int(20)]);
+    }
+
+    #[test]
+    fn test_lead_fractional_offset_uses_default() {
+        let results = run_window_two_pass(
+            &LeadFunc,
+            &[
+                vec![int(10), float(1.5), text("N/A")],
+                vec![int(20), float(1.5), text("N/A")],
+                vec![int(30), float(1.5), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![text("N/A"), text("N/A"), text("N/A")]);
+    }
+
+    #[test]
+    fn test_lead_integral_blob_offset() {
+        let results = run_window_two_pass(
+            &LeadFunc,
+            &[
+                vec![int(10), blob(b"2.0x"), text("N/A")],
+                vec![int(20), blob(b"2e0x"), text("N/A")],
+                vec![int(30), blob(b"2x"), text("N/A")],
+            ],
+        );
+        assert_eq!(results, vec![int(30), text("N/A"), text("N/A")]);
     }
 
     // ── first_value ──────────────────────────────────────────────────

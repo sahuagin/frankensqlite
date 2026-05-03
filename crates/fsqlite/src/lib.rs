@@ -5997,6 +5997,44 @@ mod tests {
     }
 
     #[test]
+    fn window_lag_lead_fractional_offset_uses_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT, off REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES(1,'a',1.5),(2,'b',1.5),(3,'c',1.5);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT id, \
+                 lag(val,off,'D') OVER (ORDER BY id), \
+                 lead(val,off,'D') OVER (ORDER BY id) \
+                 FROM t1 ORDER BY id;",
+            )
+            .unwrap();
+        let results: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert_eq!(
+            results,
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("D".into()),
+                    SqliteValue::Text("D".into()),
+                ],
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("D".into()),
+                    SqliteValue::Text("D".into()),
+                ],
+                vec![
+                    SqliteValue::Integer(3),
+                    SqliteValue::Text("D".into()),
+                    SqliteValue::Text("D".into()),
+                ],
+            ]
+        );
+    }
+
+    #[test]
     fn window_grouped_ntile_advances_two_pass_position() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t(id INTEGER, val INTEGER);")
