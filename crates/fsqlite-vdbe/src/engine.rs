@@ -13441,18 +13441,33 @@ impl VdbeEngine {
             .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
             .copied();
         let payload_includes = if let Some(ipk) = ipk_col_idx {
-            let rowid = storage_cursor_cached_rowid(cursor)?;
-            if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
-                && let Some(ipk_end) = column_payload_end(&ipk_col)
-            {
-                let ipk_refresh =
-                    ensure_storage_cursor_row_layout(cursor, ipk_end, self.collect_vdbe_metrics)?;
-                refresh_state.refreshed |= ipk_refresh.refreshed;
-                refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-            }
             if let Some(cached) = cursor.payload_includes_rowid_alias {
                 cached
+            } else if let Some(includes) = root_page.and_then(|rp| {
+                payload_includes_rowid_alias_without_rowid(
+                    &cursor.row_decode,
+                    ipk,
+                    self.table_column_count_by_root_page.get(&rp).copied(),
+                    self.first_not_null_non_ipk_col_by_root_page
+                        .get(&rp)
+                        .copied(),
+                )
+            }) {
+                cursor.payload_includes_rowid_alias = Some(includes);
+                includes
             } else {
+                let rowid = storage_cursor_cached_rowid(cursor)?;
+                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk).copied()
+                    && let Some(ipk_end) = column_payload_end(&ipk_col)
+                {
+                    let ipk_refresh = ensure_storage_cursor_row_layout(
+                        cursor,
+                        ipk_end,
+                        self.collect_vdbe_metrics,
+                    )?;
+                    refresh_state.refreshed |= ipk_refresh.refreshed;
+                    refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
+                }
                 let includes = root_page.is_some_and(|rp| {
                     payload_includes_rowid_alias_lazy(
                         &cursor.row_decode,
@@ -13473,8 +13488,8 @@ impl VdbeEngine {
         };
 
         let payload_idx = if let Some(ipk) = ipk_col_idx {
-            let rowid = storage_cursor_cached_rowid(cursor)?;
             if col_idx == ipk {
+                let rowid = storage_cursor_cached_rowid(cursor)?;
                 self.set_reg_fast(target, SqliteValue::Integer(rowid));
                 return Ok(true);
             }
@@ -13619,18 +13634,35 @@ impl VdbeEngine {
                 .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
                 .copied();
             let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
-                if let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
-                    && let Some(ipk_end) = column_payload_end(&ipk_col)
-                {
-                    let ipk_refresh =
-                        ensure_storage_cursor_row_layout(cursor, ipk_end, collect_vdbe_metrics)?;
-                    refresh_state.refreshed |= ipk_refresh.refreshed;
-                    refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
-                }
                 if let Some(cached) = cursor.payload_includes_rowid_alias {
                     cached
+                } else if let Some(includes) = root_page.and_then(|root_page| {
+                    payload_includes_rowid_alias_without_rowid(
+                        &cursor.row_decode,
+                        ipk_col_idx,
+                        self.table_column_count_by_root_page
+                            .get(&root_page)
+                            .copied(),
+                        self.first_not_null_non_ipk_col_by_root_page
+                            .get(&root_page)
+                            .copied(),
+                    )
+                }) {
+                    cursor.payload_includes_rowid_alias = Some(includes);
+                    includes
                 } else {
+                    let rowid = storage_cursor_cached_rowid(cursor)?;
+                    if let Some(ipk_col) = cursor.row_decode.column_offset(ipk_col_idx).copied()
+                        && let Some(ipk_end) = column_payload_end(&ipk_col)
+                    {
+                        let ipk_refresh = ensure_storage_cursor_row_layout(
+                            cursor,
+                            ipk_end,
+                            collect_vdbe_metrics,
+                        )?;
+                        refresh_state.refreshed |= ipk_refresh.refreshed;
+                        refresh_state.eager_values_ready |= ipk_refresh.eager_values_ready;
+                    }
                     let includes = root_page.is_some_and(|root_page| {
                         payload_includes_rowid_alias_lazy(
                             &cursor.row_decode,
@@ -13652,8 +13684,8 @@ impl VdbeEngine {
                 false
             };
             let payload_idx = if let Some(ipk) = ipk_col_idx {
-                let rowid = storage_cursor_cached_rowid(cursor)?;
                 if col_idx == ipk {
+                    let rowid = storage_cursor_cached_rowid(cursor)?;
                     return Ok(SqliteValue::Integer(rowid));
                 }
                 if col_idx > ipk && !payload_includes_rowid_alias {
@@ -15598,6 +15630,60 @@ fn payload_includes_rowid_alias(
     matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null))
 }
 
+/// Resolve the rowid-alias payload shape from record-header metadata alone.
+///
+/// Returns `None` only for the rare case where an integer stored at the IPK
+/// position must be compared with the physical rowid.
+fn payload_includes_rowid_alias_without_rowid(
+    row_decode: &RowDecodeScratch,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+    first_not_null_non_ipk_col_idx: Option<usize>,
+) -> Option<bool> {
+    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+
+    let payload_cols = row_decode.column_count();
+    if let Some(table_cols) = table_column_count {
+        if payload_cols == table_cols || payload_cols.checked_add(1) == Some(table_cols) {
+            return Some(true);
+        }
+        if let Some(not_null_col_idx) =
+            first_not_null_non_ipk_col_idx.filter(|idx| *idx > ipk_col_idx)
+        {
+            let omitted_payload_idx = not_null_col_idx - 1;
+            let present_payload_idx = not_null_col_idx;
+            if omitted_payload_idx < payload_cols
+                && present_payload_idx < payload_cols
+                && let Some(col) = row_decode.column_offset(omitted_payload_idx)
+                && matches!(classify_serial_type(col.serial_type), SerialTypeClass::Null)
+            {
+                return Some(true);
+            }
+        }
+        if ipk_col_idx >= payload_cols {
+            return Some(false);
+        }
+        let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+            return Some(false);
+        };
+        return match classify_serial_type(col.serial_type) {
+            SerialTypeClass::Null => Some(true),
+            SerialTypeClass::Integer => None,
+            _ => Some(false),
+        };
+    }
+    if ipk_col_idx >= payload_cols {
+        return Some(false);
+    }
+    let Some(col) = row_decode.column_offset(ipk_col_idx) else {
+        return Some(false);
+    };
+    match classify_serial_type(col.serial_type) {
+        SerialTypeClass::Null => Some(true),
+        _ => Some(false),
+    }
+}
+
 /// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
 /// with the header offset table instead of requiring all columns to be
 /// pre-decoded.
@@ -16549,6 +16635,54 @@ mod tests {
             None,
             Some(1)
         ));
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_without_rowid_resolves_common_width_cases() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert_eq!(
+            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(3), Some(1)),
+            Some(true),
+            "matching payload/table width proves the payload already carries the IPK alias"
+        );
+        assert_eq!(
+            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(4), Some(1)),
+            Some(true),
+            "one-column-short rows stay compatible with the existing ALTER TABLE heuristic"
+        );
+    }
+
+    #[test]
+    fn test_payload_includes_rowid_alias_without_rowid_defers_ambiguous_integer_match() {
+        let record = serialize_record(&[
+            SqliteValue::Integer(2),
+            SqliteValue::Text("local".into()),
+            SqliteValue::Text("dup-session".into()),
+        ]);
+        let mut scratch = fsqlite_types::record::RecordDecodeScratch::default();
+        scratch
+            .prepare_for_record(&record)
+            .expect("payload should decode");
+
+        assert_eq!(
+            payload_includes_rowid_alias_without_rowid(&scratch, 0, Some(5), Some(1)),
+            None,
+            "ambiguous integer-at-IPK rows still need the rowid-aware fallback"
+        );
+        assert_eq!(
+            payload_includes_rowid_alias_without_rowid(&scratch, 0, None, Some(1)),
+            Some(false),
+            "the metadata-free fallback remains conservative"
+        );
     }
 
     #[test]
