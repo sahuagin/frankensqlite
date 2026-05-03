@@ -788,6 +788,7 @@ impl MemTable {
     }
 
     /// Find a row by rowid. Returns the index.
+    #[inline]
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         if let Some(idx) = self.dense_rowid_offset(rowid) {
             return Some(idx);
@@ -795,6 +796,7 @@ impl MemTable {
         self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()
     }
 
+    #[inline]
     fn dense_rowid_offset(&self, rowid: i64) -> Option<usize> {
         let first_rowid = self.rows.first()?.rowid;
         let offset = rowid.checked_sub(first_rowid)?;
@@ -822,10 +824,10 @@ impl MemTable {
     }
 
     /// Return the values for a rowid, if present.
+    #[inline]
     pub fn row_values_by_rowid(&self, rowid: i64) -> Option<&[SqliteValue]> {
-        self.find_by_rowid(rowid)
-            .and_then(|idx| self.rows.get(idx))
-            .map(|row| row.values.as_slice())
+        let idx = self.find_by_rowid(rowid)?;
+        Some(self.rows[idx].values.as_slice())
     }
 
     /// Count rows whose rowid is in `[lower_inclusive, upper_exclusive)`.
