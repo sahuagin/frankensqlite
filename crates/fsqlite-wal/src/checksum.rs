@@ -124,6 +124,37 @@ impl WalChecksumTransform {
         }
     }
 
+    #[must_use]
+    fn linear_coefficients_for_chunk_count(chunk_count: usize) -> (u32, u32, u32, u32) {
+        fn multiply(
+            left: (u32, u32, u32, u32),
+            right: (u32, u32, u32, u32),
+        ) -> (u32, u32, u32, u32) {
+            let (l11, l12, l21, l22) = left;
+            let (r11, r12, r21, r22) = right;
+            (
+                l11.wrapping_mul(r11).wrapping_add(l12.wrapping_mul(r21)),
+                l11.wrapping_mul(r12).wrapping_add(l12.wrapping_mul(r22)),
+                l21.wrapping_mul(r11).wrapping_add(l22.wrapping_mul(r21)),
+                l21.wrapping_mul(r12).wrapping_add(l22.wrapping_mul(r22)),
+            )
+        }
+
+        let mut result = (1, 0, 0, 1);
+        let mut base = (1, 1, 1, 2);
+        let mut exp = chunk_count;
+        while exp != 0 {
+            if exp & 1 == 1 {
+                result = multiply(result, base);
+            }
+            exp >>= 1;
+            if exp != 0 {
+                base = multiply(base, base);
+            }
+        }
+        result
+    }
+
     /// Build the transform for aligned WAL checksum bytes.
     pub fn from_aligned_bytes(data: &[u8], big_endian_checksum_words: bool) -> Result<Self> {
         if data.len() % 8 != 0 {
@@ -135,30 +166,24 @@ impl WalChecksumTransform {
             });
         }
 
-        let mut transform = Self::identity();
+        let (a11, a12, a21, a22) = Self::linear_coefficients_for_chunk_count(data.len() / 8);
+        let mut c1 = 0_u32;
+        let mut c2 = 0_u32;
         for chunk in data.chunks_exact(8) {
             let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
             let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
-            // Apply the fixed SQLite two-word checksum step directly:
-            // (s1, s2) -> (s1 + s2 + x0, s1 + 2*s2 + x0 + x1).
-            let double_a21 = transform.a21.wrapping_add(transform.a21);
-            let double_a22 = transform.a22.wrapping_add(transform.a22);
-            let double_c2 = transform.c2.wrapping_add(transform.c2);
-            transform = Self {
-                a11: transform.a11.wrapping_add(transform.a21),
-                a12: transform.a12.wrapping_add(transform.a22),
-                a21: transform.a11.wrapping_add(double_a21),
-                a22: transform.a12.wrapping_add(double_a22),
-                c1: transform.c1.wrapping_add(transform.c2).wrapping_add(x0),
-                c2: transform
-                    .c1
-                    .wrapping_add(double_c2)
-                    .wrapping_add(x0)
-                    .wrapping_add(x1),
-            };
+            c1 = c1.wrapping_add(x0).wrapping_add(c2);
+            c2 = c2.wrapping_add(x1).wrapping_add(c1);
         }
 
-        Ok(transform)
+        Ok(Self {
+            a11,
+            a12,
+            a21,
+            a22,
+            c1,
+            c2,
+        })
     }
 
     /// Build the transform for one WAL frame.
@@ -1889,6 +1914,40 @@ mod tests {
             transformed, computed,
             "precomputed frame transform must match direct checksum evaluation"
         );
+    }
+
+    #[test]
+    fn test_wal_checksum_transform_matches_direct_checksum_for_chunk_counts() {
+        for big_endian in [false, true] {
+            for chunk_count in [0_usize, 1, 2, 3, 8, 31, 512] {
+                let mut data = vec![0_u8; chunk_count * 8];
+                for (idx, byte) in data.iter_mut().enumerate() {
+                    *byte = u8::try_from((idx * 37 + chunk_count * 11) & 0xFF)
+                        .expect("masked byte fits");
+                }
+                let transform = WalChecksumTransform::from_aligned_bytes(&data, big_endian)
+                    .expect("aligned transform should build");
+                for seed in [
+                    SqliteWalChecksum { s1: 0, s2: 0 },
+                    SqliteWalChecksum {
+                        s1: 0x1234_5678,
+                        s2: 0x9ABC_DEF0,
+                    },
+                    SqliteWalChecksum {
+                        s1: u32::MAX,
+                        s2: 0x0102_0304,
+                    },
+                ] {
+                    let direct = sqlite_wal_checksum(&data, seed.s1, seed.s2, big_endian)
+                        .expect("aligned checksum should compute");
+                    assert_eq!(
+                        transform.apply(seed),
+                        direct,
+                        "transform must match direct checksum for big_endian={big_endian} chunk_count={chunk_count} seed={seed:?}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
