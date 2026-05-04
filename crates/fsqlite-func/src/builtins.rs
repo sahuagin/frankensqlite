@@ -495,12 +495,24 @@ impl ScalarFunction for LengthFunc {
             return Ok(SqliteValue::Null);
         }
         let len = match &args[0] {
-            SqliteValue::Text(s) => sqlite_text_until_nul(s.as_str()).chars().count(),
+            SqliteValue::Text(s) => {
+                let text = sqlite_text_until_nul(s.as_str());
+                if text.is_ascii() {
+                    text.len()
+                } else {
+                    text.chars().count()
+                }
+            }
             SqliteValue::Blob(b) => b.len(),
             other => {
                 // Numbers: length of text representation.
                 let text = other.to_text();
-                sqlite_text_until_nul(&text).chars().count()
+                let text = sqlite_text_until_nul(&text);
+                if text.is_ascii() {
+                    text.len()
+                } else {
+                    text.chars().count()
+                }
             }
         };
         Ok(SqliteValue::Integer(len as i64))
