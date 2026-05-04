@@ -5566,6 +5566,19 @@ enum PendingUpdateRestore {
     },
 }
 
+impl PendingUpdateRestore {
+    fn matches_storage_rowid(&self, cursor_id: i32, rowid: i64) -> bool {
+        matches!(
+            self,
+            Self::Storage {
+                cursor_id: restore_cursor_id,
+                rowid: restore_rowid,
+                ..
+            } if *restore_cursor_id == cursor_id && *restore_rowid == rowid
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingInsertRollback {
     cursor_id: i32,
@@ -9314,6 +9327,10 @@ impl VdbeEngine {
                                 } else {
                                     record_blob_bytes(&record_val)
                                 };
+                                let update_reinsert_same_rowid =
+                                    pending_update_restore.as_ref().is_some_and(|restore| {
+                                        restore.matches_storage_rowid(cursor_id, rowid)
+                                    });
                                 // bd-p666i: Append fast-path — if the new rowid
                                 // is strictly greater than the last successfully
                                 // inserted rowid on this cursor, the row cannot
@@ -9330,7 +9347,9 @@ impl VdbeEngine {
                                         .last_successful_insert_rowid
                                         .is_some_and(|last| rowid > last);
                                 let mut insert_seek_result = None;
-                                let exists = if append_eligible {
+                                let exists = if update_reinsert_same_rowid {
+                                    false
+                                } else if append_eligible {
                                     FSQLITE_VDBE_INSERT_APPEND_COUNT
                                         .fetch_add(1, AtomicOrdering::Relaxed);
                                     false // Append: key is larger than anything in the table
@@ -9406,7 +9425,10 @@ impl VdbeEngine {
                                 } else {
                                     // No conflict — reuse the successor/EOF position from the
                                     // existence probe when it already proved the row is absent.
-                                    if insert_seek_result == Some(SeekResult::NotFound) {
+                                    if update_reinsert_same_rowid {
+                                        sc.cursor
+                                            .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
+                                    } else if insert_seek_result == Some(SeekResult::NotFound) {
                                         let rightmost_insert = sc.cursor.eof();
                                         sc.cursor
                                             .table_insert_prechecked_absent(&sc.cx, rowid, blob)?;
