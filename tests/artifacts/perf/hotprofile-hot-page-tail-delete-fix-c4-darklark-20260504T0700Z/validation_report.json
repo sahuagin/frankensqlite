@@ -1,0 +1,99 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_validation_report.v1",
+  "bead_id": "hot-page-tail-delete-fix-c4",
+  "run_id": "hot-page-tail-delete-fix-c4-hot_page_contention-frankensqlite-c4-s42-1777877939950",
+  "trace_id": "hot-page-tail-delete-fix-c4.hot_page_contention:frankensqlite:c4",
+  "scenario_id": "hot-page-tail-delete-fix-c4.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "artifact_root": "/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c4-darklark-20260504T0700Z",
+  "backend_identity": "iouring:parity_cert_strict",
+  "all_checks_passed": true,
+  "required_artifacts": [
+    "actionable_ranking.json",
+    "command_pack.json",
+    "opcode_profile.json",
+    "profile.json",
+    "subsystem_profile.json",
+    "summary.md"
+  ],
+  "topology_taxonomy": [
+    "allocation",
+    "io",
+    "mixed",
+    "queueing",
+    "retries",
+    "service",
+    "synchronization"
+  ],
+  "topology_sensitive_captures": [
+    "cache_to_cache",
+    "migration",
+    "remote_access"
+  ],
+  "artifact_hashes": [
+    {
+      "path": "actionable_ranking.json",
+      "bytes": 50866,
+      "sha256": "d0a2ecb83163730c81ed436165227a1888bbe3c6d7f1d01eac84e2743eee45c6",
+      "description": "structured hotspot, reuse, and baseline-waste ledger for follow-on implementation work"
+    },
+    {
+      "path": "command_pack.json",
+      "bytes": 41363,
+      "sha256": "2543abfe0c2f3de046b5dd8fc22b9a6b90d94eadeeb885b233c3259733069fcd",
+      "description": "structured replay/evidence capture commands for profiler-safe and full-validation runs"
+    },
+    {
+      "path": "opcode_profile.json",
+      "bytes": 1069,
+      "sha256": "2c39affe4133682c1478265be14db625fe5ad11dd19b285a9b9c1fa2ce792c0e",
+      "description": "raw opcode totals for the profiled run"
+    },
+    {
+      "path": "profile.json",
+      "bytes": 12839,
+      "sha256": "298aba1934b240e1c22a15a53c03a7d714c66de8a0407ab87f43da8e77033efe",
+      "description": "structured hot-path profile report"
+    },
+    {
+      "path": "subsystem_profile.json",
+      "bytes": 13154,
+      "sha256": "ed26ba4d9cbc51cf7e2a7000bd49640cac88687db960064a4aabefef2725bd9a",
+      "description": "raw execution-subsystem timing, heap profile, and WAL commit-path split/tail metrics for the run"
+    },
+    {
+      "path": "summary.md",
+      "bytes": 28483,
+      "sha256": "c81603289eb9f83ae8fbf7b8afcab8d09bb40cd4b30e713c8fd084743aeb3591",
+      "description": "human-readable hotspot ranking summary"
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "artifact_completeness",
+      "passed": true,
+      "detail": "covered 6 required artifacts with SHA-256 hashes: actionable_ranking.json, command_pack.json, opcode_profile.json, profile.json, subsystem_profile.json, summary.md"
+    },
+    {
+      "check_id": "schema_versions",
+      "passed": true,
+      "detail": "profile=fsqlite-e2e.hot_path_profile.v1 manifest=fsqlite-e2e.hot_path_profile_manifest.v1 command_pack=fsqlite-e2e.hot_path_command_pack.v2 actionable_ranking=fsqlite-e2e.hot_path_actionable_ranking.v3"
+    },
+    {
+      "check_id": "structured_id_contract",
+      "passed": true,
+      "detail": "bead=hot-page-tail-delete-fix-c4 run=hot-page-tail-delete-fix-c4-hot_page_contention-frankensqlite-c4-s42-1777877939950 trace=hot-page-tail-delete-fix-c4.hot_page_contention:frankensqlite:c4 scenario=hot-page-tail-delete-fix-c4.hot_page_contention fixture=frankensqlite workload=hot_page_contention concurrency=4"
+    },
+    {
+      "check_id": "replayability",
+      "passed": true,
+      "detail": "backend_identity=iouring:parity_cert_strict profiler_safe_commands=1 full_validation_commands=1 report_replay_matches_selected_mode=true"
+    },
+    {
+      "check_id": "conflict_topology_taxonomy",
+      "passed": true,
+      "detail": "taxonomy=allocation, io, mixed, queueing, retries, service, synchronization topology_sensitive_captures=cache_to_cache, migration, remote_access"
+    }
+  ]
+}

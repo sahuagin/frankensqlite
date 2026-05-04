@@ -1,0 +1,370 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_profile.v1",
+  "bead_id": "hot-page-tail-delete-fix-c4",
+  "scenario_id": "hot-page-tail-delete-fix-c4.hot_page_contention",
+  "run_id": "hot-page-tail-delete-fix-c4-hot_page_contention-frankensqlite-c4-s42-1777877939950",
+  "trace_id": "hot-page-tail-delete-fix-c4.hot_page_contention:frankensqlite:c4",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 4,
+  "concurrent_mode": true,
+  "run_integrity_check": false,
+  "golden_dir": "/data/projects/frankensqlite/sample_sqlite_db_files/golden",
+  "working_base": "/data/projects/frankensqlite/sample_sqlite_db_files/working",
+  "replay_command": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c4 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 4 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c4-darklark-20260504T0700Z --mvcc",
+  "engine_report": {
+    "wall_time_ms": 48,
+    "ops_total": 800,
+    "ops_per_sec": 16577.27921426349,
+    "retries": 10,
+    "aborts": 10,
+    "correctness": {
+      "raw_sha256_match": null,
+      "dump_match": null,
+      "canonical_sha256_match": null,
+      "integrity_check_ok": null,
+      "raw_sha256": null,
+      "canonical_sha256": null,
+      "logical_sha256": null,
+      "notes": "mode=concurrent (MVCC); parallel worker execution; backend_identity=iouring:parity_cert_strict; retry_diag=kind[busy=0,busy_snapshot=10,busy_recovery=0,other=0] phase[begin=0,body=10,commit=0,rollback=0] max_batch_attempts=4 top_conflict_pages[p2653:10] last_busy=\"database is busy (snapshot conflict on pages: 2653)\"; conflict_stats[page_contentions=8,fcw_drifts=0,ssi_aborts=0,fcw_merge_attempts=0,fcw_merge_successes=0] top_hotspots[p2653:8]"
+    },
+    "latency_ms": null,
+    "error": null,
+    "storage_wiring": {
+      "backend_kind": "iouring",
+      "backend_mode": "parity_cert_strict",
+      "backend_identity": "iouring:parity_cert_strict"
+    },
+    "runtime_phase_timing": {
+      "retry_backoff_time_ns": 52000000,
+      "busy_attempt_time_ns": 4838575,
+      "begin_boundary_time_ns": 8729131,
+      "body_execution_time_ns": 1582421,
+      "commit_finalize_time_ns": 10492686,
+      "rollback_time_ns": 1003140
+    }
+  },
+  "parser": {
+    "parse_single_calls": 14,
+    "parse_multi_calls": 31,
+    "parse_cache_hits": 2,
+    "parse_cache_misses": 43,
+    "parsed_sql_bytes": 1703,
+    "parse_time_ns": 191231,
+    "rewrite_calls": 14,
+    "rewrite_time_ns": 13765,
+    "compiled_cache_hits": 0,
+    "compiled_cache_misses": 4,
+    "prepared_cache_hits": 30,
+    "prepared_cache_misses": 14,
+    "statement_cache_hits": 30,
+    "statement_cache_misses": 14,
+    "plan_cache_hits": 0,
+    "plan_cache_misses": 4,
+    "compile_reuse_count": 30,
+    "compile_time_ns": 101489
+  },
+  "btree_copy_kernels": {
+    "local_payload_copy_calls": 810,
+    "local_payload_copy_bytes": 3207,
+    "owned_payload_materialization_calls": 372,
+    "owned_payload_materialization_bytes": 4278,
+    "overflow_chain_reassembly_calls": 0,
+    "overflow_chain_local_bytes": 0,
+    "overflow_chain_overflow_bytes": 0,
+    "overflow_page_reads": 0,
+    "table_leaf_cell_assembly_calls": 61,
+    "table_leaf_cell_assembly_bytes": 434,
+    "index_leaf_cell_assembly_calls": 0,
+    "index_leaf_cell_assembly_bytes": 0,
+    "interior_cell_rebuild_calls": 0,
+    "interior_cell_rebuild_bytes": 0
+  },
+  "btree_copy_kernel_targets": [
+    {
+      "subsystem": "btree_owned_payload_materialization",
+      "metric_kind": "bytes",
+      "metric_value": 4278,
+      "rationale": "372 payload materialization call(s) forced 4278 byte(s) into fresh owned buffers"
+    },
+    {
+      "subsystem": "btree_local_payload_copy",
+      "metric_kind": "bytes",
+      "metric_value": 3207,
+      "rationale": "810 local payload copy call(s) copied 3207 byte(s) into caller scratch without overflow traversal"
+    },
+    {
+      "subsystem": "btree_table_leaf_cell_assembly",
+      "metric_kind": "bytes",
+      "metric_value": 434,
+      "rationale": "61 table-leaf cell assembly call(s) emitted 434 byte(s) before page insert"
+    }
+  ],
+  "record_decode": {
+    "parse_record_calls": 656,
+    "parse_record_into_calls": 1466,
+    "parse_record_column_calls": 0,
+    "record_bytes_scanned": 52673,
+    "record_vec_capacity_slots": 6216,
+    "decode_time_ns": 217415,
+    "decoded_values": {
+      "total_values": 3754,
+      "nulls": 855,
+      "integers": 1466,
+      "reals": 0,
+      "texts": 1433,
+      "blobs": 0,
+      "text_bytes_total": 45656,
+      "blob_bytes_total": 0
+    },
+    "vdbe_record_decode_calls_total": 0,
+    "vdbe_column_reads_total": 0,
+    "vdbe_decoded_value_heap_bytes_total": 0,
+    "decode_cache_hits_total": 0,
+    "decode_cache_misses_total": 0,
+    "record_decodes_per_row_basis_points": null,
+    "decode_cache_invalidations_position_total": 0,
+    "decode_cache_invalidations_write_total": 0,
+    "decode_cache_invalidations_pseudo_total": 0,
+    "callsite_breakdown": {
+      "unattributed": {
+        "parse_record_calls": 10,
+        "parse_record_into_calls": 10,
+        "parse_record_column_calls": 0
+      },
+      "core_connection": {
+        "parse_record_calls": 646,
+        "parse_record_into_calls": 1456,
+        "parse_record_column_calls": 0
+      },
+      "core_compat_persist": {
+        "parse_record_calls": 0,
+        "parse_record_into_calls": 0,
+        "parse_record_column_calls": 0
+      },
+      "vdbe_engine": {
+        "parse_record_calls": 0,
+        "parse_record_into_calls": 0,
+        "parse_record_column_calls": 0
+      },
+      "vdbe_vectorized_scan": {
+        "parse_record_calls": 0,
+        "parse_record_into_calls": 0,
+        "parse_record_column_calls": 0
+      },
+      "btree_cursor": {
+        "parse_record_calls": 0,
+        "parse_record_into_calls": 0,
+        "parse_record_column_calls": 0
+      }
+    }
+  },
+  "row_materialization": {
+    "result_rows_total": 0,
+    "result_values_total": 0,
+    "result_value_heap_bytes_total": 0,
+    "result_row_materialization_time_ns_total": 0,
+    "make_record_calls_total": 0,
+    "make_record_blob_bytes_total": 0,
+    "value_types": {
+      "total_values": 0,
+      "nulls": 0,
+      "integers": 0,
+      "reals": 0,
+      "texts": 0,
+      "blobs": 0,
+      "text_bytes_total": 0,
+      "blob_bytes_total": 0
+    }
+  },
+  "mvcc_write": {
+    "total_write_attempts": 870,
+    "tier0_already_owned_writes_total": 770,
+    "tier1_first_touch_writes_total": 100,
+    "tier2_commit_surface_writes_total": 0,
+    "page_lock_waits_total": 8,
+    "page_lock_wait_time_ns_total": 1426749,
+    "write_busy_retries_total": 8,
+    "write_busy_timeouts_total": 0,
+    "stale_snapshot_rejects_total": 10,
+    "page_one_conflict_tracks_total": 0,
+    "page_one_conflict_track_time_ns_total": 0,
+    "pending_commit_surface_clears_total": 0,
+    "pending_commit_surface_clear_time_ns_total": 0,
+    "runtime_retry": {
+      "total_retries": 10,
+      "total_aborts": 10,
+      "kind": {
+        "busy": 0,
+        "busy_snapshot": 0,
+        "busy_recovery": 0,
+        "busy_other": 0
+      },
+      "phase": {
+        "begin": 0,
+        "body": 0,
+        "commit": 0,
+        "rollback": 0
+      },
+      "max_batch_attempts": 0
+    }
+  },
+  "page_buffer_pool": {
+    "page_buffer_pool_hits": 37,
+    "page_buffer_pool_misses": 20,
+    "page_image_slab_reuse_count": 37,
+    "staged_page_copy_bytes": 0
+  },
+  "page_data_motion": {
+    "borrowed_write_normalization_calls_total": 0,
+    "borrowed_exact_size_copies_total": 0,
+    "owned_write_normalization_calls_total": 870,
+    "owned_passthrough_total": 870,
+    "owned_in_place_zero_extends_total": 0,
+    "owned_resized_copies_total": 0,
+    "normalized_payload_bytes_total": 0,
+    "normalized_zero_fill_bytes_total": 0,
+    "normalized_bytes_total": 0
+  },
+  "connection_ceremony": {
+    "background_status_time_ns": 37757,
+    "background_status_checks": 1143,
+    "op_cx_background_gates": 38,
+    "statement_dispatch_background_gates": 0,
+    "prepared_lookup_time_ns": 125417,
+    "prepared_schema_refresh_time_ns": 645827,
+    "prepared_schema_refreshes": 84,
+    "prepared_schema_lightweight_refreshes": 0,
+    "prepared_schema_full_reloads": 0,
+    "pager_publication_refreshes": 268,
+    "memory_autocommit_fast_path_begins": 0,
+    "cached_read_snapshot_reuses": 0,
+    "cached_read_snapshot_parks": 0,
+    "begin_setup_time_ns": 9426848,
+    "begin_refresh_count": 44,
+    "commit_refresh_count": 44,
+    "memdb_refresh_count": 91,
+    "execute_body_time_ns": 314053,
+    "commit_pre_txn_time_ns": 192539,
+    "commit_txn_roundtrip_time_ns": 10746655,
+    "commit_finalize_seq_time_ns": 211937,
+    "commit_handle_finalize_time_ns": 638304,
+    "commit_post_write_maintenance_time_ns": 30040,
+    "finalize_post_publish_time_ns": 681054,
+    "column_default_evaluation_passes": 0,
+    "prepared_table_engine_fresh_allocs": 0,
+    "prepared_table_engine_reuses": 0,
+    "prepared_insert_fast_lane_hits": 40,
+    "prepared_insert_instrumented_lane_hits": 0,
+    "prepared_update_delete_fast_lane_hits": 0,
+    "prepared_update_delete_instrumented_lane_hits": 0,
+    "prepared_update_delete_fallback_returning": 0,
+    "prepared_update_delete_fallback_sqlite_sequence": 0,
+    "prepared_update_delete_fallback_without_rowid": 0,
+    "prepared_update_delete_fallback_live_vtab": 0,
+    "prepared_update_delete_fallback_trigger": 0,
+    "prepared_update_delete_fallback_foreign_key": 0,
+    "prepared_table_dml_affected_only_runs": 0,
+    "autoincrement_sequence_fast_path_updates": 0,
+    "autoincrement_sequence_scan_refreshes": 0,
+    "arena_alloc_bytes": 6128,
+    "arena_reset_count": 177,
+    "fallback_to_general_allocator_count": 10
+  },
+  "opcode_profile": [],
+  "type_profile": {
+    "decoded": {
+      "total_values": 3754,
+      "nulls": 855,
+      "integers": 1466,
+      "reals": 0,
+      "texts": 1433,
+      "blobs": 0,
+      "text_bytes_total": 45656,
+      "blob_bytes_total": 0
+    },
+    "materialized": {
+      "total_values": 0,
+      "nulls": 0,
+      "integers": 0,
+      "reals": 0,
+      "texts": 0,
+      "blobs": 0,
+      "text_bytes_total": 0,
+      "blob_bytes_total": 0
+    }
+  },
+  "subsystem_ranking": [
+    {
+      "subsystem": "mvcc_page_lock_wait",
+      "metric_kind": "time_ns",
+      "metric_value": 1426749,
+      "rationale": "time spent waiting for MVCC page-lock ownership changes"
+    },
+    {
+      "subsystem": "parser_ast_churn",
+      "metric_kind": "time_ns",
+      "metric_value": 306485,
+      "rationale": "parse + rewrite + compile time on the connection path"
+    },
+    {
+      "subsystem": "record_decode",
+      "metric_kind": "time_ns",
+      "metric_value": 217415,
+      "rationale": "time spent decoding SQLite record payloads"
+    },
+    {
+      "subsystem": "mvcc_page_one_conflict_tracking",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent recording conflict-only page-one tracking on the MVCC write surface"
+    },
+    {
+      "subsystem": "mvcc_pending_commit_surface_clear",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent clearing stale synthetic pending-commit-surface state after writes"
+    },
+    {
+      "subsystem": "row_materialization",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent cloning registers into emitted result rows"
+    }
+  ],
+  "allocator_pressure": {
+    "parser_sql_bytes": 1703,
+    "decoded_value_heap_bytes_total": 0,
+    "result_value_heap_bytes_total": 0,
+    "record_vec_capacity_slots": 6216,
+    "page_data_normalization_bytes_total": 0,
+    "ranked_sources": [
+      {
+        "subsystem": "parser_sql_bytes",
+        "metric_kind": "bytes",
+        "metric_value": 1703,
+        "rationale": "SQL text volume parsed on cache-miss paths"
+      },
+      {
+        "subsystem": "page_data_normalization_bytes",
+        "metric_kind": "bytes",
+        "metric_value": 0,
+        "rationale": "payload-copy + zero-fill bytes materialized while normalizing page images before writes"
+      },
+      {
+        "subsystem": "record_decode_values",
+        "metric_kind": "heap_bytes",
+        "metric_value": 0,
+        "rationale": "estimated heap carried by decoded record/column values"
+      },
+      {
+        "subsystem": "result_row_values",
+        "metric_kind": "heap_bytes",
+        "metric_value": 0,
+        "rationale": "estimated heap carried by emitted result values"
+      }
+    ]
+  }
+}

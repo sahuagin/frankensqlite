@@ -1,0 +1,260 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_profile_manifest.v1",
+  "bead_id": "hot-page-tail-delete-fix-c1",
+  "run_id": "hot-page-tail-delete-fix-c1-hot_page_contention-frankensqlite-c1-s42-1777877903214",
+  "trace_id": "hot-page-tail-delete-fix-c1.hot_page_contention:frankensqlite:c1",
+  "scenario_id": "hot-page-tail-delete-fix-c1.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 1,
+  "concurrent_mode": true,
+  "run_integrity_check": false,
+  "golden_dir": "/data/projects/frankensqlite/sample_sqlite_db_files/golden",
+  "working_base": "/data/projects/frankensqlite/sample_sqlite_db_files/working",
+  "replay_command": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc",
+  "counter_capture_summary": {
+    "host_capability_sensitive_captures": [
+      "topdown",
+      "cache_to_cache",
+      "migration",
+      "remote_access"
+    ],
+    "topology_sensitive_captures": [
+      "cache_to_cache",
+      "migration",
+      "remote_access"
+    ],
+    "fallback_tools": [
+      "perf-stat",
+      "perf-mem"
+    ],
+    "fallback_metric_pack": [
+      "cycles",
+      "instructions",
+      "branches",
+      "branch-misses",
+      "cache-references",
+      "cache-misses",
+      "context-switches",
+      "task-clock",
+      "page-faults"
+    ],
+    "fallback_notes": [
+      "topdown:profiler_safe: TopdownL1 unsupported on this host",
+      "cache_to_cache:profiler_safe: perf c2c unavailable or failed on this host",
+      "cache_to_cache:profiler_safe: perf c2c and perf mem unavailable or failed on this host",
+      "migration:profiler_safe: cpu-migrations unsupported on this host",
+      "remote_access:profiler_safe: perf mem unavailable or failed on this host",
+      "topdown:full_validation: TopdownL1 unsupported on this host",
+      "cache_to_cache:full_validation: perf c2c unavailable or failed on this host",
+      "cache_to_cache:full_validation: perf c2c and perf mem unavailable or failed on this host",
+      "migration:full_validation: cpu-migrations unsupported on this host",
+      "remote_access:full_validation: perf mem unavailable or failed on this host"
+    ],
+    "raw_output_relpaths": [
+      "profiles/perf-c2c.profiler_safe.data",
+      "profiles/perf-mem-remote-access.profiler_safe.data",
+      "profiles/perf-c2c.full_validation.data",
+      "profiles/perf-mem-remote-access.full_validation.data"
+    ]
+  },
+  "provenance": {
+    "row_id": "hot_page_contention_c1",
+    "mode_id": "fsqlite_mvcc",
+    "artifact_root": "/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z",
+    "command_entrypoint": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc",
+    "workspace_root": "/data/projects/frankensqlite",
+    "campaign_manifest_path": "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json",
+    "source_revision": "e8a27bc28b9c8cd5568afb30b8fb653f65477e32",
+    "beads_data_hash": "c048ac1becac20e29905cc93b7d32104c6890eaaf664264e6ed1eac4e4a83dcb",
+    "kernel_release": "Linux 6.17.0-19-generic",
+    "rustc_version": "rustc 1.97.0-nightly (20de910db 2026-05-02)",
+    "cargo_profile": "unknown",
+    "commands": [
+      {
+        "tool": "realdb-e2e",
+        "command_line": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc"
+      },
+      {
+        "tool": "hyperfine",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && hyperfine --warmup 1 --runs 5 --export-json /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/hyperfine.profiler_safe.json 'rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc'"
+      },
+      {
+        "tool": "perf-record",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && perf record -g -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-record.profiler_safe.data -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc"
+      },
+      {
+        "tool": "perf-sched-record",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && perf sched record -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-sched.profiler_safe.data -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc"
+      },
+      {
+        "tool": "strace",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/logs && strace -f -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/logs/strace.profiler_safe.log rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc"
+      },
+      {
+        "tool": "heaptrack",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && heaptrack -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/heaptrack.profiler_safe.gz rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc"
+      },
+      {
+        "tool": "perf-stat",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-stat-topdown.profiler_safe.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -M TopdownL1 -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=TopdownL1'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -M TopdownL1 -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=core_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=TopdownL1 unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; fi; cat \"$tmp\" >> \"$out\"'"
+      },
+      {
+        "tool": "perf-c2c",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-c2c.profiler_safe.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-c2c.profiler_safe.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf c2c record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc >/dev/null 2>&1 && perf c2c report --stats -i \"$raw\" > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_c2c'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; elif perf mem record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_mem_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c unavailable or failed on this host'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c and perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; cat \"$tmp\" >> \"$out\"; fi'"
+      },
+      {
+        "tool": "perf-stat",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-stat-migration.profiler_safe.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=cpu_migrations'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -e cpu-migrations,context-switches -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=context_switch_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=cpu-migrations unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e context-switches,task-clock -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; fi; cat \"$tmp\" >> \"$out\"'"
+      },
+      {
+        "tool": "perf-mem",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-mem-remote-access.profiler_safe.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-mem-remote-access.profiler_safe.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf mem record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=perf_mem'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses,page-faults -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc; cat \"$tmp\" >> \"$out\"; fi'"
+      },
+      {
+        "tool": "hyperfine",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && hyperfine --warmup 1 --runs 5 --export-json /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/hyperfine.full_validation.json 'rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check'"
+      },
+      {
+        "tool": "perf-record",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && perf record -g -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-record.full_validation.data -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check"
+      },
+      {
+        "tool": "perf-sched-record",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && perf sched record -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-sched.full_validation.data -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check"
+      },
+      {
+        "tool": "strace",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/logs && strace -f -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/logs/strace.full_validation.log rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check"
+      },
+      {
+        "tool": "heaptrack",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && heaptrack -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/heaptrack.full_validation.gz rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check"
+      },
+      {
+        "tool": "perf-stat",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-stat-topdown.full_validation.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -M TopdownL1 -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=TopdownL1'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -M TopdownL1 -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=core_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=TopdownL1 unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; fi; cat \"$tmp\" >> \"$out\"'"
+      },
+      {
+        "tool": "perf-c2c",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-c2c.full_validation.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-c2c.full_validation.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf c2c record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check >/dev/null 2>&1 && perf c2c report --stats -i \"$raw\" > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_c2c'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; elif perf mem record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_mem_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c unavailable or failed on this host'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c and perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; cat \"$tmp\" >> \"$out\"; fi'"
+      },
+      {
+        "tool": "perf-stat",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-stat-migration.full_validation.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=cpu_migrations'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -e cpu-migrations,context-switches -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=context_switch_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=cpu-migrations unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e context-switches,task-clock -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; fi; cat \"$tmp\" >> \"$out\"'"
+      },
+      {
+        "tool": "perf-mem",
+        "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-mem-remote-access.full_validation.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z/profiles/perf-mem-remote-access.full_validation.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf mem record -o \"$raw\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=perf_mem'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses,page-faults -o \"$tmp\" -- rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c1 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c1-darklark-20260504T0658Z --mvcc --integrity-check; cat \"$tmp\" >> \"$out\"; fi'"
+      }
+    ],
+    "tool_versions": [
+      {
+        "tool": "cargo",
+        "version": "cargo 1.97.0-nightly (4f9b52075 2026-05-01)"
+      },
+      {
+        "tool": "git",
+        "version": "git version 2.51.2"
+      },
+      {
+        "tool": "heaptrack",
+        "version": "heaptrack 1.5.0"
+      },
+      {
+        "tool": "hyperfine",
+        "version": "hyperfine 1.19.0"
+      },
+      {
+        "tool": "perf-c2c",
+        "version": "perf version 6.17.13"
+      },
+      {
+        "tool": "perf-mem",
+        "version": "perf version 6.17.13"
+      },
+      {
+        "tool": "perf-record",
+        "version": "perf version 6.17.13"
+      },
+      {
+        "tool": "perf-sched-record",
+        "version": "perf version 6.17.13"
+      },
+      {
+        "tool": "perf-stat",
+        "version": "perf version 6.17.13"
+      },
+      {
+        "tool": "rch",
+        "version": "rch 1.0.24"
+      },
+      {
+        "tool": "rustc",
+        "version": "rustc 1.97.0-nightly (20de910db 2026-05-02)"
+      },
+      {
+        "tool": "strace",
+        "version": "strace -- version 6.16\nCopyright (c) 1991-2025 The strace developers <https://strace.io>.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\nOptional features enabled: stack-trace=libunwind stack-demangle m32-mpers mx32-mpers"
+      }
+    ],
+    "fallback_notes": [
+      "topdown:profiler_safe: TopdownL1 unsupported on this host",
+      "cache_to_cache:profiler_safe: perf c2c unavailable or failed on this host",
+      "cache_to_cache:profiler_safe: perf c2c and perf mem unavailable or failed on this host",
+      "migration:profiler_safe: cpu-migrations unsupported on this host",
+      "remote_access:profiler_safe: perf mem unavailable or failed on this host",
+      "topdown:full_validation: TopdownL1 unsupported on this host",
+      "cache_to_cache:full_validation: perf c2c unavailable or failed on this host",
+      "cache_to_cache:full_validation: perf c2c and perf mem unavailable or failed on this host",
+      "migration:full_validation: cpu-migrations unsupported on this host",
+      "remote_access:full_validation: perf mem unavailable or failed on this host"
+    ]
+  },
+  "files": [
+    {
+      "path": "profile.json",
+      "bytes": 12522,
+      "sha256": "07b8503e23ae7b7a796aaea895714f6cdbeb90f7babe51a44ba7e50a50c2584a",
+      "description": "structured hot-path profile report"
+    },
+    {
+      "path": "opcode_profile.json",
+      "bytes": 1069,
+      "sha256": "fc2211079e811de24e115ee9918c2ec79ba05ba7edfd8062f4d19526f259d97e",
+      "description": "raw opcode totals for the profiled run"
+    },
+    {
+      "path": "subsystem_profile.json",
+      "bytes": 13102,
+      "sha256": "b935606688e2fa2aa58d637ad81514396ca6a9046192d68eca5f023f39b32a44",
+      "description": "raw execution-subsystem timing, heap profile, and WAL commit-path split/tail metrics for the run"
+    },
+    {
+      "path": "summary.md",
+      "bytes": 28150,
+      "sha256": "86b2109a846b524601a58ca9af19e4779a7665f240b8c15b9f936e4d7f349a1e",
+      "description": "human-readable hotspot ranking summary"
+    },
+    {
+      "path": "actionable_ranking.json",
+      "bytes": 50841,
+      "sha256": "08e5096d323ee932f00d063a65399238be4c19b9e930aec6be356a41d8ab007a",
+      "description": "structured hotspot, reuse, and baseline-waste ledger for follow-on implementation work"
+    },
+    {
+      "path": "command_pack.json",
+      "bytes": 41363,
+      "sha256": "ae75e6ebe89fdc5a81776263eed9b92655f276727aa68508933aafdbfd5867bc",
+      "description": "structured replay/evidence capture commands for profiler-safe and full-validation runs"
+    },
+    {
+      "path": "validation_report.json",
+      "bytes": 3988,
+      "sha256": "5ea8f8b64736fb674b7e3666b970f361585fdf6d8232083b9eb3e82f58a71332",
+      "description": "deterministic hot-path pack checks for completeness, shared IDs, replayability, and conflict-topology taxonomy"
+    }
+  ]
+}

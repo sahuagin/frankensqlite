@@ -5826,7 +5826,11 @@ impl<P: PageWriter> BtCursor<P> {
             refreshed.cell_idx = new_count - 1;
             self.at_eof = false;
             self.stack[depth - 1] = refreshed;
-            self.advance_next(cx)?;
+            let eof_insert_stack = self.stack.clone();
+            if !self.advance_next(cx)? {
+                self.stack = eof_insert_stack;
+                self.at_eof = true;
+            }
         } else {
             refreshed.cell_idx = delete_idx as u16;
             self.at_eof = false;
@@ -9344,6 +9348,32 @@ mod tests {
 
         assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn test_table_insert_prechecked_absent_reuses_eof_after_tail_delete() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        cursor.table_insert(&cx, 1, b"one").unwrap();
+        cursor.table_insert(&cx, 2, b"two").unwrap();
+        cursor.table_insert(&cx, 3, b"three").unwrap();
+
+        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
+        cursor.delete(&cx).unwrap();
+        assert!(
+            cursor.eof(),
+            "tail delete should leave an EOF insertion context"
+        );
+
+        cursor
+            .table_insert_prechecked_absent(&cx, 3, b"THREE-updated")
+            .unwrap();
+
+        assert!(cursor.table_move_to(&cx, 3).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"THREE-updated");
     }
 
     #[test]

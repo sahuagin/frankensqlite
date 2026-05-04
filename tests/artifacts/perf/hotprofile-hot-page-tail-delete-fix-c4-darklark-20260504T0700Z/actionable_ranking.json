@@ -1,0 +1,1166 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_actionable_ranking.v3",
+  "bead_id": "hot-page-tail-delete-fix-c4",
+  "run_id": "hot-page-tail-delete-fix-c4-hot_page_contention-frankensqlite-c4-s42-1777877939950",
+  "trace_id": "hot-page-tail-delete-fix-c4.hot_page_contention:frankensqlite:c4",
+  "scenario_id": "hot-page-tail-delete-fix-c4.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 4,
+  "replay_command": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c4 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 4 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c4-darklark-20260504T0700Z --mvcc",
+  "baseline_reuse_ledger": [
+    {
+      "rank": 1,
+      "surface": "compiled_plan_cache",
+      "supported": true,
+      "hits": 0,
+      "misses": 4,
+      "hit_rate_basis_points": 0,
+      "rationale": "compiled-plan cache hits/misses are captured directly at the prepare/compile boundary",
+      "implication": "J4 target: compiled-plan misses are direct evidence for statement/plan caching work.",
+      "mapped_beads": [
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 2,
+      "surface": "cursor_frame_reuse",
+      "supported": true,
+      "hits": 0,
+      "misses": 0,
+      "hit_rate_basis_points": 0,
+      "rationale": "prepared table execution now reports fresh engine allocations (0) versus reuse hits (0) directly",
+      "implication": "J7 target: prepared engine fresh-vs-reuse counters now expose setup churn directly, so the next cuts should drive the reuse rate up instead of treating frame setup as opaque.",
+      "mapped_beads": [
+        "bd-db300.10.7"
+      ]
+    },
+    {
+      "rank": 3,
+      "surface": "record_decode_cache",
+      "supported": true,
+      "hits": 0,
+      "misses": 0,
+      "hit_rate_basis_points": 0,
+      "rationale": "record decode cache hits/misses are measured directly in the VDBE (0 hits, 0 misses; invalidations: position=0, write=0, pseudo=0) across 1466 decode entrypoints. dominant full-record decode callsite: core_connection (646 parse_record calls). The representative path did not revisit any cached row image, so zero hits do not imply a broken cache.",
+      "implication": "J5 target: decode-cache hits/misses are now surfaced directly, so the next cuts should push the hit rate up and the invalidation counts down instead of treating decode churn as opaque.",
+      "mapped_beads": [
+        "bd-db300.10.5"
+      ]
+    },
+    {
+      "rank": 4,
+      "surface": "statement_parse_cache",
+      "supported": true,
+      "hits": 2,
+      "misses": 43,
+      "hit_rate_basis_points": 444,
+      "rationale": "parse cache hits/misses are measured directly across 45 parse calls",
+      "implication": "J4 target: repeated parse misses still show avoidable prepare churn on the low-contention path.",
+      "mapped_beads": [
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 5,
+      "surface": "page_buffer_pool_reuse",
+      "supported": true,
+      "hits": 37,
+      "misses": 20,
+      "hit_rate_basis_points": 6491,
+      "rationale": "hot-path artifacts now emit explicit page-buffer pool hits/misses (37/20), plus derived staged copy bytes (0) and slab reuse count (37) for reusable page-image staging",
+      "implication": "J3 target: page-buffer pool hits/misses and staged page-copy bytes are now explicit, so the next cuts should drive miss rate and copied bytes down instead of treating staging churn as opaque.",
+      "mapped_beads": [
+        "bd-db300.10.3"
+      ]
+    },
+    {
+      "rank": 6,
+      "surface": "prepared_statement_cache",
+      "supported": true,
+      "hits": 30,
+      "misses": 14,
+      "hit_rate_basis_points": 6818,
+      "rationale": "prepared-statement template cache hits/misses are measured at the `Connection::prepare()` boundary",
+      "implication": "Secondary baseline reuse surface after the named Track J cache/reuse buckets.",
+      "mapped_beads": []
+    },
+    {
+      "rank": 7,
+      "surface": "page_data_ownership_reuse",
+      "supported": true,
+      "hits": 870,
+      "misses": 0,
+      "hit_rate_basis_points": 10000,
+      "rationale": "owned PageData writes now report passthrough, in-place zero-extend, and resized-copy outcomes (870 passthrough, 0 in-place zero-extends, 0 resized copies); borrowed writes remain a separate explicit copy lane",
+      "implication": "J6 target: PageData ownership reuse is now measured directly, so next cuts can use passthrough, in-place zero-extend, and resized-copy evidence instead of treating ownership churn as a blind spot.",
+      "mapped_beads": [
+        "bd-db300.10.6"
+      ]
+    }
+  ],
+  "baseline_waste_ledger": [
+    {
+      "rank": 1,
+      "component": "busy_retry_queueing",
+      "classification": "structural_side_effect",
+      "metric_kind": "time_ns",
+      "metric_value": 56838575,
+      "wall_share_basis_points": 11841,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 10,
+      "rationale": "BUSY-attempt time and retry-backoff sleep are contention spillover, not evidence of intrinsic single-writer baseline tax",
+      "implication": "Structural spillover: retry and BUSY queueing are not baseline tax and should steer Track A work instead of J-lane fixes.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ]
+    },
+    {
+      "rank": 2,
+      "component": "boundary_coordination",
+      "classification": "mixed_or_residual",
+      "metric_kind": "time_ns",
+      "metric_value": 20224957,
+      "wall_share_basis_points": 4214,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 800,
+      "rationale": "BEGIN/ROLLBACK boundaries plus non-durable COMMIT coordination are real wall time, but they are not pure baseline tax and should stay separated",
+      "implication": "Mixed lane: boundary coordination should stay visible so baseline fixes do not accidentally absorb residual commit/path coordination into the wrong bucket.",
+      "mapped_beads": [
+        "bd-db300.1.5",
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 3,
+      "component": "mvcc_page_lock_wait",
+      "classification": "structural_side_effect",
+      "metric_kind": "time_ns",
+      "metric_value": 1426749,
+      "wall_share_basis_points": 297,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 8,
+      "rationale": "page-lock handoff wait time is measured directly inside the MVCC write helpers instead of being inferred from aggregate retries",
+      "implication": "Structural spillover: measured page-lock wait is explicit MVCC contention tax and should steer tiny-publish and topology work before generic baseline cleanup.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 4,
+      "component": "executor_body_residual",
+      "classification": "mixed_or_residual",
+      "metric_kind": "time_ns",
+      "metric_value": 1365006,
+      "wall_share_basis_points": 284,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 800,
+      "rationale": "body execution time that remains after explicit decode and row-materialization accounting; likely mixes VDBE dispatch, cursor motion, page fetch, and PageData ownership churn",
+      "implication": "J6/J7/J8 target: residual service time beyond decode/materialization is where VDBE setup, cursor motion, page fetch, and ownership churn likely still hide.",
+      "mapped_beads": [
+        "bd-db300.10.6",
+        "bd-db300.10.7",
+        "bd-db300.10.8"
+      ]
+    },
+    {
+      "rank": 5,
+      "component": "parser_prepare_churn",
+      "classification": "baseline_tax",
+      "metric_kind": "time_ns",
+      "metric_value": 306485,
+      "wall_share_basis_points": 64,
+      "allocator_pressure_bytes": 1703,
+      "activity_count": 45,
+      "rationale": "parse, rewrite, and compile time represent repeated prepare-path work on the common path",
+      "implication": "J2/J4 target: parse/rewrite/compile work is still visible enough that caching and arena-backed scratch should move first.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 6,
+      "component": "record_decode",
+      "classification": "baseline_tax",
+      "metric_kind": "time_ns",
+      "metric_value": 217415,
+      "wall_share_basis_points": 45,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 1466,
+      "rationale": "record decode time and decoded-value heap bytes are measured directly in the VDBE hot path",
+      "implication": "J2/J5 target: decode time and decoded-value heap churn remain direct baseline-tax candidates.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.5"
+      ]
+    },
+    {
+      "rank": 7,
+      "component": "durability",
+      "classification": "mixed_or_residual",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "wall_share_basis_points": 0,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 800,
+      "rationale": "WAL durability is an explicit measured lane and must remain visible so baseline optimization claims stay honest",
+      "implication": "Mixed lane: durability must stay explicit so later baseline work does not overclaim gains that really belong to WAL/commit-path changes.",
+      "mapped_beads": [
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 8,
+      "component": "mvcc_commit_surface_maintenance",
+      "classification": "mixed_or_residual",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "wall_share_basis_points": 0,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 0,
+      "rationale": "page-one conflict tracking plus synthetic pending-surface cleanup are now explicit MVCC maintenance lanes",
+      "implication": "Mixed lane: page-one tracking plus pending-surface maintenance are now measurable enough to steer publish-shrink versus topology work without hiding them inside generic service time.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 9,
+      "component": "page_data_normalization",
+      "classification": "baseline_tax",
+      "metric_kind": "bytes",
+      "metric_value": 0,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 870,
+      "rationale": "page writes now expose payload-copy + zero-fill byte volume that still materializes while normalizing page images before pager entry",
+      "implication": "J3/J6 target: page normalization bytes are now explicit baseline tax, so reusable page buffers and ownership-preserving writes can be prioritized with real evidence.",
+      "mapped_beads": [
+        "bd-db300.10.3",
+        "bd-db300.10.6"
+      ]
+    },
+    {
+      "rank": 10,
+      "component": "row_materialization",
+      "classification": "baseline_tax",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "wall_share_basis_points": 0,
+      "allocator_pressure_bytes": 0,
+      "activity_count": 0,
+      "rationale": "result-row materialization isolates emitted-value cloning and transient ownership work",
+      "implication": "J2/J6/J7 target: emitted-row cloning is still paying avoidable heap and ownership cost on the common path.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    }
+  ],
+  "named_hotspots": [
+    {
+      "rank": 1,
+      "subsystem": "mvcc_page_lock_wait",
+      "metric_kind": "time_ns",
+      "metric_value": 1426749,
+      "rationale": "time spent waiting for MVCC page-lock ownership changes",
+      "implication": "E2.1/E5.1 target: measured page-lock wait time is a first-class MVCC tax, so publish shrink and disjoint-page topology should move before deeper executor tuning.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 2,
+      "subsystem": "parser_ast_churn",
+      "metric_kind": "time_ns",
+      "metric_value": 306485,
+      "rationale": "parse + rewrite + compile time on the connection path",
+      "implication": "J2/J4 target: parser, AST, and compile churn should be reduced through prepared-artifact reuse and arena-backed scratch.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 3,
+      "subsystem": "record_decode",
+      "metric_kind": "time_ns",
+      "metric_value": 217415,
+      "rationale": "time spent decoding SQLite record payloads",
+      "implication": "J2/J5 target: row decode work is expensive enough to justify scratch-space reuse, decode caching, and copy reduction.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.5"
+      ]
+    },
+    {
+      "rank": 4,
+      "subsystem": "mvcc_page_one_conflict_tracking",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent recording conflict-only page-one tracking on the MVCC write surface",
+      "implication": "E5.1/E5.2 target: page-one conflict-only tracking is visible enough to justify home-lane/extent runway work that keeps disjoint inserts physically disjoint longer.",
+      "mapped_beads": [
+        "bd-db300.5.5.1",
+        "bd-db300.5.5.2"
+      ]
+    },
+    {
+      "rank": 5,
+      "subsystem": "mvcc_pending_commit_surface_clear",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent clearing stale synthetic pending-commit-surface state after writes",
+      "implication": "E2.1/E2.2 target: synthetic pending-surface cleanup is now measured directly, so the next metadata-plane cut should shrink or bypass this publish-side maintenance.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.2.2"
+      ]
+    },
+    {
+      "rank": 6,
+      "subsystem": "row_materialization",
+      "metric_kind": "time_ns",
+      "metric_value": 0,
+      "rationale": "time spent cloning registers into emitted result rows",
+      "implication": "J2/J6/J7 target: result-row materialization is still paying avoidable clone/allocation and reusable-frame cost in the mixed hot path.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    }
+  ],
+  "microarchitectural_signatures": [
+    {
+      "rank": 1,
+      "target": "durability",
+      "primary_signature": "durability_pressure",
+      "secondary_signatures": [],
+      "confidence_label": "high",
+      "confidence_score_basis_points": 9000,
+      "mixed_or_ambiguous": false,
+      "rationale": "WAL append, sync, and checkpoint service time are measured directly on the commit-finalize path, so this cell is a genuine durability-pressure lane rather than a generic executor slowdown.",
+      "evidence_sources": [
+        "wall_time_component:durability",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses",
+        "wal_runtime:wal_service_us_total",
+        "wal_runtime:wal_append_us_total",
+        "wal_runtime:wal_sync_us_total",
+        "wal_runtime:checkpoint_duration_us_total"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "E target: commit durability is now an explicit measured lane, so future architecture work can separate durable ordering from general executor service cost.",
+      "mapped_beads": [
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 2,
+      "target": "mvcc_wait",
+      "primary_signature": "ownership_ping_pong_hitm",
+      "secondary_signatures": [
+        "remote_numa_traffic"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 7400,
+      "mixed_or_ambiguous": true,
+      "rationale": "Measured page-lock wait time is the clearest MVCC coordination lane, and cache-to-cache or remote-access captures determine whether we can say more than an explicit mixed contention story.",
+      "evidence_sources": [
+        "wall_time_component:mvcc_wait",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses",
+        "mvcc:page_lock_wait_time_ns_total"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "E2.1/E5.1 target: page-lock wait time is now explicit in the wall-time story, so tiny-publish and topological disjointness can be judged against a real synchronization lane instead of guesses.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 3,
+      "target": "synchronization",
+      "primary_signature": "ownership_ping_pong_hitm",
+      "secondary_signatures": [
+        "remote_numa_traffic"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 7000,
+      "mixed_or_ambiguous": true,
+      "rationale": "BEGIN/COMMIT/ROLLBACK boundary time is visible, and the split WAL lock-wait plus wake evidence distinguishes coordination topology from durable append/sync service without inventing a single cause.",
+      "evidence_sources": [
+        "wall_time_component:synchronization",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses",
+        "wal_runtime:flusher_lock_wait_us_total",
+        "wal_runtime:wal_backend_lock_wait_us_total",
+        "wal_runtime:hist_wal_backend_lock_wait",
+        "wal_runtime:wake_reasons"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "A/E target: transaction-boundary coordination is still a first-class wall-time tax and should be pushed toward narrower residual serialized regions.",
+      "mapped_beads": [
+        "bd-db300.1.5",
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 4,
+      "target": "service",
+      "primary_signature": "front_end_starvation",
+      "secondary_signatures": [
+        "branch_waste"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 6300,
+      "mixed_or_ambiguous": true,
+      "rationale": "Service time is dominated by parser/compile work, so front-end starvation with branch waste as a secondary signature is the most honest interpretation of the current evidence pack.",
+      "evidence_sources": [
+        "wall_time_component:service",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses",
+        "subsystem_hotspot:parser_ast_churn"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "J target: useful body execution still dominates enough wall time that parser, decode, row-path, and residual VDBE/page-motion optimizations remain the main throughput lever once contention is under control.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4",
+        "bd-db300.10.5",
+        "bd-db300.10.6",
+        "bd-db300.10.7",
+        "bd-db300.10.8"
+      ]
+    },
+    {
+      "rank": 5,
+      "target": "allocator_copy",
+      "primary_signature": "llc_pressure",
+      "secondary_signatures": [
+        "tlb_pressure"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 6200,
+      "mixed_or_ambiguous": true,
+      "rationale": "Copy-heavy row materialization is the clearest cache/memory lane in the hot path, and the capture pack includes cache-oriented evidence, so LLC/TLB pressure is the most defensible signature pair here.",
+      "evidence_sources": [
+        "wall_time_component:allocator_copy",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "J target: allocator and copy work is large enough to justify scratch-space reuse, row-value ownership reduction, and reusable buffers.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.3",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    },
+    {
+      "rank": 6,
+      "target": "mvcc_commit_surface",
+      "primary_signature": "mixed_or_ambiguous",
+      "secondary_signatures": [
+        "ownership_ping_pong_hitm",
+        "remote_numa_traffic"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 5800,
+      "mixed_or_ambiguous": true,
+      "rationale": "Page-one conflict tracking plus synthetic pending-surface maintenance are measured directly, but the honest microarchitectural reading is still a mixed metadata/coordination lane unless stronger counter evidence is present.",
+      "evidence_sources": [
+        "wall_time_component:mvcc_commit_surface",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses",
+        "mvcc:page_one_conflict_track_time_ns_total",
+        "mvcc:pending_commit_surface_clear_time_ns_total"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "E2.1/E5.1 target: page-one tracking plus pending-surface maintenance are an explicit wall-time lane, which is the right steering signal for publish-plane shrink versus page-topology work.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 7,
+      "target": "queueing",
+      "primary_signature": "mixed_or_ambiguous",
+      "secondary_signatures": [
+        "ownership_ping_pong_hitm",
+        "remote_numa_traffic"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 5500,
+      "mixed_or_ambiguous": true,
+      "rationale": "BUSY/retry wall time proves contention is present, but the available evidence only narrows it to topology-sensitive coordination candidates rather than a single definitive microarchitectural culprit.",
+      "evidence_sources": [
+        "wall_time_component:queueing",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "A/B target: retried BUSY attempts are consuming visible wall time before useful work resumes, so the handoff policy should be tightened before scaling further.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ]
+    },
+    {
+      "rank": 8,
+      "target": "retry",
+      "primary_signature": "mixed_or_ambiguous",
+      "secondary_signatures": [
+        "ownership_ping_pong_hitm",
+        "remote_numa_traffic"
+      ],
+      "confidence_label": "medium",
+      "confidence_score_basis_points": 5500,
+      "mixed_or_ambiguous": true,
+      "rationale": "BUSY/retry wall time proves contention is present, but the available evidence only narrows it to topology-sensitive coordination candidates rather than a single definitive microarchitectural culprit.",
+      "evidence_sources": [
+        "wall_time_component:retry",
+        "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        "counter_capture:topdown(TopdownL1/core-event fallback)",
+        "fallback_metric:cache-misses"
+      ],
+      "fixture_id": "frankensqlite",
+      "row_id": "hot_page_contention_c4",
+      "mode_id": "fsqlite_mvcc",
+      "placement_profile_id": "baseline_unpinned",
+      "hardware_class_id": "linux_x86_64_any",
+      "hardware_signature": "linux:x86_64:any",
+      "implication": "B target: sleep-based retry backoff is still showing up in the hot cell and should be replaced with a bounded handoff strategy.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ]
+    }
+  ],
+  "wall_time_components": [
+    {
+      "rank": 1,
+      "component": "retry",
+      "time_ns": 52000000,
+      "wall_share_basis_points": 10833,
+      "rationale": "configured backoff sleep requested after BUSY-family retries in the hot cell",
+      "implication": "B target: sleep-based retry backoff is still showing up in the hot cell and should be replaced with a bounded handoff strategy.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ]
+    },
+    {
+      "rank": 2,
+      "component": "synchronization",
+      "time_ns": 20224957,
+      "wall_share_basis_points": 4214,
+      "rationale": "BEGIN/ROLLBACK boundary time plus non-durable COMMIT coordination observed directly by the executor",
+      "implication": "A/E target: transaction-boundary coordination is still a first-class wall-time tax and should be pushed toward narrower residual serialized regions.",
+      "mapped_beads": [
+        "bd-db300.1.5",
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 3,
+      "component": "queueing",
+      "time_ns": 4838575,
+      "wall_share_basis_points": 1008,
+      "rationale": "elapsed wall time spent inside batch attempts that ended in BUSY and had to queue for a later retry",
+      "implication": "A/B target: retried BUSY attempts are consuming visible wall time before useful work resumes, so the handoff policy should be tightened before scaling further.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ]
+    },
+    {
+      "rank": 4,
+      "component": "service",
+      "time_ns": 1582421,
+      "wall_share_basis_points": 330,
+      "rationale": "batch body execution time outside the explicit allocator/copy bucket, capturing useful in-engine service work",
+      "implication": "J target: useful body execution still dominates enough wall time that parser, decode, row-path, and residual VDBE/page-motion optimizations remain the main throughput lever once contention is under control.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4",
+        "bd-db300.10.5",
+        "bd-db300.10.6",
+        "bd-db300.10.7",
+        "bd-db300.10.8"
+      ]
+    },
+    {
+      "rank": 5,
+      "component": "mvcc_wait",
+      "time_ns": 1426749,
+      "wall_share_basis_points": 297,
+      "rationale": "page-lock handoff time measured inside the MVCC write helpers, separate from coarse retry/backoff wall time",
+      "implication": "E2.1/E5.1 target: page-lock wait time is now explicit in the wall-time story, so tiny-publish and topological disjointness can be judged against a real synchronization lane instead of guesses.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    },
+    {
+      "rank": 6,
+      "component": "allocator_copy",
+      "time_ns": 0,
+      "wall_share_basis_points": 0,
+      "rationale": "row materialization time measured inline at the VDBE boundary, isolating value cloning and copy-heavy result emission",
+      "implication": "J target: allocator and copy work is large enough to justify scratch-space reuse, row-value ownership reduction, and reusable buffers.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.3",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    },
+    {
+      "rank": 7,
+      "component": "durability",
+      "time_ns": 0,
+      "wall_share_basis_points": 0,
+      "rationale": "WAL append, sync, and checkpoint service time captured by runtime telemetry, clipped to observed COMMIT finalize time",
+      "implication": "E target: commit durability is now an explicit measured lane, so future architecture work can separate durable ordering from general executor service cost.",
+      "mapped_beads": [
+        "bd-db300.5.1"
+      ]
+    },
+    {
+      "rank": 8,
+      "component": "mvcc_commit_surface",
+      "time_ns": 0,
+      "wall_share_basis_points": 0,
+      "rationale": "page-one conflict tracking plus synthetic pending-surface cleanup now form an explicit MVCC maintenance lane",
+      "implication": "E2.1/E5.1 target: page-one tracking plus pending-surface maintenance are an explicit wall-time lane, which is the right steering signal for publish-plane shrink versus page-topology work.",
+      "mapped_beads": [
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ]
+    }
+  ],
+  "causal_classification": {
+    "dominant_bucket": "retries",
+    "dominant_estimated_time_ns": 52000000,
+    "dominant_wall_share_basis_points": 10833,
+    "dominant_score_basis_points": 6494,
+    "runner_up_bucket": "synchronization",
+    "runner_up_estimated_time_ns": 21651706,
+    "runner_up_score_basis_points": 2704,
+    "runner_up_gap_basis_points": 3790,
+    "mixed_or_ambiguous": false,
+    "rationale": "`retries` leads the concrete bucket ranking by 3790 score bps over `synchronization` using classified hot-path time derived from the existing wall-time, waste-ledger, and cost-component artifacts."
+  },
+  "causal_buckets": [
+    {
+      "rank": 1,
+      "bucket": "retries",
+      "dominant": true,
+      "estimated_time_ns": 52000000,
+      "wall_share_basis_points": 10833,
+      "score_basis_points": 6494,
+      "rationale": "Retries bucket isolates configured backoff sleep and retry counters so passive waiting is not conflated with queueing or synchronization work.",
+      "implication": "Retry-dominant rows are losing wall time to configured backoff, which is distinct from in-attempt queueing and should stay explicit.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"retry\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 52000000,
+          "rationale": "retry bucket maps to explicit configured backoff sleep rather than in-attempt wait time"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.runtime_phase_timing.retry_backoff_time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 52000000,
+          "rationale": "runtime phase timing already exposes aggregate retry-backoff sleep directly"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.retries",
+          "metric_kind": "count",
+          "metric_value": 10,
+          "rationale": "top-level engine retries keep the wall-time lane tied to observed retry frequency"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".mvcc_write.runtime_retry.total_retries",
+          "metric_kind": "count",
+          "metric_value": 10,
+          "rationale": "structured retry taxonomy refines the retry bucket without collapsing it into generic queueing"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".mvcc_write.runtime_retry.total_aborts",
+          "metric_kind": "count",
+          "metric_value": 10,
+          "rationale": "abort counts remain adjacent evidence for retry-heavy rows that fail to converge cleanly"
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "bucket": "synchronization",
+      "dominant": false,
+      "estimated_time_ns": 21651706,
+      "wall_share_basis_points": 4511,
+      "score_basis_points": 2704,
+      "rationale": "Synchronization bucket intentionally aggregates executor boundary coordination, MVCC page-lock wait, and commit-surface maintenance because those are the explicit coordination counters the code exposes today.",
+      "implication": "Synchronization-dominant rows are paying boundary or MVCC coordination cost; keep publish-plane and page-topology work ahead of generic copy tuning.",
+      "mapped_beads": [
+        "bd-db300.1.5",
+        "bd-db300.5.1",
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"synchronization\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 20224957,
+          "rationale": "boundary coordination already has its own explicit wall-time component"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"mvcc_wait\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 1426749,
+          "rationale": "page-lock handoff wait is the strongest direct MVCC coordination counter the profile exposes today"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"mvcc_commit_surface\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 0,
+          "rationale": "page-one tracking plus pending-surface maintenance are already split out as a separate coordination lane"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.vfs.lock_ops",
+          "metric_kind": "count",
+          "metric_value": 0,
+          "rationale": "VFS lock activity is emitted in the hot-path profile and helps explain synchronization-heavy rows without inventing a new counter"
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "bucket": "queueing",
+      "dominant": false,
+      "estimated_time_ns": 4838575,
+      "wall_share_basis_points": 1008,
+      "score_basis_points": 604,
+      "rationale": "Queueing bucket uses the explicit BUSY-attempt wall-time lane and keeps it separate from retry-backoff sleep.",
+      "implication": "Queueing-dominant rows are spending time inside failed BUSY attempts; steer fixes toward contention topology rather than allocator cleanup.",
+      "mapped_beads": [
+        "bd-db300.2.4"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"queueing\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 4838575,
+          "rationale": "queueing is the wall-time lane for time spent inside BUSY attempts that later retried"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.runtime_phase_timing.busy_attempt_time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 4838575,
+          "rationale": "runtime phase timing captures the raw busy-attempt wall time directly"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".baseline_waste_ledger[] | select(.component == \"busy_retry_queueing\") | .metric_value",
+          "metric_kind": "time_ns",
+          "metric_value": 56838575,
+          "rationale": "the spillover ledger keeps busy-attempt queueing visible alongside the separate retry-backoff lane"
+        }
+      ]
+    },
+    {
+      "rank": 4,
+      "bucket": "service",
+      "dominant": false,
+      "estimated_time_ns": 1582421,
+      "wall_share_basis_points": 330,
+      "score_basis_points": 198,
+      "rationale": "Service bucket is anchored to executor body time after allocator-copy work is carved out, then cross-checked against parser/decode/materialization artifacts already emitted in the actionable ranking.",
+      "implication": "Service-dominant rows should be explained with parser/decode/materialization evidence before blaming contention or durability.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4",
+        "bd-db300.10.5",
+        "bd-db300.10.6",
+        "bd-db300.10.7",
+        "bd-db300.10.8"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"service\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 1582421,
+          "rationale": "service starts from executor body time after the explicit allocator-copy carve-out"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.runtime_phase_timing.body_execution_time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 1582421,
+          "rationale": "raw executor body time anchors the useful-work lane before allocation is split out"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".cost_components[] | select(.component == \"parser_ast_churn\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 306485,
+          "rationale": "parser/prepare churn is already exposed as a named cost component inside service work"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".cost_components[] | select(.component == \"record_decode\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 217415,
+          "rationale": "record decode remains one of the direct measured contributors to useful in-engine service time"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".cost_components[] | select(.component == \"row_materialization\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 0,
+          "rationale": "row materialization is kept visible so service and allocation can be reasoned about together instead of conflated"
+        }
+      ]
+    },
+    {
+      "rank": 5,
+      "bucket": "allocation",
+      "dominant": false,
+      "estimated_time_ns": 0,
+      "wall_share_basis_points": 0,
+      "score_basis_points": 0,
+      "rationale": "Allocation bucket starts with explicit allocator-copy wall time and is reinforced by emitted heap-byte and page-normalization artifacts.",
+      "implication": "Allocation-dominant rows are burning time or bytes on value/page copies; use the ownership-preserving and page-buffer lanes before broader executor work.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.3",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"allocator_copy\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 0,
+          "rationale": "allocator/copy wall time is already isolated at the VDBE boundary"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".baseline_waste_ledger[] | select(.component == \"page_data_normalization\") | .metric_value",
+          "metric_kind": "bytes",
+          "metric_value": 0,
+          "rationale": "page normalization bytes are the clearest existing artifact for write-path allocation and copy pressure"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".cost_components[] | select(.component == \"page_data_motion\") | .allocator_pressure_bytes",
+          "metric_kind": "bytes",
+          "metric_value": 0,
+          "rationale": "page-data motion already exposes allocator pressure even when the surrounding wall time lives inside service work"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".allocator_pressure.result_value_heap_bytes_total",
+          "metric_kind": "bytes",
+          "metric_value": 0,
+          "rationale": "result-row heap bytes keep value materialization pressure attached to the allocation bucket"
+        }
+      ]
+    },
+    {
+      "rank": 6,
+      "bucket": "io",
+      "dominant": false,
+      "estimated_time_ns": 0,
+      "wall_share_basis_points": 0,
+      "score_basis_points": 0,
+      "rationale": "I/O bucket maps directly onto the durability wall-time lane and the VFS/WAL byte, frame, and sync counters already present in the raw profile artifact.",
+      "implication": "I/O-dominant rows are durability-bound, so WAL/VFS evidence should steer the next cut instead of retry or parser hypotheses.",
+      "mapped_beads": [
+        "bd-db300.5.1"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"durability\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 0,
+          "rationale": "durability is the explicit wall-time lane for commit-path I/O pressure"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.wal.commit_path.wal_service_us_total",
+          "metric_kind": "time_us",
+          "metric_value": 0,
+          "rationale": "commit-path WAL service time is the direct source for the durability wall-time lane when raw WAL telemetry is present"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.vfs.sync_ops",
+          "metric_kind": "count",
+          "metric_value": 0,
+          "rationale": "VFS sync operations are already exposed in the raw hot-path profile"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.vfs.write_bytes_total",
+          "metric_kind": "bytes",
+          "metric_value": 0,
+          "rationale": "VFS write-byte volume anchors file-system I/O intensity"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.wal.frames_written_total",
+          "metric_kind": "count",
+          "metric_value": 0,
+          "rationale": "WAL frames written quantify commit-path write volume without needing a new artifact"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.wal.bytes_written_total",
+          "metric_kind": "bytes",
+          "metric_value": 0,
+          "rationale": "WAL byte volume is the clearest existing counter for log-heavy I/O rows"
+        },
+        {
+          "artifact": "profile.json",
+          "metric_path": ".engine_report.hot_path_profile.wal.group_commit_latency_us_total",
+          "metric_kind": "time_us",
+          "metric_value": 0,
+          "rationale": "group-commit latency keeps the durability bucket connected to real commit-path timing"
+        }
+      ]
+    },
+    {
+      "rank": 7,
+      "bucket": "mixed",
+      "dominant": false,
+      "estimated_time_ns": 0,
+      "wall_share_basis_points": 0,
+      "score_basis_points": 0,
+      "rationale": "Mixed is a deliberate fallback lane for rows where the concrete bucket leaderboard is too flat or too small to defend a single dominant cause with the current artifact set.",
+      "implication": "Mixed stays available as a deliberate fallback when the top concrete buckets are too close to call with the current evidence pack.",
+      "mapped_beads": [
+        "bd-db300.2.4",
+        "bd-db300.1.5",
+        "bd-db300.5.1",
+        "bd-db300.5.2.1",
+        "bd-db300.5.5.1"
+      ],
+      "evidence": [
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"retry\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 52000000,
+          "rationale": "retry bucket maps to explicit configured backoff sleep rather than in-attempt wait time"
+        },
+        {
+          "artifact": "actionable_ranking.json",
+          "metric_path": ".wall_time_components[] | select(.component == \"synchronization\") | .time_ns",
+          "metric_kind": "time_ns",
+          "metric_value": 20224957,
+          "rationale": "boundary coordination already has its own explicit wall-time component"
+        }
+      ]
+    }
+  ],
+  "cost_components": [
+    {
+      "rank": 1,
+      "component": "parser_ast_churn",
+      "time_ns": 306485,
+      "time_share_basis_points": 5850,
+      "allocator_pressure_bytes": 0,
+      "allocator_share_basis_points": 0,
+      "activity_count": 45,
+      "rationale": "parse, rewrite, and compile time on the connection path; parser heap pressure is not directly instrumented",
+      "implication": "J2/J4 target: parser and compile reuse still dominate this component enough to justify prepared-artifact work next.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 2,
+      "component": "record_decode",
+      "time_ns": 217415,
+      "time_share_basis_points": 4150,
+      "allocator_pressure_bytes": 0,
+      "allocator_share_basis_points": 0,
+      "activity_count": 1466,
+      "rationale": "record/column decode time paired with decoded-value heap pressure",
+      "implication": "J2/J5 target: decode cost is large enough to justify scratch buffers and decode-cache work.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.5"
+      ]
+    },
+    {
+      "rank": 3,
+      "component": "page_data_motion",
+      "time_ns": 0,
+      "time_share_basis_points": 0,
+      "allocator_pressure_bytes": 0,
+      "allocator_share_basis_points": 0,
+      "activity_count": 870,
+      "rationale": "write-path page normalization now surfaces payload-copy + zero-fill byte motion even when time attribution remains in the surrounding executor body",
+      "implication": "J3/J6 target: page-image normalization is now visible as its own copy lane, so reusable page buffers and owned passthrough should move before more speculative executor surgery.",
+      "mapped_beads": [
+        "bd-db300.10.3",
+        "bd-db300.10.6"
+      ]
+    },
+    {
+      "rank": 4,
+      "component": "row_materialization",
+      "time_ns": 0,
+      "time_share_basis_points": 0,
+      "allocator_pressure_bytes": 0,
+      "allocator_share_basis_points": 0,
+      "activity_count": 0,
+      "rationale": "result-row cloning time paired with emitted-value allocator pressure",
+      "implication": "J2/J6/J7 target: emitted-row cloning and transient value ownership remain a first-class hot-path cost.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    }
+  ],
+  "allocator_pressure": [
+    {
+      "rank": 1,
+      "subsystem": "parser_sql_bytes",
+      "metric_kind": "bytes",
+      "metric_value": 1703,
+      "rationale": "SQL text volume parsed on cache-miss paths",
+      "implication": "J2/J4 target: parse-volume churn is visible and should be reduced with reuse rather than repeated prepare work.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.4"
+      ]
+    },
+    {
+      "rank": 2,
+      "subsystem": "page_data_normalization_bytes",
+      "metric_kind": "bytes",
+      "metric_value": 0,
+      "rationale": "payload-copy + zero-fill bytes materialized while normalizing page images before writes",
+      "implication": "J3/J6 target: full-page normalization is materializing avoidable bytes before writes, so owned passthrough and reusable page buffers are still live optimization work.",
+      "mapped_beads": [
+        "bd-db300.10.3",
+        "bd-db300.10.6"
+      ]
+    },
+    {
+      "rank": 3,
+      "subsystem": "record_decode_values",
+      "metric_kind": "heap_bytes",
+      "metric_value": 0,
+      "rationale": "estimated heap carried by decoded record/column values",
+      "implication": "J2/J5 target: decoded record values create enough heap churn to justify scratch buffers and decode caching.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.5"
+      ]
+    },
+    {
+      "rank": 4,
+      "subsystem": "result_row_values",
+      "metric_kind": "heap_bytes",
+      "metric_value": 0,
+      "rationale": "estimated heap carried by emitted result values",
+      "implication": "J2/J6/J7 target: emitted result rows are carrying most of the transient heap pressure and should benefit from ownership and frame reuse.",
+      "mapped_beads": [
+        "bd-db300.10.2",
+        "bd-db300.10.6",
+        "bd-db300.10.7"
+      ]
+    }
+  ],
+  "top_opcodes": []
+}

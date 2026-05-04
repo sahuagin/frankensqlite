@@ -3640,6 +3640,17 @@ mod tests {
     }
 
     #[test]
+    fn run_oplog_fsqlite_hot_contention_single_worker_completes_without_error() {
+        let oplog = crate::oplog::preset_hot_page_contention("test-fixture", 42, 1, 1);
+        let report =
+            run_oplog_fsqlite(Path::new(":memory:"), &oplog, &FsqliteExecConfig::default())
+                .unwrap();
+
+        assert_eq!(report.error, None, "{report:?}");
+        assert_eq!(report.ops_total, 10, "{report:?}");
+    }
+
+    #[test]
     fn execute_sql_expected_error_behavior() {
         let conn = Connection::open(":memory:").unwrap();
 

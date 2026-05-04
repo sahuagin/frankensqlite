@@ -1,0 +1,14 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_opcode_profile.v1",
+  "bead_id": "hot-page-tail-delete-fix-c4",
+  "run_id": "hot-page-tail-delete-fix-c4-hot_page_contention-frankensqlite-c4-s42-1777877939950",
+  "trace_id": "hot-page-tail-delete-fix-c4.hot_page_contention:frankensqlite:c4",
+  "scenario_id": "hot-page-tail-delete-fix-c4.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 4,
+  "replay_command": "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=hot-page-tail-delete-fix-c4 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 4 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-tail-delete-fix-c4-darklark-20260504T0700Z --mvcc",
+  "opcodes": []
+}
