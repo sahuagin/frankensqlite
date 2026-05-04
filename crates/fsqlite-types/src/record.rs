@@ -1769,6 +1769,83 @@ where
     Ok(())
 }
 
+/// One-shot record serialization plan with precomputed serial-type layout.
+#[derive(Debug)]
+pub struct PlannedRecordSerialization<'a> {
+    layouts: SmallVec<[(&'a SqliteValue, u64, usize); 16]>,
+    header_content_size: usize,
+    body_size: usize,
+}
+
+impl PlannedRecordSerialization<'_> {
+    /// Return the exact record byte length this plan will write.
+    #[must_use]
+    pub fn exact_size(&self) -> usize {
+        compute_header_size(self.header_content_size).saturating_add(self.body_size)
+    }
+
+    /// Write the planned record into an exact-sized destination slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(())` if `dst.len()` differs from [`Self::exact_size`] or if
+    /// arithmetic bounds checks fail while writing the record.
+    #[allow(clippy::result_unit_err)]
+    pub fn write_into_slice(self, dst: &mut [u8]) -> Result<(), ()> {
+        let header_size = compute_header_size(self.header_content_size);
+        let total_size = header_size.checked_add(self.body_size).ok_or(())?;
+        if dst.len() != total_size {
+            return Err(());
+        }
+
+        let mut header_offset = write_varint(dst, u64::try_from(header_size).unwrap_or(u64::MAX));
+        let mut body_offset = header_size;
+        for (value, serial_type, payload_len) in self.layouts {
+            header_offset += write_varint(&mut dst[header_offset..], serial_type);
+            let body_end = body_offset.checked_add(payload_len).ok_or(())?;
+            if body_end > dst.len() {
+                return Err(());
+            }
+            encode_serialized_value(value, payload_len, &mut dst[body_offset..body_end]);
+            body_offset = body_end;
+        }
+
+        if header_offset != header_size || body_offset != total_size {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+/// Precompute the serial types and payload widths needed to serialize a record.
+///
+/// Callers that need to reserve an exact destination slot before writing can
+/// use [`PlannedRecordSerialization::exact_size`] and then consume the plan with
+/// [`PlannedRecordSerialization::write_into_slice`], avoiding a second layout
+/// pass and an intermediate `Vec<u8>` payload buffer.
+#[must_use]
+pub fn plan_record_iter_serialization<'a, I>(values: I) -> PlannedRecordSerialization<'a>
+where
+    I: Iterator<Item = &'a SqliteValue>,
+{
+    let mut header_content_size = 0usize;
+    let mut body_size = 0usize;
+    let mut layouts: SmallVec<[(&'a SqliteValue, u64, usize); 16]> = SmallVec::new();
+
+    for value in values {
+        let (serial_type, payload_len) = serialized_value_layout(value);
+        header_content_size = header_content_size.saturating_add(varint_len(serial_type));
+        body_size = body_size.saturating_add(payload_len);
+        layouts.push((value, serial_type, payload_len));
+    }
+
+    PlannedRecordSerialization {
+        layouts,
+        header_content_size,
+        body_size,
+    }
+}
+
 /// Build a reusable record-header template for value tuples whose serial types
 /// all fit in a single-byte varint.
 #[must_use]
@@ -2628,6 +2705,28 @@ mod tests {
         assert_eq!(parsed.len(), 5);
         assert!(parsed[0].is_null());
         assert_eq!(parsed[1].as_integer(), Some(42));
+    }
+
+    #[test]
+    fn planned_record_serialization_matches_vec_for_large_mixed_record() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(2.25),
+            SqliteValue::Text(SmallText::new(
+                "large text payload that forces the generic header planner path",
+            )),
+            SqliteValue::Blob(Arc::from(&[9u8, 8, 7, 6, 5, 4, 3, 2][..])),
+        ];
+        let expected = serialize_record(&values);
+        let plan = plan_record_iter_serialization(values.iter());
+        assert_eq!(plan.exact_size(), expected.len());
+
+        let mut dst = vec![0u8; plan.exact_size()];
+        plan.write_into_slice(dst.as_mut_slice())
+            .expect("planned slice serialize must succeed");
+        assert_eq!(dst, expected);
+        assert_eq!(parse_record(&dst).unwrap(), values);
     }
 
     #[test]

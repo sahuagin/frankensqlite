@@ -3464,6 +3464,29 @@ impl CursorBackend {
         }
     }
 
+    fn table_append_after_last_position_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<bool>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        match self {
+            Self::Mem(c) => {
+                c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
+            }
+            Self::Txn(c) => {
+                c.table_append_after_last_position_with_writer(cx, rowid, payload_len, writer)
+            }
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         match self {
             Self::Mem(c) => c.delete(cx),
@@ -12604,24 +12627,52 @@ impl VdbeEngine {
             };
             rowid
         };
-        let mut payload_buf = self.make_record_lookaside.take_buf();
-        fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
-        let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id) {
-            let result = sc
-                .cursor
-                .table_append_after_last_position(&sc.cx, rowid, &payload_buf);
-            if result.is_ok() {
+        let record_plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+        let payload_len = record_plan.exact_size();
+        let appended_directly = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
+        {
+            let result = sc.cursor.table_append_after_last_position_with_writer(
+                &sc.cx,
+                rowid,
+                payload_len,
+                move |dst| {
+                    record_plan.write_into_slice(dst).map_err(|()| {
+                        FrankenError::internal(
+                            "compiled simple INSERT direct record serialization size mismatch",
+                        )
+                    })
+                },
+            )?;
+            if result {
                 sc.last_successful_insert_rowid = Some(rowid);
             }
             result
         } else {
-            Err(FrankenError::internal(
+            return Err(FrankenError::internal(
                 "compiled simple INSERT lost its cursor",
-            ))
+            ));
         };
-        payload_buf.clear();
-        self.make_record_lookaside.replace_buf(payload_buf);
-        append_result?;
+        if !appended_directly {
+            let mut payload_buf = self.make_record_lookaside.take_buf();
+            fsqlite_types::record::serialize_record_iter_into(values.iter(), &mut payload_buf);
+            let append_result = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
+            {
+                let result =
+                    sc.cursor
+                        .table_append_after_last_position(&sc.cx, rowid, &payload_buf);
+                if result.is_ok() {
+                    sc.last_successful_insert_rowid = Some(rowid);
+                }
+                result
+            } else {
+                Err(FrankenError::internal(
+                    "compiled simple INSERT lost its cursor",
+                ))
+            };
+            payload_buf.clear();
+            self.make_record_lookaside.replace_buf(payload_buf);
+            append_result?;
+        }
 
         self.changes += 1;
         self.last_insert_rowid = rowid;

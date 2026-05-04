@@ -4431,6 +4431,45 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
+    fn try_append_payload_on_current_leaf_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<bool>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let mut entry = self
+            .stack
+            .pop()
+            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+        let leaf_page_no = entry.page_no;
+        let Some((insert_idx, new_cell_offset)) = self
+            .try_append_table_leaf_payload_in_place_no_overflow_with_writer(
+                cx,
+                leaf_page_no,
+                &mut entry.page_data,
+                &mut entry.header,
+                rowid,
+                payload_len,
+                writer,
+            )?
+        else {
+            self.stack.push(entry);
+            return Ok(false);
+        };
+
+        entry.cell_pointers.push(new_cell_offset);
+        entry.cell_idx = insert_idx;
+        entry.mutation_counter = Self::page_mutation_counter(&entry.page_data);
+        self.stack.push(entry);
+        self.at_eof = false;
+        self.last_insert_rowid = Some(rowid);
+        Ok(true)
+    }
+
     fn try_append_leaf_page_in_place(
         &mut self,
         cx: &Cx,
@@ -4637,7 +4676,6 @@ impl<P: PageWriter> BtCursor<P> {
     /// slice it receives (or return `Err`). On `Err` the page buffer state is
     /// unspecified and the cell header/pointer updates in this function are
     /// still in effect — callers should abort the statement rather than retry.
-    #[allow(dead_code)] // wired in follow-up commit; primitive landed ahead of caller
     fn try_append_table_leaf_payload_in_place_no_overflow_mutate_only_with_writer<W>(
         usable_size: u32,
         leaf_page_no: PageNumber,
@@ -4736,7 +4774,6 @@ impl<P: PageWriter> BtCursor<P> {
     /// See the `_mutate_only_with_writer` helper for the payload-writing
     /// contract; this wrapper additionally stages the mutated page image
     /// through the pager.
-    #[allow(dead_code)] // wired in follow-up commit; primitive landed ahead of caller
     #[allow(clippy::too_many_arguments)]
     fn try_append_table_leaf_payload_in_place_no_overflow_with_writer<W>(
         &mut self,
@@ -7173,6 +7210,56 @@ impl<P: PageWriter> BtCursor<P> {
             cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)
         });
         if result.is_ok() {
+            self.bump_row_image_epoch();
+        }
+        result
+    }
+
+    /// Writer-callback variant of [`Self::table_append_after_last_position`].
+    ///
+    /// Returns `Ok(true)` when the payload was written directly into the current
+    /// rightmost leaf. Returns `Ok(false)` without inserting when the caller must
+    /// fall back to the byte-slice path, for example after a page fills, when the
+    /// rowid is no longer an append, or when the payload would need overflow
+    /// pages.
+    #[doc(hidden)]
+    pub fn table_append_after_last_position_with_writer<W>(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload_len: usize,
+        writer: W,
+    ) -> Result<bool>
+    where
+        W: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            if !cursor.is_on_rightmost_insert_edge() {
+                let has_last = cursor.last(cx)?;
+                if has_last {
+                    let last_rowid = cursor.rowid(cx)?;
+                    if rowid <= last_rowid {
+                        cursor.clear_rightmost_leaf_cache();
+                        return Ok(false);
+                    }
+                }
+            }
+            cursor.at_eof = true;
+            if cursor.stack.is_empty() && !cursor.seed_empty_root_leaf_cursor(cx)? {
+                return Ok(false);
+            }
+            if !cursor.try_append_payload_on_current_leaf_with_writer(
+                cx,
+                rowid,
+                payload_len,
+                writer,
+            )? {
+                return Ok(false);
+            }
+            cursor.refresh_rightmost_leaf_cache_after_insert(cx, rowid)?;
+            Ok(true)
+        });
+        if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
         }
         result
@@ -13352,6 +13439,36 @@ mod tests {
             "append-after-last should reuse the current right-edge cursor state"
         );
         assert_eq!(cursor.rowid(&cx).unwrap(), 129);
+    }
+
+    #[test]
+    fn test_table_append_after_last_position_with_writer_writes_payload_directly() {
+        let cx = Cx::new();
+        let root = pn(2);
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let payload = b"direct-page-payload";
+        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
+
+        cursor.table_insert(&cx, 1, b"seed").unwrap();
+        assert!(cursor.last(&cx).unwrap());
+        cursor.pager.clear_reads();
+        let appended = cursor
+            .table_append_after_last_position_with_writer(&cx, 2, payload.len(), |dst| {
+                dst.copy_from_slice(payload);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            appended,
+            "direct writer should append into the rightmost leaf"
+        );
+        assert!(
+            cursor.pager.read_pages().is_empty(),
+            "writer append should reuse the current right-edge cursor state"
+        );
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+        assert_eq!(cursor.payload(&cx).unwrap(), payload);
     }
 
     #[test]
