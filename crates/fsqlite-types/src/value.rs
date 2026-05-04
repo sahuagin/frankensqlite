@@ -1128,6 +1128,9 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 * *b as f64),
             },
+            (Self::Integer(a), Self::Float(b)) => Self::float_result_or_null(*a as f64 * *b),
+            (Self::Float(a), Self::Integer(b)) => Self::float_result_or_null(*a * *b as f64),
+            (Self::Float(a), Self::Float(b)) => Self::float_result_or_null(*a * *b),
             _ if !self.is_float_numeric_type() && !other.is_float_numeric_type() => {
                 let a = self.to_integer();
                 let b = other.to_integer();
@@ -2994,6 +2997,18 @@ mod tests {
         let zero = SqliteValue::Float(0.0);
         let pos_inf = SqliteValue::Float(f64::INFINITY);
         assert!(zero.sql_mul(&pos_inf).is_null());
+        assert!(
+            SqliteValue::Integer(0).sql_mul(&pos_inf).is_null(),
+            "mixed INTEGER/REAL multiplication should preserve NaN-to-NULL semantics"
+        );
+    }
+
+    #[test]
+    fn test_sql_mul_mixed_int_float_stays_real() {
+        let left = SqliteValue::Integer(10);
+        let right = SqliteValue::Float(0.25);
+        assert_eq!(left.sql_mul(&right).as_float(), Some(2.5));
+        assert_eq!(right.sql_mul(&left).as_float(), Some(2.5));
     }
 
     #[test]
