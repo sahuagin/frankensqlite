@@ -11561,30 +11561,26 @@ pub fn codegen_update(
         .as_ref()
         .map_or(0, count_anon_placeholders);
 
-    let rowset_reg = b.alloc_reg();
-    let matched_rowid_reg = b.alloc_reg();
-    let collect_done_label = b.emit_label();
-
-    if let Some(target_expr) = rowid_target {
+    let matched_rowid_reg;
+    let apply_done_label = b.emit_label();
+    let (apply_seek_miss_label, apply_loop) = if let Some(target_expr) = rowid_target {
+        matched_rowid_reg = b.alloc_reg();
         b.set_next_anon_placeholder(set_placeholder_count + 1);
         emit_expr(b, target_expr, matched_rowid_reg, None);
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             table_cursor,
             matched_rowid_reg,
-            collect_done_label,
+            apply_done_label,
             P4::None,
             0,
         );
-        b.emit_op(
-            Opcode::RowSetAdd,
-            rowset_reg,
-            matched_rowid_reg,
-            0,
-            P4::None,
-            0,
-        );
+        (None, None)
     } else {
+        let rowset_reg = b.alloc_reg();
+        matched_rowid_reg = b.alloc_reg();
+        let collect_done_label = b.emit_label();
+
         // Pass 1: collect matching rowids before mutating the table cursor.
         let collect_start = b.current_addr();
         b.emit_jump_to_label(
@@ -11630,29 +11626,29 @@ pub fn codegen_update(
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let collect_body = (collect_start + 1) as i32;
         b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
-    }
-    b.resolve_label(collect_done_label);
+        b.resolve_label(collect_done_label);
 
-    // Pass 2: revisit each matched rowid and perform the delete+insert rewrite.
-    let apply_done_label = b.emit_label();
-    let apply_loop = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::RowSetRead,
-        rowset_reg,
-        matched_rowid_reg,
-        apply_done_label,
-        P4::None,
-        0,
-    );
-    let apply_seek_miss_label = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::SeekRowid,
-        table_cursor,
-        matched_rowid_reg,
-        apply_seek_miss_label,
-        P4::None,
-        0,
-    );
+        // Pass 2: revisit each matched rowid and perform the delete+insert rewrite.
+        let apply_loop = b.current_addr();
+        b.emit_jump_to_label(
+            Opcode::RowSetRead,
+            rowset_reg,
+            matched_rowid_reg,
+            apply_done_label,
+            P4::None,
+            0,
+        );
+        let apply_seek_miss_label = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            table_cursor,
+            matched_rowid_reg,
+            apply_seek_miss_label,
+            P4::None,
+            0,
+        );
+        (Some(apply_seek_miss_label), Some(apply_loop))
+    };
 
     // Read ALL existing columns into registers.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -11814,10 +11810,12 @@ pub fn codegen_update(
         emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
-    b.resolve_label(apply_seek_miss_label);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let apply_loop_addr = apply_loop as i32;
-    b.emit_op(Opcode::Goto, 0, apply_loop_addr, 0, P4::None, 0);
+    if let (Some(apply_seek_miss_label), Some(apply_loop)) = (apply_seek_miss_label, apply_loop) {
+        b.resolve_label(apply_seek_miss_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let apply_loop_addr = apply_loop as i32;
+        b.emit_op(Opcode::Goto, 0, apply_loop_addr, 0, P4::None, 0);
+    }
 
     // Done: Close index cursors, then table cursor.
     b.resolve_label(apply_done_label);
@@ -21270,6 +21268,11 @@ mod tests {
                 .any(|op| op.opcode == Opcode::Column),
             "UPDATE should read the non-IPK column from the current row"
         );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::RowSetAdd | Opcode::RowSetRead)),
+            "single-rowid UPDATE should not materialize a one-row RowSet"
+        );
         assert_eq!(
             delete.p5 & OPFLAG_ISUPDATE,
             OPFLAG_ISUPDATE,
@@ -23145,8 +23148,10 @@ mod tests {
             .count();
         assert_eq!(open_reads, 2, "outer + probe OpenRead expected");
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in probe scan"
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Eq | Opcode::Found)),
+            "expected IN membership probe"
         );
     }
 
@@ -23206,8 +23211,10 @@ mod tests {
             .count();
         assert_eq!(open_reads, 2, "outer + probe OpenRead expected");
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in probe scan"
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Eq | Opcode::Found)),
+            "expected IN membership probe"
         );
     }
 
@@ -29546,8 +29553,10 @@ mod tests {
             "expected subquery probe OpenRead on root page 3"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in IN probe scan"
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Eq | Opcode::Found)),
+            "expected IN membership probe"
         );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Insert),
@@ -29677,8 +29686,10 @@ mod tests {
             "expected IN-table probe OpenRead on root page 3"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in IN probe scan"
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::Eq | Opcode::Found)),
+            "expected IN membership probe"
         );
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Delete),
