@@ -892,7 +892,7 @@ fn conformance_matrix_is_machine_readable_json() {
     };
 
     // Verify the JSON is well-formed and contains expected keys.
-    assert!(json_matrix["bead_id"].as_str() == Some("bd-3plop.7"));
+    assert_eq!(json_matrix["bead_id"].as_str(), Some("bd-3plop.7"));
     assert!(json_matrix["total_tests"].as_u64().unwrap() > 0);
     assert!(json_matrix["passed_tests"].as_u64().unwrap() > 0);
     assert!(json_matrix["categories"].is_object());

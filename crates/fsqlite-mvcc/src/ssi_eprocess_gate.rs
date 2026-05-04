@@ -486,7 +486,7 @@ mod tests {
         let mut gate = SsiEProcessGate::new(fast_open_config());
         assert_eq!(gate.alert_state(), GateAlertState::Clear);
         assert!(!gate.should_skip_ssi(0));
-        assert!(gate.observations() == 0);
+        assert_eq!(gate.observations(), 0);
         assert!((gate.e_value() - 1.0).abs() < f64::EPSILON);
     }
 

@@ -486,7 +486,7 @@ fn test_encoding_stats_populated() {
     assert_eq!(stats.repair_bytes_emitted, 10 * 64);
     assert!(stats.degree_min >= 1);
     assert!(stats.degree_max >= stats.degree_min);
-    assert!(stats.degree_count == 10);
+    assert_eq!(stats.degree_count, 10);
     assert!(stats.overhead_ratio() > 1.0);
 }
 
