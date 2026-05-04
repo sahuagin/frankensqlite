@@ -1769,6 +1769,46 @@ where
     Ok(())
 }
 
+/// Compute the exact byte length for a one-column record.
+///
+/// This is the single-value specialization of [`record_iter_exact_size`].
+/// It avoids iterator cloning and layout storage on the compiled INSERT path
+/// for `INTEGER PRIMARY KEY`-only rows.
+#[must_use]
+pub fn single_value_record_exact_size(value: &SqliteValue) -> usize {
+    let (serial_type, payload_len) = serialized_value_layout(value);
+    compute_header_size(varint_len(serial_type)).saturating_add(payload_len)
+}
+
+/// Serialize a one-column record into an exact-sized destination slice.
+///
+/// The output is byte-identical to `serialize_record(&[value.clone()])`.
+///
+/// # Errors
+///
+/// Returns `Err(())` when `dst.len()` does not match
+/// [`single_value_record_exact_size`].
+#[allow(clippy::result_unit_err)]
+pub fn serialize_single_value_record_into_slice(
+    value: &SqliteValue,
+    dst: &mut [u8],
+) -> Result<(), ()> {
+    let (serial_type, payload_len) = serialized_value_layout(value);
+    let header_size = compute_header_size(varint_len(serial_type));
+    let total_size = header_size.checked_add(payload_len).ok_or(())?;
+    if dst.len() != total_size {
+        return Err(());
+    }
+
+    let header_offset = write_varint(dst, u64::try_from(header_size).unwrap_or(u64::MAX));
+    let body_offset = header_offset + write_varint(&mut dst[header_offset..], serial_type);
+    if body_offset != header_size {
+        return Err(());
+    }
+    encode_serialized_value(value, payload_len, &mut dst[header_size..]);
+    Ok(())
+}
+
 /// One-shot record serialization plan with precomputed serial-type layout.
 #[derive(Debug)]
 pub struct PlannedRecordSerialization<'a> {
@@ -3518,6 +3558,32 @@ mod tests {
     }
 
     #[test]
+    fn single_value_record_slice_matches_generic_vectors() {
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(42),
+            SqliteValue::Integer(256),
+            SqliteValue::Integer(0x0102_0304_0506_0708_i64),
+            SqliteValue::Float(3.14),
+            SqliteValue::Text(SmallText::new("hello")),
+            SqliteValue::Blob(Arc::from([0xCAu8, 0xFE].as_slice())),
+        ];
+
+        for value in &values {
+            let generic = serialize_record(std::slice::from_ref(value));
+            let exact = single_value_record_exact_size(value);
+            assert_eq!(exact, generic.len());
+
+            let mut dst = vec![0u8; exact];
+            serialize_single_value_record_into_slice(value, &mut dst)
+                .expect("single-value exact-size serialization should succeed");
+            assert_eq!(dst, generic);
+        }
+    }
+
+    #[test]
     fn test_record_format_worked_example_exact_bytes() {
         let values = vec![
             SqliteValue::Integer(42),
@@ -3984,6 +4050,20 @@ mod tests {
                 .expect("slice serialize must succeed at exact size");
             prop_assert_eq!(dst, via_vec,
                 "slice-based generic serializer must produce byte-identical output");
+        }
+
+        #[test]
+        fn prop_serialize_single_value_record_into_slice_matches_vec(value in arb_sqlite_value()) {
+            let via_vec = serialize_record(std::slice::from_ref(&value));
+            let exact = single_value_record_exact_size(&value);
+            prop_assert_eq!(exact, via_vec.len(),
+                "single_value_record_exact_size must match serialize_record length");
+
+            let mut dst = vec![0u8; exact];
+            serialize_single_value_record_into_slice(&value, dst.as_mut_slice())
+                .expect("single-value slice serialize must succeed at exact size");
+            prop_assert_eq!(dst, via_vec,
+                "single-value slice serializer must produce byte-identical output");
         }
 
         #[test]

@@ -165,7 +165,8 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{
     ColumnOffset, PrecomputedSerialTypeKind, RecordProfileScope, enter_record_profile_scope,
     parse_record, serialize_record, serialize_record_iter_with_precomputed_header_into,
-    simd_serialize_integer_record,
+    serialize_single_value_record_into_slice, simd_serialize_integer_record,
+    single_value_record_exact_size,
 };
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
@@ -12627,30 +12628,56 @@ impl VdbeEngine {
             };
             rowid
         };
-        let record_plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
-        let payload_len = record_plan.exact_size();
-        let appended_directly = if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id)
-        {
-            let result = sc.cursor.table_append_after_last_position_with_writer(
-                &sc.cx,
-                rowid,
-                payload_len,
-                move |dst| {
-                    record_plan.write_into_slice(dst).map_err(|()| {
-                        FrankenError::internal(
-                            "compiled simple INSERT direct record serialization size mismatch",
-                        )
-                    })
-                },
-            )?;
-            if result {
-                sc.last_successful_insert_rowid = Some(rowid);
+        let appended_directly = if values.len() == 1 {
+            let value = &values[0];
+            let payload_len = single_value_record_exact_size(value);
+            if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id) {
+                let result = sc.cursor.table_append_after_last_position_with_writer(
+                    &sc.cx,
+                    rowid,
+                    payload_len,
+                    move |dst| {
+                        serialize_single_value_record_into_slice(value, dst).map_err(|()| {
+                            FrankenError::internal(
+                                "compiled simple INSERT single-value record serialization size mismatch",
+                            )
+                        })
+                    },
+                )?;
+                if result {
+                    sc.last_successful_insert_rowid = Some(rowid);
+                }
+                result
+            } else {
+                return Err(FrankenError::internal(
+                    "compiled simple INSERT lost its cursor",
+                ));
             }
-            result
         } else {
-            return Err(FrankenError::internal(
-                "compiled simple INSERT lost its cursor",
-            ));
+            let record_plan = fsqlite_types::record::plan_record_iter_serialization(values.iter());
+            let payload_len = record_plan.exact_size();
+            if let Some(sc) = self.storage_cursors.get_mut(&template.cursor_id) {
+                let result = sc.cursor.table_append_after_last_position_with_writer(
+                    &sc.cx,
+                    rowid,
+                    payload_len,
+                    move |dst| {
+                        record_plan.write_into_slice(dst).map_err(|()| {
+                            FrankenError::internal(
+                                "compiled simple INSERT direct record serialization size mismatch",
+                            )
+                        })
+                    },
+                )?;
+                if result {
+                    sc.last_successful_insert_rowid = Some(rowid);
+                }
+                result
+            } else {
+                return Err(FrankenError::internal(
+                    "compiled simple INSERT lost its cursor",
+                ));
+            }
         };
         if !appended_directly {
             let mut payload_buf = self.make_record_lookaside.take_buf();
