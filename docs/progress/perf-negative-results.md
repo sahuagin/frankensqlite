@@ -12,6 +12,43 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-04 - CASS archaeology guardrails
+
+Scope: `cass` searches restricted to FrankenSQLite content since `2026-03-04`,
+covering terms such as `rejected`, `reverted`, `abandoned`, `slower`,
+`regressed`, `did not help`, `no improvement`, `within noise`, `rollback`,
+`candidate`, `benchmark`, and `matrix`.
+
+- `SqliteValue` `Arc` wrapping (`Arc<str>`, `Arc<[u8]>`, `Arc<String>`,
+  `Arc<Vec<u8>>`) showed up repeatedly as a clone-reduction idea, but March
+  fresh-eyes sessions report that the attempt broke serde/type constraints and
+  left cross-crate type mismatches. Do not retry without a designed serde story
+  and a compile/test proof before measuring.
+- Broad `SmallVec` register/op sweeps caused dependency, initialization, and
+  borrow-check failures around `VdbeProgram`, `VdbeEngine::registers`, and
+  `Opcode::MakeRecord`; the safe recovery was to restore owned clones before
+  mutably borrowing storage cursors. Do not repeat as a broad mechanical sweep.
+- A broad "alien" batch combining multi-tiered SSI witness indexing, B-tree
+  stack elision, Adaptive Sharded ARC, and CAMP produced correctness hazards:
+  custom/global witnesses were dropped, dirty write-set pages could be hidden by
+  stack elision, `ArcCache::get` could deep-clone page data, witness bridge
+  methods were lost during edits, and the CAMP path initially used `unsafe`.
+  Revisit only as narrow, separately measured patches with SSI/witness and
+  dirty-page correctness tests.
+- `with_pager_write_txn` bypassing active transactions was a CASS false lead:
+  the same session re-read the helper and corrected itself that the function is
+  centralized and handles active transactions. Do not spend another pass on that
+  theory without new evidence.
+- Audit-only CASS leads such as `OP_Count` full-table scans, `cursor_column`
+  payload comparison cost, parse-cache full flushes, index-ordered OFFSET after
+  column reads, and Bloom one-hash false positives should remain optimization
+  backlog, not negative results, until someone has a measured rejected patch.
+
+Primary CASS evidence:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-84f3c374.json -n 44 -C 6`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 18`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 10`
+
 ## 2026-05-04 - Single-value insert serialization specialization
 
 - Target: insert throughput, especially tiny/small single-column and small-record rows.
@@ -61,6 +98,23 @@ Each entry should include:
 - Do not retry the same one-entry rowid result cache. Reconsider only if the
   query-row dispatch path is redesigned so the cache removes more work than it
   adds, and prove it with a close A/B read-section run.
+
+## 2026-05-04 - Unbounded grouped join rowid-count helper
+
+- Target: join read rows, especially `JOIN + GROUP BY` and `JOIN + HAVING`.
+- Touched: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: remove the small-right-table limit around the prepared inner
+  join grouped rowid-count helper so larger right tables use the direct helper.
+- Evidence:
+  - Candidate: `tests/artifacts/perf/join-rowid-count-peer-candidate-cyangorge-20260504T1955Z/report.json`.
+  - Baseline context from clean quick matrix at `a05d1e02`: `JOIN + GROUP BY`
+    fsqlite median about `14.08 ms`; `JOIN + HAVING` about `13.97 ms`.
+- Result: rejected before commit. Candidate focused join rows measured
+  `17.42 ms` for `JOIN + GROUP BY` and `19.22 ms` for `JOIN + HAVING`, worse
+  than the clean context despite the direct helper test shape.
+- Do not retry by simply removing the row limit. Reconsider only if the helper
+  is fed through the real prepared-query refresh path and a close A/B join run
+  improves the actual matrix rows.
 
 ## 2026-05-04 - Standard-library ASCII LIKE byte comparison
 
