@@ -1849,7 +1849,7 @@ fn serialize_record_iter_into_impl<'a, I>(values: I, buf: &mut Vec<u8>)
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
-    if values.size_hint().1.is_some_and(|len| len <= 3) {
+    if values.size_hint().1.is_some_and(|len| len <= 2) {
         serialize_record_iter_into_impl_two_pass(values, buf);
     } else {
         serialize_record_iter_into_impl_cached_layout(values, buf);
