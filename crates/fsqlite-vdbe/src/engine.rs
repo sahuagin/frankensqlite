@@ -12298,17 +12298,18 @@ impl VdbeEngine {
                             )?
                         };
 
-                        // 2. Serialize record from registers into sideband buf
+                        // 2. Serialize record from registers into sideband buf.
+                        // The peephole preserves MakeRecord's p4 metadata; keep
+                        // this fused path byte-equivalent to OP_MakeRecord so IPK
+                        // placeholder columns and fixed record headers do not
+                        // silently fall back to the generic encoder.
                         let mut rec_buf = self.make_record_lookaside.take_buf();
-                        {
-                            let this = &*self;
-                            let iter = (0..num_cols).map(move |i| {
-                                #[allow(clippy::cast_possible_wrap)]
-                                let reg = first_reg + i as i32;
-                                this.get_reg(reg)
-                            });
-                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-                        }
+                        self.serialize_record_from_register_range(
+                            first_reg,
+                            num_cols,
+                            &op.p4,
+                            &mut rec_buf,
+                        );
 
                         // 3. Append to B-tree (prechecked absent — sequential rowid)
                         let append_result =
@@ -12953,6 +12954,94 @@ impl VdbeEngine {
     }
 
     #[inline(always)]
+    fn serialize_record_from_register_range(
+        &self,
+        first_reg: i32,
+        n_cols: usize,
+        p4: &P4,
+        rec_buf: &mut Vec<u8>,
+    ) {
+        match p4 {
+            P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
+                let null_placeholder = SqliteValue::Null;
+                let make_iter = || {
+                    header
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .map(|(i, slot)| match slot.kind {
+                            PrecomputedSerialTypeKind::NullPlaceholder => &null_placeholder,
+                            _ => {
+                                #[allow(clippy::cast_possible_wrap)]
+                                let reg = first_reg + i as i32;
+                                self.get_reg(reg)
+                            }
+                        })
+                };
+                let used_integer_fast_path =
+                    n_cols >= 4 && simd_serialize_integer_record(make_iter(), rec_buf);
+                if !used_integer_fast_path
+                    && !serialize_record_iter_with_precomputed_header_into(
+                        make_iter(),
+                        header,
+                        rec_buf,
+                    )
+                {
+                    fsqlite_types::record::serialize_record_iter_into(make_iter(), rec_buf);
+                }
+            }
+            // The opcode's p1..p1+p2-1 register range is the source of truth
+            // for OP_MakeRecord. If cached header metadata drifts from that
+            // shape, fall back to the generic path instead of serializing the
+            // wrong number of columns.
+            P4::PrecomputedHeader(_) => {
+                let iter = (0..n_cols).map(move |i| {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let reg = first_reg + i as i32;
+                    self.get_reg(reg)
+                });
+                if n_cols >= 4 && simd_serialize_integer_record(iter.clone(), rec_buf) {
+                    // Integer-only row used the SIMD/scalar fixed-width fast path.
+                } else {
+                    fsqlite_types::record::serialize_record_iter_into(iter, rec_buf);
+                }
+            }
+            P4::Affinity(aff) => {
+                let null_placeholder = SqliteValue::Null;
+                let affinity = aff.as_bytes();
+                let make_iter = || {
+                    (0..n_cols).map(|i| {
+                        if affinity.get(i) == Some(&b'X') {
+                            &null_placeholder
+                        } else {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let reg = first_reg + i as i32;
+                            self.get_reg(reg)
+                        }
+                    })
+                };
+                if n_cols >= 4 && simd_serialize_integer_record(make_iter(), rec_buf) {
+                    // Integer-only row used the SIMD/scalar fixed-width fast path.
+                } else {
+                    fsqlite_types::record::serialize_record_iter_into(make_iter(), rec_buf);
+                }
+            }
+            _ => {
+                let iter = (0..n_cols).map(move |i| {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let reg = first_reg + i as i32;
+                    self.get_reg(reg)
+                });
+                if n_cols >= 4 && simd_serialize_integer_record(iter.clone(), rec_buf) {
+                    // Integer-only row used the SIMD/scalar fixed-width fast path.
+                } else {
+                    fsqlite_types::record::serialize_record_iter_into(iter, rec_buf);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
     fn execute_make_record_hot(&mut self, op: &VdbeOp, collect_vdbe_metrics: bool) {
         let target = op.p3;
         let n_cols = usize::try_from(op.p2).unwrap_or(0);
@@ -12962,93 +13051,7 @@ impl VdbeEngine {
             self.materialize_make_record_sideband(armed_reg);
         }
         let mut rec_buf = self.make_record_lookaside.take_buf();
-        {
-            let this = &*self;
-            match &op.p4 {
-                P4::PrecomputedHeader(header) if header.column_count() == n_cols => {
-                    let null_placeholder = SqliteValue::Null;
-                    let make_iter = || {
-                        header
-                            .slots
-                            .iter()
-                            .enumerate()
-                            .map(|(i, slot)| match slot.kind {
-                                PrecomputedSerialTypeKind::NullPlaceholder => &null_placeholder,
-                                _ => {
-                                    #[allow(clippy::cast_possible_wrap)]
-                                    let reg = op.p1 + i as i32;
-                                    this.get_reg(reg)
-                                }
-                            })
-                    };
-                    let used_integer_fast_path =
-                        n_cols >= 4 && simd_serialize_integer_record(make_iter(), &mut rec_buf);
-                    if !used_integer_fast_path
-                        && !serialize_record_iter_with_precomputed_header_into(
-                            make_iter(),
-                            header,
-                            &mut rec_buf,
-                        )
-                    {
-                        fsqlite_types::record::serialize_record_iter_into(
-                            make_iter(),
-                            &mut rec_buf,
-                        );
-                    }
-                }
-                // The opcode's p1..p1+p2-1 register range is the source of
-                // truth for OP_MakeRecord. If cached header metadata drifts
-                // from that shape, fall back to the generic path instead of
-                // serializing the wrong number of columns.
-                P4::PrecomputedHeader(_) => {
-                    let iter = (0..n_cols).map(move |i| {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let reg = op.p1 + i as i32;
-                        this.get_reg(reg)
-                    });
-                    if n_cols >= 4 && simd_serialize_integer_record(iter.clone(), &mut rec_buf) {
-                        // Integer-only row used the SIMD/scalar fixed-width fast path.
-                    } else {
-                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-                    }
-                }
-                P4::Affinity(aff) => {
-                    let null_placeholder = SqliteValue::Null;
-                    let affinity = aff.as_bytes();
-                    let make_iter = || {
-                        (0..n_cols).map(|i| {
-                            if affinity.get(i) == Some(&b'X') {
-                                &null_placeholder
-                            } else {
-                                #[allow(clippy::cast_possible_wrap)]
-                                let reg = op.p1 + i as i32;
-                                this.get_reg(reg)
-                            }
-                        })
-                    };
-                    if n_cols >= 4 && simd_serialize_integer_record(make_iter(), &mut rec_buf) {
-                        // Integer-only row used the SIMD/scalar fixed-width fast path.
-                    } else {
-                        fsqlite_types::record::serialize_record_iter_into(
-                            make_iter(),
-                            &mut rec_buf,
-                        );
-                    }
-                }
-                _ => {
-                    let iter = (0..n_cols).map(move |i| {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let reg = op.p1 + i as i32;
-                        this.get_reg(reg)
-                    });
-                    if n_cols >= 4 && simd_serialize_integer_record(iter.clone(), &mut rec_buf) {
-                        // Integer-only row used the SIMD/scalar fixed-width fast path.
-                    } else {
-                        fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
-                    }
-                }
-            }
-        }
+        self.serialize_record_from_register_range(op.p1, n_cols, &op.p4, &mut rec_buf);
         if collect_vdbe_metrics {
             FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.fetch_add(
@@ -24404,6 +24407,96 @@ mod tests {
         );
         assert_eq!(rows[0][0], SqliteValue::Integer(42));
         assert_eq!(rows[0][1], SqliteValue::Text("hello".into()));
+    }
+
+    #[test]
+    fn test_fused_append_insert_honors_make_record_p4_metadata() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(2), 0);
+            b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, 3, 0, P4::Str("fused".to_owned()), 0);
+            b.emit_op(
+                Opcode::FusedAppendInsert,
+                0,
+                2,
+                2,
+                P4::Affinity("XD".to_owned()),
+                2,
+            );
+
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 1, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 2, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Null, SqliteValue::Text("fused".into())]],
+            "FusedAppendInsert must preserve MakeRecord X-affinity placeholder semantics",
+        );
+    }
+
+    #[test]
+    fn test_fused_append_insert_honors_precomputed_record_header() {
+        let precomputed = fsqlite_types::record::PrecomputedRecordHeader::new(&[
+            fsqlite_types::record::PrecomputedSerialTypeKind::NullPlaceholder,
+            fsqlite_types::record::PrecomputedSerialTypeKind::IntegerOrNull,
+        ]);
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(2), 0);
+            b.emit_op(Opcode::Integer, 99, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, 3, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::FusedAppendInsert,
+                0,
+                2,
+                2,
+                P4::PrecomputedHeader(precomputed),
+                2,
+            );
+
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 5, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 1, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 5, 2, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.resolve_label(done);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Null, SqliteValue::Integer(7)]],
+            "FusedAppendInsert must preserve MakeRecord precomputed-header placeholders",
+        );
     }
 
     #[test]
