@@ -1,0 +1,364 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_command_pack.v2",
+  "bead_id": "bd-db300.4.1",
+  "run_id": "bd-db300.4.1-hot_page_contention-frankensqlite-c1-s42-1777898120165",
+  "trace_id": "bd-db300.4.1.hot_page_contention:frankensqlite:c1",
+  "scenario_id": "bd-db300.4.1.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 1,
+  "concurrent_mode": true,
+  "artifact_root": "/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z",
+  "profiler_safe_replay_command": "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+  "full_validation_replay_command": "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check",
+  "commands": [
+    {
+      "capture": "wall_clock",
+      "mode": "profiler_safe",
+      "tool": "hyperfine",
+      "output_relpath": "profiles/hyperfine.profiler_safe.json",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && hyperfine --warmup 1 --runs 5 --export-json /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc'",
+      "description": "wall-clock benchmark replay for profiler_safe capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "on_cpu",
+      "mode": "profiler_safe",
+      "tool": "perf-record",
+      "output_relpath": "profiles/perf-record.profiler_safe.data",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && perf record -g -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-record.profiler_safe.data -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+      "description": "sampled on-CPU profile for profiler_safe capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "scheduler",
+      "mode": "profiler_safe",
+      "tool": "perf-sched-record",
+      "output_relpath": "profiles/perf-sched.profiler_safe.data",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && perf sched record -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-sched.profiler_safe.data -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+      "description": "scheduler and off-CPU trace for profiler_safe capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "syscall",
+      "mode": "profiler_safe",
+      "tool": "strace",
+      "output_relpath": "logs/strace.profiler_safe.log",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/logs && strace -f -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/logs/strace.profiler_safe.log rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+      "description": "syscall trace for profiler_safe capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "allocation",
+      "mode": "profiler_safe",
+      "tool": "heaptrack",
+      "output_relpath": "profiles/heaptrack.profiler_safe.gz",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && heaptrack -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/heaptrack.profiler_safe.gz rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+      "description": "allocation profile for profiler_safe capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "topdown",
+      "mode": "profiler_safe",
+      "tool": "perf-stat",
+      "output_relpath": "profiles/perf-stat-topdown.profiler_safe.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-stat-topdown.profiler_safe.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -M TopdownL1 -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=TopdownL1'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -M TopdownL1 -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=core_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=TopdownL1 unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; fi; cat \"$tmp\" >> \"$out\"'",
+      "description": "topdown counter pack with comparable fallback metrics for profiler_safe capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": false,
+        "primary_tool": "perf-stat",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "TopdownL1",
+        "fallback_selections": [
+          "core_event_fallback"
+        ],
+        "capability_probe": "perf stat -M TopdownL1 -o \"$tmp\" -- true",
+        "fallback_event_pack": [
+          "cycles",
+          "instructions",
+          "branches",
+          "branch-misses",
+          "cache-references",
+          "cache-misses"
+        ],
+        "fallback_reason_hints": [
+          "TopdownL1 unsupported on this host"
+        ],
+        "raw_output_relpaths": []
+      }
+    },
+    {
+      "capture": "cache_to_cache",
+      "mode": "profiler_safe",
+      "tool": "perf-c2c",
+      "output_relpath": "profiles/perf-c2c.profiler_safe.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-c2c.profiler_safe.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-c2c.profiler_safe.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf c2c record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc >/dev/null 2>&1 && perf c2c report --stats -i \"$raw\" > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_c2c'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; elif perf mem record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_mem_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c unavailable or failed on this host'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c and perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; cat \"$tmp\" >> \"$out\"; fi'",
+      "description": "cache-to-cache or HITM evidence with perf mem/cache-stat fallbacks for profiler_safe capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-c2c",
+        "fallback_tools": [
+          "perf-mem",
+          "perf-stat"
+        ],
+        "primary_selection": "perf_c2c",
+        "fallback_selections": [
+          "perf_mem_fallback",
+          "cache_event_fallback"
+        ],
+        "capability_probe": "perf c2c record/report, else perf mem record/report",
+        "fallback_event_pack": [
+          "cache-references",
+          "cache-misses"
+        ],
+        "fallback_reason_hints": [
+          "perf c2c unavailable or failed on this host",
+          "perf c2c and perf mem unavailable or failed on this host"
+        ],
+        "raw_output_relpaths": [
+          "profiles/perf-c2c.profiler_safe.data"
+        ]
+      }
+    },
+    {
+      "capture": "migration",
+      "mode": "profiler_safe",
+      "tool": "perf-stat",
+      "output_relpath": "profiles/perf-stat-migration.profiler_safe.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-stat-migration.profiler_safe.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=cpu_migrations'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -e cpu-migrations,context-switches -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=context_switch_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=cpu-migrations unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e context-switches,task-clock -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; fi; cat \"$tmp\" >> \"$out\"'",
+      "description": "migration and scheduling counter pack with fallback metrics for profiler_safe capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-stat",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "cpu_migrations",
+        "fallback_selections": [
+          "context_switch_fallback"
+        ],
+        "capability_probe": "perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true",
+        "fallback_event_pack": [
+          "context-switches",
+          "task-clock"
+        ],
+        "fallback_reason_hints": [
+          "cpu-migrations unsupported on this host"
+        ],
+        "raw_output_relpaths": []
+      }
+    },
+    {
+      "capture": "remote_access",
+      "mode": "profiler_safe",
+      "tool": "perf-mem",
+      "output_relpath": "profiles/perf-mem-remote-access.profiler_safe.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-mem-remote-access.profiler_safe.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-mem-remote-access.profiler_safe.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf mem record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=perf_mem'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses,page-faults -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc; cat \"$tmp\" >> \"$out\"; fi'",
+      "description": "remote-access memory evidence with cache-stat fallback metrics for profiler_safe capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-mem",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "perf_mem",
+        "fallback_selections": [
+          "cache_event_fallback"
+        ],
+        "capability_probe": "perf mem record/report",
+        "fallback_event_pack": [
+          "cache-references",
+          "cache-misses",
+          "page-faults"
+        ],
+        "fallback_reason_hints": [
+          "perf mem unavailable or failed on this host"
+        ],
+        "raw_output_relpaths": [
+          "profiles/perf-mem-remote-access.profiler_safe.data"
+        ]
+      }
+    },
+    {
+      "capture": "wall_clock",
+      "mode": "full_validation",
+      "tool": "hyperfine",
+      "output_relpath": "profiles/hyperfine.full_validation.json",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && hyperfine --warmup 1 --runs 5 --export-json /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/hyperfine.full_validation.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check'",
+      "description": "wall-clock benchmark replay for full_validation capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "on_cpu",
+      "mode": "full_validation",
+      "tool": "perf-record",
+      "output_relpath": "profiles/perf-record.full_validation.data",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && perf record -g -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-record.full_validation.data -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check",
+      "description": "sampled on-CPU profile for full_validation capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "scheduler",
+      "mode": "full_validation",
+      "tool": "perf-sched-record",
+      "output_relpath": "profiles/perf-sched.full_validation.data",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && perf sched record -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-sched.full_validation.data -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check",
+      "description": "scheduler and off-CPU trace for full_validation capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "syscall",
+      "mode": "full_validation",
+      "tool": "strace",
+      "output_relpath": "logs/strace.full_validation.log",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/logs && strace -f -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/logs/strace.full_validation.log rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check",
+      "description": "syscall trace for full_validation capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "allocation",
+      "mode": "full_validation",
+      "tool": "heaptrack",
+      "output_relpath": "profiles/heaptrack.full_validation.gz",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && heaptrack -o /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/heaptrack.full_validation.gz rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check",
+      "description": "allocation profile for full_validation capture",
+      "counter_pack": null
+    },
+    {
+      "capture": "topdown",
+      "mode": "full_validation",
+      "tool": "perf-stat",
+      "output_relpath": "profiles/perf-stat-topdown.full_validation.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-stat-topdown.full_validation.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -M TopdownL1 -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=TopdownL1'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -M TopdownL1 -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=topdown'\"'\"' '\"'\"'selected=core_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=TopdownL1 unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e cycles,instructions,branches,branch-misses,cache-references,cache-misses -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; fi; cat \"$tmp\" >> \"$out\"'",
+      "description": "topdown counter pack with comparable fallback metrics for full_validation capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": false,
+        "primary_tool": "perf-stat",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "TopdownL1",
+        "fallback_selections": [
+          "core_event_fallback"
+        ],
+        "capability_probe": "perf stat -M TopdownL1 -o \"$tmp\" -- true",
+        "fallback_event_pack": [
+          "cycles",
+          "instructions",
+          "branches",
+          "branch-misses",
+          "cache-references",
+          "cache-misses"
+        ],
+        "fallback_reason_hints": [
+          "TopdownL1 unsupported on this host"
+        ],
+        "raw_output_relpaths": []
+      }
+    },
+    {
+      "capture": "cache_to_cache",
+      "mode": "full_validation",
+      "tool": "perf-c2c",
+      "output_relpath": "profiles/perf-c2c.full_validation.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-c2c.full_validation.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-c2c.full_validation.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf c2c record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check >/dev/null 2>&1 && perf c2c report --stats -i \"$raw\" > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_c2c'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; elif perf mem record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=perf_mem_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c unavailable or failed on this host'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=cache_to_cache'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf c2c and perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; cat \"$tmp\" >> \"$out\"; fi'",
+      "description": "cache-to-cache or HITM evidence with perf mem/cache-stat fallbacks for full_validation capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-c2c",
+        "fallback_tools": [
+          "perf-mem",
+          "perf-stat"
+        ],
+        "primary_selection": "perf_c2c",
+        "fallback_selections": [
+          "perf_mem_fallback",
+          "cache_event_fallback"
+        ],
+        "capability_probe": "perf c2c record/report, else perf mem record/report",
+        "fallback_event_pack": [
+          "cache-references",
+          "cache-misses"
+        ],
+        "fallback_reason_hints": [
+          "perf c2c unavailable or failed on this host",
+          "perf c2c and perf mem unavailable or failed on this host"
+        ],
+        "raw_output_relpaths": [
+          "profiles/perf-c2c.full_validation.data"
+        ]
+      }
+    },
+    {
+      "capture": "migration",
+      "mode": "full_validation",
+      "tool": "perf-stat",
+      "output_relpath": "profiles/perf-stat-migration.full_validation.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-stat-migration.full_validation.summary.txt; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; if perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true >/dev/null 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=cpu_migrations'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; perf stat -x, -e cpu-migrations,context-switches -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; else printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=migration'\"'\"' '\"'\"'selected=context_switch_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=cpu-migrations unsupported on this host'\"'\"' > \"$out\"; perf stat -x, -e context-switches,task-clock -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; fi; cat \"$tmp\" >> \"$out\"'",
+      "description": "migration and scheduling counter pack with fallback metrics for full_validation capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-stat",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "cpu_migrations",
+        "fallback_selections": [
+          "context_switch_fallback"
+        ],
+        "capability_probe": "perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true",
+        "fallback_event_pack": [
+          "context-switches",
+          "task-clock"
+        ],
+        "fallback_reason_hints": [
+          "cpu-migrations unsupported on this host"
+        ],
+        "raw_output_relpaths": []
+      }
+    },
+    {
+      "capture": "remote_access",
+      "mode": "full_validation",
+      "tool": "perf-mem",
+      "output_relpath": "profiles/perf-mem-remote-access.full_validation.summary.txt",
+      "command_line": "mkdir -p /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles && bash -lc 'set -euo pipefail; out=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-mem-remote-access.full_validation.summary.txt; raw=/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z/profiles/perf-mem-remote-access.full_validation.data; tmp=$(mktemp); trap '\"'\"'rm -f \"$tmp\"'\"'\"' EXIT; rm -f \"$raw\"; if perf mem record -o \"$raw\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check >/dev/null 2>&1 && perf mem report -i \"$raw\" --stdio > \"$tmp\" 2>&1; then printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=perf_mem'\"'\"' '\"'\"'fallback=false'\"'\"' > \"$out\"; cat \"$tmp\" >> \"$out\"; else rm -f \"$raw\"; printf '\"'\"'%s\\n'\"'\"' '\"'\"'capture=remote_access'\"'\"' '\"'\"'selected=cache_event_fallback'\"'\"' '\"'\"'fallback=true'\"'\"' '\"'\"'reason=perf mem unavailable or failed on this host'\"'\"' > \"$out\"; perf stat -x, -e cache-references,cache-misses,page-faults -o \"$tmp\" -- rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc --integrity-check; cat \"$tmp\" >> \"$out\"; fi'",
+      "description": "remote-access memory evidence with cache-stat fallback metrics for full_validation capture",
+      "counter_pack": {
+        "host_capability_sensitive": true,
+        "topology_sensitive": true,
+        "primary_tool": "perf-mem",
+        "fallback_tools": [
+          "perf-stat"
+        ],
+        "primary_selection": "perf_mem",
+        "fallback_selections": [
+          "cache_event_fallback"
+        ],
+        "capability_probe": "perf mem record/report",
+        "fallback_event_pack": [
+          "cache-references",
+          "cache-misses",
+          "page-faults"
+        ],
+        "fallback_reason_hints": [
+          "perf mem unavailable or failed on this host"
+        ],
+        "raw_output_relpaths": [
+          "profiles/perf-mem-remote-access.full_validation.data"
+        ]
+      }
+    }
+  ]
+}

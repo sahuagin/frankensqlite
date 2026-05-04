@@ -1,0 +1,99 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_validation_report.v1",
+  "bead_id": "bd-db300.4.1",
+  "run_id": "bd-db300.4.1-hot_page_contention-frankensqlite-c1-s42-1777898120165",
+  "trace_id": "bd-db300.4.1.hot_page_contention:frankensqlite:c1",
+  "scenario_id": "bd-db300.4.1.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "artifact_root": "/data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z",
+  "backend_identity": "iouring:parity_cert_strict",
+  "all_checks_passed": true,
+  "required_artifacts": [
+    "actionable_ranking.json",
+    "command_pack.json",
+    "opcode_profile.json",
+    "profile.json",
+    "subsystem_profile.json",
+    "summary.md"
+  ],
+  "topology_taxonomy": [
+    "allocation",
+    "io",
+    "mixed",
+    "queueing",
+    "retries",
+    "service",
+    "synchronization"
+  ],
+  "topology_sensitive_captures": [
+    "cache_to_cache",
+    "migration",
+    "remote_access"
+  ],
+  "artifact_hashes": [
+    {
+      "path": "actionable_ranking.json",
+      "bytes": 50666,
+      "sha256": "a6f2ce70e294ce1df0ae8e402933ba21a5e3de2751717435bbf64a1b3e5a484b",
+      "description": "structured hotspot, reuse, and baseline-waste ledger for follow-on implementation work"
+    },
+    {
+      "path": "command_pack.json",
+      "bytes": 38331,
+      "sha256": "ee1f0f618649b7b4e9499d698aa44cd4f3e6fc8f09ed0ae5fb38308d0017e37d",
+      "description": "structured replay/evidence capture commands for profiler-safe and full-validation runs"
+    },
+    {
+      "path": "opcode_profile.json",
+      "bytes": 899,
+      "sha256": "0c60fae80ad7bd8cebdb6abbe686824d800e60bb53df1cfc0db907e7e76dd664",
+      "description": "raw opcode totals for the profiled run"
+    },
+    {
+      "path": "profile.json",
+      "bytes": 12108,
+      "sha256": "41ef1f732d78ae2675b848e86a1a8c0b3c6974c880519a7b2cf05b0c55429f37",
+      "description": "structured hot-path profile report"
+    },
+    {
+      "path": "subsystem_profile.json",
+      "bytes": 12690,
+      "sha256": "5e27bd2d28fca71a3ac681b4bdd1c73bb533ce7567fad1889d78fae100f96cad",
+      "description": "raw execution-subsystem timing, heap profile, and WAL commit-path split/tail metrics for the run"
+    },
+    {
+      "path": "summary.md",
+      "bytes": 27830,
+      "sha256": "28351f15fc26b5f5888cda245819326ab6fa636f8636fdb30cbe48045176e657",
+      "description": "human-readable hotspot ranking summary"
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "artifact_completeness",
+      "passed": true,
+      "detail": "covered 6 required artifacts with SHA-256 hashes: actionable_ranking.json, command_pack.json, opcode_profile.json, profile.json, subsystem_profile.json, summary.md"
+    },
+    {
+      "check_id": "schema_versions",
+      "passed": true,
+      "detail": "profile=fsqlite-e2e.hot_path_profile.v1 manifest=fsqlite-e2e.hot_path_profile_manifest.v1 command_pack=fsqlite-e2e.hot_path_command_pack.v2 actionable_ranking=fsqlite-e2e.hot_path_actionable_ranking.v3"
+    },
+    {
+      "check_id": "structured_id_contract",
+      "passed": true,
+      "detail": "bead=bd-db300.4.1 run=bd-db300.4.1-hot_page_contention-frankensqlite-c1-s42-1777898120165 trace=bd-db300.4.1.hot_page_contention:frankensqlite:c1 scenario=bd-db300.4.1.hot_page_contention fixture=frankensqlite workload=hot_page_contention concurrency=1"
+    },
+    {
+      "check_id": "replayability",
+      "passed": true,
+      "detail": "backend_identity=iouring:parity_cert_strict profiler_safe_commands=1 full_validation_commands=1 report_replay_matches_selected_mode=true"
+    },
+    {
+      "check_id": "conflict_topology_taxonomy",
+      "passed": true,
+      "detail": "taxonomy=allocation, io, mixed, queueing, retries, service, synchronization topology_sensitive_captures=cache_to_cache, migration, remote_access"
+    }
+  ]
+}

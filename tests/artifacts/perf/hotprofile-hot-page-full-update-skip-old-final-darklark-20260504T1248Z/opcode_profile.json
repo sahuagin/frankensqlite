@@ -1,0 +1,14 @@
+{
+  "schema_version": "fsqlite-e2e.hot_path_opcode_profile.v1",
+  "bead_id": "bd-db300.4.1",
+  "run_id": "bd-db300.4.1-hot_page_contention-frankensqlite-c1-s42-1777898120165",
+  "trace_id": "bd-db300.4.1.hot_page_contention:frankensqlite:c1",
+  "scenario_id": "bd-db300.4.1.hot_page_contention",
+  "fixture_id": "frankensqlite",
+  "workload": "hot_page_contention",
+  "seed": 42,
+  "scale": 20,
+  "concurrency": 1,
+  "replay_command": "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db frankensqlite --workload hot_page_contention --golden-dir /data/projects/frankensqlite/sample_sqlite_db_files/golden --working-base /data/projects/frankensqlite/sample_sqlite_db_files/working --concurrency 1 --seed 42 --scale 20 --output-dir /data/projects/frankensqlite/tests/artifacts/perf/hotprofile-hot-page-full-update-skip-old-final-darklark-20260504T1248Z --mvcc",
+  "opcodes": []
+}
