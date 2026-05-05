@@ -1101,3 +1101,65 @@ CASS evidence:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 120 -C 45`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-ee1022e3.json -n 30 -C 25`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-854547a1.json -n 140 -C 45`
+
+## 2026-05-05 - CASS/git follow-up: reverted fast paths not yet named
+
+Scope: another `cass` pass over the last 60 days restricted to FrankenSQLite
+signals (`cass search "frankensqlite <term>" --days 60 ...`) for `reverted`,
+`rollback`, `slower`, `worse`, `abandon*`, and related wording. The useful
+new leads were then cross-checked against recent revert commits and preserved
+artifact bundles. These entries are intentionally terse because they mainly
+serve as search handles for future agents.
+
+- `ensure_storage_cursor_row_layout` early-return fast path: reverted by
+  `9dd7bc53`. The premise that a non-empty row decode table plus a large enough
+  payload buffer meant the layout was reusable was false: multi-row cursor
+  callers relied on the slow path to reset eager-value state. Do not re-add an
+  early return here unless the guard also proves prior-row eager values cannot
+  leak, with correctness coverage before any read benchmark.
+- Prepared indexed-equality text/null side maps: reverted by `53679a91`
+  (`7d9814e5`). The idea added `SmallText` and NULL-specific rowid maps beside
+  the generic `PreparedIndexedEqualityCache`, but was dropped before becoming a
+  durable read win. This is distinct from the later last-result cache rejects:
+  do not retry by adding parallel value-shape maps unless a profile proves
+  generic lookup-key construction dominates and a read-section A/B improves
+  absolute FrankenSQLite medians.
+- B-tree cell-slot cache rotation experiment: reverted by `facba056`.
+  Replacing remove/insert LRU promotion with slice rotation and special
+  in-entry slot updates did not survive the measured/reviewed perf pass. Keep
+  the simpler current promotion path; do not retry cache-order micro-rotation
+  without a profile showing `CellSlotCache` promotion itself is hot and a join
+  or read-index A/B win.
+- VDBE index-prefix binary compare shortcut: rejected by `f7fce439`. The
+  candidate bypassed the collation registry for apparently binary index
+  prefixes, then was removed in favor of the single registry-backed
+  `compare_index_prefix_keys` path. Do not retry a registry-free prefix compare
+  unless the collation and DESC/null semantics are proven with focused tests and
+  the index-boundary/read-query artifacts show a real row-level win.
+- Prepared rowid-bucket `SUM` fast path family: reverted by `6d8a44f4` after
+  the initial `SimpleGroupByRowidBucketSum` helper and later streaming variant
+  failed the keep bar. Artifacts include
+  `tests/artifacts/perf/read-after-write-group-by-rowid-bucket-sum-candidate-calm-20260503T2008Z/report.json`
+  and
+  `tests/artifacts/perf/read-after-write-rowid-bucket-stream-candidate-calm-20260503T2018Z/report.json`.
+  Do not recreate a whole prepared fast-path variant for `rowid / divisor`
+  grouped `SUM` unless all row counts and the read-section score improve, not
+  just the largest row.
+- UPDATE reinsert existence-probe skip: reverted by `8dd631d7`. The candidate
+  skipped the existence probe when reinserting the same rowid during UPDATE,
+  but the update/delete section was worse than the disabled comparison
+  (`4.1226` weighted score versus `3.7545` in
+  `tests/artifacts/perf/update-delete-reinsert-skip-candidate-chartreuse-20260504T0057Z/report.json`
+  and
+  `tests/artifacts/perf/update-delete-reinsert-skip-disabled-dirty-chartreuse-20260504T0101Z/report.json`).
+  Do not retry this as a local `PendingUpdateRestore` shortcut without an
+  UPDATE-only A/B win and conflict/unique-index coverage.
+- Top-category CTE rowid-carry regression: reverted by `86944a1b`. The
+  candidate carried rowids for top categories through the direct CTE helper and
+  then had to be unwound back to the simpler rescan-by-category shape. Evidence
+  lives in
+  `tests/artifacts/perf/subquery-current-head-cte-rowid-carry-local-20260501T0523Z/`
+  and
+  `tests/artifacts/perf/subquery-current-head-cte-rowid-carry-reverted-local-20260501T0530Z/`.
+  Do not retry by preserving per-category rowid vectors unless the subquery/CTE
+  row improves in a same-window run and memory growth is bounded.
