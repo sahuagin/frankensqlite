@@ -8,12 +8,14 @@
 //!   perf-update-delete                         # default: 10_000 rows, 10 iters, update+delete, fsqlite only
 //!   perf-update-delete 100000 3 update
 //!   perf-update-delete 1000   5 delete compare
+//!   perf-update-delete 10000 250 delete fsqlite isolated
 //!
 //! Arguments:
 //!   [rows]   Number of rows to pre-populate (default 10_000)
 //!   [iters]  Number of outer iterations for profiling (default 10)
 //!   [which]  "update" | "delete" | "both" (default "both")
 //!   [engine] "fsqlite" | "sqlite" | "compare" (default "fsqlite")
+//!   [mode]   "standard" | "isolated" (default "standard")
 
 use std::fmt;
 use std::process::ExitCode;
@@ -117,12 +119,40 @@ impl fmt::Display for EngineKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileMode {
+    Standard,
+    Isolated,
+}
+
+impl ProfileMode {
+    fn parse(raw: &str) -> Result<Self, RunError> {
+        match raw {
+            "standard" => Ok(Self::Standard),
+            "isolated" => Ok(Self::Isolated),
+            other => Err(RunError::Usage(format!(
+                "invalid mode '{other}'; expected standard or isolated"
+            ))),
+        }
+    }
+}
+
+impl fmt::Display for ProfileMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Standard => f.write_str("standard"),
+            Self::Isolated => f.write_str("isolated"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BenchArgs {
     rows: usize,
     iters: usize,
     workload: WorkloadKind,
     engine: EngineKind,
+    profile_mode: ProfileMode,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -184,9 +214,13 @@ where
         Some(raw) => EngineKind::parse(&raw)?,
         None => EngineKind::Fsqlite,
     };
+    let profile_mode = match args.next() {
+        Some(raw) => ProfileMode::parse(&raw)?,
+        None => ProfileMode::Standard,
+    };
     if let Some(extra) = args.next() {
         return Err(RunError::Usage(format!(
-            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare]"
+            "unexpected extra argument '{extra}'; usage: perf-update-delete [rows] [iters] [update|delete|both] [fsqlite|sqlite|compare] [standard|isolated]"
         )));
     }
     if iters == 0 {
@@ -200,6 +234,7 @@ where
         iters,
         workload,
         engine,
+        profile_mode,
     })
 }
 
@@ -210,6 +245,34 @@ fn per_row_ns(total_ns: u128, op_count: usize, iters: usize) -> f64 {
     } else {
         total_ns as f64 / total_ops as f64
     }
+}
+
+fn isolated_populate_rows_i64(
+    args: &BenchArgs,
+    rows_i64: i64,
+    delete_count: usize,
+) -> Result<i64, RunError> {
+    if !args.workload.do_delete() {
+        return Ok(rows_i64);
+    }
+
+    let required_delete_rows = args
+        .iters
+        .checked_mul(delete_count)
+        .ok_or_else(|| RunError::Usage("isolated delete row count overflowed usize".to_string()))?;
+    let required_delete_rows_i64 = i64::try_from(required_delete_rows).map_err(|_| {
+        RunError::Usage("isolated delete row count must fit within i64".to_string())
+    })?;
+    Ok(rows_i64.max(required_delete_rows_i64))
+}
+
+fn isolated_delete_id(iter: usize, index: usize, delete_count: usize) -> Result<i64, RunError> {
+    let row_offset = iter
+        .checked_mul(delete_count)
+        .and_then(|base| base.checked_add(index))
+        .ok_or_else(|| RunError::Usage("isolated delete row id overflowed usize".to_string()))?;
+    i64::try_from(row_offset)
+        .map_err(|_| RunError::Usage("isolated delete row id must fit within i64".to_string()))
 }
 
 fn apply_benchmark_pragmas(conn: &fsqlite::Connection) -> Result<(), RunError> {
@@ -260,11 +323,12 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     let delete_count = args.rows / 20;
 
     eprintln!(
-        "perf-update-delete: rows={} iters={} which={} engine={} (do_update={} do_delete={} update_count={} delete_count={})",
+        "perf-update-delete: rows={} iters={} which={} engine={} mode={} (do_update={} do_delete={} update_count={} delete_count={})",
         args.rows,
         args.iters,
         args.workload,
         args.engine,
+        args.profile_mode,
         args.workload.do_update(),
         args.workload.do_delete(),
         update_count,
@@ -275,13 +339,27 @@ fn run_benchmark(args: &BenchArgs) -> Result<(), RunError> {
     let mut sqlite_totals = None;
 
     if args.engine.run_fsqlite() {
-        let totals = run_fsqlite_benchmark(args, rows_i64, update_count, delete_count)?;
+        let totals = match args.profile_mode {
+            ProfileMode::Standard => {
+                run_fsqlite_benchmark(args, rows_i64, update_count, delete_count)?
+            }
+            ProfileMode::Isolated => {
+                run_fsqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
+            }
+        };
         print_engine_summary("fsqlite", args, update_count, delete_count, totals);
         fsqlite_totals = Some(totals);
     }
 
     if args.engine.run_sqlite() {
-        let totals = run_sqlite_benchmark(args, rows_i64, update_count, delete_count)?;
+        let totals = match args.profile_mode {
+            ProfileMode::Standard => {
+                run_sqlite_benchmark(args, rows_i64, update_count, delete_count)?
+            }
+            ProfileMode::Isolated => {
+                run_sqlite_isolated_benchmark(args, rows_i64, update_count, delete_count)?
+            }
+        };
         print_engine_summary("sqlite", args, update_count, delete_count, totals);
         sqlite_totals = Some(totals);
     }
@@ -370,6 +448,97 @@ fn run_fsqlite_benchmark(
         if iter == 0 {
             eprintln!("  (first iter complete)");
         }
+    }
+
+    Ok(TimingTotals {
+        total: t_all.elapsed().as_nanos(),
+        populate: total_populate_ns,
+        update: total_update_ns,
+        delete: total_delete_ns,
+    })
+}
+
+fn run_fsqlite_isolated_benchmark(
+    args: &BenchArgs,
+    rows_i64: i64,
+    update_count: usize,
+    delete_count: usize,
+) -> Result<TimingTotals, RunError> {
+    let t_all = Instant::now();
+    let populate_rows_i64 = isolated_populate_rows_i64(args, rows_i64, delete_count)?;
+    let conn = fsqlite::Connection::open(":memory:")
+        .map_err(|err| RunError::Runtime(format!("open in-memory database: {err}")))?;
+    apply_benchmark_pragmas(&conn)?;
+    conn.execute(BENCH_CREATE_SQL)
+        .map_err(|err| RunError::Runtime(format!("create benchmark table: {err}")))?;
+    conn.execute("BEGIN")
+        .map_err(|err| RunError::Runtime(format!("begin populate transaction: {err}")))?;
+    let stmt = conn
+        .prepare(BENCH_INSERT_SQL)
+        .map_err(|err| RunError::Runtime(format!("prepare populate statement: {err}")))?;
+    let t0 = Instant::now();
+    for i in 0..populate_rows_i64 {
+        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)])
+            .map_err(|err| RunError::Runtime(format!("populate row {i}: {err}")))?;
+    }
+    conn.execute("COMMIT")
+        .map_err(|err| RunError::Runtime(format!("commit populate transaction: {err}")))?;
+    let total_populate_ns = t0.elapsed().as_nanos();
+
+    let mut total_update_ns: u128 = 0;
+    let mut total_delete_ns: u128 = 0;
+
+    if args.workload.do_update() {
+        let update = conn
+            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+            .map_err(|err| RunError::Runtime(format!("prepare update statement: {err}")))?;
+        conn.execute("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin isolated update transaction: {err}"))
+        })?;
+        let t0 = Instant::now();
+        for iter in 0..args.iters {
+            let next_value = (iter as f64).mul_add(0.001, 999.99);
+            for i in 0..update_count {
+                let id = i64::try_from(i).map_err(|_| {
+                    RunError::Usage("update_count index overflowed i64".to_string())
+                })? * 10;
+                update
+                    .execute_with_params(&[
+                        fsqlite::SqliteValue::Integer(id),
+                        fsqlite::SqliteValue::Float(next_value),
+                    ])
+                    .map_err(|err| RunError::Runtime(format!("update row {id}: {err}")))?;
+            }
+        }
+        total_update_ns = t0.elapsed().as_nanos();
+        conn.execute("ROLLBACK").map_err(|err| {
+            RunError::Runtime(format!("rollback isolated update transaction: {err}"))
+        })?;
+    }
+
+    if args.workload.do_delete() {
+        let delete = conn
+            .prepare("DELETE FROM bench WHERE id = ?1")
+            .map_err(|err| RunError::Runtime(format!("prepare delete statement: {err}")))?;
+        conn.execute("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin isolated delete transaction: {err}"))
+        })?;
+        let t0 = Instant::now();
+        for iter in 0..args.iters {
+            for i in 0..delete_count {
+                let id = isolated_delete_id(iter, i, delete_count)?;
+                delete
+                    .execute_with_params(&[fsqlite::SqliteValue::Integer(id)])
+                    .map_err(|err| RunError::Runtime(format!("delete row {id}: {err}")))?;
+            }
+            if iter == 0 {
+                eprintln!("  (first isolated delete iter complete)");
+            }
+        }
+        total_delete_ns = t0.elapsed().as_nanos();
+        conn.execute("COMMIT").map_err(|err| {
+            RunError::Runtime(format!("commit isolated delete transaction: {err}"))
+        })?;
     }
 
     Ok(TimingTotals {
@@ -474,6 +643,102 @@ fn run_sqlite_benchmark(
     })
 }
 
+fn run_sqlite_isolated_benchmark(
+    args: &BenchArgs,
+    rows_i64: i64,
+    update_count: usize,
+    delete_count: usize,
+) -> Result<TimingTotals, RunError> {
+    let t_all = Instant::now();
+    let populate_rows_i64 = isolated_populate_rows_i64(args, rows_i64, delete_count)?;
+    let conn = rusqlite::Connection::open_in_memory()
+        .map_err(|err| RunError::Runtime(format!("open C SQLite in-memory database: {err}")))?;
+    apply_csqlite_benchmark_pragmas(&conn)?;
+    conn.execute(BENCH_CREATE_SQL, [])
+        .map_err(|err| RunError::Runtime(format!("create C SQLite benchmark table: {err}")))?;
+    conn.execute_batch("BEGIN")
+        .map_err(|err| RunError::Runtime(format!("begin C SQLite populate transaction: {err}")))?;
+    let mut stmt = conn
+        .prepare(BENCH_INSERT_SQL)
+        .map_err(|err| RunError::Runtime(format!("prepare C SQLite populate statement: {err}")))?;
+    let t0 = Instant::now();
+    for i in 0..populate_rows_i64 {
+        stmt.execute(rusqlite::params![i])
+            .map_err(|err| RunError::Runtime(format!("populate C SQLite row {i}: {err}")))?;
+    }
+    conn.execute_batch("COMMIT")
+        .map_err(|err| RunError::Runtime(format!("commit C SQLite populate transaction: {err}")))?;
+    let total_populate_ns = t0.elapsed().as_nanos();
+
+    let mut total_update_ns: u128 = 0;
+    let mut total_delete_ns: u128 = 0;
+
+    if args.workload.do_update() {
+        let mut update = conn
+            .prepare("UPDATE bench SET value = ?2 WHERE id = ?1")
+            .map_err(|err| {
+                RunError::Runtime(format!("prepare C SQLite update statement: {err}"))
+            })?;
+        conn.execute_batch("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin C SQLite isolated update transaction: {err}"))
+        })?;
+        let t0 = Instant::now();
+        for iter in 0..args.iters {
+            let next_value = (iter as f64).mul_add(0.001, 999.99);
+            for i in 0..update_count {
+                let id = i64::try_from(i).map_err(|_| {
+                    RunError::Usage("update_count index overflowed i64".to_string())
+                })? * 10;
+                update
+                    .execute(rusqlite::params![id, next_value])
+                    .map_err(|err| RunError::Runtime(format!("update C SQLite row {id}: {err}")))?;
+            }
+        }
+        total_update_ns = t0.elapsed().as_nanos();
+        conn.execute_batch("ROLLBACK").map_err(|err| {
+            RunError::Runtime(format!(
+                "rollback C SQLite isolated update transaction: {err}"
+            ))
+        })?;
+    }
+
+    if args.workload.do_delete() {
+        let mut delete = conn
+            .prepare("DELETE FROM bench WHERE id = ?1")
+            .map_err(|err| {
+                RunError::Runtime(format!("prepare C SQLite delete statement: {err}"))
+            })?;
+        conn.execute_batch("BEGIN").map_err(|err| {
+            RunError::Runtime(format!("begin C SQLite isolated delete transaction: {err}"))
+        })?;
+        let t0 = Instant::now();
+        for iter in 0..args.iters {
+            for i in 0..delete_count {
+                let id = isolated_delete_id(iter, i, delete_count)?;
+                delete
+                    .execute(rusqlite::params![id])
+                    .map_err(|err| RunError::Runtime(format!("delete C SQLite row {id}: {err}")))?;
+            }
+            if iter == 0 {
+                eprintln!("  (first isolated sqlite delete iter complete)");
+            }
+        }
+        total_delete_ns = t0.elapsed().as_nanos();
+        conn.execute_batch("COMMIT").map_err(|err| {
+            RunError::Runtime(format!(
+                "commit C SQLite isolated delete transaction: {err}"
+            ))
+        })?;
+    }
+
+    Ok(TimingTotals {
+        total: t_all.elapsed().as_nanos(),
+        populate: total_populate_ns,
+        update: total_update_ns,
+        delete: total_delete_ns,
+    })
+}
+
 fn print_engine_summary(
     engine: &str,
     args: &BenchArgs,
@@ -531,7 +796,8 @@ fn print_comparison_summary(args: &BenchArgs, fsqlite: TimingTotals, sqlite: Tim
 mod tests {
     use super::{
         BENCH_CREATE_SQL, BENCH_INSERT_SQL, BENCHMARK_PRAGMAS, BenchArgs, DEFAULT_ITERS,
-        DEFAULT_ROWS, EngineKind, RunError, WorkloadKind, parse_args, per_row_ns, run_benchmark,
+        DEFAULT_ROWS, EngineKind, ProfileMode, RunError, WorkloadKind, parse_args, per_row_ns,
+        run_benchmark,
     };
 
     #[test]
@@ -543,6 +809,7 @@ mod tests {
                 iters: DEFAULT_ITERS,
                 workload: WorkloadKind::Both,
                 engine: EngineKind::Fsqlite,
+                profile_mode: ProfileMode::Standard,
             }
         );
     }
@@ -584,6 +851,7 @@ mod tests {
                 iters: 1,
                 workload: WorkloadKind::Update,
                 engine: EngineKind::Fsqlite,
+                profile_mode: ProfileMode::Standard,
             }
         );
     }
@@ -603,6 +871,28 @@ mod tests {
                 iters: 1,
                 workload: WorkloadKind::Both,
                 engine: EngineKind::Compare,
+                profile_mode: ProfileMode::Standard,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_isolated_mode() {
+        assert_eq!(
+            parse_args([
+                "5".to_string(),
+                "3".to_string(),
+                "delete".to_string(),
+                "fsqlite".to_string(),
+                "isolated".to_string(),
+            ])
+            .unwrap(),
+            BenchArgs {
+                rows: 5,
+                iters: 3,
+                workload: WorkloadKind::Delete,
+                engine: EngineKind::Fsqlite,
+                profile_mode: ProfileMode::Isolated,
             }
         );
     }
@@ -621,6 +911,22 @@ mod tests {
             RunError::Usage(
                 "invalid engine 'bogus'; expected fsqlite, sqlite, or compare".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_mode() {
+        let err = parse_args([
+            "100".to_string(),
+            "2".to_string(),
+            "both".to_string(),
+            "fsqlite".to_string(),
+            "bogus".to_string(),
+        ])
+        .expect_err("invalid profile mode should fail");
+        assert_eq!(
+            err,
+            RunError::Usage("invalid mode 'bogus'; expected standard or isolated".to_string())
         );
     }
 
@@ -652,6 +958,7 @@ mod tests {
             iters: 1,
             workload: WorkloadKind::Both,
             engine: EngineKind::Compare,
+            profile_mode: ProfileMode::Standard,
         };
         run_benchmark(&args).expect("small smoke workload should succeed");
     }
