@@ -78,6 +78,72 @@ Primary CASS evidence:
   close A/B read-section run improves the primary weighted score and
   FrankenSQLite absolute medians.
 
+## 2026-05-05 - File-backed prepared indexed-equality last-result cache
+
+- Target: prepared secondary indexed equality probes in the read benchmark.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: reuse `prepared_indexed_equality_last_result` in the
+  file-backed `SimpleIndexedEqualityLookup` collection and `query_row` arms,
+  with file-backed proof coverage for repeat-probe reuse and invalidation after
+  external writes.
+- Evidence:
+  - Focused proof: `cargo test -p fsqlite-core test_file_backed_clean_prepared_indexed_equality_reuses_last_probe_until_external_write -- --nocapture`.
+  - Baseline: `/data/tmp/frankensqlite-purplecoast-indexeq-base-read-20260505T0100Z.json`.
+  - Candidate: `/data/tmp/frankensqlite-purplecoast-indexeq-candidate-read-20260505T005522Z.json`.
+- Result: rejected and reverted before commit. The proof test passed, but the
+  e2e read benchmark's secondary-index row uses `:memory:` and exits through
+  `PreparedStatement::try_query_clean_memory_indexed_equality_fast`, so the
+  candidate did not target the matrix path. Same-HEAD A/B artifacts were too
+  noisy to defend as a real matrix win.
+- Do not retry the file-backed last-result cache for the current read-section
+  gap. Reconsider only for a workload that actually exercises file-backed
+  prepared indexed equality, or after the benchmark target is proven to enter
+  the file-backed branch.
+
+## 2026-05-05 - GROUP_CONCAT integer itoa append
+
+- Target: string workload `GROUP_CONCAT` rows, especially
+  `SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag`.
+- Touched during rejected candidate:
+  `crates/fsqlite-func/src/agg_builtins.rs`,
+  `crates/fsqlite-func/Cargo.toml`.
+- Candidate shape: add `itoa` to `fsqlite-func` and format
+  `SqliteValue::Integer` directly into the aggregate accumulator string instead
+  of allocating through `to_text()` / `i64::to_string()`.
+- Evidence:
+  - Candidate: `/data/tmp/frankensqlite-purplecoast-groupconcat-candidate-string-20260505T0118Z.json`.
+  - Same-window clean baseline: `/data/tmp/frankensqlite-purplecoast-groupconcat-base-string-20260505T0120Z.json`.
+- Result: rejected before commit and manually reverted. Same-window
+  FrankenSQLite medians worsened: 100 rows `77.1 us` to `242.8 us`, 1000 rows
+  `701.7 us` to `725.1 us`, and 10000 rows `6.06 ms` to `8.85 ms`. The average
+  string ratio stayed about `3.38x` and did not improve.
+- Do not retry direct per-step `itoa::Buffer` formatting inside
+  `GroupConcatFunc::step`. Reconsider only with a design that avoids per-row
+  formatter setup and proves real string-section wins.
+
+## 2026-05-05 - Positive-start ASCII-prefix SUBSTR fast path
+
+- Target: `String & Pattern Matching Performance`, specifically
+  `string functions (LENGTH + UPPER + SUBSTR)` rows.
+- Touched: `crates/fsqlite-func/src/builtins.rs`.
+- Candidate shape: for `SUBSTR(text, positive_start, positive_length)`, prove
+  only the requested prefix is ASCII and slice by byte offset before the
+  existing full-string `is_ascii()` / Unicode-count path.
+- Candidate commit: `ee1649d5 perf(substr): ascii-prefix fast path for positive (start, length) substr`.
+- Revert commit: `426590d5 perf(substr): revert rejected ascii-prefix fast path`.
+- Evidence:
+  - Baseline: `/data/tmp/frankensqlite-purplecoast-substr-prefix-base-string-20260505T0142Z.json`.
+  - Candidate: `/data/tmp/frankensqlite-purplecoast-substr-prefix-candidate-string-20260505T0148Z.json`.
+- Result: rejected and reverted. The candidate improved only the largest
+  string-functions row slightly (`10000 rows` FrankenSQLite median `12.06 ms`
+  to `11.84 ms`), while worsening smaller rows (`100 rows` `107.1 us` to
+  `133.7 us`, `1000 rows` `1.23 ms` to `1.38 ms`) and worsening the string
+  section average ratio from `3.17x` to `3.66x`.
+- Do not retry as a per-call prefix probe in `SubstrFunc`. Reconsider only if a
+  profile isolates `SUBSTR` body scanning as the dominant cost and a close A/B
+  string-section run improves every affected string-functions row or the section
+  score without small-row regression.
+
 ## 2026-05-05 - SmallText direct-byte Eq/Ord/Hash traits
 
 - Target: `Read-After-Write Query Performance`, especially secondary indexed
