@@ -128,6 +128,13 @@ the target workload, files touched, evidence artifacts, measured result, and the
 condition under which it is worth retrying. This is mandatory: failed
 optimization ideas must be durable so future agents do not repeat them.
 
+For major perf campaigns, also mine recent `$cass` session history, recent
+commits, and perf artifacts for terms like `rejected`, `reverted`, `slower`,
+`regressed`, `did not help`, and `within noise`, scoped to this repo and recent
+history. If the ledger is reserved by another agent, do not edit through the
+lock; send patch-ready entries to the reservation holder and record the blocker
+in your handoff.
+
 ---
 
 ## Code Editing Discipline

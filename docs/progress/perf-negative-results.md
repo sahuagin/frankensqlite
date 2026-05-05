@@ -49,6 +49,37 @@ Primary CASS evidence:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 18`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 10`
 
+## 2026-05-05 - Additional CASS-derived rejected candidates
+
+Scope: last-two-month FrankenSQLite session history searched for negative
+signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
+`did not help`, `within noise`, `abandoned`, and nearby misspellings.
+
+- `concurrent_page_state` structural rewrite / empty-map short-circuit:
+  rejected after micro results only moved `1.6 ns` to `1.5 ns` on the empty
+  case while populated lookup barely moved (`+0.1%`); the patch was reverted.
+  Do not retry without a real matrix row showing state lookup dominates.
+- WAL checksum transform hand-folding: rejected after the hand-folded checksum
+  path measured roughly `30%` slower than the existing implementation. Do not
+  retry scalar checksum reshuffling unless a CPU profile isolates checksum math
+  and the candidate is checked against WAL benchmark rows.
+- PAX-style `Column` decode cache: deprioritized because the important decode
+  cache had already landed and later traces showed different hotspots. Do not
+  reopen this as a generic "cache decoded column" idea without proving the
+  current row shape is missing the existing cache.
+- Same-page `PageBuf` steal allocator: a proof test passed, but wall-clock
+  movement was within noise. Do not retry as allocator surgery unless a fresh
+  profile shows page-buffer allocation, not pager/VDBE work, dominates.
+- Statement-renewal micro-batcher: abandoned after small-N benchmark movement
+  stayed within noise; a naive deadline check using `Instant::now()` regressed.
+  Do not retry per-call time checks in the hot path.
+- `PageData` `Arc<Vec<u8>>` to `Arc<[u8]>`: deferred as high-risk and low
+  isolated expected value. Do not attempt as a broad type rewrite without a
+  migration plan covering all pager/WAL/MVCC consumers and a matrix target.
+- Rust PGO plus full LTO for INSERT: rejected after INSERT benchmarking showed
+  roughly `20-25%` slower results. Do not repeat toolchain/profile flag
+  exploration for insert throughput unless the profile setup itself changes.
+
 ## 2026-05-05 - Prepared indexed-equality schema microbatch carry
 
 - Target: `Read-After-Write Query Performance`, especially repeated prepared
@@ -325,6 +356,31 @@ Primary CASS evidence:
   with only the 1K-row prefix case improving.
 - Do not retry as a general LIKE matcher cleanup. Reconsider only with an
   end-to-end string-section A/B that shows row-level wins beyond noise.
+
+## 2026-05-05 - Manual ASCII alpha bit-test in LIKE byte comparison
+
+- Target: string workload rows, especially prepared `COUNT(*) ... LIKE`
+  prefix/wildcard scans.
+- Touched during rejected scratch candidate:
+  `crates/fsqlite-types/src/value.rs`.
+- Candidate shape: replace `u8::is_ascii_alphabetic()` in
+  `fsqlite_types::ascii_ci_eq_byte` with a branchless-style
+  `(byte | 0x20).wrapping_sub(b'a') <= b'z' - b'a'` helper. This was narrower
+  than the previously rejected standard-library `eq_ignore_ascii_case`
+  substitution.
+- Evidence:
+  - Correctness: `cargo test -p fsqlite-types like --release` passed in the
+    clean detached worktree.
+  - Baseline:
+    `/data/tmp/frankensqlite-purplecoast-clean-20260505T032950Z/tests/artifacts/perf/string-clean-purplecoast-20260505T0330Z/report.json`.
+  - Candidate:
+    `/data/tmp/frankensqlite-purplecoast-clean-20260505T032950Z/tests/artifacts/perf/string-ascii-alpha-bit-candidate-purplecoast-20260505T0340Z/report.json`.
+- Result: rejected before commit and reverted in scratch. The focused string
+  matrix worsened from `3.37x` average ratio to `3.63x`; key FrankenSQLite
+  medians regressed: 10K prefix LIKE `2.32 ms` to `2.78 ms`, 10K wildcard LIKE
+  `3.42 ms` to `3.70 ms`, and 10K GROUP_CONCAT `6.64 ms` to `8.29 ms`.
+- Do not retry bit-test microcleanup unless a future compiler/codegen profile
+  proves this exact helper dominates LIKE matching.
 
 ## 2026-05-04 - Exact-sized record body writes
 
