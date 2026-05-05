@@ -395,6 +395,38 @@ Primary CASS evidence:
   unless a later design can prove lower per-row overhead and an insert-section
   A/B improves the primary ratios, not just a unit proof.
 
+## 2026-05-05 - Pager sorted write-page append fast path
+
+- Target: `INSERTThroughput` quick insert matrix, especially split-heavy 10K
+  single-transaction rows where the pager maintains `write_pages_sorted` before
+  WAL commit publication.
+- Touched during rejected candidate:
+  `crates/fsqlite-pager/src/pager.rs::insert_page_sorted`.
+- Candidate shape: check the current last sorted page first, append when the
+  new page number is greater, return on duplicate-last, and fall back to the
+  existing binary-search insertion only for out-of-order page numbers.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/insert-profile-current-head-cyangorge-20260505T122449Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/insert-sorted-page-append-cyangorge-20260505T1450Z/report.json`.
+  - Candidate summary:
+    `tests/artifacts/perf/insert-sorted-page-append-cyangorge-20260505T1450Z/summary.md`.
+  - Focused pager sorted-order tests passed under `rch exec -- env
+    CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-sorted-page-target cargo
+    test -p fsqlite-pager sorted -- --nocapture`; `cargo fmt --check` also
+    passed before the benchmark run.
+- Result: rejected and manually reverted before commit. The primary weighted
+  score worsened from `1.6991` to `1.7591`, average ratio from `2.4610x` to
+  `2.5153x`, and geomean ratio from `2.3623x` to `2.4081x`. The important
+  10K single-transaction rows did not produce a usable win: `small_3col`
+  worsened from `6.895 ms` to `7.105 ms`, `large_10col` worsened from
+  `36.165 ms` to `36.909 ms`, and only `medium_6col` improved
+  (`13.666 ms` to `12.944 ms`). Do not retry this standalone
+  append/equal-last `write_pages_sorted` micro-optimization unless a fresh
+  profile shows sorted-page maintenance dominating and a full insert-section
+  A/B improves the primary weighted score and the large-row medians.
+
 ## 2026-05-05 - WAL prepared-frame no-memset serializer
 
 - Target: insert commit hot path where WAL frame preparation appeared to pay a
