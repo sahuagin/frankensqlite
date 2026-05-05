@@ -1,0 +1,105 @@
+
+================================================================================
+  Comprehensive FrankenSQLite vs C SQLite Benchmark
+================================================================================
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ d2e98ca67524124fb05e6e3fe075b5f8ddf633fe
+  Build: release-perf (opt-level 3, LTO)
+  Mode: quick
+  Row counts: [100, 1000, 10000]
+  Measurement: 2 warmup, 3-10 iters, target 5s
+  Filter: insert
+================================================================================
+
+
+============================================================================================================================================
+  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
+  2026-05-05 21:19:09 UTC
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ d2e98ca67524124fb05e6e3fe075b5f8ddf633fe
+  Build: release-perf (opt-level 3, LTO)
+  Total benchmark time: 2.9s
+============================================================================================================================================
+
+
+## INSERTThroughput — Single Transaction — tiny_1col
+   Record: 1 col (INTEGER PK only). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                        64.8 us     254.5 us      1.54M/s     392.9K/s 3.93x [31mslower[0m    11.1%     7.3%
+  1000 rows                                      251.8 us     683.0 us      3.97M/s      1.46M/s 2.71x [31mslower[0m     4.4%     3.1%
+  10000 rows                                      2.30 ms      4.72 ms      4.34M/s      2.12M/s 2.05x [31mslower[0m     0.6%    11.5%
+
+## INSERTThroughput — Single Transaction — small_3col
+   Record: 3 cols (~30B: id, name, value). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                        73.8 us     296.1 us      1.36M/s     337.7K/s 4.01x [31mslower[0m     9.7%    13.0%
+  1000 rows                                      359.7 us     831.7 us      2.78M/s      1.20M/s 2.31x [31mslower[0m    11.6%     3.4%
+  10000 rows                                      3.12 ms      6.90 ms      3.21M/s      1.45M/s 2.21x [31mslower[0m     0.4%     2.9%
+
+## INSERTThroughput — Single Transaction — medium_6col
+   Record: 6 cols (~180B: id, name, email, bio, category, score). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                        99.8 us     273.5 us      1.00M/s     365.6K/s 2.74x [31mslower[0m     5.7%     4.1%
+  1000 rows                                      535.6 us      1.46 ms      1.87M/s     685.3K/s 2.72x [31mslower[0m     2.0%     1.5%
+  10000 rows                                      4.91 ms     13.61 ms      2.03M/s     734.7K/s 2.77x [31mslower[0m     0.4%     2.5%
+
+## INSERTThroughput — Single Transaction — large_10col
+   Record: 10 cols (~600B: includes long text fields). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                       165.7 us     398.8 us     603.4K/s     250.8K/s 2.41x [31mslower[0m    13.9%    10.2%
+  1000 rows                                      930.6 us      1.91 ms      1.07M/s     524.2K/s 2.05x [31mslower[0m     0.5%     1.9%
+  10000 rows                                      9.46 ms     36.14 ms      1.06M/s     276.7K/s 3.82x [31mslower[0m     1.2%     2.9%
+
+## INSERTThroughput — Transaction Strategy Comparison (small_3col)
+   Compares autocommit, batched (1K/txn), and single-txn strategies.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / autocommit                          152.2 us     245.8 us     657.0K/s     406.9K/s 1.61x [31mslower[0m     4.9%     4.7%
+  100 rows / batched (100/txn)                    74.0 us     207.9 us      1.35M/s     481.0K/s 2.81x [31mslower[0m    12.3%     2.1%
+  100 rows / single txn                           73.1 us     206.0 us      1.37M/s     485.4K/s 2.82x [31mslower[0m     3.5%     2.9%
+  1000 rows / autocommit                         853.1 us      1.25 ms      1.17M/s     799.5K/s 1.47x [31mslower[0m     1.0%     0.9%
+  1000 rows / batched (1000/txn)                 343.5 us     795.0 us      2.91M/s      1.26M/s 2.31x [31mslower[0m     2.4%     2.3%
+  1000 rows / single txn                         341.0 us     801.0 us      2.93M/s      1.25M/s 2.35x [31mslower[0m     2.8%     3.2%
+  10000 rows / autocommit                         8.29 ms     11.46 ms      1.21M/s     872.6K/s 1.38x [31mslower[0m     3.3%     0.7%
+  10000 rows / batched (1000/txn)                 3.15 ms      6.38 ms      3.18M/s      1.57M/s 2.03x [31mslower[0m     0.4%     4.2%
+  10000 rows / single txn                         3.13 ms      6.39 ms      3.20M/s      1.56M/s 2.05x [31mslower[0m     0.7%     7.8%
+
+## INSERTThroughput — Record Size Comparison (10K rows, single txn)
+   Fixed 10K rows in a single transaction, varying payload size.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  tiny_1col — 1 col (INTEGER PK only)             2.31 ms      4.39 ms      4.33M/s      2.28M/s 1.90x [31mslower[0m     0.6%     0.9%
+  small_3col — 3 cols (~30B: id, name, value)      3.40 ms      6.34 ms      2.94M/s      1.58M/s 1.86x [31mslower[0m     5.5%     6.5%
+  medium_6col — 6 cols (~180B: id, name, email, bio, category, score)      4.95 ms     10.27 ms      2.02M/s     973.6K/s 2.07x [31mslower[0m     3.1%     3.5%
+  large_10col — 10 cols (~600B: includes long text fields)      8.97 ms     36.54 ms      1.11M/s     273.7K/s 4.07x [31mslower[0m     0.6%     2.3%
+
+========================================================================================================================
+  SUMMARY STATISTICS
+========================================================================================================================
+
+  Total scenarios: 25  |  FrankenSQLite faster: 0  |  Comparable: 0  |  C SQLite faster: 25
+  Average time ratio (FrankenSQLite / C SQLite): 2.50x

@@ -1,0 +1,24 @@
+diff --git a/crates/fsqlite-btree/src/cursor.rs b/crates/fsqlite-btree/src/cursor.rs
+index 58166133..55f3bd85 100644
+--- a/crates/fsqlite-btree/src/cursor.rs
++++ b/crates/fsqlite-btree/src/cursor.rs
+@@ -7155,17 +7155,9 @@ impl<P: PageWriter> BtCursor<P> {
+                 hint.leaf_page = result.new_pgno;
+                 hint.last_rowid = rowid;
+                 hint.parent_page = Some(parent_page);
+-                hint.page_data = Some(result.new_page_data.clone());
++                hint.page_data = Some(result.new_page_data);
+                 hint.header = result.new_header;
+-                self.rightmost_leaf_cache = Some(RightmostLeafCacheEntry {
+-                    page_no: result.new_pgno,
+-                    rowid,
+-                    tree_depth: hint.tree_depth,
+-                    parent_page: Some(parent_page),
+-                    page_data: result.new_page_data,
+-                    header: result.new_header,
+-                    cell_pointers: vec![result.new_cell_ptr],
+-                });
++                self.clear_rightmost_leaf_cache();
+                 Ok(true)
+             }
+             Ok(None) => {

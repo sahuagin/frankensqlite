@@ -48,6 +48,40 @@ slower than C SQLite and still carrying a small
   dominant DELETE cost or if a broader measured change removes the retained
   cache scratch dependency entirely.
 
+## 2026-05-05 - External quick-balance retained-hint single authority
+
+Scope: prepared direct INSERT external rightmost-leaf append path in
+`crates/fsqlite-btree/src/cursor.rs`, after insert profiles showed large-row
+time in B-tree append and quick-balance work.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` in a
+  clean candidate worktree; source was not applied to the shared checkout.
+- Candidate shape: after `balance_quick_known_divider_rowid` succeeds in
+  `try_quick_balance_on_external_rightmost_leaf_hint`, move
+  `result.new_page_data` solely into the caller-owned `TableAppendHint` and
+  clear the cursor's internal `rightmost_leaf_cache` instead of retaining a
+  duplicate `RightmostLeafCacheEntry`.
+- Correctness proof for the candidate passed:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-proudanchor-qbcache-candidate-test-target cargo test -p fsqlite-btree table_try_append_cached_rightmost_leaf_hint -- --nocapture`
+  (`4` tests). `rch` failed open for the `/data/tmp` worktree, so the command
+  ran locally.
+- Evidence artifacts:
+  `tests/artifacts/perf/external-qb-cache-single-authority-proudanchor-20260505T2118Z/summary.md`,
+  `tests/artifacts/perf/external-qb-cache-single-authority-proudanchor-20260505T2118Z/candidate.diff`,
+  `tests/artifacts/perf/external-qb-cache-single-authority-proudanchor-20260505T2118Z/baseline-report.json`,
+  and
+  `tests/artifacts/perf/external-qb-cache-single-authority-proudanchor-20260505T2118Z/candidate-report.json`.
+- Result: rejected. The same-host insert quick matrix regressed average ratio
+  `2.4990x -> 2.5713x`, geomean `2.3954x -> 2.4847x`, primary weighted score
+  `1.7007 -> 1.7335`, write-bulk geomean `2.5568x -> 2.6611x`, and
+  write-single geomean `1.4846x -> 1.5027x`. The large 10-column record-size
+  ratio looked better (`4.07x -> 3.79x`), but the absolute FrankenSQLite median
+  still regressed (`36.54 ms -> 38.74 ms`) while C SQLite moved too.
+- Do not retry this single-authority external quick-balance retained-hint
+  change as a standalone INSERT optimization. Revisit only if a future profile
+  proves the internal post-split cache entry itself is dominant and a same-window
+  insert matrix improves absolute FrankenSQLite medians.
+
 ## 2026-05-05 - CASS synonym sweep coverage note
 
 Scope: user-requested CASS search restricted to FrankenSQLite session history
