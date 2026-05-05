@@ -1163,3 +1163,32 @@ serve as search handles for future agents.
   `tests/artifacts/perf/subquery-current-head-cte-rowid-carry-reverted-local-20260501T0530Z/`.
   Do not retry by preserving per-category rowid vectors unless the subquery/CTE
   row improves in a same-window run and memory growth is bounded.
+
+## 2026-05-05 - Conservative WAL raw append for large INSERT commits
+
+Scope: `comprehensive-bench --quick --filter insert`, targeting the default
+conservative WAL path in
+`crates/fsqlite-pager/src/pager.rs::commit_wal_group_commit_with_snapshot`
+after insert profiling showed 2014-frame `large_10col` commits spending
+several milliseconds in prepared-frame construction and WAL append.
+
+- Candidate shape: when `ParallelWalFallbackReason::OperatorForced` selected
+  conservative mode and no lane-prepared batch was available, skip
+  `wal.prepare_append_frames` / `finalize_prepared_frames` and fall through to
+  the existing fused `wal.append_frames` raw append path.
+- Evidence: baseline
+  `tests/artifacts/perf/insert-profile-after-wal-default-cyangorge-20260505T1022Z/report-insert-profile.json`;
+  candidate
+  `tests/artifacts/perf/insert-profile-after-wal-default-cyangorge-20260505T1022Z/report-insert-raw-conservative-candidate.json`;
+  candidate profile
+  `tests/artifacts/perf/insert-profile-after-wal-default-cyangorge-20260505T1022Z/run-insert-raw-conservative-candidate.log`.
+- Result: rejected and reverted. Insert geomean worsened `2.384x -> 2.444x`;
+  write-bulk geomean worsened `2.546x -> 2.623x`; p99 worsened
+  `4.301x -> 4.460x`. The motivating large rows regressed badly:
+  `Single Transaction large_10col 10000` F median `35.404 ms -> 43.130 ms`,
+  and `Record Size Comparison large_10col 10K` F median
+  `34.613 ms -> 49.192 ms`.
+- Do not retry raw conservative WAL append as a standalone prepared-batch
+  bypass. Revisit only if a new design preserves prelock prepared-frame
+  construction while reducing its transform/buffer cost, and proves the
+  large-row insert section improves in a same-window matrix.
