@@ -80,6 +80,31 @@ signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
   roughly `20-25%` slower results. Do not repeat toolchain/profile flag
   exploration for insert throughput unless the profile setup itself changes.
 
+## 2026-05-05 - Direct UPDATE fixed-width REAL one-byte header offset
+
+Scope: `perf-update-delete 10000 40 update`, targeting the prepared
+`UPDATE bench SET value = ?2 WHERE id = ?1` direct-simple fixed-width REAL
+path in `crates/fsqlite-core/src/connection.rs`.
+
+- Candidate shape: after `BtCursor::payload_into`, bypass
+  `parse_record_projected_column_offsets` for records whose header is exactly a
+  one-byte header-size varint plus one-byte serial types, validate the target
+  serial type is REAL (`7`), compute the column payload offset by summing the
+  preceding one-byte serial lengths, and fall back to the generic parser for
+  every other record shape.
+- Behavior proof: added a direct helper test comparing the computed offset to
+  the generic projected-column parser, plus the existing direct-simple REAL
+  update proof still passed under `rch exec -- env
+  CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-connection-target cargo
+  test -p fsqlite-core real_column -- --nocapture` (2 matching tests passed).
+- Evidence: paired release-perf hyperfine artifact
+  `tests/artifacts/perf/direct-update-real-offset-candidate-cyangorge-20260505T0838Z/hyperfine-update.json`.
+- Result: rejected and reverted. Baseline averaged `344.2 ms +/- 6.9 ms`;
+  candidate averaged `347.2 ms +/- 5.4 ms`, so the unpatched binary was
+  `1.01x +/- 0.03` faster. Do not retry header-offset microparsing for this
+  direct UPDATE path unless a fresh profile shows projected record-header parse
+  dominating wall time rather than page write, payload copy, or insert setup.
+
 ## 2026-05-05 - Additional CASS/artifact-backed rejects to avoid repeating
 
 Scope: follow-up sweep of the last-two-month CASS hits, recent commits, and
