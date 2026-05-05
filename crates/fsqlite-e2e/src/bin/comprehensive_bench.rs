@@ -2473,7 +2473,7 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
         label,
         record_size.name(),
         profile.prepared_direct_insert_executions,
@@ -2509,6 +2509,31 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
         profile.btree_copy_kernels.local_payload_copy_bytes,
         profile.btree_copy_kernels.table_leaf_cell_assembly_calls,
         profile.btree_copy_kernels.table_leaf_cell_assembly_bytes,
+        profile.btree_leaf_reuse.fast_table_leaf_payload_appends,
+        profile
+            .btree_leaf_reuse
+            .fast_table_leaf_payload_mutate_time_ns,
+        profile
+            .btree_leaf_reuse
+            .fast_table_leaf_payload_stage_time_ns,
+        profile.btree_leaf_reuse.fast_table_leaf_full_cell_appends,
+        profile
+            .btree_leaf_reuse
+            .fast_table_leaf_full_cell_mutate_time_ns,
+        profile
+            .btree_leaf_reuse
+            .fast_table_leaf_full_cell_stage_time_ns,
+        profile.btree_leaf_reuse.quick_balance_attempts,
+        profile.btree_leaf_reuse.quick_balance_hits,
+        profile.btree_leaf_reuse.quick_balance_time_ns,
+        profile.btree_leaf_reuse.local_split_attempts,
+        profile.btree_leaf_reuse.local_split_hits,
+        profile.btree_leaf_reuse.local_split_time_ns,
+        profile.btree_leaf_reuse.nonroot_balance_calls,
+        profile.btree_leaf_reuse.nonroot_balance_time_ns,
+        profile.btree_leaf_reuse.no_split_reuse_hits,
+        profile.btree_leaf_reuse.conservative_reload_fallbacks,
+        profile.btree_leaf_reuse.page_header_rebuild_count,
         profile.vdbe.opcodes_executed_total,
         profile.vdbe.statements_total,
         profile.vdbe.make_record_calls_total,

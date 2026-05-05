@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[cfg(test)]
-use fsqlite_btree::BtreeCopyProfileSnapshot;
+use fsqlite_btree::{BtreeCopyProfileSnapshot, BtreeLeafReuseSnapshot};
 use fsqlite_core::connection::{
     HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
     hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
@@ -4996,6 +4996,7 @@ mod tests {
                 interior_cell_rebuild_calls: 1,
                 interior_cell_rebuild_bytes: 44,
             },
+            btree_leaf_reuse: BtreeLeafReuseSnapshot::default(),
             record_decode: RecordHotPathProfileSnapshot {
                 parse_record_calls: 4,
                 parse_record_into_calls: 2,

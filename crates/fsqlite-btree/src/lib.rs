@@ -47,9 +47,10 @@ pub use cursor::{
     TransactionPageIo,
 };
 pub use instrumentation::{
-    BtreeCopyProfileSnapshot, BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals,
-    btree_copy_profile_snapshot, btree_metrics_enabled, btree_metrics_snapshot,
-    reset_btree_copy_profile, reset_btree_metrics, set_btree_copy_profile_enabled,
+    BtreeCopyProfileSnapshot, BtreeLeafReuseSnapshot, BtreeMetricsSnapshot, BtreeOpType,
+    BtreeOperationTotals, btree_copy_profile_snapshot, btree_leaf_reuse_snapshot,
+    btree_metrics_enabled, btree_metrics_snapshot, reset_btree_copy_profile,
+    reset_btree_leaf_reuse_profile, reset_btree_metrics, set_btree_copy_profile_enabled,
     set_btree_metrics_enabled,
 };
 pub use learned_index::{
