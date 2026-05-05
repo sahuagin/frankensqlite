@@ -4424,7 +4424,7 @@ impl<P: PageWriter> BtCursor<P> {
             &mut entry.page_data,
             &mut entry.header,
             cell_data,
-        };
+        );
         let (insert_idx, new_cell_offset) = match append_result {
             Ok(Some(result)) => result,
             Ok(None) => {
@@ -4432,6 +4432,7 @@ impl<P: PageWriter> BtCursor<P> {
                 return Ok(false);
             }
             Err(error) => {
+                self.at_eof = false;
                 self.stack.push(entry);
                 return Err(error);
             }
@@ -4476,6 +4477,7 @@ impl<P: PageWriter> BtCursor<P> {
                 return Ok(false);
             }
             Err(error) => {
+                self.at_eof = false;
                 self.stack.push(entry);
                 return Err(error);
             }
