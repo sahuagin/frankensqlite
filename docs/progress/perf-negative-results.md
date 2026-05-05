@@ -1401,3 +1401,40 @@ DELETE maintenance.
   reworking the lazy seed lifecycle. The empty-map state is not merely an
   inert "disabled" state; it can be part of the path that lets later DELETE /
   UPDATE consultation seed and maintain the filter correctly.
+
+## 2026-05-05 - Retained autocommit count-sum explicit transaction skip
+
+Scope: direct-simple INSERT per-row bookkeeping in
+`crates/fsqlite-core/src/connection.rs`, after insert profiles showed large
+unaccounted execute-body time beyond row-build, serialization, B-tree insert,
+and commit counters. The candidate targeted
+`retained_autocommit_count_sum_cache_note_insert`, which runs after successful
+direct-simple INSERT.
+
+- Candidate shape: return early from
+  `retained_autocommit_count_sum_cache_note_insert` when
+  `self.in_transaction.get()` is true. Explicit `BEGIN..COMMIT` insert
+  workloads cannot seed the retained autocommit count/sum cache because
+  `maybe_seed_retained_autocommit_count_sum_cache_from_clean_memdb` already
+  returns inside a transaction, so the candidate tried to avoid one per-row
+  cache path.
+- Evidence: same-window baseline
+  `tests/artifacts/perf/insert-concat-owned-text-baseline-cyangorge-20260505T124529Z/`;
+  candidate
+  `tests/artifacts/perf/insert-retained-cache-explicit-skip-cyangorge-20260505T130650Z/`.
+  Focused correctness/build gates passed before the A/B:
+  `cargo fmt --check`,
+  `cargo test -p fsqlite-core retained_autocommit_count_sum_cache -- --nocapture`,
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture`,
+  and
+  `cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Result: rejected and reverted. Insert geomean regressed
+  `2.2471x -> 2.4574x`, weighted score regressed `1.6366 -> 1.7698`,
+  and p99 regressed `3.7572x -> 4.0913x`. The target large rows also
+  regressed in absolute FrankenSQLite medians:
+  `large_10col` single-transaction 10K `35.292 ms -> 36.626 ms`, and
+  record-size `large_10col` 10K `36.379 ms -> 36.733 ms`.
+- Do not retry explicit-transaction skipping of retained-autocommit count/sum
+  cache maintenance as a standalone direct INSERT optimization. The cache path
+  is logically redundant for this workload, but the branch/codegen perturbation
+  was not free and the benchmark matrix moved the wrong way.
