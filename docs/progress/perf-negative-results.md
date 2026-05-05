@@ -860,3 +860,46 @@ Primary CASS evidence for the stale-target and false-lead guardrails:
   patch that avoids rebuilding the full record first, or if a profile shows
   `write_page_data` copying itself dominates after connection-level payload
   construction is removed.
+
+## 2026-05-05 - VDBE IntDivide opcode for rowid-bucket GROUP BY
+
+- Target: remaining read-aggregate gap, especially
+  `100 rows / SUM + GROUP BY (~10 groups)`.
+- Touched during rejected candidate: `crates/fsqlite-types/src/opcode.rs`,
+  `crates/fsqlite-vdbe/src/lib.rs`, `crates/fsqlite-vdbe/src/engine.rs`,
+  and `crates/fsqlite-vdbe/src/codegen.rs`.
+- Candidate shape: add a custom `Opcode::IntDivide`, emitted only by
+  `codegen_select_group_by_rowid_bucket_sum`, to fast-path already-integer
+  `rowid / divisor` before falling back to ordinary `Divide` semantics.
+- Evidence:
+  - Correctness:
+    `cargo fmt --check` passed.
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-intdivide-test-target cargo test -p fsqlite-types opcode_ -- --nocapture`
+    passed.
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-intdivide-test-target cargo test -p fsqlite-vdbe rowid_bucket -- --nocapture`
+    passed.
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-intdivide-test-target cargo test -p fsqlite-vdbe divide -- --nocapture`
+    passed.
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-intdivide-test-target cargo test -p fsqlite-vdbe division -- --nocapture`
+    passed.
+  - Same-host A/B reports:
+    `tests/artifacts/perf/read-groupby-intdivide-clean-current-peer-baseline-purplecoast-20260505T082235Z/report.json`
+    and
+    `tests/artifacts/perf/read-groupby-intdivide-candidate-current-peer-purplecoast-20260505T082725Z/report.json`.
+  - Repeat remote run log:
+    `tests/artifacts/perf/read-groupby-intdivide-repeat-purplecoast-20260505T0926Z/run.log`.
+    RCH did not retrieve the ignored `tests/artifacts/.../report.json`, so
+    treat this as corroborating log evidence only, not the primary artifact.
+- Result: rejected and reverted. The same-host read weighted score improved
+  from `0.25776` to `0.24784`, but the targeted FrankenSQLite medians did not
+  justify a new opcode: 100-row group-by improved only `0.022081 ms` to
+  `0.021861 ms`, 1000-row group-by improved only `0.119825 ms` to
+  `0.119293 ms`, and 10000-row group-by regressed from `1.111733 ms` to
+  `1.162087 ms`. The apparent section-score and ratio wins were mostly C
+  SQLite timing noise and unrelated read-single movement, while the remaining
+  100-row group-by gap stayed open.
+- Do not retry this by adding a narrow arithmetic opcode or by special-casing
+  `Divide` dispatch for the rowid-bucket aggregate path. Reconsider only if a
+  fresh bytecode profile proves division dispatch itself dominates the current
+  workload and a same-window A/B improves FrankenSQLite absolute medians at
+  all row counts plus the read-section weighted score.
