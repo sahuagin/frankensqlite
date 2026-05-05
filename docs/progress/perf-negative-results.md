@@ -1696,3 +1696,46 @@ commits. Entries already present in this ledger were not duplicated.
 - Do not retry a simple frame-count threshold around WAL prepared-frame direct
   publication. First prove why the full direct path improved large rows, then
   design a narrower change that does not disturb write-single or B-tree timing.
+
+## 2026-05-05 - CASS strict project-folder follow-up
+
+Scope: user-requested CASS pass restricted to the last 60 days. Direct
+`--workspace /data/projects/frankensqlite` searches for `rejected`,
+`reverted`, `slower`, `didn't help`, `abandoned`, and the misspelling
+`abandones` found only a sparse 2026-03-07 direct-workspace slice and no direct
+negative-term hits. To avoid treating that as an empty history, the follow-up
+used CASS workspace aliases whose source paths clearly map to this repo,
+especially `/home/ubuntu/.gemini/tmp/frankensqlite`, then cross-checked leads
+against preserved perf artifacts before recording them here.
+
+- Session-shared page-1 synthetic hint flag: rejected after the target
+  `SharedTxnPageIo::clear_stale_synthetic_pending_commit_surface` profile stack
+  dropped but `perf-update-delete 10000 100 both` stayed inside noise. Baseline
+  mean was `1.206 s +/- 0.021 s`; candidate v3 mean was
+  `1.204 s +/- 0.025 s` (`1.00 +/- 0.03` faster). Evidence:
+  `tests/artifacts/perf/20260428T2230Z-sapphirecrane-page1-synthetic-flag/RESULT-page1-synthetic-flag.md`.
+  Do not add session-shared page-1 hint state in `Connection` /
+  `SharedTxnPageIo` merely because the narrow stack disappears; require a
+  measurable update/delete matrix win.
+- Unguarded rowid-count helper for larger right tables: this reinforces the
+  existing rowid-count guardrail with a clean local A/B. Removing
+  `ROWID_COUNT_SMALL_RIGHT_ROW_LIMIT` improved only the 100-order HAVING row
+  (`0.2168 ms` to `0.2113 ms`) but regressed the 1000-order HAVING row
+  materially (`1.2285 ms` to `1.6221 ms`) and did not improve the 10000-order
+  row (`10.6338 ms` to `10.7713 ms`). Evidence:
+  `tests/artifacts/perf/join-rowid-count-large-candidate-purplecoast-20260504T2045Z/summary.md`.
+  Do not remove the rowid-count right-table guard without a close join-section
+  A/B that improves all affected row counts or the section score.
+- March raw-`bench_insert` hash-swap/cache experiments are stale evidence, not
+  a keep/retry basis. CASS shows attempts to justify `foldhash` swaps in SQL
+  cache, cursor/hash maps, pager `PageCache`, and `MemPageStore` from the old
+  raw-string `bench_insert` profile while repeated compile churn and background
+  edits prevented a stable current-matrix proof. This reinforces the existing
+  stale-benchmark rule: retry hash-function or dense-index storage changes only
+  from a current prepared-statement matrix/profile, not from old raw SQL-string
+  cache-thrash sessions.
+
+CASS evidence:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 84 -C 60`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-9581ae40.json -n 120 -C 40`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-628c8b17.json -n 90 -C 35`
