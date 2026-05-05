@@ -837,20 +837,16 @@ impl VfsFile for MemoryFile {
                 .map_err(|_| FrankenError::OutOfMemory)?;
         }
 
+        if required_len > storage.data.len() {
+            storage.data.resize(required_len, 0);
+        }
+
         for (offset, data) in normalized_writes {
             let end = offset + data.len();
-            let current_len = storage.data.len();
-            if offset == current_len {
-                storage.data.extend_from_slice(data);
-            } else if end <= current_len {
-                storage.data[offset..end].copy_from_slice(data);
-            } else if offset > current_len {
-                storage.data.resize(offset, 0);
-                storage.data.extend_from_slice(data);
+            if end == storage.data.len() && offset == storage.data.len() - data.len() {
+                storage.data[offset..].copy_from_slice(data);
             } else {
-                let prefix_len = current_len - offset;
-                storage.data[offset..].copy_from_slice(&data[..prefix_len]);
-                storage.data.extend_from_slice(&data[prefix_len..]);
+                storage.data[offset..end].copy_from_slice(data);
             }
         }
         inner.usage.apply_file_change(

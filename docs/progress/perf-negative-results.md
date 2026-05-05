@@ -415,3 +415,30 @@ signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
 - Do not retry as a broad runtime-header extension. Only revisit if two-byte
   patching is isolated to a proven row shape and judged on FrankenSQLite absolute
   time as well as C/FrankenSQLite ratio.
+
+## 2026-05-05 - MemoryVfs contiguous batch append
+
+- Target: insert throughput rows, especially explicit single-transaction
+  `large_10col` and record-size insert rows where profiling showed commit
+  roundtrip dominated by many dirty memory pages.
+- Touched during rejected candidate: `crates/fsqlite-vfs/src/memory.rs`.
+- Candidate shape: keep existing `MemoryFile::write_page_batch` reservation and
+  accounting, but process normalized writes in order so contiguous append
+  suffixes use `Vec::extend_from_slice` instead of resizing the whole final
+  file length to zero and then copying dirty pages over it.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/insert-profile-cyangorge-20260505T044600Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/insert-memoryvfs-batch-append-candidate-cyangorge-20260505T050100Z/report.json`.
+  - Correctness: `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-target cargo test -p fsqlite-vfs write_page_batch -- --nocapture`
+    passed the three focused `write_page_batch` tests.
+- Result: rejected before commit and reverted. Insert-only average ratio
+  worsened from `2.77x` to `3.12x`; `large_10col` 10K single-transaction
+  FrankenSQLite median regressed from `37.81 ms` to `44.58 ms`, and the
+  profile hook showed `commit_roundtrip_ns` for record-size `large_10col`
+  remained essentially unchanged/slightly worse (`15.98 ms` to `16.42 ms`).
+- Do not retry this as a MemoryVfs microcopy cleanup. Reconsider only if a
+  lower-level profile proves `Vec::resize` zero-fill is still a top self-time
+  frame and a close insert-section A/B improves FrankenSQLite absolute medians,
+  not just ratio noise.
