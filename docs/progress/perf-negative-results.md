@@ -36,6 +36,35 @@ sparse. Searched terms included `rejected`, `reverted`, `slower`,
   direct `cass view` inspection of the relevant hits. Refresh CASS before
   repeating this sweep only if newer sessions need to be included.
 
+## 2026-05-05 - Exact-path CASS session-set follow-up
+
+Scope: follow-up to the user request to restrict CASS mining to this project
+folder and the last two months. Because direct
+`--workspace /data/projects/frankensqlite` was sparse and returned at least one
+cross-project false positive, the search first built a session set from CASS
+sessions that explicitly mention `/data/projects/frankensqlite`, then searched
+only those sessions with `--sessions-from` and `--days 60`.
+
+- Session seed command:
+  `cass search '/data/projects/frankensqlite' --days 60 --robot-format sessions --limit 500 --mode lexical`
+  returned `38` session paths in the existing CASS index.
+- Negative terms searched inside that seed set included `rejected`,
+  `reverted`, `slower`, `regressed`, `didn't help`, `did not help`,
+  `abandoned`, `abandones`, `within noise`, `no improvement`, `rollback`,
+  `worse`, and `failed to improve`, plus benchmark/perf phrase combinations.
+- No additional benchmark-rejected performance candidates were found that were
+  not already represented elsewhere in this ledger. The high-signal perf hits
+  led back to existing entries such as stale March hash/cache experiments,
+  page-1 synthetic hint state, WAL/checksum/publication candidates, direct
+  INSERT row-build candidates, and benchmark-policy rejects.
+- Excluded hits were non-perf or non-negative: multi-repo commit grouping
+  summaries, FrankenTUI accessibility sessions indexed under a broad workspace,
+  SHM correctness work with pre-existing harness failures, UNIQUE/quoting bug
+  fixes, and landed feature summaries.
+- Practical rule for future sweeps: prefer this explicit-path session-set
+  method over trusting the exact workspace filter alone, then add only
+  artifact-backed perf rejects or correctness-abandoned optimization attempts.
+
 ## 2026-05-04 - CASS archaeology guardrails
 
 Scope: `cass` searches restricted to FrankenSQLite content since `2026-03-04`,
