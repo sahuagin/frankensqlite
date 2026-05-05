@@ -80,6 +80,65 @@ signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
   roughly `20-25%` slower results. Do not repeat toolchain/profile flag
   exploration for insert throughput unless the profile setup itself changes.
 
+## 2026-05-05 - Additional CASS/artifact-backed rejects to avoid repeating
+
+Scope: follow-up sweep of the last-two-month CASS hits, recent commits, and
+artifact result files for ideas that were measured, rolled back, or explicitly
+kept out of the tree but did not yet have a ledger entry.
+
+- `MemDatabase` row-value `Arc<[SqliteValue]>` container swap: rolled back
+  after the target `perf-update-delete 10000 10 both` run regressed from
+  `264.6 ms +/- 3.9 ms` to `271.5 ms +/- 4.5 ms`, despite passing
+  `rch exec -- cargo check -p fsqlite-vdbe -p fsqlite-core --all-targets`.
+  Evidence: `docs/perf-a1-memdb-row-values-conclusion.md` and commit
+  `0319ea00`. Do not retry shared row-value ownership without an independent
+  snapshot-design reason; the narrower `parse_record_into` destination-slot
+  idea is the only documented fallback, and only if the clone band grows above
+  the ship threshold.
+- Direct INSERT rowid-alias borrow: rejected after a behavior proof passed but
+  alternating A/B runs on `perf-update-delete 10000 50 both` moved median total
+  from `858 ms` to `872 ms` and populate from `412 ms` to `418 ms`. Evidence:
+  `tests/artifacts/perf/20260427T1700Z-azurepine-direct-insert-rowid/RESULT.md`.
+  Do not retry rowid-alias borrowing as the direct INSERT lever.
+- Direct INSERT stateless append hint: rejected after both isolated and
+  current-HEAD comparisons made populate slower by roughly `1-2%`. Evidence:
+  `tests/artifacts/perf/20260427T2005Z-azurepine-direct-insert-stateless-hint/RESULT.md`.
+  Do not retry by dropping retained append-hint page images from explicit
+  transactions unless the B-tree hint contract changes materially.
+- Synthetic page-one hint cache: rejected after `perf-update-delete 10000 100
+  both` median regressed by `5.04%` (`1.2366 s` to `1.2990 s`). Evidence:
+  `tests/artifacts/perf/20260428T034415Z-sapphirecrane-next-profile/RESULT-clear-hint-rejected.md`
+  and commit `f113fe8c`. Keep the predicate-only stale synthetic page-one
+  helper unless a profile proves page-one cleanup dominates a current workload.
+- Prepared direct INSERT expression fast path: rejected after targeted concat
+  and `?N op literal` handling made the same DML workload mean `3.55%` slower
+  while median stayed noise-level. Evidence:
+  `tests/artifacts/perf/20260428T1908Z-sapphirecrane-expr-fast/RESULT-expr-fast-rejected.md`.
+  Do not add expression-shape special cases without an insert-section A/B win.
+- Direct leaf payload writer for prepared INSERT: rejected after the writer
+  callback/exact-size route regressed mean by `2.27%` and median by `1.07%`.
+  Evidence:
+  `tests/artifacts/perf/20260428T1925Z-sapphirecrane-direct-page/RESULT-direct-page-rejected.md`
+  and commit `0743bc17`. This is distinct from the later retained-leaf writer
+  append entry below; both measured the same basic idea as a loss.
+- Direct DML cursor scratch reuse: rejected after interleaved hyperfine showed
+  clean parent `1.262 s` versus scratch-routing patch `1.270 s`. Evidence:
+  `tests/artifacts/perf/20260428T2135Z-sapphirecrane-direct-dml-cursor-scratch/RESULT-direct-dml-cursor-scratch.md`
+  and commit `80777b6b`. Do not retry cursor scratch swaps without a broader
+  cursor-owned mutation scratch API and an update/delete-isolated benchmark.
+- Direct-simple UPDATE/DELETE schema-proof microbatch carry: committed as
+  `4b8151fc` and forward-reverted by `df032429` after measured DML rows and
+  the narrow update/delete profiler regressed. Do not reapply schema-proof carry
+  to direct UPDATE/DELETE unless the validation cost is proven to dominate and
+  the exact DML matrix rows improve.
+- Unguarded grouped join aggregate indexed-cache carry: rejected because it
+  improved only the 100-row grouped case while dense joins regressed badly
+  (`JOIN + GROUP BY` 10K `11.8966 ms` to `14.1428 ms`; `JOIN + HAVING` 10K
+  `10.6338 ms` to `15.4707 ms`). Evidence:
+  `tests/artifacts/perf/join-grouped-index-cache-candidate-purplecoast-20260504T2040Z/summary.md`.
+  Keep the guarded path shape; do not remove the density/table-size guard based
+  on small-row wins alone.
+
 ## 2026-05-05 - Prepared indexed-equality schema microbatch carry
 
 - Target: `Read-After-Write Query Performance`, especially repeated prepared
