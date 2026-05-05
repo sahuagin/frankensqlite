@@ -49,6 +49,35 @@ Primary CASS evidence:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 18`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 10`
 
+## 2026-05-05 - Prepared indexed-equality schema microbatch carry
+
+- Target: `Read-After-Write Query Performance`, especially repeated prepared
+  secondary indexed equality probes.
+- Touched: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: apply the existing prepared-statement microbatch
+  schema-identity carry to `PreparedStatement::try_query_clean_memory_indexed_equality_fast`,
+  mirroring the rowid query-row no-refresh path.
+- Evidence:
+  - Baseline/read context:
+    `tests/artifacts/perf/read-point-pathtrace-cyangorge-20260505T0112Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/read-indexed-equality-microbatch-candidate-cyangorge-20260505T0131Z/report.json`.
+  - Candidate repeat:
+    `tests/artifacts/perf/read-indexed-equality-microbatch-candidate-repeat-cyangorge-20260505T0135Z/report.json`.
+- Result: rejected before commit and reverted. A focused correctness proof
+  showed the no-refresh indexed path could renew then carry the schema epoch,
+  but the e2e read matrix did not produce a clean primary win. The first
+  candidate run worsened the primary weighted score from `2.685x` to `2.995x`.
+  The repeat improved the slowest 100K secondary-index ratio (`48.28x` to
+  `33.06x`) and p90/p99, but still worsened the primary weighted score to
+  `2.779x`; absolute FrankenSQLite secondary medians also regressed at 1K and
+  10K rows.
+- Do not retry the same schema-carry placement inside
+  `try_query_clean_memory_indexed_equality_fast`. Reconsider only if a profile
+  proves schema identity validation dominates repeated secondary probes and a
+  close A/B read-section run improves the primary weighted score and
+  FrankenSQLite absolute medians.
+
 ## 2026-05-05 - SmallText direct-byte Eq/Ord/Hash traits
 
 - Target: `Read-After-Write Query Performance`, especially secondary indexed
