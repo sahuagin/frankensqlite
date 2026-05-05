@@ -658,3 +658,47 @@ kept out of the tree but did not yet have a ledger entry.
   headers. Reconsider only if a lower-level profile proves `Vec::resize`
   zero-fill is a dominant self-time frame and a same-window A/B improves
   FrankenSQLite absolute medians, not just ratio noise against C SQLite.
+
+## 2026-05-05 - VDBE concurrent-context borrow in stale page-one clear
+
+- Target: update/delete write rows where `clear_stale_synthetic_pending_commit_surface`
+  appeared as visible self-time under `SharedTxnPageIo::write_page_internal`.
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs`.
+- Candidate shape: inside `clear_stale_synthetic_pending_commit_surface`, borrow
+  `self.concurrent` once and use `as_ref()` instead of calling
+  `self.concurrent_context()`, avoiding a `ConcurrentContext` clone on every
+  stale synthetic page-one cleanup.
+- Evidence:
+  - Baseline update/delete profiles:
+    `tests/artifacts/perf/update-delete-update-profile-cyangorge-20260505T0824Z/`
+    and
+    `tests/artifacts/perf/update-delete-delete-profile-cyangorge-20260505T0819Z/`.
+  - Candidate profile:
+    `tests/artifacts/perf/update-clear-context-borrow-candidate-cyangorge-20260505T0835Z/`.
+  - Focused A/B:
+    `tests/artifacts/perf/update-clear-context-borrow-ab-cyangorge-20260505T0843Z/hyperfine-update.json`.
+  - Quick update baseline/candidate:
+    `tests/artifacts/perf/update-clear-context-borrow-comprehensive-baseline-cyangorge-20260505T0848Z/report.json`
+    and
+    `tests/artifacts/perf/update-clear-context-borrow-comprehensive-candidate-cyangorge-20260505T0853Z/report.json`.
+  - Quick insert candidate:
+    `tests/artifacts/perf/update-clear-context-borrow-insert-candidate-cyangorge-20260505T0858Z/report.json`,
+    compared against same-code clean insert baseline
+    `tests/artifacts/perf/record-precomputed-append-samewindow-baseline-cyangorge-20260505T0732Z/report.json`.
+  - Correctness:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-current-clean-cyangorge-target-20260505T0815Z RUSTFLAGS='-C force-frame-pointers=yes' cargo test -p fsqlite-vdbe shared_txn_page_io --profile release-perf -- --nocapture`
+    passed in the detached measurement worktree.
+- Result: rejected and reverted. The focused update/delete probe looked
+  promising: `perf-update-delete 10000 40 update` improved from `1969 ns` to
+  `1851 ns` per updated row, the focused hyperfine mean improved about `2.1%`,
+  and the quick update section geomean ratio improved from `3.8912x` to
+  `3.3689x`. The broader insert quick section failed the keep bar: the
+  candidate's insert average ratio worsened from `2.9409x` to `2.9584x`, the
+  geomean worsened from `2.6920x` to `2.7167x`, and FrankenSQLite absolute
+  medians regressed across nearly every insert row, including medium_6col
+  100 rows (`0.432 ms` to `0.572 ms`), small_3col 1000 rows (`1.013 ms` to
+  `1.151 ms`), and record-size large_10col 10K (`34.98 ms` to `37.87 ms`).
+- Do not retry this clone-avoidance borrow change as a standalone hot-path
+  cleanup. Reconsider only if a same-window insert and update A/B both improve
+  FrankenSQLite absolute medians, or if the stale page-one cleanup is isolated
+  away from insert-heavy write paths.
