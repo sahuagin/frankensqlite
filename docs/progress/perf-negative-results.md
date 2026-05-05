@@ -1529,3 +1529,29 @@ commits. Entries already present in this ledger were not duplicated.
   `tests/artifacts/perf/profiling-handoff-20260423T155542Z/hypothesis-ledger.md`.
   Do not spend a perf pass optimizing this in isolation unless a connection
   pool or open-heavy workload is the explicit benchmark target.
+
+## 2026-05-05 - Pager EOF page-lease batch size 8 -> 32
+
+- Target: INSERT throughput, especially large single-transaction rows that
+  allocate about 2K pages and show `page_pool_misses=2013` plus multi-ms B-tree
+  quick-balance/commit time.
+- Touched during rejected candidate: `crates/fsqlite-pager/src/pager.rs`
+  (`PAGE_LEASE_BATCH_SIZE`). Reverted to `8` after measurement.
+- Candidate shape: increase `PAGE_LEASE_BATCH_SIZE` from `8` to `32` so
+  concurrent transactions pre-allocate follow-on EOF pages in larger batches,
+  aiming to reduce repeated `inner` mutex acquisitions during right-edge B-tree
+  splits.
+- Evidence artifacts:
+  `tests/artifacts/perf/page-lease-8-baseline-purplecoast-20260505T1316Z/report.json`
+  and
+  `tests/artifacts/perf/page-lease-32-candidate-purplecoast-20260505T1322Z/report.json`.
+- Result: rejected and reverted. The focused insert matrix worsened overall
+  average ratio from `2.36x` to `2.56x`. Primary large-row medians did not
+  improve: `large_10col` single transaction FSQLite moved `37.57 ms` to
+  `38.27 ms`, and record-size `large_10col` moved `36.99 ms` to `42.37 ms`.
+  Medium 10K single transaction also worsened `14.28 ms` to `15.88 ms`; small
+  10K worsened `7.25 ms` to `7.96 ms`.
+- Do not retry as a standalone larger EOF lease batch. Reconsider only with a
+  page-allocation profile showing `TransactionHandle::allocate_page`
+  inner-lock acquisition dominating and an adaptive policy that preserves or
+  improves the full insert matrix, especially the large record-size row.
