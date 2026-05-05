@@ -105,6 +105,33 @@ path in `crates/fsqlite-core/src/connection.rs`.
   direct UPDATE path unless a fresh profile shows projected record-header parse
   dominating wall time rather than page write, payload copy, or insert setup.
 
+## 2026-05-05 - Direct UPDATE fixed-width REAL payload-range patch
+
+Scope: `perf-update-delete 10000 40 update`, targeting the prepared
+`UPDATE bench SET value = ?2 WHERE id = ?1` direct-simple fixed-width REAL
+path after the one-byte header-offset candidate still left full-payload copy and
+same-size overwrite work in the hot path.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: add a B-tree helper that borrows the current local
+  no-overflow table payload for record-header inspection, plus a second helper
+  that patches only the 8-byte REAL value range in the current leaf payload.
+  The direct UPDATE path used these helpers to avoid `BtCursor::payload_into`
+  and avoid copying the whole payload back through
+  `table_overwrite_current_payload_same_size_no_overflow`.
+- Behavior proof: focused B-tree helper test passed, and
+  `test_direct_simple_update_single_real_column_patches_payload_without_decode`
+  passed after adding an assertion that the fixed-width REAL path performs zero
+  local-payload copy calls.
+- Evidence: paired release-perf hyperfine artifact
+  `tests/artifacts/perf/direct-update-real-range-patch-candidate-cyangorge-20260505T0900Z/hyperfine-update.json`.
+- Result: rejected and reverted. Baseline averaged `348.6 ms +/- 5.7 ms`;
+  candidate averaged `354.1 ms +/- 8.2 ms`, so the unpatched binary was
+  `1.02x +/- 0.03` faster. Do not retry this two-helper payload-range patch as
+  an UPDATE microcopy optimization unless a fresh profile proves payload copy is
+  again dominant and the B-tree helper overhead has been removed or amortized.
+
 ## 2026-05-05 - Additional CASS/artifact-backed rejects to avoid repeating
 
 Scope: follow-up sweep of the last-two-month CASS hits, recent commits, and
@@ -163,6 +190,73 @@ kept out of the tree but did not yet have a ledger entry.
   `tests/artifacts/perf/join-grouped-index-cache-candidate-purplecoast-20260504T2040Z/summary.md`.
   Keep the guarded path shape; do not remove the density/table-size guard based
   on small-row wins alone.
+
+## 2026-05-05 - CASS follow-up: stale targets and older no-retry artifacts
+
+Scope: second CASS sweep restricted to FrankenSQLite last-two-month history,
+using negative-result terms such as `rejected`, `reverted`, `slower`,
+`regressed`, `abandon*`, `did not help`, `within noise`, `worse`, and
+`rollback`, then cross-checking matching repo artifacts before adding entries.
+
+- Pre-prepared-statement benchmark ratios are stale routing evidence, not
+  current engine targets. March CASS records show a large artificial penalty
+  where FrankenSQLite benchmark loops used dynamic `execute(format!(...))`
+  while the C SQLite side used prepared statements; commit
+  `473f82c3 perf(e2e): convert benchmarks to prepared statements for
+  structurally fair comparisons` fixed that class. Do not reuse the old
+  `read_count_star 275x` / read-heavy ratios as current target selection
+  without rerunning the current benchmark matrix. Do not count benchmark-harness
+  rewrites as engine wins unless the asymmetry still exists in current code.
+- Tiny ASCII `lower()` / `upper()` stack-buffering in
+  `crates/fsqlite-func/src/builtins.rs` was rejected after the string-function
+  row failed to show a clean end-to-end win. Evidence:
+  `tests/artifacts/perf/string-small-ascii-case-purplecoast-20260504T1940Z/summary.md`.
+  Do not retry this exact tiny-ASCII case-conversion lever without a cleaner
+  A/B harness and all affected string-function rows improving.
+- JSON path array-index ASCII parsing in
+  `crates/fsqlite-ext-json/src/lib.rs::resolve_path` was rejected. Forward
+  A/B favored baseline (`711.238 ms` vs `731.814 ms`), reverse A/B favored the
+  candidate only noisily (`726.703 ms` vs `717.422 ms`). Evidence:
+  `tests/artifacts/perf/20260428T1845Z-icybluff-json-path-index/RESULT.md`.
+  Do not retry local digit parser specialization for JSON paths unless a
+  process-level benchmark clears the stability bar.
+- WAL frame assembly v2, which built a local 24-byte frame header and appended
+  header plus payload instead of the committed field-by-field helper, was
+  rejected because current-head v1 was slightly faster (`327.444 ms` vs
+  `330.427 ms`). Evidence:
+  `tests/artifacts/perf/20260428T0920Z-icybluff-wal-frame-assembly/RESULT.md`.
+  Keep the existing `push_wal_frame_bytes` shape unless a fresh WAL benchmark
+  shows a real frame-assembly hotspot.
+- WAL checksum `then_aligned_bytes` streaming was rejected as within noise:
+  candidate `329.915 ms` versus baseline `331.209 ms`, a `0.39%` delta inside
+  run sigma. Evidence:
+  `tests/artifacts/perf/20260428T0900Z-icybluff-wal-checksum/RESULT.md`.
+  Do not retry checksum-transform reshaping based on sub-1% microbench movement.
+- B-tree delete sort-record narrowing was rejected. Replacing
+  `(usize, usize, usize)` triples with a compact `CellMove` did not improve the
+  target path; longest check was flat/slower overall (`7885 ms` to `7902 ms`)
+  while delete regressed by about `11.3%`. Evidence:
+  `tests/artifacts/perf/20260427T1855Z-azurepine-btree-sort-record/RESULT.md`.
+  Do not retry by shrinking the carried sort record width alone.
+- Compact table-leaf delete sub-ideas: deferred scratch reuse and unrefined
+  physical-neighbor delete were both rejected while the refined accepted path
+  was kept. Deferred scratch reuse showed no measured win, and applying the
+  physical-neighbor path to all compact leaves regressed delete-only. Evidence:
+  `tests/artifacts/perf/20260427T2348Z-snowyfortress-next-hotspot/RESULT.md`.
+  Do not replace the cheaper descending fast path or reintroduce scratch reuse
+  without a delete-only win.
+- Profile-pass hypotheses rejected as primary causes: syscall I/O and
+  lock/futex contention were explicitly ruled out as first targets. Evidence:
+  `tests/artifacts/perf/20260424T212631Z-profile-pass/HYPOTHESIS_LEDGER.md`
+  and `tests/artifacts/perf/20260424T212631Z-profile-pass/REPORT.md`.
+  For mixed/insert OLTP, start from row materialization, decode, cursor
+  traversal, commit maintenance, memdb reload, and snapshot cloning before
+  spending another pass on syscall or futex tuning.
+
+Primary CASS evidence for the stale-target and false-lead guardrails:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-84f3c374.json -n 42 -C 12`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 24`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 28`
 
 ## 2026-05-05 - Direct INSERT transient heap TEXT pooling
 
