@@ -3147,6 +3147,7 @@ struct GroupByRowidBucketSumPlan {
     group_out_idx: usize,
     sum_out_idx: usize,
     sum_col_idx: usize,
+    direct_real_sum: bool,
 }
 
 fn rowid_bucket_divisor(
@@ -3232,12 +3233,17 @@ fn simple_group_by_rowid_bucket_sum_plan(
             _ => return None,
         }
     }
+    let sum_col_idx = sum_col_idx?;
+    let sum_col = table.columns.get(sum_col_idx)?;
+    let direct_real_sum =
+        sum_col.notnull && !sum_col.is_ipk && matches!(sum_col.affinity, 'E' | 'e');
 
     Some(GroupByRowidBucketSumPlan {
         group_divisor,
         group_out_idx: group_out_idx?,
         sum_out_idx: sum_out_idx?,
-        sum_col_idx: sum_col_idx?,
+        sum_col_idx,
+        direct_real_sum,
     })
 }
 
@@ -3624,7 +3630,11 @@ fn codegen_select_group_by_rowid_bucket_sum(
         0,
     );
     b.emit_op(Opcode::Null, 0, prev_key_reg, 0, P4::None, 0);
-    b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+    if plan.direct_real_sum {
+        b.emit_op(Opcode::Real, 0, sum_accum_reg, 0, P4::Real(0.0), 0);
+    } else {
+        b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Integer, 0, have_group_reg, 0, P4::None, 0);
 
     let finalize_label = b.emit_label();
@@ -3666,18 +3676,24 @@ fn codegen_select_group_by_rowid_bucket_sum(
     b.emit_jump_to_label(Opcode::Goto, 0, 0, same_group_label, P4::None, 0);
 
     b.resolve_label(new_group_label);
-    b.emit_op(
-        Opcode::AggFinal,
-        sum_accum_reg,
-        1,
-        0,
-        P4::FuncName("SUM".to_owned()),
-        0,
-    );
+    if !plan.direct_real_sum {
+        b.emit_op(
+            Opcode::AggFinal,
+            sum_accum_reg,
+            1,
+            0,
+            P4::FuncName("SUM".to_owned()),
+            0,
+        );
+    }
     b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, sum_accum_reg, sum_out_reg, 0, P4::None, 0);
     b.emit_op(Opcode::ResultRow, out_regs, 2, 0, P4::None, 0);
-    b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+    if plan.direct_real_sum {
+        b.emit_op(Opcode::Real, 0, sum_accum_reg, 0, P4::Real(0.0), 0);
+    } else {
+        b.emit_op(Opcode::Null, 0, sum_accum_reg, 0, P4::None, 0);
+    }
 
     b.resolve_label(first_row_label);
     b.emit_op(Opcode::Integer, 1, have_group_reg, 0, P4::None, 0);
@@ -3692,14 +3708,25 @@ fn codegen_select_group_by_rowid_bucket_sum(
         P4::None,
         0,
     );
-    b.emit_op(
-        Opcode::AggStep,
-        0,
-        sum_arg_reg,
-        sum_accum_reg,
-        P4::FuncName("SUM".to_owned()),
-        1,
-    );
+    if plan.direct_real_sum {
+        b.emit_op(
+            Opcode::Add,
+            sum_arg_reg,
+            sum_accum_reg,
+            sum_accum_reg,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_op(
+            Opcode::AggStep,
+            0,
+            sum_arg_reg,
+            sum_accum_reg,
+            P4::FuncName("SUM".to_owned()),
+            1,
+        );
+    }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let scan_body = (scan_start + 1) as i32;
@@ -3718,14 +3745,16 @@ fn codegen_select_group_by_rowid_bucket_sum(
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
     b.resolve_label(output_final_label);
-    b.emit_op(
-        Opcode::AggFinal,
-        sum_accum_reg,
-        1,
-        0,
-        P4::FuncName("SUM".to_owned()),
-        0,
-    );
+    if !plan.direct_real_sum {
+        b.emit_op(
+            Opcode::AggFinal,
+            sum_accum_reg,
+            1,
+            0,
+            P4::FuncName("SUM".to_owned()),
+            0,
+        );
+    }
     b.emit_op(Opcode::Copy, prev_key_reg, group_reg, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, sum_accum_reg, sum_out_reg, 0, P4::None, 0);
     b.emit_op(Opcode::ResultRow, out_regs, 2, 0, P4::None, 0);
@@ -28648,7 +28677,7 @@ mod tests {
         let group_expr = Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
             op: AstBinaryOp::Divide,
-            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            right: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
             span: Span::ZERO,
         };
         let stmt = SelectStatement {
@@ -28726,6 +28755,97 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.p4, P4::Int64(value) if value == 10)),
             "fast path should encode the bucket divisor literal"
+        );
+    }
+
+    #[test]
+    fn test_codegen_group_by_rowid_bucket_sum_real_not_null_uses_direct_accumulator() {
+        let group_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("id"), Span::ZERO)),
+            op: AstBinaryOp::Divide,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: group_expr.clone(),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "sum".to_owned(),
+                                args: FunctionArgs::List(vec![Expr::Column(
+                                    ColumnRef::bare("value"),
+                                    Span::ZERO,
+                                )]),
+                                distinct: false,
+                                order_by: vec![],
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("bench")),
+                    where_clause: None,
+                    group_by: vec![group_expr],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let mut schema = test_small_bench_schema();
+        schema[0].columns[2].notnull = true;
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            !prog
+                .ops()
+                .iter()
+                .any(|op| matches!(op.opcode, Opcode::AggStep | Opcode::AggFinal)),
+            "REAL NOT NULL rowid-bucket SUM should avoid generic aggregate dispatch"
+        );
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead,
+                Opcode::Real,
+                Opcode::Rowid,
+                Opcode::Divide,
+                Opcode::Add,
+                Opcode::ResultRow,
+                Opcode::Halt,
+            ]
+        ));
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| matches!(op.p4, P4::Real(value) if value == 0.0)),
+            "direct accumulator should initialize SUM with a REAL zero"
+        );
+
+        let rows =
+            execute_codegen_select_with_storage_cursor(&stmt, &schema, seed_small_bench_db(7));
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(0), SqliteValue::Float(12.0)],
+                vec![SqliteValue::Integer(1), SqliteValue::Float(39.0)],
+                vec![SqliteValue::Integer(2), SqliteValue::Float(19.0)],
+            ]
         );
     }
 
