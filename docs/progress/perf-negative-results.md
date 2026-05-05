@@ -1895,3 +1895,39 @@ CASS evidence:
 - Do not retry this simple `Arc::make_mut` hoist as a standalone WAL
   publication optimization. The branch looked mechanically cheaper, but the
   current end-to-end insert matrix rejected it.
+
+## 2026-05-05 - Direct INSERT precomputed column affinities
+
+- Target: direct-simple INSERT row value handling in
+  `crates/fsqlite-core/src/connection.rs`, after perf showed visible time in
+  `push_prepared_direct_simple_insert_value` / `SqliteValue::apply_affinity`
+  on the insert matrix.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after measurement.
+- Candidate shape: add `column_affinities: Vec<TypeAffinity>` to
+  `PreparedDirectSimpleInsert`, compute it once during
+  `prepared_direct_simple_insert_plan`, and pass the precomputed enum to
+  `push_prepared_direct_simple_insert_value` instead of calling
+  `type_affinity_for_direct_insert(column.affinity)` for every inserted column.
+- Correctness smoke passed:
+  `cargo fmt --check` and
+  `env CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p fsqlite-core prepared_direct_simple_insert -- --nocapture`
+  (`28` matching tests).
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-insert-precomputed-affinity-cyangorge-20260505T1525Z/baseline-report.json`
+  and
+  `tests/artifacts/perf/direct-insert-precomputed-affinity-cyangorge-20260505T1525Z/candidate-report.json`.
+  Summary:
+  `tests/artifacts/perf/direct-insert-precomputed-affinity-cyangorge-20260505T1525Z/summary.md`.
+- Result: rejected. The primary weighted insert score regressed
+  `1.5606 -> 1.8360`, avg/geomean ratios regressed
+  `2.3295x -> 2.5739x` and `2.2311x -> 2.4638x`, write_bulk geomean
+  regressed `2.3883x -> 2.6058x`, and write_single geomean regressed
+  `1.3542x -> 1.6338x`. The target large-row row-build counters did not
+  improve reliably: `large_10col` single txn row_build_ns was essentially flat
+  (`6114165 -> 6115810`), while record-size `large_10col` worsened
+  (`5951537 -> 6813546`).
+- Do not retry precomputing direct INSERT column affinity metadata as a
+  standalone micro-optimization. The per-row char-to-affinity match is not the
+  bottleneck; future affinity work should remove or fuse value coercion itself
+  and must improve the same-window insert matrix.
