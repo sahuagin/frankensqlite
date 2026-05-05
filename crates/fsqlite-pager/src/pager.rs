@@ -48,9 +48,9 @@ use fsqlite_wal::{
     ParallelWalFallbackReason, ParallelWalLaneBatch, ParallelWalLaneStager,
     ParallelWalOperatingMode, ParallelWalShadowVerdict, RecoveryFence, SubmitOutcome,
     TransactionConflictSnapshot, TransactionFrameBatch, TransactionFrameBatchContext, WalFile,
-    WalGenerationIdentity, parallel_wal_fallback_reason_name, parallel_wal_mode_name,
-    parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
-    resolve_parallel_wal_control_surface_from_env,
+    WalGenerationIdentity, detailed_consolidation_metrics_enabled,
+    parallel_wal_fallback_reason_name, parallel_wal_mode_name, parallel_wal_shadow_verdict_name,
+    parallel_wal_should_shadow_compare, resolve_parallel_wal_control_surface_from_env,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -66,6 +66,13 @@ fn prefetch_l1_read<T>(ptr: *const T) {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
 fn prefetch_l1_read<T>(_ptr: *const T) {}
+
+#[inline]
+fn elapsed_profile_us(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| {
+        u64::try_from(Instant::now().duration_since(start).as_micros()).unwrap_or(u64::MAX)
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Group Commit Queue (D1: replaces global WAL_APPEND_GATES mutex)
@@ -7021,14 +7028,20 @@ where
         // The caller supplies the Phase A snapshot so production commits do not
         // re-acquire the pager mutex before entering the group-commit queue.
 
+        let detailed_metrics = detailed_consolidation_metrics_enabled();
+        let t_batch_build_start = detailed_metrics.then(Instant::now);
         let (batch, _our_new_db_size) =
             match build_group_commit_batch(current_db_size, write_set, write_pages_sorted)? {
                 Some(b) => b,
                 None => return Ok(()), // Nothing to commit
             };
+        let batch_build_us = elapsed_profile_us(t_batch_build_start);
+
+        let t_conflict_snapshot_start = detailed_metrics.then(Instant::now);
         let conflict_snapshot =
             with_wal_backend_read(wal_backend, |wal| Ok(wal.pinned_read_snapshot()))?;
         let batch = attach_group_commit_conflict_metadata(batch, conflict_pages, conflict_snapshot);
+        let conflict_snapshot_us = elapsed_profile_us(t_conflict_snapshot_start);
 
         let parallel_wal_control = queue.parallel_wal_control().clone();
         let batch_id = queue.next_parallel_wal_batch_id();
@@ -7062,15 +7075,19 @@ where
             staging_elapsed_ns: 0,
         });
 
+        let mut lane_prepare_us = 0;
         if staging_fallback_reason.is_none() {
-            if let Some(staged_prepared) = prepare_group_commit_batch_for_lane(
+            let t_lane_prepare_start = detailed_metrics.then(Instant::now);
+            let staged_prepared = prepare_group_commit_batch_for_lane(
                 cx,
                 wal_backend,
                 &batch,
                 batch_id,
                 lane_id,
                 &parallel_wal_control,
-            )? {
+            )?;
+            lane_prepare_us = elapsed_profile_us(t_lane_prepare_start);
+            if let Some(staged_prepared) = staged_prepared {
                 let staged_frame_count = staged_prepared.staged_frame_count;
                 let staging_elapsed_ns = staged_prepared.staging_elapsed_ns;
                 lane_shadow_verdict = staged_prepared.shadow_verdict;
@@ -7253,6 +7270,7 @@ where
                     flush
                 };
 
+                let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
                 if !conflicting_pages.is_empty() {
                     let flush_batch_membership = physical_writer_batch_membership(&batches);
@@ -7452,6 +7470,7 @@ where
                     })?;
                     prepared_batch = prepared;
                 }
+                let flush_frame_prep_us = elapsed_profile_us(t_flush_frame_prep_start);
                 GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
                     u64::try_from(batch_count).unwrap_or(u64::MAX),
                     AtomicOrdering::Relaxed,
@@ -7462,6 +7481,8 @@ where
                 let mut inner_lock_wait_us: u64 = 0;
                 let mut exclusive_lock_us: u64 = 0;
                 let mut wal_append_us: u64 = 0;
+                let mut append_conflict_check_us: u64 = 0;
+                let mut append_frames_us: u64 = 0;
                 let mut wal_sync_us: u64 = 0;
                 let mut frames_written_start: u64 = 0;
                 let mut frames_written_end: u64 = 0;
@@ -7504,8 +7525,12 @@ where
                                 frames_written_start = u64::try_from(wal.frame_count())
                                     .unwrap_or(u64::MAX)
                                     .saturating_add(1);
+                                let t_append_conflict_check_start =
+                                    detailed_metrics.then(Instant::now);
                                 let stale_conflict_pages =
                                     conflicting_pages_since_batch_snapshots(cx, wal, &batches)?;
+                                append_conflict_check_us =
+                                    elapsed_profile_us(t_append_conflict_check_start);
                                 if !stale_conflict_pages.is_empty() {
                                     return Err(FrankenError::BusySnapshot {
                                         conflicting_pages: stale_conflict_pages
@@ -7515,11 +7540,13 @@ where
                                             .join(","),
                                     });
                                 }
+                                let t_append_frames_start = detailed_metrics.then(Instant::now);
                                 if let Some(prepared) = prepared_batch.as_mut() {
                                     wal.append_prepared_frames(cx, prepared)?;
                                 } else {
                                     wal.append_frames(cx, &frame_refs)?;
                                 }
+                                append_frames_us = elapsed_profile_us(t_append_frames_start);
                                 frames_written_end =
                                     u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
                                 Ok(())
@@ -7617,6 +7644,20 @@ where
                                 AtomicOrdering::Relaxed,
                             );
 
+                        if detailed_metrics {
+                            if record_initial_metrics {
+                                GLOBAL_CONSOLIDATION_METRICS.record_prepare_breakdown(
+                                    batch_build_us,
+                                    conflict_snapshot_us,
+                                    lane_prepare_us,
+                                );
+                            }
+                            GLOBAL_CONSOLIDATION_METRICS.record_flush_breakdown(
+                                flush_frame_prep_us,
+                                append_conflict_check_us,
+                                append_frames_us,
+                            );
+                        }
                         GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
                             if record_initial_metrics {
                                 prepare_us
@@ -7866,6 +7907,13 @@ where
                             );
                         }
                         // Record phase timing for waiter
+                        if detailed_metrics {
+                            GLOBAL_CONSOLIDATION_METRICS.record_prepare_breakdown(
+                                batch_build_us,
+                                conflict_snapshot_us,
+                                lane_prepare_us,
+                            );
+                        }
                         GLOBAL_CONSOLIDATION_METRICS.record_phase_timing(
                             prepare_us,
                             consolidator_lock_wait_us,

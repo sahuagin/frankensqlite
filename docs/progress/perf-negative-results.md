@@ -2222,3 +2222,30 @@ CASS evidence:
   `WalChecksumTransform::for_wal_frame` as a standalone micro-optimization.
   Future WAL checksum work should reduce the payload transform or prepared-frame
   pipeline cost and must improve the full insert matrix.
+
+## 2026-05-05 - Defaulting INSERT commits to parallel WAL auto lane staging
+
+- Target: default conservative WAL group-commit path for `:memory:` INSERT
+  workloads, after detailed commit profiling split phase B into batch-build,
+  flusher frame-prep, and append-call costs.
+- Candidate shape: use `FSQLITE_PARALLEL_WAL_MODE=auto` as the behavior proxy
+  for changing the default from conservative WAL staging to lane-local prepared
+  WAL staging. No source behavior change was kept.
+- Evidence artifacts:
+  - Default/conservative current-code run:
+    `tests/artifacts/perf/insert-commit-phase-split-gated-cyangorge-20260505T2058Z/report.json`
+    and
+    `tests/artifacts/perf/insert-commit-phase-split-gated-cyangorge-20260505T2058Z/summary.md`.
+  - Auto-lane candidate run:
+    `tests/artifacts/perf/insert-commit-phase-split-auto-cyangorge-20260505T2050Z/report.json`
+    and
+    `tests/artifacts/perf/insert-commit-phase-split-auto-cyangorge-20260505T2050Z/summary.md`.
+- Result: rejected. Auto mode regressed the insert matrix average ratio
+  `2.51x -> 2.86x`, geomean `2.42x -> 2.65x`, primary weighted score
+  `1.7652 -> 2.0219`, and p99 ratio `3.95x -> 6.15x`. The large-row
+  record-size ratio improved in this noisy quick run (`3.95x -> 3.74x`), but
+  the whole matrix and write-single category rejected a default-mode switch.
+- Do not switch the default WAL path from conservative to auto lane staging as
+  a standalone INSERT optimization. Revisit only with a selective policy that
+  improves the same-window insert matrix and preserves the lane-staging
+  correctness/shadow-compare contract.

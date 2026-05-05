@@ -2438,6 +2438,10 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
     }
 }
 
+fn metric_delta(after: u64, before: u64) -> u64 {
+    after.saturating_sub(before)
+}
+
 fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
     let conn = fsqlite::Connection::open(":memory:").unwrap();
     apply_pragmas_fsqlite(&conn);
@@ -2449,6 +2453,9 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
     let setup_start = Instant::now();
     fs_execute(&conn, record_size.create_table_sql());
     let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    reset_hot_path_profile();
+    let wal_before = fsqlite_wal::wal_telemetry_snapshot();
 
     let begin_start = Instant::now();
     fs_execute(&conn, "BEGIN");
@@ -2469,11 +2476,125 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
     fs_execute(&conn, "COMMIT");
     let commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
 
+    let wal_after = fsqlite_wal::wal_telemetry_snapshot();
+    let wal_frames = metric_delta(
+        wal_after.wal.frames_written_total,
+        wal_before.wal.frames_written_total,
+    );
+    let wal_bytes = metric_delta(
+        wal_after.wal.bytes_written_total,
+        wal_before.wal.bytes_written_total,
+    );
+    let wal_group_commits = metric_delta(
+        wal_after.group_commit.group_commits_total,
+        wal_before.group_commit.group_commits_total,
+    );
+    let wal_group_commit_size_sum = metric_delta(
+        wal_after.group_commit.group_commit_size_sum,
+        wal_before.group_commit.group_commit_size_sum,
+    );
+    let wal_group_commit_latency_us = metric_delta(
+        wal_after.group_commit.commit_latency_us_total,
+        wal_before.group_commit.commit_latency_us_total,
+    );
+    let commit_prepare_us = metric_delta(
+        wal_after.consolidation.prepare_us_total,
+        wal_before.consolidation.prepare_us_total,
+    );
+    let commit_batch_build_us = metric_delta(
+        wal_after.consolidation.batch_build_us_total,
+        wal_before.consolidation.batch_build_us_total,
+    );
+    let commit_conflict_snapshot_us = metric_delta(
+        wal_after.consolidation.conflict_snapshot_us_total,
+        wal_before.consolidation.conflict_snapshot_us_total,
+    );
+    let commit_lane_prepare_us = metric_delta(
+        wal_after.consolidation.lane_prepare_us_total,
+        wal_before.consolidation.lane_prepare_us_total,
+    );
+    let commit_consolidator_lock_wait_us = metric_delta(
+        wal_after.consolidation.consolidator_lock_wait_us_total,
+        wal_before.consolidation.consolidator_lock_wait_us_total,
+    );
+    let commit_consolidator_flushing_wait_us = metric_delta(
+        wal_after.consolidation.consolidator_flushing_wait_us_total,
+        wal_before.consolidation.consolidator_flushing_wait_us_total,
+    );
+    let commit_flusher_arrival_wait_us = metric_delta(
+        wal_after.consolidation.flusher_arrival_wait_us_total,
+        wal_before.consolidation.flusher_arrival_wait_us_total,
+    );
+    let commit_wal_backend_lock_wait_us = metric_delta(
+        wal_after.consolidation.inner_lock_wait_us_total,
+        wal_before.consolidation.inner_lock_wait_us_total,
+    );
+    let commit_exclusive_lock_us = metric_delta(
+        wal_after.consolidation.exclusive_lock_us_total,
+        wal_before.consolidation.exclusive_lock_us_total,
+    );
+    let commit_wal_append_us = metric_delta(
+        wal_after.consolidation.wal_append_us_total,
+        wal_before.consolidation.wal_append_us_total,
+    );
+    let commit_flush_frame_prep_us = metric_delta(
+        wal_after.consolidation.flush_frame_prep_us_total,
+        wal_before.consolidation.flush_frame_prep_us_total,
+    );
+    let commit_append_conflict_check_us = metric_delta(
+        wal_after.consolidation.append_conflict_check_us_total,
+        wal_before.consolidation.append_conflict_check_us_total,
+    );
+    let commit_append_frames_us = metric_delta(
+        wal_after.consolidation.append_frames_us_total,
+        wal_before.consolidation.append_frames_us_total,
+    );
+    let commit_wal_sync_us = metric_delta(
+        wal_after.consolidation.wal_sync_us_total,
+        wal_before.consolidation.wal_sync_us_total,
+    );
+    let commit_waiter_epoch_wait_us = metric_delta(
+        wal_after.consolidation.waiter_epoch_wait_us_total,
+        wal_before.consolidation.waiter_epoch_wait_us_total,
+    );
+    let commit_flusher_commits = metric_delta(
+        wal_after.consolidation.flusher_commits,
+        wal_before.consolidation.flusher_commits,
+    );
+    let commit_waiter_commits = metric_delta(
+        wal_after.consolidation.waiter_commits,
+        wal_before.consolidation.waiter_commits,
+    );
+    let commit_phase_a_us = metric_delta(
+        wal_after.consolidation.commit_phase_a_us_total,
+        wal_before.consolidation.commit_phase_a_us_total,
+    );
+    let commit_phase_b_us = metric_delta(
+        wal_after.consolidation.commit_phase_b_us_total,
+        wal_before.consolidation.commit_phase_b_us_total,
+    );
+    let commit_phase_c1_us = metric_delta(
+        wal_after.consolidation.commit_phase_c1_us_total,
+        wal_before.consolidation.commit_phase_c1_us_total,
+    );
+    let commit_phase_c2_us = metric_delta(
+        wal_after.consolidation.commit_phase_c2_us_total,
+        wal_before.consolidation.commit_phase_c2_us_total,
+    );
+    let commit_phase_count = metric_delta(
+        wal_after.consolidation.commit_phase_count,
+        wal_before.consolidation.commit_phase_count,
+    );
+    let commit_flusher_lock_wait_us = commit_consolidator_flushing_wait_us
+        .saturating_add(commit_wal_backend_lock_wait_us)
+        .saturating_add(commit_exclusive_lock_us);
+    let commit_wal_service_us = commit_wal_append_us.saturating_add(commit_wal_sync_us);
+
     let profile = hot_path_profile_snapshot();
     set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
 
     eprintln!(
-        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} btree_leaf_payload_appends={} btree_leaf_payload_mutate_ns={} btree_leaf_payload_stage_ns={} btree_leaf_full_cell_appends={} btree_leaf_full_cell_mutate_ns={} btree_leaf_full_cell_stage_ns={} btree_quick_balance_attempts={} btree_quick_balance_hits={} btree_quick_balance_ns={} btree_local_split_attempts={} btree_local_split_hits={} btree_local_split_ns={} btree_nonroot_balance_calls={} btree_nonroot_balance_ns={} btree_no_split_reuse_hits={} btree_conservative_reloads={} btree_page_header_rebuilds={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={} wal_frames={} wal_bytes={} wal_group_commits={} wal_group_commit_size_sum={} wal_group_commit_latency_us={} commit_prepare_us={} commit_batch_build_us={} commit_conflict_snapshot_us={} commit_lane_prepare_us={} commit_consolidator_lock_wait_us={} commit_consolidator_flushing_wait_us={} commit_flusher_arrival_wait_us={} commit_wal_backend_lock_wait_us={} commit_exclusive_lock_us={} commit_wal_append_us={} commit_flush_frame_prep_us={} commit_append_conflict_check_us={} commit_append_frames_us={} commit_wal_sync_us={} commit_waiter_epoch_wait_us={} commit_flusher_commits={} commit_waiter_commits={} commit_phase_a_us={} commit_phase_b_us={} commit_phase_c1_us={} commit_phase_c2_us={} commit_phase_count={} commit_flusher_lock_wait_us={} commit_wal_service_us={}",
         label,
         record_size.name(),
         profile.prepared_direct_insert_executions,
@@ -2537,6 +2658,35 @@ fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
         profile.vdbe.opcodes_executed_total,
         profile.vdbe.statements_total,
         profile.vdbe.make_record_calls_total,
+        wal_frames,
+        wal_bytes,
+        wal_group_commits,
+        wal_group_commit_size_sum,
+        wal_group_commit_latency_us,
+        commit_prepare_us,
+        commit_batch_build_us,
+        commit_conflict_snapshot_us,
+        commit_lane_prepare_us,
+        commit_consolidator_lock_wait_us,
+        commit_consolidator_flushing_wait_us,
+        commit_flusher_arrival_wait_us,
+        commit_wal_backend_lock_wait_us,
+        commit_exclusive_lock_us,
+        commit_wal_append_us,
+        commit_flush_frame_prep_us,
+        commit_append_conflict_check_us,
+        commit_append_frames_us,
+        commit_wal_sync_us,
+        commit_waiter_epoch_wait_us,
+        commit_flusher_commits,
+        commit_waiter_commits,
+        commit_phase_a_us,
+        commit_phase_b_us,
+        commit_phase_c1_us,
+        commit_phase_c2_us,
+        commit_phase_count,
+        commit_flusher_lock_wait_us,
+        commit_wal_service_us,
     );
 }
 

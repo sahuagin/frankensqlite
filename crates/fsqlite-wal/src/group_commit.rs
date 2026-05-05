@@ -51,6 +51,26 @@ use tracing::{debug, info, trace};
 
 use crate::wal::{WalAppendFrameRef, WalFile};
 
+fn env_flag_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
+/// Whether expensive per-substep consolidation timing is enabled.
+#[must_use]
+pub fn detailed_consolidation_metrics_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("FSQLITE_WAL_DETAILED_COMMIT_METRICS")
+            .is_ok_and(|value| env_flag_enabled(&value))
+            || std::env::var("FSQLITE_BENCH_PROFILE_INSERT")
+                .is_ok_and(|value| env_flag_enabled(&value))
+    });
+    *ENABLED
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -484,6 +504,12 @@ pub struct ConsolidationMetrics {
     // ── Phase timing instrumentation ──
     /// Time building batch before entering consolidator (microseconds).
     pub prepare_us_total: AtomicU64,
+    /// Time cloning staged pages into an owned group-commit batch (microseconds).
+    pub batch_build_us_total: AtomicU64,
+    /// Time pinning WAL conflict snapshot and attaching metadata (microseconds).
+    pub conflict_snapshot_us_total: AtomicU64,
+    /// Time spent preparing lane-local WAL frame bytes (microseconds).
+    pub lane_prepare_us_total: AtomicU64,
     /// Time waiting to acquire consolidator.lock() (microseconds).
     pub consolidator_lock_wait_us_total: AtomicU64,
     /// Time waiting while consolidator phase == FLUSHING (microseconds).
@@ -496,6 +522,12 @@ pub struct ConsolidationMetrics {
     pub exclusive_lock_us_total: AtomicU64,
     /// Time in WAL append_frames (microseconds).
     pub wal_append_us_total: AtomicU64,
+    /// Time preparing flusher frame refs and prepared batches (microseconds).
+    pub flush_frame_prep_us_total: AtomicU64,
+    /// Time checking stale WAL conflicts immediately before append (microseconds).
+    pub append_conflict_check_us_total: AtomicU64,
+    /// Time spent in the WAL append call itself (microseconds).
+    pub append_frames_us_total: AtomicU64,
     /// Time in WAL sync/fsync (microseconds).
     pub wal_sync_us_total: AtomicU64,
     /// Time waiters spend waiting for epoch completion (microseconds).
@@ -556,12 +588,18 @@ impl ConsolidationMetrics {
             busy_retries: AtomicU64::new(0),
             // Phase timing
             prepare_us_total: AtomicU64::new(0),
+            batch_build_us_total: AtomicU64::new(0),
+            conflict_snapshot_us_total: AtomicU64::new(0),
+            lane_prepare_us_total: AtomicU64::new(0),
             consolidator_lock_wait_us_total: AtomicU64::new(0),
             consolidator_flushing_wait_us_total: AtomicU64::new(0),
             flusher_arrival_wait_us_total: AtomicU64::new(0),
             inner_lock_wait_us_total: AtomicU64::new(0),
             exclusive_lock_us_total: AtomicU64::new(0),
             wal_append_us_total: AtomicU64::new(0),
+            flush_frame_prep_us_total: AtomicU64::new(0),
+            append_conflict_check_us_total: AtomicU64::new(0),
+            append_frames_us_total: AtomicU64::new(0),
             wal_sync_us_total: AtomicU64::new(0),
             waiter_epoch_wait_us_total: AtomicU64::new(0),
             flusher_commits: AtomicU64::new(0),
@@ -609,6 +647,36 @@ impl ConsolidationMetrics {
     /// Record a flush retry triggered by a transient busy error.
     pub fn record_busy_retry(&self) {
         self.busy_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record pre-queue commit preparation breakdown.
+    pub fn record_prepare_breakdown(
+        &self,
+        batch_build_us: u64,
+        conflict_snapshot_us: u64,
+        lane_prepare_us: u64,
+    ) {
+        self.batch_build_us_total
+            .fetch_add(batch_build_us, Ordering::Relaxed);
+        self.conflict_snapshot_us_total
+            .fetch_add(conflict_snapshot_us, Ordering::Relaxed);
+        self.lane_prepare_us_total
+            .fetch_add(lane_prepare_us, Ordering::Relaxed);
+    }
+
+    /// Record flusher-side frame preparation and append breakdown.
+    pub fn record_flush_breakdown(
+        &self,
+        flush_frame_prep_us: u64,
+        append_conflict_check_us: u64,
+        append_frames_us: u64,
+    ) {
+        self.flush_frame_prep_us_total
+            .fetch_add(flush_frame_prep_us, Ordering::Relaxed);
+        self.append_conflict_check_us_total
+            .fetch_add(append_conflict_check_us, Ordering::Relaxed);
+        self.append_frames_us_total
+            .fetch_add(append_frames_us, Ordering::Relaxed);
     }
 
     /// Record phase timing for a commit operation.
@@ -717,6 +785,9 @@ impl ConsolidationMetrics {
             busy_retries: self.busy_retries.load(Ordering::Relaxed),
             // Phase timing
             prepare_us_total: self.prepare_us_total.load(Ordering::Relaxed),
+            batch_build_us_total: self.batch_build_us_total.load(Ordering::Relaxed),
+            conflict_snapshot_us_total: self.conflict_snapshot_us_total.load(Ordering::Relaxed),
+            lane_prepare_us_total: self.lane_prepare_us_total.load(Ordering::Relaxed),
             consolidator_lock_wait_us_total: self
                 .consolidator_lock_wait_us_total
                 .load(Ordering::Relaxed),
@@ -729,6 +800,11 @@ impl ConsolidationMetrics {
             inner_lock_wait_us_total: self.inner_lock_wait_us_total.load(Ordering::Relaxed),
             exclusive_lock_us_total: self.exclusive_lock_us_total.load(Ordering::Relaxed),
             wal_append_us_total: self.wal_append_us_total.load(Ordering::Relaxed),
+            flush_frame_prep_us_total: self.flush_frame_prep_us_total.load(Ordering::Relaxed),
+            append_conflict_check_us_total: self
+                .append_conflict_check_us_total
+                .load(Ordering::Relaxed),
+            append_frames_us_total: self.append_frames_us_total.load(Ordering::Relaxed),
             wal_sync_us_total: self.wal_sync_us_total.load(Ordering::Relaxed),
             waiter_epoch_wait_us_total: self.waiter_epoch_wait_us_total.load(Ordering::Relaxed),
             flusher_commits: self.flusher_commits.load(Ordering::Relaxed),
@@ -764,6 +840,9 @@ impl ConsolidationMetrics {
         self.busy_retries.store(0, Ordering::Relaxed);
         // Phase timing
         self.prepare_us_total.store(0, Ordering::Relaxed);
+        self.batch_build_us_total.store(0, Ordering::Relaxed);
+        self.conflict_snapshot_us_total.store(0, Ordering::Relaxed);
+        self.lane_prepare_us_total.store(0, Ordering::Relaxed);
         self.consolidator_lock_wait_us_total
             .store(0, Ordering::Relaxed);
         self.consolidator_flushing_wait_us_total
@@ -773,6 +852,10 @@ impl ConsolidationMetrics {
         self.inner_lock_wait_us_total.store(0, Ordering::Relaxed);
         self.exclusive_lock_us_total.store(0, Ordering::Relaxed);
         self.wal_append_us_total.store(0, Ordering::Relaxed);
+        self.flush_frame_prep_us_total.store(0, Ordering::Relaxed);
+        self.append_conflict_check_us_total
+            .store(0, Ordering::Relaxed);
+        self.append_frames_us_total.store(0, Ordering::Relaxed);
         self.wal_sync_us_total.store(0, Ordering::Relaxed);
         self.waiter_epoch_wait_us_total.store(0, Ordering::Relaxed);
         self.flusher_commits.store(0, Ordering::Relaxed);
@@ -815,12 +898,18 @@ pub struct ConsolidationMetricsSnapshot {
     pub busy_retries: u64,
     // Phase timing (all in microseconds)
     pub prepare_us_total: u64,
+    pub batch_build_us_total: u64,
+    pub conflict_snapshot_us_total: u64,
+    pub lane_prepare_us_total: u64,
     pub consolidator_lock_wait_us_total: u64,
     pub consolidator_flushing_wait_us_total: u64,
     pub flusher_arrival_wait_us_total: u64,
     pub inner_lock_wait_us_total: u64,
     pub exclusive_lock_us_total: u64,
     pub wal_append_us_total: u64,
+    pub flush_frame_prep_us_total: u64,
+    pub append_conflict_check_us_total: u64,
+    pub append_frames_us_total: u64,
     pub wal_sync_us_total: u64,
     pub waiter_epoch_wait_us_total: u64,
     pub flusher_commits: u64,
