@@ -258,6 +258,41 @@ Primary CASS evidence for the stale-target and false-lead guardrails:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 24`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 28`
 
+## 2026-05-05 - CASS follow-up: correctness-abandoned fast paths
+
+Scope: last-60-day CASS search for the user-suggested negative terms. Direct
+`--workspace /data/projects/frankensqlite` searches returned no hits for
+`rejected`, `reverted`, `slower`, and `within noise`, so the follow-up searched
+`frankensqlite <term>` and accepted only source paths or titles clearly tied to
+this repo, especially `/home/ubuntu/.gemini/tmp/frankensqlite`.
+
+- Prepared DML direct-VDBE execution bypass: a March optimization pass started
+  changing prepared statements so DML could execute the stored `VdbeProgram`
+  directly instead of re-entering `execute_statement_dispatch`, but abandoned
+  the idea after reading the dispatch path. The reason is semantic, not just
+  performance noise: DML dispatch owns trigger firing, FK enforcement,
+  constraint handling, autocommit wrapping, and complex fallback routing. Do not
+  retry by simply calling the precompiled VDBE program from
+  `execute_prepared_with_params` for `INSERT`, `UPDATE`, or `DELETE`. A viable
+  retry must first design a semantic-preserving prepared-DML executor that
+  carries all trigger/FK/constraint/autocommit behavior, then prove it with
+  DML correctness tests before any matrix benchmark.
+- Whole-engine async/asupersync rewrite as an immediate perf lever: CASS
+  contains conflicting March analyses, with one session arguing FrankenSQLite
+  was leaving asupersync runtime benefits on the table and creating async VFS /
+  pager / B-tree / VDBE migration beads, while a sibling session argued the
+  synchronous `Cx` bridge is the intentional compatibility design. Treat this
+  as architecture plan-space, not a rejected micro-optimization and not a
+  substitute for current matrix profiling. Do not spend a performance campaign
+  pass on "make the engine async" unless it is picked up as a tracked
+  architecture epic with FFI/WASM compatibility, cancellation, and e2e logging
+  gates.
+
+Primary CASS evidence:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-ee1022e3.json -n 27 -C 6`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T20-25-52485ea5.json -n 13 -C 6`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T20-28-be5f24f8.json -n 9 -C 6`
+
 ## 2026-05-05 - Direct INSERT transient heap TEXT pooling
 
 - Target: `INSERTThroughput` quick insert matrix, especially 10K single-txn

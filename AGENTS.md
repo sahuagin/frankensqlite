@@ -137,6 +137,13 @@ well as benchmark-rejected ideas. If the ledger is reserved by another agent, do
 not edit through the lock; send patch-ready entries to the reservation holder
 and record the blocker in your handoff.
 
+If a direct CASS workspace filter for `/data/projects/frankensqlite` returns no
+hits, do not conclude there is no history. Search for `frankensqlite <term>` and
+accept only hits whose source path or title clearly maps to this repo, such as
+archived Gemini sessions under `/home/ubuntu/.gemini/tmp/frankensqlite`. Treat
+CASS summaries as leads until backed by code, commits, or benchmark artifacts;
+do not revive an old idea from CASS without checking the negative ledger first.
+
 ---
 
 ## Code Editing Discipline
