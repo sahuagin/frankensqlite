@@ -1845,3 +1845,28 @@ CASS evidence:
   fairness/performance correction. It is only worth revisiting as part of a
   broader benchmark policy change that improves or preserves the full
   end-to-end matrix, not merely the insert-only rows.
+
+## 2026-05-05 - insert_page_sorted append/equal fast path
+
+- Target: sequential INSERT write-set staging in the pager, where page numbers
+  are often appended in sorted order.
+- Touched during rejected isolated candidate:
+  `crates/fsqlite-pager/src/pager.rs` in clean worktree
+  `/data/tmp/frankensqlite-purplecoast-clean-20260505T1458`; shared source was
+  not edited or staged by this measurement.
+- Candidate shape: check `pages.last()` in `insert_page_sorted` and return
+  immediately for monotonic append (`last < page_no`) or duplicate-last
+  (`last == page_no`) before falling back to the existing binary search and
+  insertion path.
+- Evidence artifact:
+  `tests/artifacts/perf/insert-page-sorted-append-candidate-purplecoast-20260505T1504Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-page-sorted-append-candidate-purplecoast-20260505T1504Z/summary.md`.
+- Result: rejected. Avg/geomean ratios improved slightly
+  (`2.4610x -> 2.4231x`, `2.3623x -> 2.3470x`) and write_bulk geomean improved
+  (`2.5153x -> 2.4909x`), but the primary weighted insert score regressed
+  `1.6991 -> 1.7171` and write-single geomean regressed
+  `1.4908x -> 1.5168x`.
+- Do not retry the simple `insert_page_sorted` last-page append/equal branch as
+  a standalone optimization. The branch is cheap and plausible, but current
+  end-to-end insert evidence says it is not a keep.
