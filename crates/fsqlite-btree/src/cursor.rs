@@ -6985,65 +6985,6 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(false)
     }
 
-    fn try_append_on_external_rightmost_leaf_hint_with_writer<W>(
-        &mut self,
-        cx: &Cx,
-        hint: &mut TableAppendHint,
-        rowid: i64,
-        payload_len: usize,
-        writer: W,
-    ) -> Result<bool>
-    where
-        W: FnOnce(&mut [u8]) -> Result<()>,
-    {
-        observe_cursor_cancellation(cx)?;
-        self.last_known_depth = Some(hint.tree_depth);
-        self.stack.clear();
-        self.at_eof = true;
-
-        if rowid <= hint.last_rowid
-            || hint.header.page_type != cell::BtreePageType::LeafTable
-            || hint.header.cell_count == 0
-        {
-            return Ok(false);
-        }
-
-        self.record_range_page_witness(hint.leaf_page);
-        let Some(mut page_data) = hint.page_data.take() else {
-            return Ok(false);
-        };
-
-        let append_result = self.try_append_table_leaf_payload_in_place_no_overflow_with_writer(
-            cx,
-            hint.leaf_page,
-            &mut page_data,
-            &mut hint.header,
-            rowid,
-            payload_len,
-            writer,
-        );
-        match append_result {
-            Ok(Some(_)) => {
-                self.last_insert_rowid = Some(rowid);
-                self.last_known_depth = Some(hint.tree_depth);
-                hint.last_rowid = rowid;
-                hint.page_data = Some(page_data);
-                // The caller-owned retained hint now carries the newest leaf
-                // image; do not keep an older cursor-local cache.
-                self.clear_rightmost_leaf_cache();
-                Ok(true)
-            }
-            Ok(None) => {
-                hint.page_data = Some(page_data);
-                Ok(false)
-            }
-            Err(error) => {
-                hint.page_data = Some(page_data);
-                Err(error)
-            }
-        }
-    }
-
     fn try_append_on_external_rightmost_leaf_hint_page_data(
         &mut self,
         cx: &Cx,
@@ -7519,41 +7460,6 @@ impl<P: PageWriter> BtCursor<P> {
     ) -> Result<bool> {
         let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             cursor.try_append_on_external_rightmost_leaf_hint(cx, hint, rowid, data)
-        });
-        if matches!(result, Ok(true)) {
-            self.bump_row_image_epoch();
-        }
-        result
-    }
-
-    /// Reuse a retained rightmost-leaf image and let the caller write the
-    /// record payload directly into the reserved page slot.
-    ///
-    /// This is the writer-callback analogue of
-    /// [`Self::table_try_append_cached_rightmost_leaf_hint`]. It returns
-    /// `Ok(false)` without invoking `writer` when the retained hint is stale,
-    /// lacks page data, the rowid is not a monotonic append, the payload would
-    /// need overflow, or the leaf does not have room.
-    #[doc(hidden)]
-    pub fn table_try_append_cached_rightmost_leaf_hint_with_writer<W>(
-        &mut self,
-        cx: &Cx,
-        hint: &mut TableAppendHint,
-        rowid: i64,
-        payload_len: usize,
-        writer: W,
-    ) -> Result<bool>
-    where
-        W: FnOnce(&mut [u8]) -> Result<()>,
-    {
-        let result = self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            cursor.try_append_on_external_rightmost_leaf_hint_with_writer(
-                cx,
-                hint,
-                rowid,
-                payload_len,
-                writer,
-            )
         });
         if matches!(result, Ok(true)) {
             self.bump_row_image_epoch();
@@ -13585,47 +13491,6 @@ mod tests {
             "writer append should reuse the current right-edge cursor state"
         );
         assert_eq!(cursor.rowid(&cx).unwrap(), 2);
-        assert_eq!(cursor.payload(&cx).unwrap(), payload);
-    }
-
-    #[test]
-    fn test_cached_rightmost_leaf_hint_with_writer_updates_retained_hint() {
-        let cx = Cx::new();
-        let root = pn(2);
-        let store = MemPageStore::with_empty_table(root, USABLE);
-        let payload = b"retained-writer-payload";
-        let mut cursor = BtCursor::new(SeekProbeStore::new(store), root, USABLE, true);
-
-        cursor.table_insert(&cx, 1, b"seed").unwrap();
-        let mut hint = cursor
-            .table_cached_rightmost_leaf_hint()
-            .expect("first append should seed a retained rightmost-leaf hint");
-
-        cursor.pager.clear_reads();
-        let appended = cursor
-            .table_try_append_cached_rightmost_leaf_hint_with_writer(
-                &cx,
-                &mut hint,
-                2,
-                payload.len(),
-                |dst| {
-                    dst.copy_from_slice(payload);
-                    Ok(())
-                },
-            )
-            .unwrap();
-
-        assert!(appended, "retained writer hint should accept rowid 2");
-        assert!(
-            cursor.pager.read_pages().is_empty(),
-            "retained writer append should not re-read the hinted leaf"
-        );
-        assert_eq!(hint.last_rowid(), 2);
-        assert!(
-            hint.retains_page_data(),
-            "explicit-transaction callers reuse the retained leaf image"
-        );
-        assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), payload);
     }
 

@@ -442,3 +442,41 @@ signals such as `rejected`, `reverted`, `slower`, `regressed`, `didn't help`,
   lower-level profile proves `Vec::resize` zero-fill is still a top self-time
   frame and a close insert-section A/B improves FrankenSQLite absolute medians,
   not just ratio noise.
+
+## 2026-05-05 - Prepared direct insert retained-leaf writer append
+
+- Target: insert throughput rows, especially explicit single-transaction
+  `large_10col` and record-size comparison rows where the profile showed
+  serialization plus B-tree cell assembly still visible under the direct insert
+  path.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`,
+  `crates/fsqlite-btree/src/cursor.rs`.
+- Candidate shape: route prepared monotonic direct inserts through writer
+  callbacks (`table_append_after_last_position_with_writer` plus a retained
+  `TableAppendHint` writer analogue) and exact-size record slice serializers so
+  the record bytes are written directly into the reserved leaf cell instead of
+  first materializing `record_scratch`.
+- Evidence:
+  - Baseline:
+    `tests/artifacts/perf/insert-profile-cyangorge-20260505T044600Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/insert-writer-candidate-cyangorge-20260505T0545Z/report.json`.
+  - Correctness: `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-target cargo check -p fsqlite-core -p fsqlite-btree`
+    passed before measurement.
+  - Correctness: `cargo test -p fsqlite-btree test_cached_rightmost_leaf_hint_with_writer_updates_retained_hint -- --nocapture`
+    passed; the RCH wrapper later had to be killed while retrieving artifacts.
+  - Correctness: `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-target cargo test -p fsqlite-core test_prepared_direct_simple_insert_large_profile_breakdown -- --nocapture`
+    passed.
+- Result: rejected after commit and reverted by follow-up commit. Insert-only
+  average ratio worsened from `2.77x` to `3.10x`. The 10K single-transaction
+  `large_10col` FrankenSQLite median regressed from `37.81 ms` to `42.26 ms`;
+  the record-size `large_10col` FrankenSQLite median regressed from `40.37 ms`
+  to `42.89 ms`. The profile showed the root cause: record serialization did
+  shrink on the record-size `large_10col` path (`serialize_ns` about `1.74 ms`
+  to `1.40 ms`), but B-tree insert time grew much more (`btree_insert_ns` about
+  `7.91 ms` to `12.52 ms`) because the writer route added extra append
+  preflight/callback overhead on the hot leaf path.
+- Do not retry the retained-leaf writer callback as a general direct insert
+  optimization. Reconsider only if the B-tree writer path can preflight room
+  without duplicate layout work on full leaves and a close insert-section A/B
+  improves FrankenSQLite absolute medians, not just serialization counters.
