@@ -1,0 +1,223 @@
+
+================================================================================
+  Comprehensive FrankenSQLite vs C SQLite Benchmark
+================================================================================
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ e3421e89b96faf15ad995fba58c24f34c48a533b
+  Build: release-perf (opt-level 3, LTO)
+  Mode: quick
+  Row counts: [100, 1000, 10000]
+  Measurement: 2 warmup, 3-10 iters, target 5s
+================================================================================
+
+
+============================================================================================================================================
+  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
+  2026-05-05 15:45:14 UTC
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ e3421e89b96faf15ad995fba58c24f34c48a533b
+  Build: release-perf (opt-level 3, LTO)
+  Total benchmark time: 10.7s
+============================================================================================================================================
+
+
+## INSERTThroughput — Single Transaction — tiny_1col
+   Record: 1 col (INTEGER PK only). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                        66.3 us     254.2 us      1.51M/s     393.4K/s 3.83x [31mslower[0m     6.7%    15.5%
+  1000 rows                                      263.0 us     703.3 us      3.80M/s      1.42M/s 2.67x [31mslower[0m     3.1%    25.0%
+  10000 rows                                      2.64 ms      4.55 ms      3.78M/s      2.20M/s 1.72x [31mslower[0m     8.2%     3.4%
+
+## INSERTThroughput — Single Transaction — small_3col
+   Record: 3 cols (~30B: id, name, value). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                        75.4 us     204.3 us      1.33M/s     489.4K/s 2.71x [31mslower[0m     3.7%     4.4%
+  1000 rows                                      345.4 us     817.1 us      2.90M/s      1.22M/s 2.37x [31mslower[0m     2.6%     1.9%
+  10000 rows                                      3.16 ms      7.02 ms      3.17M/s      1.42M/s 2.22x [31mslower[0m     0.6%     1.3%
+
+## INSERTThroughput — Single Transaction — medium_6col
+   Record: 6 cols (~180B: id, name, email, bio, category, score). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                       101.5 us     290.3 us     985.4K/s     344.5K/s 2.86x [31mslower[0m     6.9%     7.5%
+  1000 rows                                      541.0 us      1.38 ms      1.85M/s     724.9K/s 2.55x [31mslower[0m     1.2%     6.2%
+  10000 rows                                      5.00 ms     13.54 ms      2.00M/s     738.5K/s 2.71x [31mslower[0m     0.2%     4.5%
+
+## INSERTThroughput — Single Transaction — large_10col
+   Record: 10 cols (~600B: includes long text fields). All rows inserted in a single BEGIN..COMMIT.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows                                       147.0 us     370.3 us     680.2K/s     270.1K/s 2.52x [31mslower[0m     9.7%     2.2%
+  1000 rows                                      908.7 us      1.88 ms      1.10M/s     531.9K/s 2.07x [31mslower[0m     0.6%     1.2%
+  10000 rows                                      9.29 ms     35.40 ms      1.08M/s     282.5K/s 3.81x [31mslower[0m     1.1%     2.2%
+
+## INSERTThroughput — Transaction Strategy Comparison (small_3col)
+   Compares autocommit, batched (1K/txn), and single-txn strategies.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / autocommit                          125.2 us     203.3 us     798.5K/s     492.0K/s 1.62x [31mslower[0m     4.8%     4.0%
+  100 rows / batched (100/txn)                    73.9 us     206.0 us      1.35M/s     485.5K/s 2.79x [31mslower[0m    12.2%     4.7%
+  100 rows / single txn                           74.0 us     207.0 us      1.35M/s     483.2K/s 2.80x [31mslower[0m     7.2%     3.8%
+  1000 rows / autocommit                         866.2 us      1.25 ms      1.15M/s     800.6K/s 1.44x [31mslower[0m     0.6%     1.0%
+  1000 rows / batched (1000/txn)                 343.5 us     799.2 us      2.91M/s      1.25M/s 2.33x [31mslower[0m     2.1%     0.8%
+  1000 rows / single txn                         449.4 us     807.6 us      2.22M/s      1.24M/s 1.80x [31mslower[0m    15.0%     4.7%
+  10000 rows / autocommit                         8.51 ms     11.94 ms      1.17M/s     837.3K/s 1.40x [31mslower[0m     1.3%     2.6%
+  10000 rows / batched (1000/txn)                 3.21 ms      6.84 ms      3.11M/s      1.46M/s 2.13x [31mslower[0m     2.2%     5.6%
+  10000 rows / single txn                         3.16 ms      6.68 ms      3.17M/s      1.50M/s 2.11x [31mslower[0m     0.8%     1.7%
+
+## INSERTThroughput — Record Size Comparison (10K rows, single txn)
+   Fixed 10K rows in a single transaction, varying payload size.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  tiny_1col — 1 col (INTEGER PK only)             2.39 ms      4.63 ms      4.19M/s      2.16M/s 1.94x [31mslower[0m     0.9%     1.1%
+  small_3col — 3 cols (~30B: id, name, value)      3.16 ms      6.59 ms      3.17M/s      1.52M/s 2.09x [31mslower[0m     0.7%     1.3%
+  medium_6col — 6 cols (~180B: id, name, email, bio, category, score)      5.18 ms     10.11 ms      1.93M/s     988.9K/s 1.95x [31mslower[0m     4.0%     3.2%
+  large_10col — 10 cols (~600B: includes long text fields)      9.63 ms     37.41 ms      1.04M/s     267.3K/s 3.88x [31mslower[0m     0.9%     2.5%
+
+## Concurrent Writers — C SQLite WAL vs FrankenSQLite MVCC
+   Each writer inserts 1000 rows into non-overlapping key ranges on the same file-backed WAL database. Both engines spawn N OS threads each owning its own connection; C SQLite uses WAL + busy_timeout, FrankenSQLite uses the MVCC page-lock table via `PRAGMA fsqlite.concurrent_mode=ON` + `BEGIN CONCURRENT` (falling back to plain BEGIN if the pragma is declined). This mirrors the standalone `mt_mvcc_bench` harness.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  2 writers x 1000 rows                          11.89 ms     18.37 ms     168.3K/s     108.9K/s 1.55x [31mslower[0m     5.8%     4.3%
+  4 writers x 1000 rows                          19.34 ms     33.04 ms     206.8K/s     121.1K/s 1.71x [31mslower[0m     3.5%     9.0%
+  8 writers x 1000 rows                          91.31 ms     54.37 ms      87.6K/s     147.1K/s 1.68x [32mfaster[0m     2.6%    10.7%
+
+## Concurrent Writers — C SQLite Single-Thread Baseline
+   Same total row count as concurrent tests, but single-threaded file-backed C SQLite.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  C SQLite 1 thread / 2000 rows (baseline)       992.8 us          N/A      2.01M/s          N/A              N/A     7.3%      N/A
+  C SQLite 1 thread / 4000 rows (baseline)        1.63 ms          N/A      2.46M/s          N/A              N/A     1.3%      N/A
+  C SQLite 1 thread / 8000 rows (baseline)        2.95 ms          N/A      2.71M/s          N/A              N/A     1.8%      N/A
+
+## Read-After-Write Query Performance
+   Insert N rows, then benchmark various SELECT patterns. Record: small_3col.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / full table scan                      18.5 us       4.3 us      5.40M/s     23.49M/s 4.35x [32mfaster[0m     1.7%     3.8%
+  100 rows / point lookup (PK)                     662 ns       160 ns      1.51M/s      6.25M/s 4.14x [32mfaster[0m     6.7%    18.2%
+  100 rows / range scan (10 rows)                  2.3 us       471 ns      4.40M/s     21.23M/s 4.83x [32mfaster[0m     6.4%     7.2%
+  100 rows / COUNT(*)                              351 ns        80 ns      2.85M/s     12.50M/s 4.39x [32mfaster[0m     5.3%    18.3%
+  100 rows / SUM + GROUP BY (~10 groups)          14.9 us      23.0 us      6.71M/s      4.35M/s 1.54x [31mslower[0m    26.9%     4.4%
+  100 rows / indexed lookup (secondary)            841 ns       151 ns      1.19M/s      6.62M/s 5.57x [32mfaster[0m     7.1%    14.4%
+  100 rows / ORDER BY + LIMIT 20                  22.0 us       5.1 us     909.0K/s      3.91M/s 4.30x [32mfaster[0m     1.2%     1.8%
+  1000 rows / full table scan                    166.4 us      41.1 us      6.01M/s     24.31M/s 4.04x [32mfaster[0m     4.4%     5.5%
+  1000 rows / point lookup (PK)                    702 ns       141 ns      1.42M/s      7.09M/s 4.98x [32mfaster[0m     8.7%    16.1%
+  1000 rows / range scan (100 rows)               19.3 us       4.3 us      5.19M/s     23.27M/s 4.49x [32mfaster[0m     1.5%     2.5%
+  1000 rows / COUNT(*)                             511 ns        80 ns      1.96M/s     12.50M/s 6.39x [32mfaster[0m     3.8%    12.9%
+  1000 rows / SUM + GROUP BY (~10 groups)        127.7 us     118.4 us      7.83M/s      8.44M/s 1.08x [32mfaster[0m     1.2%     3.5%
+  1000 rows / indexed lookup (secondary)           981 ns       150 ns      1.02M/s      6.67M/s 6.54x [32mfaster[0m     6.8%    17.3%
+  1000 rows / ORDER BY + LIMIT 20                171.9 us      42.4 us     116.3K/s     471.2K/s 4.05x [32mfaster[0m     1.3%     1.5%
+  10000 rows / full table scan                    1.69 ms     380.8 us      5.91M/s     26.26M/s 4.45x [32mfaster[0m     0.5%     2.2%
+  10000 rows / point lookup (PK)                   721 ns       130 ns      1.39M/s      7.69M/s 5.55x [32mfaster[0m    18.5%    13.4%
+  10000 rows / range scan (1000 rows)            186.1 us      42.8 us      5.37M/s     23.35M/s 4.35x [32mfaster[0m     6.4%    11.8%
+  10000 rows / COUNT(*)                            1.3 us        80 ns     750.2K/s     12.50M/s 16.66x [32mfaster[0m     3.0%    33.0%
+  10000 rows / SUM + GROUP BY (~10 groups)        1.31 ms      1.09 ms      7.65M/s      9.17M/s 1.20x [32mfaster[0m     0.8%     0.8%
+  10000 rows / indexed lookup (secondary)          982 ns       140 ns      1.02M/s      7.14M/s 7.01x [32mfaster[0m     6.7%    16.3%
+  10000 rows / ORDER BY + LIMIT 20                1.71 ms     421.1 us      11.7K/s      47.5K/s 4.05x [32mfaster[0m     0.8%     1.8%
+
+## UPDATE/DELETEThroughput
+   Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / update 10 rows                       83.6 us     272.7 us     119.6K/s      36.7K/s 3.26x [31mslower[0m     9.1%     3.9%
+  100 rows / delete 5 rows                        79.8 us     257.7 us      62.6K/s      19.4K/s 3.23x [31mslower[0m     3.1%     3.1%
+  1000 rows / update 100 rows                    393.0 us     996.8 us     254.4K/s     100.3K/s 2.54x [31mslower[0m     2.4%     1.5%
+  1000 rows / delete 50 rows                     371.4 us     952.0 us     134.6K/s      52.5K/s 2.56x [31mslower[0m     3.0%     0.7%
+  10000 rows / update 1000 rows                   3.55 ms      7.85 ms     281.9K/s     127.3K/s 2.21x [31mslower[0m     0.7%     5.7%
+  10000 rows / delete 500 rows                    3.39 ms      7.50 ms     147.6K/s      66.7K/s 2.21x [31mslower[0m     1.0%     0.8%
+
+## Mixed OLTP Workload (80% read / 20% write)
+   Pre-seeded with 5K rows. Runs 5K operations with realistic distribution: 40% point lookups, 20% range scans, 20% aggregates, 15% inserts, 3% updates, 2% deletes.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  5K ops (80r/20w) on 5K-row table              222.57 ms     46.62 ms      22.5K/s     107.3K/s 4.77x [32mfaster[0m     1.0%     2.0%
+
+## JOIN Performance — Multi-Table Queries
+   Two related tables (orders+customers). Measures INNER JOIN, LEFT JOIN, self-join, and JOIN with aggregation.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 orders / INNER JOIN                         18.7 us       5.4 us      5.35M/s     18.41M/s 3.44x [32mfaster[0m     2.0%     6.6%
+  100 orders / LEFT JOIN                          25.5 us       5.5 us      3.91M/s     18.32M/s 4.68x [32mfaster[0m     4.1%     4.2%
+  100 orders / JOIN + GROUP BY                    21.0 us       4.5 us     476.9K/s      2.21M/s 4.63x [32mfaster[0m     3.0%     6.8%
+  100 orders / JOIN + HAVING                      15.4 us       4.7 us     650.2K/s      2.12M/s 3.25x [32mfaster[0m     1.5%     7.4%
+  1000 orders / INNER JOIN                       186.2 us      53.6 us      5.37M/s     18.65M/s 3.47x [32mfaster[0m     2.6%     5.4%
+  1000 orders / LEFT JOIN                        312.3 us      54.0 us      3.20M/s     18.52M/s 5.79x [32mfaster[0m     3.3%     1.6%
+  1000 orders / JOIN + GROUP BY                  213.1 us      97.1 us     469.4K/s      1.03M/s 2.19x [32mfaster[0m     3.3%     5.9%
+  1000 orders / JOIN + HAVING                    139.3 us      77.6 us     718.1K/s      1.29M/s 1.79x [32mfaster[0m     7.2%     1.2%
+  10000 orders / INNER JOIN                       1.75 ms     535.0 us      5.71M/s     18.69M/s 3.27x [32mfaster[0m     0.7%     1.5%
+  10000 orders / LEFT JOIN                        3.38 ms     538.9 us      2.96M/s     18.55M/s 6.28x [32mfaster[0m    16.4%     5.7%
+  10000 orders / JOIN + GROUP BY                  2.28 ms      1.15 ms     438.8K/s     873.0K/s 1.99x [32mfaster[0m     0.6%     0.7%
+  10000 orders / JOIN + HAVING                    1.49 ms     933.3 us     669.3K/s      1.07M/s 1.60x [32mfaster[0m     0.6%     0.5%
+
+## Subquery & CTE Performance
+   Measures scalar subqueries, EXISTS, IN subqueries, and recursive CTEs.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / scalar subquery (LIMIT 100)          45.7 us       5.1 us      2.19M/s     19.46M/s 8.89x [32mfaster[0m    21.1%     6.2%
+  100 rows / EXISTS subquery                      10.3 us       110 ns      97.0K/s      9.09M/s 93.72x [32mfaster[0m     0.9%     8.8%
+  100 rows / IN subquery                           4.7 us       100 ns     210.6K/s     10.00M/s 47.48x [32mfaster[0m     3.8%    36.0%
+  100 rows / CTE + JOIN                           41.0 us       5.7 us      2.44M/s     17.42M/s 7.14x [32mfaster[0m     6.0%     6.4%
+  1000 rows / scalar subquery (LIMIT 100)         34.3 us       5.1 us      2.92M/s     19.46M/s 6.68x [32mfaster[0m     6.1%     8.5%
+  1000 rows / EXISTS subquery                    105.6 us       110 ns       9.5K/s      9.09M/s 959.98x [32mfaster[0m     4.4%     6.6%
+  1000 rows / IN subquery                          5.0 us       110 ns     199.6K/s      9.09M/s 45.54x [32mfaster[0m     4.5%    44.1%
+  1000 rows / CTE + JOIN                         278.8 us      16.7 us      3.59M/s     59.73M/s 16.65x [32mfaster[0m    15.5%    36.1%
+  10000 rows / scalar subquery (LIMIT 100)        37.5 us       5.1 us      2.67M/s     19.53M/s 7.33x [32mfaster[0m     0.8%    21.7%
+  10000 rows / EXISTS subquery                    1.41 ms       101 ns        708/s      9.90M/s 13990.16x [32mfaster[0m     1.1%    12.6%
+  10000 rows / IN subquery                         5.0 us       100 ns     201.7K/s     10.00M/s 49.59x [32mfaster[0m     5.0%    41.2%
+  10000 rows / CTE + JOIN                         1.85 ms     121.9 us      5.39M/s     82.01M/s 15.21x [32mfaster[0m     0.5%     4.3%
+  Recursive CTE (1..1000 SUM)                    142.0 us     223.8 us      7.04M/s      4.47M/s 1.58x [31mslower[0m     2.5%     2.0%
+
+## String & Pattern Matching Performance
+   LIKE patterns, string functions, and text-heavy queries.
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / LIKE 'prefix%'                        5.3 us       1.3 us     189.4K/s     779.4K/s 4.12x [32mfaster[0m     1.2%     3.0%
+  100 rows / LIKE '%wildcard%'                     7.9 us       5.7 us     126.3K/s     174.8K/s 1.38x [32mfaster[0m     1.3%     1.0%
+  100 rows / string functions                     39.0 us      15.4 us      2.56M/s      6.49M/s 2.53x [32mfaster[0m     1.8%     1.5%
+  100 rows / GROUP_CONCAT                         20.3 us       7.7 us      4.93M/s     13.01M/s 2.64x [32mfaster[0m    22.8%     2.2%
+  1000 rows / LIKE 'prefix%'                      47.8 us      10.7 us      20.9K/s      93.3K/s 4.46x [32mfaster[0m     1.2%     1.5%
+  1000 rows / LIKE '%wildcard%'                   76.7 us      59.6 us      13.0K/s      16.8K/s 1.29x [32mfaster[0m     8.5%     1.3%
+  1000 rows / string functions                   410.3 us     161.2 us      2.44M/s      6.20M/s 2.55x [32mfaster[0m     2.8%     3.7%
+  1000 rows / GROUP_CONCAT                       187.0 us      72.6 us      5.35M/s     13.77M/s 2.58x [32mfaster[0m     3.4%     0.4%
+  10000 rows / LIKE 'prefix%'                    500.1 us     147.5 us       2.0K/s       6.8K/s 3.39x [32mfaster[0m     2.1%     0.4%
+  10000 rows / LIKE '%wildcard%'                 819.3 us     631.8 us       1.2K/s       1.6K/s 1.30x [32mfaster[0m     1.0%     1.6%
+  10000 rows / string functions                   4.88 ms      2.05 ms      2.05M/s      4.87M/s 2.38x [32mfaster[0m     3.1%     4.3%
+  10000 rows / GROUP_CONCAT                       2.08 ms     742.0 us      4.80M/s     13.48M/s 2.81x [32mfaster[0m     0.9%     1.5%
+
+========================================================================================================================
+  SUMMARY STATISTICS
+========================================================================================================================
+
+  Total scenarios: 93  |  FrankenSQLite faster: 58  |  Comparable: 0  |  C SQLite faster: 35
+  Average time ratio (FrankenSQLite / C SQLite): 1.07x
