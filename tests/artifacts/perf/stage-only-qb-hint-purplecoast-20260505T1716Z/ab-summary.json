@@ -1,0 +1,139 @@
+{
+  "n": 25,
+  "fsqlite_improved": 10,
+  "fsqlite_regressed": 15,
+  "fs_geomean_candidate_over_baseline": 1.0253762606399015,
+  "ratio_geomean_candidate_over_baseline": 0.9590419621388985,
+  "worst_fs_regressions": [
+    {
+      "k": "insertthroughput-single-transaction-small-3col|insertthroughput-single-transaction-small-3col__1000-rows",
+      "pct": 17.99195565765053,
+      "baseline_fs": 0.802303,
+      "candidate_fs": 0.946653,
+      "baseline_ratio": 2.3609924194269842,
+      "candidate_ratio": 2.5607917288839834
+    },
+    {
+      "k": "insertthroughput-single-transaction-large-10col|insertthroughput-single-transaction-large-10col__1000-rows",
+      "pct": 12.143628763327241,
+      "baseline_fs": 1.9161899999999998,
+      "candidate_fs": 2.148885,
+      "baseline_ratio": 2.1066895051969383,
+      "candidate_ratio": 2.110043322519069
+    },
+    {
+      "k": "insertthroughput-transaction-strategy-comparison-small-3col|insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-single-txn",
+      "pct": 11.272153442544885,
+      "baseline_fs": 6.3667869999999995,
+      "candidate_fs": 7.084461,
+      "baseline_ratio": 1.9321380200248663,
+      "candidate_ratio": 2.0631836544980535
+    },
+    {
+      "k": "insertthroughput-single-transaction-small-3col|insertthroughput-single-transaction-small-3col__10000-rows",
+      "pct": 10.264155452245172,
+      "baseline_fs": 6.862815,
+      "candidate_fs": 7.5672250000000005,
+      "baseline_ratio": 2.222879923351816,
+      "candidate_ratio": 2.215757145948377
+    },
+    {
+      "k": "insertthroughput-single-transaction-tiny-1col|insertthroughput-single-transaction-tiny-1col__1000-rows",
+      "pct": 8.042152827210547,
+      "baseline_fs": 0.7108420000000001,
+      "candidate_fs": 0.768009,
+      "baseline_ratio": 2.835202616464582,
+      "candidate_ratio": 2.7181444634382
+    },
+    {
+      "k": "insertthroughput-record-size-comparison-10k-rows-single-txn|insertthroughput-record-size-comparison-10k-rows-single-txn__tiny-1col-1-col-integer-pk-only",
+      "pct": 5.389101212877745,
+      "baseline_fs": 4.522962000000001,
+      "candidate_fs": 4.766709,
+      "baseline_ratio": 1.9839118877806143,
+      "candidate_ratio": 1.8260174529964297
+    },
+    {
+      "k": "insertthroughput-transaction-strategy-comparison-small-3col|insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-autocommit",
+      "pct": 4.27461244667755,
+      "baseline_fs": 1.236346,
+      "candidate_fs": 1.2891949999999999,
+      "baseline_ratio": 1.4647764175387505,
+      "candidate_ratio": 1.291662074562414
+    },
+    {
+      "k": "insertthroughput-record-size-comparison-10k-rows-single-txn|insertthroughput-record-size-comparison-10k-rows-single-txn__large-10col-10-cols-600b-includes-long-text-fields",
+      "pct": 3.099001286030023,
+      "baseline_fs": 35.612699,
+      "candidate_fs": 36.716337,
+      "baseline_ratio": 3.6705022105343983,
+      "candidate_ratio": 3.734417853274609
+    }
+  ],
+  "best_fs_wins": [
+    {
+      "k": "insertthroughput-single-transaction-tiny-1col|insertthroughput-single-transaction-tiny-1col__100-rows",
+      "pct": 3.901837971044253,
+      "baseline_fs": 0.262953,
+      "candidate_fs": 0.252693,
+      "baseline_ratio": 3.654459793757123,
+      "candidate_ratio": 3.8418956106609095
+    },
+    {
+      "k": "insertthroughput-single-transaction-large-10col|insertthroughput-single-transaction-large-10col__10000-rows",
+      "pct": 3.472905415651406,
+      "baseline_fs": 37.483284,
+      "candidate_fs": 36.181525,
+      "baseline_ratio": 3.9546904765723054,
+      "candidate_ratio": 3.6411009025484016
+    },
+    {
+      "k": "insertthroughput-transaction-strategy-comparison-small-3col|insertthroughput-transaction-strategy-comparison-small-3col__100-rows-single-txn",
+      "pct": 2.9629837274167015,
+      "baseline_fs": 0.21404099999999998,
+      "candidate_fs": 0.207699,
+      "baseline_ratio": 3.0953592965914187,
+      "candidate_ratio": 2.622197252802747
+    },
+    {
+      "k": "insertthroughput-transaction-strategy-comparison-small-3col|insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-autocommit",
+      "pct": 2.8350351089468817,
+      "baseline_fs": 12.245739,
+      "candidate_fs": 11.898568,
+      "baseline_ratio": 1.4575036854943275,
+      "candidate_ratio": 1.352982673824617
+    },
+    {
+      "k": "insertthroughput-single-transaction-tiny-1col|insertthroughput-single-transaction-tiny-1col__10000-rows",
+      "pct": 2.5212714353138543,
+      "baseline_fs": 4.881664,
+      "candidate_fs": 4.758584,
+      "baseline_ratio": 2.042488526424265,
+      "candidate_ratio": 1.8267474718315022
+    },
+    {
+      "k": "insertthroughput-single-transaction-medium-6col|insertthroughput-single-transaction-medium-6col__1000-rows",
+      "pct": 2.191579369550889,
+      "baseline_fs": 1.466066,
+      "candidate_fs": 1.433936,
+      "baseline_ratio": 2.7295654861424,
+      "candidate_ratio": 2.434431253108962
+    },
+    {
+      "k": "insertthroughput-single-transaction-medium-6col|insertthroughput-single-transaction-medium-6col__100-rows",
+      "pct": 1.5105871206434585,
+      "baseline_fs": 0.299751,
+      "candidate_fs": 0.295223,
+      "baseline_ratio": 3.094651097965125,
+      "candidate_ratio": 2.925056227645176
+    },
+    {
+      "k": "insertthroughput-transaction-strategy-comparison-small-3col|insertthroughput-transaction-strategy-comparison-small-3col__100-rows-autocommit",
+      "pct": 1.4977789034797295,
+      "baseline_fs": 0.20530400000000001,
+      "candidate_fs": 0.202229,
+      "baseline_ratio": 1.7273775167644065,
+      "candidate_ratio": 1.6446596888444303
+    }
+  ]
+}

@@ -100,6 +100,51 @@ and page I/O wrapper construction.
   optimization. The allocation avoided here is too small and too noisy relative
   to row-build, B-tree, pager, WAL, and benchmark fixed costs.
 
+## 2026-05-05 - Stage-only external quick-balance retained hint
+
+Scope: prepared direct INSERT rightmost-leaf append path, after profiles showed
+large-row time in B-tree quick-balance and `PageData` clone/retention around
+`try_quick_balance_on_external_rightmost_leaf_hint`.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`;
+  source was reverted after measurement.
+- Candidate shape: after `balance_quick_known_divider_rowid`, skip retaining
+  the new leaf `PageData` in the caller-owned external `TableAppendHint` when
+  the pager can mutate staged `PageData` directly. The measured version also
+  preserved the old retained-page behavior for non-staged PageWriters and added
+  a staged-page quick-balance fallback when the staged hinted leaf fills.
+- Correctness note: the first stage-only attempt was rejected before
+  benchmarking because
+  `test_table_try_append_cached_rightmost_leaf_hint_reuses_retained_leaf_image`
+  found row-order corruption (`59` expected, `95` observed). The measured
+  staged-capability guarded candidate passed the focused clean-worktree proofs:
+  `cargo fmt --check`,
+  `cargo test -p fsqlite-btree table_try_append_cached_rightmost_leaf_hint --profile release-perf -- --nocapture`
+  (`4` matching tests), and
+  `cargo test -p fsqlite-core prepared_direct_simple_insert_implicit_rowid --profile release-perf -- --nocapture`
+  (`3` matching tests). Shared worktree verification was blocked at the time by
+  an unrelated dirty `crates/fsqlite-pager/src/pager.rs` compile error, so the
+  proof and benchmark used a clean detached worktree at `f7ea3cdd`.
+- Evidence artifacts:
+  `tests/artifacts/perf/stage-only-qb-hint-purplecoast-20260505T1716Z/baseline-insert-report.json`,
+  `tests/artifacts/perf/stage-only-qb-hint-purplecoast-20260505T1716Z/candidate-insert-report.json`,
+  `tests/artifacts/perf/stage-only-qb-hint-purplecoast-20260505T1716Z/ab-summary.json`,
+  and
+  `tests/artifacts/perf/stage-only-qb-hint-purplecoast-20260505T1716Z/summary.md`.
+- Result: rejected. Same-window insert quick matrix had `10` FSQLite median
+  wins and `15` regressions, with FSQLite geomean `1.0254x`
+  candidate/baseline (`2.54%` slower). C-relative ratio geomean improved to
+  `0.9590x`, but this was driven by C-side timing movement rather than absolute
+  FSQLite improvement. The target `large_10col` 10K single-txn row improved
+  `37.483 ms -> 36.182 ms`, but record-size `large_10col` 10K regressed
+  `35.613 ms -> 36.716 ms`; small/medium rows regressed materially, including
+  `small_3col` 1000 `+18.0%` and small transaction-strategy 10K single txn
+  `+11.3%`.
+- Do not retry this stage-only retained-hint clone avoidance as a standalone
+  B-tree optimization. The retained leaf image is a useful fallback/rollback
+  shape, and removing it does not improve the end-to-end insert matrix even
+  when correctness is preserved for staged-capable writers.
+
 ## 2026-05-05 - Large borrowed WAL commit threshold
 
 Scope: `comprehensive-bench --quick --filter insert`, targeting the large-row
