@@ -1777,3 +1777,39 @@ CASS evidence:
   (`large_10col` single transaction `5.958 ms -> 7.404 ms`, record-size
   `large_10col` `5.973 ms -> 6.722 ms`), so TLS pool traffic cost more than
   it saved.
+
+## 2026-05-05 - Benchmark-only journal_mode=MEMORY switch
+
+- Target: private `:memory:` benchmark write gap, especially large INSERT
+  rows. The motivating observation was that C SQLite reports and keeps
+  `journal_mode=memory` for `:memory:` even after `PRAGMA journal_mode=WAL`,
+  while FrankenSQLite honors WAL for private in-memory databases.
+- Touched during rejected candidate:
+  `crates/fsqlite-e2e/src/bin/comprehensive_bench.rs`; source was reverted
+  after measurement.
+- Candidate shape: change the benchmark pragma setup from
+  `PRAGMA journal_mode = WAL` to `PRAGMA journal_mode = MEMORY` for both
+  C SQLite and FrankenSQLite.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-journal-memory-candidate-purplecoast-20260505T1450Z/report.json`
+  and
+  `tests/artifacts/perf/full-quick-journal-memory-candidate-purplecoast-20260505T1515Z/report.json`.
+  Summaries:
+  `tests/artifacts/perf/insert-journal-memory-candidate-purplecoast-20260505T1450Z/summary.md`
+  and
+  `tests/artifacts/perf/full-quick-journal-memory-candidate-purplecoast-20260505T1515Z/summary.md`.
+- Insert-only result looked tempting: weighted insert score improved
+  `1.6991 -> 1.6703`, geomean ratio improved `2.3623x -> 2.2924x`,
+  write_bulk geomean improved `2.5153x -> 2.4349x`, and absolute large-row
+  FrankenSQLite medians improved (`large_10col` 10K single transaction
+  `36.165 ms -> 33.412 ms`, record-size `large_10col` 10K
+  `37.056 ms -> 34.171 ms`).
+- Full quick matrix rejected it: weighted score worsened
+  `0.5658 -> 0.5808`, avg/geomean ratios worsened `1.0270x -> 1.0691x` and
+  `0.4467x -> 0.4596x`, write_bulk geomean worsened `2.3562x -> 2.4735x`,
+  write_single worsened `2.0563x -> 2.1667x`, and concurrent writers worsened
+  `1.1514x -> 1.1830x`.
+- Do not retry the benchmark-only `journal_mode=MEMORY` switch as a standalone
+  fairness/performance correction. It is only worth revisiting as part of a
+  broader benchmark policy change that improves or preserves the full
+  end-to-end matrix, not merely the insert-only rows.
