@@ -1817,6 +1817,13 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     fn record_range_page_witness(&mut self, page_no: PageNumber) {
+        if self
+            .read_witnesses
+            .last()
+            .is_some_and(|key| matches!(key, WitnessKey::Page(existing) if *existing == page_no))
+        {
+            return;
+        }
         self.read_witnesses.push(WitnessKey::Page(page_no));
     }
 
@@ -14251,6 +14258,31 @@ mod tests {
                 .witness_keys()
                 .iter()
                 .any(|key| matches!(key, WitnessKey::Page(_)))
+        );
+    }
+
+    #[test]
+    fn test_range_page_witness_dedups_consecutive_leaf() {
+        let mut store = MemPageStore::new(USABLE);
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (5, b"b"), (10, b"c")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        assert!(cursor.first(&cx).unwrap());
+        assert!(cursor.next(&cx).unwrap());
+        assert!(cursor.next(&cx).unwrap());
+
+        let page_witnesses = cursor
+            .witness_keys()
+            .iter()
+            .filter(|key| matches!(key, WitnessKey::Page(page) if *page == pn(2)))
+            .count();
+        assert_eq!(
+            page_witnesses, 1,
+            "one page witness is enough for repeated range steps on the same leaf"
         );
     }
 
