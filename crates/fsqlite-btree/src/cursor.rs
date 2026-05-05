@@ -5548,11 +5548,12 @@ impl<P: PageWriter> BtCursor<P> {
             (cell_ref.overflow_page, delete_idx, top.page_no)
         };
 
-        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
+        let top = &self.stack[depth - 1];
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
+        let mut page_data = top.page_data.clone();
+        let mut header = top.header;
         let mut ptrs = take_pooled_cell_pointers();
-        cell::read_cell_pointers_into(page_data.as_bytes(), &header, header_offset, &mut ptrs)?;
+        ptrs.extend_from_slice(&top.cell_pointers);
         let original_len = ptrs.len();
         if delete_idx >= original_len {
             return Err(FrankenError::DatabaseCorrupt {
@@ -5873,11 +5874,23 @@ impl<P: PageWriter> BtCursor<P> {
             self.defrag_cells_scratch = cells_to_move;
         }
 
-        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
-        recycle_cell_pointers(ptrs);
+        let refreshed_page_data = page_data.clone();
+        let write_result = self.pager.write_page_data(cx, leaf_page_no, page_data);
+        if let Err(error) = write_result {
+            recycle_cell_pointers(ptrs);
+            return Err(error);
+        }
 
-        let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
-        let new_count = refreshed.header.cell_count;
+        let new_count = header.cell_count;
+        let mutation_counter = Self::page_mutation_counter(&refreshed_page_data);
+        let mut refreshed = StackEntry {
+            page_no: leaf_page_no,
+            page_data: refreshed_page_data,
+            header,
+            cell_pointers: ptrs,
+            mutation_counter,
+            cell_idx: 0,
+        };
         if new_count == 0 {
             refreshed.cell_idx = 0;
             self.at_eof = true;
