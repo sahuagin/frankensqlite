@@ -12,6 +12,30 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-05 - CASS synonym sweep coverage note
+
+Scope: user-requested CASS search restricted to FrankenSQLite session history
+since `2026-03-05`, using direct `/data/projects/frankensqlite` workspace
+filters first and then the archived Gemini workspace alias
+`/home/ubuntu/.gemini/tmp/frankensqlite` when the direct workspace filter was
+sparse. Searched terms included `rejected`, `reverted`, `slower`,
+`regressed`, `didn't help`, `did not help`, `within noise`, `abandoned`,
+`abandones`, `no improvement`, `rollback`, `worse`, `failed to improve`,
+`no measurable`, `revert it for now`, `not worth`, and `failed the keep`.
+
+- No new benchmark-rejected performance ideas were found beyond the existing
+  CASS/artifact sections in this ledger. Useful hits were already represented
+  by the Arc/SmallVec, stale raw-benchmark, prepared-DML bypass, async-rewrite
+  plan-space, and recent artifact-backed no-retry entries below.
+- The remaining hits were intentionally excluded because they were correctness
+  fixes that landed, commit-log summaries from multi-repo sessions, accepted
+  optimizations, issue-triage text, or CASS false positives where the negative
+  word was unrelated to a performance candidate.
+- The attempted `cass index --json` refresh timed out after staying in
+  `preparing total=0`, so this note is based on the existing CASS index plus
+  direct `cass view` inspection of the relevant hits. Refresh CASS before
+  repeating this sweep only if newer sessions need to be included.
+
 ## 2026-05-04 - CASS archaeology guardrails
 
 Scope: `cass` searches restricted to FrankenSQLite content since `2026-03-04`,
