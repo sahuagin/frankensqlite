@@ -131,9 +131,11 @@ optimization ideas must be durable so future agents do not repeat them.
 For major perf campaigns, also mine recent `$cass` session history, recent
 commits, and perf artifacts for terms like `rejected`, `reverted`, `slower`,
 `regressed`, `did not help`, and `within noise`, scoped to this repo and recent
-history. If the ledger is reserved by another agent, do not edit through the
-lock; send patch-ready entries to the reservation holder and record the blocker
-in your handoff.
+history. Include CASS workspace aliases that clearly map to this repo (for
+example archived Gemini workspaces), and record correctness-abandoned ideas as
+well as benchmark-rejected ideas. If the ledger is reserved by another agent, do
+not edit through the lock; send patch-ready entries to the reservation holder
+and record the blocker in your handoff.
 
 ---
 
