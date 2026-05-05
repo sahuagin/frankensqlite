@@ -1,0 +1,56 @@
+
+================================================================================
+  Comprehensive FrankenSQLite vs C SQLite Benchmark
+================================================================================
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ 47869cc3f6837ffcb56a9ec63c6b6f2e7d1d8bb6
+  Build: release-perf (opt-level 3, LTO)
+  Mode: quick
+  Row counts: [100, 1000, 10000]
+  Measurement: 2 warmup, 3-10 iters, target 5s
+  Filter: update
+================================================================================
+
+
+============================================================================================================================================
+  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
+  2026-05-05 15:50:37 UTC
+  OS: Ubuntu 25.10
+  Arch: x86_64
+  Kernel: 6.17.0-19-generic
+  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
+  RAM: 499.3 GB
+  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by '/data/projects/frankensqlite/rust-toolchain.toml')
+  Rust: rustc 1.97.0-nightly (cb40c25f6 2026-05-04)
+  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
+  Git: main @ 47869cc3f6837ffcb56a9ec63c6b6f2e7d1d8bb6
+  Build: release-perf (opt-level 3, LTO)
+  Total benchmark time: 0.5s
+============================================================================================================================================
+
+
+## UPDATE/DELETEThroughput
+   Pre-populated table with N rows. Measures batch update (10% of rows) and batch delete (5% of rows).
+
+  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
+  ----------------------------------------------------------------------------------------------------------------------------------------
+  100 rows / update 10 rows                       87.5 us     336.9 us     114.3K/s      29.7K/s 3.85x [31mslower[0m     8.5%    20.1%
+  100 rows / delete 5 rows                        85.3 us     334.0 us      58.6K/s      15.0K/s 3.92x [31mslower[0m    10.0%     4.0%
+  1000 rows / update 100 rows                    443.6 us      1.24 ms     225.4K/s      80.4K/s 2.80x [31mslower[0m    12.9%    10.2%
+  1000 rows / delete 50 rows                     439.7 us      1.18 ms     113.7K/s      42.4K/s 2.68x [31mslower[0m    13.9%    17.6%
+  10000 rows / update 1000 rows                   3.95 ms      9.21 ms     253.5K/s     108.6K/s 2.33x [31mslower[0m     3.2%     3.8%
+  10000 rows / delete 500 rows                    3.63 ms      9.23 ms     137.6K/s      54.2K/s 2.54x [31mslower[0m     2.6%     5.7%
+
+========================================================================================================================
+  SUMMARY STATISTICS
+========================================================================================================================
+
+  Total scenarios: 6  |  FrankenSQLite faster: 0  |  Comparable: 0  |  C SQLite faster: 6
+  Average time ratio (FrankenSQLite / C SQLite): 3.02x
