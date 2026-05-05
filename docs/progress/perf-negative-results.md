@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-05 - Prepared direct DELETE scratch-reset narrowing
+
+Scope: isolated prepared direct DELETE after
+`dml-mutation-profile-purplecoast-20260505T1830Z` showed DELETE about `5.23x`
+slower than C SQLite and still carrying a small
+`reset_prepared_direct_insert_statement_scratch` sub-signal.
+
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`;
+  source was reverted after measurement.
+- Candidate shape: skip the broad `PreparedDirectInsertScratchResetGuard` in
+  `execute_prepared_direct_simple_delete`, but after a fresh-eyes review add a
+  DELETE-specific reset guard in the retained COUNT/SUM cache maintenance path
+  so the scratch buffers actually used by DELETE are still cleared on success
+  and error.
+- Correctness proof for the candidate passed:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-cyangorge-current-target cargo test -p fsqlite-core --lib prepared_delete -- --nocapture`
+  (`4` tests). The broader
+  `fsqlite-core --test fast_path_separation test_fast_path_prepared_delete`
+  failure was reproduced on a clean baseline worktree first and is pre-existing
+  (`ud_fast=0`), so it was not attributed to this candidate.
+- Evidence artifacts:
+  `tests/artifacts/perf/delete-scratch-reset-cyangorge-20260505T1925Z/summary.md`,
+  `tests/artifacts/perf/delete-scratch-reset-cyangorge-20260505T1925Z/candidate.diff`,
+  and
+  `tests/artifacts/perf/delete-scratch-reset-cyangorge-20260505T1925Z/hyperfine-delete-isolated-local-local.json`.
+- Result: rejected. The fair local/local A/B on
+  `perf-update-delete 10000 1000 delete fsqlite isolated` measured baseline
+  `1.3775s +/- 0.0138s` and candidate `1.3712s +/- 0.0126s`, only about
+  `0.45%` faster and inside the same-host variance envelope. A first
+  local-baseline/RCH-candidate run showed a misleading candidate slowdown and is
+  preserved only as a cross-build caution, not a decision signal.
+- Do not retry prepared direct DELETE scratch-reset narrowing as a standalone
+  optimization. Retry only if a future profile makes statement scratch reset a
+  dominant DELETE cost or if a broader measured change removes the retained
+  cache scratch dependency entirely.
+
 ## 2026-05-05 - CASS synonym sweep coverage note
 
 Scope: user-requested CASS search restricted to FrankenSQLite session history
