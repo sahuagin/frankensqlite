@@ -2160,6 +2160,7 @@ fn bench_insert_by_row_count(
             record_size.description()
         ),
     );
+    let profile_insert_enabled = bench_env_flag("FSQLITE_BENCH_PROFILE_INSERT");
 
     for &count in row_counts {
         eprint!(
@@ -2199,6 +2200,9 @@ fn bench_insert_by_row_count(
                 fs_execute(&conn, "COMMIT");
             })
         };
+        if profile_insert_enabled {
+            profile_fsqlite_insert(record_size, count, "single_txn");
+        }
 
         eprintln!(
             "C={} F={}",
@@ -2377,6 +2381,7 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
     );
 
     let count = 10_000_usize;
+    let profile_insert_enabled = bench_env_flag("FSQLITE_BENCH_PROFILE_INSERT");
 
     for &record_size in RecordSize::ALL {
         eprint!(
@@ -2416,6 +2421,9 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
                 fs_execute(&conn, "COMMIT");
             })
         };
+        if profile_insert_enabled {
+            profile_fsqlite_insert(record_size, count, "record_size");
+        }
 
         eprintln!(
             "C={} F={}",
@@ -2428,6 +2436,83 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
             Some(fs),
         );
     }
+}
+
+fn profile_fsqlite_insert(record_size: RecordSize, count: usize, label: &str) {
+    let conn = fsqlite::Connection::open(":memory:").unwrap();
+    apply_pragmas_fsqlite(&conn);
+
+    let previous_hot_path_profile_enabled = hot_path_profile_enabled();
+    set_hot_path_profile_enabled(true);
+    reset_hot_path_profile();
+
+    let setup_start = Instant::now();
+    fs_execute(&conn, record_size.create_table_sql());
+    let setup_us = setup_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let begin_start = Instant::now();
+    fs_execute(&conn, "BEGIN");
+    let begin_us = begin_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let prepare_start = Instant::now();
+    let statement = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+    let prepare_us = prepare_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let insert_start = Instant::now();
+    #[allow(clippy::cast_possible_wrap)]
+    for i in 0..count as i64 {
+        fs_stmt_execute_with_params(&statement, &[fsqlite::SqliteValue::Integer(i)]);
+    }
+    let insert_us = insert_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let commit_start = Instant::now();
+    fs_execute(&conn, "COMMIT");
+    let commit_us = commit_start.elapsed().as_secs_f64() * 1_000_000.0;
+
+    let profile = hot_path_profile_snapshot();
+    set_hot_path_profile_enabled(previous_hot_path_profile_enabled);
+
+    eprintln!(
+        "    [fs_insert_{}_{}_{count}] insert_profile setup_us={setup_us:.1} begin_us={begin_us:.1} prepare_us={prepare_us:.1} insert_us={insert_us:.1} commit_us={commit_us:.1} rows={count} direct_insert={} fast={} slow={} schema_refreshes={} schema_refresh_ns={} begin_ns={} execute_body_ns={} commit_pre_ns={} commit_roundtrip_ns={} commit_finalize_ns={} commit_handle_ns={} post_write_ns={} memdb_refresh={} cached_write_reuses={} cached_write_parks={} page_pool_hits={} page_pool_misses={} row_build_ns={} cursor_setup_ns={} serialize_ns={} btree_insert_ns={} memdb_apply_ns={} schema_validation_ns={} autocommit_begin_ns={} autocommit_resolve_ns={} autocommit_executions={} change_tracking_ns={} record_parse_into={} record_decode_ns={} btree_payload_copy_calls={} btree_payload_copy_bytes={} btree_cell_assembly_calls={} btree_cell_assembly_bytes={} vdbe_opcodes={} vdbe_statements={} vdbe_make_record={}",
+        label,
+        record_size.name(),
+        profile.prepared_direct_insert_executions,
+        profile.parser.fast_path_executions,
+        profile.parser.slow_path_executions,
+        profile.prepared_schema_refreshes,
+        profile.prepared_schema_refresh_time_ns,
+        profile.begin_setup_time_ns,
+        profile.execute_body_time_ns,
+        profile.commit_pre_txn_time_ns,
+        profile.commit_txn_roundtrip_time_ns,
+        profile.commit_finalize_seq_time_ns,
+        profile.commit_handle_finalize_time_ns,
+        profile.commit_post_write_maintenance_time_ns,
+        profile.memdb_refresh_count,
+        profile.cached_write_txn_reuses,
+        profile.cached_write_txn_parks,
+        profile.page_buffer_pool_hits,
+        profile.page_buffer_pool_misses,
+        profile.prepared_direct_insert_row_build_time_ns,
+        profile.prepared_direct_insert_cursor_setup_time_ns,
+        profile.prepared_direct_insert_serialize_time_ns,
+        profile.prepared_direct_insert_btree_insert_time_ns,
+        profile.prepared_direct_insert_memdb_apply_time_ns,
+        profile.prepared_direct_insert_schema_validation_time_ns,
+        profile.prepared_direct_insert_autocommit_begin_time_ns,
+        profile.prepared_direct_insert_autocommit_resolve_time_ns,
+        profile.prepared_direct_insert_autocommit_executions,
+        profile.prepared_direct_insert_change_tracking_time_ns,
+        profile.record_decode.parse_record_into_calls,
+        profile.record_decode.decode_time_ns,
+        profile.btree_copy_kernels.local_payload_copy_calls,
+        profile.btree_copy_kernels.local_payload_copy_bytes,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_calls,
+        profile.btree_copy_kernels.table_leaf_cell_assembly_bytes,
+        profile.vdbe.opcodes_executed_total,
+        profile.vdbe.statements_total,
+        profile.vdbe.make_record_calls_total,
+    );
 }
 
 // ─── Section 4: Concurrent writers ─────────────────────────────────────
