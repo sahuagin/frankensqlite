@@ -1592,3 +1592,35 @@ commits. Entries already present in this ledger were not duplicated.
   avoids the page clone while preserving the useful cache state, and require an
   interleaved A/B that improves the full insert matrix without regressing the
   small/medium record-size rows or the 10K large single-transaction row.
+
+## 2026-05-05 - Direct INSERT integer placeholder text cache
+
+- Target: direct-simple INSERT concat row building after the insert profile
+  showed multi-ms row-build cost on 10K medium/large rows. The candidate was
+  tested in the isolated worktree
+  `/data/tmp/frankensqlite-cyangorge-paramtext-cache-20260505T1340` so the
+  shared main worktree and peer source edits were not disturbed.
+- Candidate shape: add a stack-local cache for integer bind placeholder decimal
+  text during one direct INSERT row build, aiming to avoid repeated `itoa`
+  formatting for repeated concat references such as `?1`.
+- Correctness smoke passed in the isolated worktree:
+  `cargo fmt --check`,
+  `cargo test -p fsqlite-core test_prepared_direct_simple_insert_autocommit_profile_breakdown -- --nocapture`,
+  `cargo test -p fsqlite-core prepared_direct_simple_insert_concat_chain -- --nocapture`,
+  and `cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-external-qb-hint-owned-cyangorge-baseline-20260505T1318Z/report.json`
+  and
+  `tests/artifacts/perf/insert-param-text-cache-cyangorge-20260505T1347Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-param-text-cache-cyangorge-20260505T1347Z/summary.md`.
+- Result: rejected and not applied to main. The focused insert matrix worsened:
+  geomean F/C ratio `2.3832x` to `2.5280x`, weighted score `1.6578` to
+  `1.7978`, write-bulk geomean `2.5538x` to `2.6975x`, and write-single
+  geomean `1.4354x` to `1.5703x`. Target large rows did not improve:
+  single-transaction `large_10col` 10K moved `37.5866 ms` to `37.7624 ms`,
+  and record-size `large_10col` moved `39.4682 ms` to `41.3979 ms`.
+- Do not retry per-row integer placeholder text caching as a standalone
+  row-build optimization. Reconsider only with a direct serialization design
+  that avoids transient text materialization rather than caching its decimal
+  representation, and require a full insert-matrix win.
