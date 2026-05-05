@@ -1870,3 +1870,28 @@ CASS evidence:
 - Do not retry the simple `insert_page_sorted` last-page append/equal branch as
   a standalone optimization. The branch is cheap and plausible, but current
   end-to-end insert evidence says it is not a keep.
+
+## 2026-05-05 - WAL publication page-index Arc::make_mut hoist
+
+- Target: large INSERT commit publication overhead in
+  `WalBackendAdapter::publish_pending_commit_snapshot`.
+- Touched during rejected candidate: `crates/fsqlite-core/src/wal_adapter.rs`;
+  source was reverted after measurement.
+- Candidate shape: hoist `Arc::make_mut(&mut page_index)` out of the
+  per-frame loop so a commit that publishes thousands of frames only performs
+  the mutable Arc access once.
+- Correctness/build smoke passed:
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-wal-makemut-target cargo test -p fsqlite-core --lib append -- --nocapture`
+  (`17` tests) and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-wal-makemut-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench`.
+- Evidence artifact:
+  `tests/artifacts/perf/insert-wal-page-index-makemut-purplecoast-20260505T1513Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-wal-page-index-makemut-purplecoast-20260505T1513Z/summary.md`.
+- Result: rejected. Insert weighted score regressed `1.6991 -> 1.8022`,
+  avg/geomean ratios regressed `2.4610x -> 2.5586x` and
+  `2.3623x -> 2.4753x`, write_bulk regressed `2.5153x -> 2.6295x`, and
+  write_single regressed `1.4908x -> 1.5889x`.
+- Do not retry this simple `Arc::make_mut` hoist as a standalone WAL
+  publication optimization. The branch looked mechanically cheaper, but the
+  current end-to-end insert matrix rejected it.
