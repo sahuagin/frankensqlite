@@ -1,0 +1,30 @@
+diff --git a/crates/fsqlite-pager/src/pager.rs b/crates/fsqlite-pager/src/pager.rs
+index b3685010..814e6011 100644
+--- a/crates/fsqlite-pager/src/pager.rs
++++ b/crates/fsqlite-pager/src/pager.rs
+@@ -8337,14 +8337,17 @@ where
+             self.freed_pages.swap_remove(pos);
+         }
+ 
+-        // Same-page steal fast path (see `write_page`). The borrow split is
+-        // done first so we don't hand the fresh `PageData` to the
+-        // StagedPage constructor (and its pool acquire) unless we actually
+-        // need a new buffer.
+-        if let Some(existing) = self.write_set.get_mut(&page_no)
+-            && existing.try_overwrite_page_data_in_place(&data)
+-        {
+-            STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
++        // Same-page steal fast path (see `write_page`). If the existing staged
++        // image cannot be overwritten because it has been published or is no
++        // longer single-owner, replace that map entry directly. Routing through
++        // `insert_staged_page` would hash and insert the same key again even
++        // though `write_pages_sorted` is already correct.
++        if let Some(existing) = self.write_set.get_mut(&page_no) {
++            if existing.try_overwrite_page_data_in_place(&data) {
++                STAGED_PAGE_OVERWRITE_STEALS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
++                return Ok(());
++            }
++            *existing = StagedPage::from_page_data_for_pool(&self.pool, data)?;
+             return Ok(());
+         }
+ 
