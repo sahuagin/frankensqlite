@@ -65,6 +65,41 @@ only those sessions with `--sessions-from` and `--days 60`.
   method over trusting the exact workspace filter alone, then add only
   artifact-backed perf rejects or correctness-abandoned optimization attempts.
 
+## 2026-05-05 - Direct DML `SharedTxnPageIo` wrapper reuse
+
+Scope: prepared direct INSERT/UPDATE/DELETE in concurrent mode, after the
+UPDATE/DELETE profile showed fixed setup costs around short-lived B-tree cursor
+and page I/O wrapper construction.
+
+- Touched during rejected candidate:
+  `crates/fsqlite-core/src/connection.rs` and
+  `crates/fsqlite-vdbe/src/engine.rs`; source was reverted after measurement.
+- Candidate shape: park a reusable `SharedTxnPageIo` wrapper on `Connection`,
+  refill it with the current pager transaction plus concurrent writer context
+  for each direct DML statement, then drain the transaction back to
+  `active_txn`. The intent was to avoid rebuilding the internal
+  `Rc<RefCell<...>>` pair for every prepared direct INSERT/UPDATE/DELETE row.
+- Correctness smoke for the candidate passed:
+  `cargo fmt --check` and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-direct-dml-pageio-target cargo test -p fsqlite-vdbe shared_txn_page_io --profile release-perf -- --nocapture`
+  (`15` matching tests). A broader `fsqlite-core` filtered test attempt was
+  killed after the remote command ran silently for more than ten minutes, so
+  the keep/revert decision used benchmark evidence instead.
+- Evidence artifacts:
+  `tests/artifacts/perf/direct-dml-pageio-reuse-candidate-purplecoast-20260505T1640Z/baseline-update-report.json`,
+  `tests/artifacts/perf/direct-dml-pageio-reuse-candidate-purplecoast-20260505T1640Z/update-report.json`,
+  `tests/artifacts/perf/direct-dml-pageio-reuse-candidate-purplecoast-20260505T1640Z/baseline-insert-report.json`,
+  and
+  `tests/artifacts/perf/direct-dml-pageio-reuse-candidate-purplecoast-20260505T1640Z/candidate-insert-report.json`.
+- Result: rejected. Same-machine A/B showed the INSERT FrankenSQLite median
+  geomean improved only `0.9%` while the C-relative geomean regressed `2.2%`
+  (`25` scenarios, `14` FSQLite medians up and `11` down). UPDATE/DELETE was
+  effectively flat on FSQLite geomean (`0.36%` slower), regressed the tiny
+  delete row by `21.7%`, and regressed the C-relative geomean by `13.9%`.
+- Do not retry direct DML `SharedTxnPageIo` wrapper reuse as a standalone
+  optimization. The allocation avoided here is too small and too noisy relative
+  to row-build, B-tree, pager, WAL, and benchmark fixed costs.
+
 ## 2026-05-04 - CASS archaeology guardrails
 
 Scope: `cass` searches restricted to FrankenSQLite content since `2026-03-04`,
