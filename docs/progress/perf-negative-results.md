@@ -594,3 +594,31 @@ kept out of the tree but did not yet have a ledger entry.
   optimization. Reconsider only if the B-tree writer path can preflight room
   without duplicate layout work on full leaves and a close insert-section A/B
   improves FrankenSQLite absolute medians, not just serialization counters.
+
+## 2026-05-05 - Explicit :memory: concurrent transaction retained writer
+
+- Target: explicit single-transaction INSERT and UPDATE/DELETE rows where
+  benchmark-shaped private `:memory:` workloads pay fixed BEGIN/COMMIT ceremony
+  between logical transactions.
+- Touched during rejected candidate: `crates/fsqlite-core/src/connection.rs`.
+- Candidate shape: reuse the existing committed cached writer machinery across
+  explicit private-memory concurrent transactions. `COMMIT` would call
+  `commit_and_retain()` and park the committed writer; the next default
+  explicit `BEGIN` would take that cached writer while still registering a fresh
+  MVCC concurrent session.
+- Evidence:
+  - Correctness proof attempted:
+    `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-local-target cargo test -p fsqlite-core test_memory_explicit_concurrent_commit_parks_and_reuses_writer -- --nocapture`
+  - The focused proof failed on the second `COMMIT` with
+    `BusySnapshot { conflicting_pages: "2" }` after the second transaction
+    wrote the same table root page. The first retained commit appeared to park,
+    and the second `BEGIN` appeared to register a distinct concurrent session,
+    but FCW still treated page 2 as too new for the second logical transaction.
+- Result: rejected before any benchmark. The code was reverted because it
+  violated the explicit concurrent transaction visibility model. The failure is
+  a correctness blocker, not a tuning tradeoff.
+- Do not retry by simply allowing explicit `BEGIN` to reuse `cached_write_txn`.
+  A viable version would first need a proof that the retained pager handle's
+  published snapshot, the new `ConcurrentRegistry` session snapshot, and the
+  `concurrent_commit_index` frontier are all advanced together before any page
+  write is tracked.
