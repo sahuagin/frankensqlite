@@ -65,6 +65,56 @@ only those sessions with `--sessions-from` and `--days 60`.
   method over trusting the exact workspace filter alone, then add only
   artifact-backed perf rejects or correctness-abandoned optimization attempts.
 
+## 2026-05-05 - CASS user-term dedupe refresh
+
+Scope: follow-up to the explicit request to search last-two-month project history
+for failure vocabulary such as `rejected`, `reverted`, `slower`,
+`didn't help`, `did not help`, `abandoned`, `abandones`, `within noise`,
+`no improvement`, `rollback`, `worse`, `failed to improve`, and `not worth`.
+The existing CASS index was stale but usable. A direct session seed for
+`/data/projects/frankensqlite` returned `38` session paths; direct
+`--sessions-from` searches reported term totals without usable snippets, so the
+fallback was global `frankensqlite <term>` CASS search plus targeted `cass view`
+inspection of only source paths/titles clearly tied to this repo.
+
+- No additional benchmark-rejected or correctness-abandoned optimization
+  candidates were found beyond entries already represented in this ledger.
+- Hits for the March `bench_insert` serializer/VFS/hash-map optimization pass
+  reinforce the existing stale-benchmark rule: the raw benchmark moved only
+  about `0.271 s` to `0.265 s` while thrashing parse/codegen with unique SQL
+  strings. Do not use that run as a keep/retry signal for current insert work.
+- Hits for `SqliteValue` `Arc<str>` / `Arc<[u8]>`, prepared-DML direct VDBE
+  execution, and public `Row` `SmallVec` were already covered by the CASS
+  last-60-day no-retry expansion below.
+- Hits for async VFS / true-asupersync migration beads were already classified
+  as architecture plan-space, not a rejected micro-optimization.
+- Hits for `ConcurrentRegistry` global-lock stripping, VDBE/B-tree index-record
+  parse hoists, cancellation checkpoints, and JSON/VFS correctness audits were
+  excluded because CASS presented them as accepted or correctness-focused work,
+  not as ideas that were tried and abandoned. Add them later only if a commit,
+  artifact, or follow-up session shows a measured revert or keep-gate failure.
+
+CASS evidence inspected in this refresh:
+- `cass search '/data/projects/frankensqlite' --days 60 --robot-format sessions --limit 500 --mode lexical`
+- `cass search 'frankensqlite rejected' --days 60 --json --fields summary --limit 20 --mode lexical`
+- `cass search 'frankensqlite reverted' --days 60 --json --fields summary --limit 20 --mode lexical`
+- `cass search 'frankensqlite slower' --days 60 --json --fields summary --limit 20 --mode lexical`
+- `cass search 'frankensqlite abandoned' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search "frankensqlite didn't help" --days 60 --json --fields summary --limit 20 --mode lexical`
+- `cass search 'frankensqlite did not help' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite within noise' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite no improvement' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite rollback' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite worse' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite failed to improve' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite not worth' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 104 -C 60`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 285 -C 24`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-f0efb944.json -n 219 -C 28`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-07T20-25-52485ea5.json -n 13 -C 24`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T22-16-466c7bcd.json -n 168 -C 30`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-08T00-01-e13b2d1e.json -n 4 -C 20`
+
 ## 2026-05-05 - Direct DML `SharedTxnPageIo` wrapper reuse
 
 Scope: prepared direct INSERT/UPDATE/DELETE in concurrent mode, after the
