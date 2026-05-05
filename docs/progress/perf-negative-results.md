@@ -1375,3 +1375,29 @@ large-row `row_build_ns` around 5-6 ms for 10K-row large-record inserts.
   materializing transient `SqliteValue::Text` for lazy `:memory:` inserts or
   serialize concat output directly into a record/page destination with a
   same-window insert matrix win.
+
+## 2026-05-05 - Quotient-filter empty-map maintenance skip
+
+Scope: direct INSERT per-row bookkeeping in
+`crates/fsqlite-core/src/connection.rs`, after insert profiles showed
+substantial execute-body time not fully covered by row-build, serialization,
+B-tree, and commit counters. The candidate targeted `qf_record_insert` /
+`qf_record_delete`, which are called after successful direct-simple INSERT and
+DELETE maintenance.
+
+- Candidate shape: return early when `self.quotient_filters.borrow().is_empty()`
+  before taking the existing mutable borrow and attempting a root-page lookup.
+  The intended fast path was benchmark-style INSERT workloads where no
+  quotient filter has been seeded yet, making QF maintenance a logical no-op.
+- Evidence: correctness gate failed before benchmarking:
+  `cargo test -p fsqlite-core quotient_filter -- --nocapture`. Artifact note:
+  `tests/artifacts/perf/insert-qf-empty-skip-cyangorge-20260505T1256Z/summary.md`.
+- Result: rejected and reverted before A/B measurement. Two existing tests
+  failed: `test_quotient_filter_short_circuits_absent_rowids_on_delete`
+  reported `expected >= 90 QF short-circuits, got 0`, and
+  `test_quotient_filter_delete_then_redelete_short_circuits` reported that the
+  second delete of a removed rowid did not short-circuit.
+- Do not retry an empty-map early return in QF maintenance without first
+  reworking the lazy seed lifecycle. The empty-map state is not merely an
+  inert "disabled" state; it can be part of the path that lets later DELETE /
+  UPDATE consultation seed and maintain the filter correctly.
