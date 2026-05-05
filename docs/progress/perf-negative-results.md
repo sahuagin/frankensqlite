@@ -258,6 +258,52 @@ Primary CASS evidence for the stale-target and false-lead guardrails:
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-5b9da3d6.json -n 153 -C 24`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 267 -C 28`
 
+## 2026-05-05 - CASS/artifact follow-up: older measured rejects
+
+Scope: additional last-two-month CASS pass over the user-suggested negative
+terms, then cross-checking older April artifact bundles that the CASS hits
+pointed back toward. These are not broad design opinions; each item had a
+measured reject or focused-test rollback.
+
+- Mixed-OLTP record-header length microparser: replacing the serial-type length
+  branch in `parse_record_header_into` with direct `SMALL_TYPE_SIZES` table use
+  was rejected. The quick mixed baseline envelope was `1.399 s` and `1.425 s`,
+  while candidate repeats were `1.390 s` and `1.518 s`; the average after-run
+  was slower and the patch was rolled back. Evidence:
+  `tests/artifacts/perf/20260424T2334Z-optimization-pass/RESULT.md`. Do not
+  retry record-header length table reshuffling as an isolated mixed-OLTP lever;
+  the later two-byte-header insert rejects reinforce that header microparsing
+  only matters when a full matrix row moves.
+- Delete sort insertion threshold: raising
+  `sort_cells_desc_by_ptr::INSERTION_SORT_THRESHOLD` from `20` to `64` passed
+  the focused sort-order proof but failed the wall-clock confirmation. The
+  500-iteration delete run regressed from `5470.7 ms` to `5579.3 ms`, and the
+  500-iteration `both` delete phase regressed from `1205.3 ms` to `1217.7 ms`.
+  Evidence:
+  `tests/artifacts/perf/20260427T2045Z-azurepine-delete-sort-threshold/RESULT.md`.
+  Keep the threshold at `20`; do not tune it upward from a sort microbench
+  without a delete/both e2e win.
+- Delete large-N monotonic pre-scan removal: removing the pre-scan in
+  `sort_cells_desc_by_ptr` improved local sort microbench cases, but the e2e
+  `both` workload regressed within noise (`1.566 s` to `1.578 s`) and
+  delete-only was only `1.01x +/- 0.03`, below the keep bar. Evidence:
+  `tests/artifacts/perf/20260427T2235Z-snowyfortress-sort-prescan/RESULT.md`.
+  Do not remove the pre-scan based on local sort timings; the accepted packed
+  gap-shift path was the useful part of that pass.
+- Early prepared direct INSERT zero-copy writer: an attempt to serialize
+  prepared direct INSERT records directly into retained rightmost-leaf page
+  space was fully rolled back before benchmarking because focused
+  `direct_simple_insert` tests exposed unsafe retained/autocommit validation
+  behavior (`29 passed`, `2 failed`). Evidence:
+  `tests/artifacts/perf/20260428T0106Z-snowyfortress-post-compact/RESULT.md`.
+  This is an earlier correctness-abandoned version of the later measured
+  retained-leaf writer reject; do not re-enter this route without first
+  isolating the retained/autocommit validation surface.
+
+Primary CASS evidence that led back to these older bundles:
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 120 -C 35`
+- `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-68d80f81.json -n 118 -C 24`
+
 ## 2026-05-05 - CASS follow-up: correctness-abandoned fast paths
 
 Scope: last-60-day CASS search for the user-suggested negative terms. Direct
