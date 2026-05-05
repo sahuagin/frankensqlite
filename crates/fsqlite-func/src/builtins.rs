@@ -1363,25 +1363,19 @@ impl ScalarFunction for SubstrFunc {
 
         let text = text_arg(&args[0]);
         let s = text.as_ref();
-        let has_length = args.len() > 2 && !args[2].is_null();
-        let mut p1 = args[1].to_integer();
-        let mut p2 = if has_length {
-            args[2].to_integer()
-        } else {
-            1_000_000_000
-        };
-
-        if has_length {
-            if let Some(result) = ascii_positive_substr_prefix(s, p1, p2) {
-                return Ok(SqliteValue::Text(result));
-            }
-        }
-
         let ascii_fast_path = s.is_ascii();
         let len = if ascii_fast_path {
             s.len() as i64
         } else {
             s.chars().count() as i64
+        };
+        let has_length = args.len() > 2 && !args[2].is_null();
+
+        let mut p1 = args[1].to_integer();
+        let mut p2 = if has_length {
+            args[2].to_integer()
+        } else {
+            1_000_000_000
         };
 
         // Match C SQLite's 2-phase substr algorithm exactly:
@@ -1506,28 +1500,6 @@ impl SubstrFunc {
             &blob[p1 as usize..(p1 + p2) as usize],
         )))
     }
-}
-
-fn ascii_positive_substr_prefix(s: &str, start_arg: i64, length_arg: i64) -> Option<SmallText> {
-    if start_arg <= 0 || length_arg <= 0 {
-        return None;
-    }
-
-    let start_arg = start_arg - 1;
-    let Ok(start) = usize::try_from(start_arg) else {
-        return Some(SmallText::new(""));
-    };
-    if start >= s.len() {
-        return Some(SmallText::new(""));
-    }
-
-    let requested_end = start_arg.saturating_add(length_arg);
-    let prefix_end = usize::try_from(requested_end).map_or(s.len(), |end| end.min(s.len()));
-    if !s.as_bytes()[..prefix_end].is_ascii() {
-        return None;
-    }
-
-    Some(SmallText::new(&s[start..prefix_end]))
 }
 
 // ── soundex(X) ───────────────────────────────────────────────────────────
@@ -4258,16 +4230,6 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("ell"))
         );
-    }
-
-    #[test]
-    fn test_substr_ascii_prefix_preserves_unicode_fallback_boundary() {
-        let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s));
-        let i = SqliteValue::Integer;
-
-        assert_eq!(f.invoke(&[t("abcdefé"), i(2), i(3)]).unwrap(), t("bcd"));
-        assert_eq!(f.invoke(&[t("abcédef"), i(2), i(3)]).unwrap(), t("bcé"));
     }
 
     #[test]
