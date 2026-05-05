@@ -1555,3 +1555,40 @@ commits. Entries already present in this ledger were not duplicated.
   page-allocation profile showing `TransactionHandle::allocate_page`
   inner-lock acquisition dominating and an adaptive policy that preserves or
   improves the full insert matrix, especially the large record-size row.
+
+## 2026-05-05 - External quick-balance owned page handoff
+
+- Target: INSERT throughput rows that split the rightmost leaf through
+  `try_quick_balance_on_external_rightmost_leaf_hint`, especially 10K
+  `large_10col` single-transaction and record-size rows.
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`.
+  The code was reverted after measurement.
+- Candidate shape: on the external retained-hint quick-balance success path,
+  move `result.new_page_data` directly into `hint.page_data` and clear
+  `rightmost_leaf_cache` instead of cloning the page into the hint and storing
+  another owned copy in the cursor-local cache.
+- Correctness smoke:
+  `cargo test -p fsqlite-btree test_table_try_append_cached_rightmost_leaf_hint -- --nocapture`
+  passed (`4` tests).
+- Evidence artifacts:
+  `tests/artifacts/perf/qb-owned-handoff-baseline-dirtyconn-purplecoast-20260505T132841Z/report.json`,
+  `tests/artifacts/perf/qb-owned-handoff-candidate-purplecoast-20260505T132443Z/report.json`,
+  and
+  `tests/artifacts/perf/qb-owned-handoff-candidate-repeat-purplecoast-20260505T133407Z/report.json`.
+  A peer dirty-tree check reached the same disposition in
+  `tests/artifacts/perf/insert-external-qb-hint-current-dirty-cyangorge-20260505T1333Z/summary.md`.
+- Result: rejected and reverted. The primary weighted score looked better in
+  the local paired runs (`1.8386` baseline to `1.7808` / `1.7728` candidate),
+  but this was not a full-workload win: geomean ratio worsened on both
+  candidates (`2.5061x` to `2.5690x` / `2.6859x`), write-bulk worsened on the
+  repeat (`2.8074x` to `2.9619x`), and the main 10K `large_10col`
+  single-transaction FSQLite median worsened `37.61 ms` to `39.12 ms` and then
+  `42.22 ms`. Record-size tiny/small/medium rows consistently regressed
+  (`4.50/6.78/10.68 ms` baseline to `5.36/8.00/12.04 ms`, then
+  `6.03/8.01/12.75 ms`). The only large record-size improvement was unstable
+  (`44.89 ms` baseline to `37.97 ms`, then `43.03 ms`).
+- Do not retry this exact "move page to external hint and clear internal
+  cache" handoff. Reconsider only with a different rightmost-cache design that
+  avoids the page clone while preserving the useful cache state, and require an
+  interleaved A/B that improves the full insert matrix without regressing the
+  small/medium record-size rows or the 10K large single-transaction row.
