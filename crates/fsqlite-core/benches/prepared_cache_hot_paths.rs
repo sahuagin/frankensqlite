@@ -2,7 +2,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::Instant;
 
-use fsqlite_core::connection::Connection;
+use fsqlite_core::connection::{Connection, hot_path_profile_snapshot, reset_hot_path_profile};
 use fsqlite_types::SqliteValue;
 use tempfile::NamedTempFile;
 
@@ -165,6 +165,73 @@ fn bench_prepared_indexed_equality_query(iterations: u64, count: i64) -> f64 {
     start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64
 }
 
+fn open_e2e_read_indexed_equality_shape_conn(count: i64) -> Connection {
+    let conn = Connection::open(":memory:").expect("open memory connection");
+    for pragma in [
+        "PRAGMA page_size = 4096;",
+        "PRAGMA journal_mode = WAL;",
+        "PRAGMA synchronous = NORMAL;",
+        "PRAGMA cache_size = -64000;",
+        "PRAGMA fsqlite_capture_time_travel_snapshots=false;",
+    ] {
+        let _ = conn.execute(pragma);
+    }
+    conn.execute(
+        "CREATE TABLE bench (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            value REAL NOT NULL
+        );",
+    )
+    .expect("create e2e-shaped bench table");
+    conn.execute("BEGIN;").expect("begin e2e-shaped seed");
+    let insert = conn
+        .prepare("INSERT INTO bench VALUES (?1, ('user_' || ?1), (?1 * 0.137))")
+        .expect("prepare e2e-shaped insert");
+    for id in 0..count {
+        insert
+            .execute_with_params(&[SqliteValue::Integer(id)])
+            .expect("seed e2e-shaped row");
+    }
+    conn.execute("COMMIT;").expect("commit e2e-shaped seed");
+    conn.execute("CREATE INDEX idx_name ON bench(name);")
+        .expect("create e2e-shaped name index");
+    conn
+}
+
+fn bench_prepared_indexed_equality_e2e_shape_query(iterations: u64, count: i64) -> (f64, u64) {
+    let conn = open_e2e_read_indexed_equality_shape_conn(count);
+    let indexed_equality = conn
+        .prepare("SELECT * FROM bench WHERE name = ?1")
+        .expect("prepare e2e-shaped indexed equality");
+    let probe = [SqliteValue::Text(format!("user_{}", count / 2).into())];
+    black_box(
+        indexed_equality
+            .query_with_params(&probe)
+            .expect("warm e2e-shaped indexed equality"),
+    );
+    black_box(
+        indexed_equality
+            .query_with_params(&probe)
+            .expect("warm cached e2e-shaped indexed equality"),
+    );
+
+    reset_hot_path_profile();
+    let start = Instant::now();
+    let mut row_count = 0_usize;
+    for _ in 0..iterations {
+        let rows = indexed_equality
+            .query_with_params(&probe)
+            .expect("e2e-shaped indexed equality fast path");
+        row_count = row_count.saturating_add(rows.len());
+        black_box(rows);
+    }
+    black_box(row_count);
+    let elapsed_ns = start.elapsed().as_secs_f64() * 1_000_000_000.0 / iterations as f64;
+    let profile = hot_path_profile_snapshot();
+    (elapsed_ns, profile.direct_indexed_equality_query_hits)
+}
+
 fn open_prepared_count_indexed_rowid_probe_conn(count: i64) -> Connection {
     let conn = Connection::open(":memory:").expect("open memory connection");
     for pragma in [
@@ -297,6 +364,15 @@ fn parse_iterations() -> u64 {
                 println!(
                     "prepared_cache_hot_paths indexed_equality_query_ns_per_op={indexed_equality_ns:.2} rows=100000 iterations={}",
                     iterations.min(200_000)
+                );
+                std::process::exit(0);
+            }
+            "indexed_equality_e2e_shape_100k" => {
+                let iterations = iterations.min(200_000);
+                let (indexed_equality_ns, direct_hits) =
+                    bench_prepared_indexed_equality_e2e_shape_query(iterations, 100_000);
+                println!(
+                    "prepared_cache_hot_paths indexed_equality_e2e_shape_query_ns_per_op={indexed_equality_ns:.2} rows=100000 iterations={iterations} direct_indexed_equality_hits={direct_hits}"
                 );
                 std::process::exit(0);
             }
