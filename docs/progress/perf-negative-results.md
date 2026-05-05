@@ -1192,3 +1192,38 @@ several milliseconds in prepared-frame construction and WAL append.
   bypass. Revisit only if a new design preserves prelock prepared-frame
   construction while reducing its transform/buffer cost, and proves the
   large-row insert section improves in a same-window matrix.
+
+## 2026-05-05 - Private `:memory:` WAL commit bypass
+
+Scope: `comprehensive-bench --quick --filter insert`, targeting private
+`/:memory:` pager commits in `crates/fsqlite-pager/src/pager.rs` after insert
+profiles showed large-row single-transaction commits dominated by dirty-page
+publication.
+
+- Candidate shape: in a clean temporary worktree based on `71b6720f`, route
+  `memory_db_bump_alloc` commits through direct private-memory page flushing
+  before the WAL branch, skip WAL conflict prediction for private memory, and
+  avoid synthetic page-1 rewrites for ordinary private-memory growth unless
+  page 1 or the freelist was actually dirty. The candidate also made
+  `commit_and_retain` defer private-memory VFS flushing when the retained
+  writer could publish committed pages through its retained cache.
+- Evidence:
+  - Focused proof:
+    `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-memcommit-target cargo test -p fsqlite-pager private_memory -- --nocapture`
+    passed in the temporary worktree.
+  - Baseline:
+    `tests/artifacts/perf/private-memory-commit-base-purplecoast-20260505T1120Z/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/private-memory-commit-candidate-purplecoast-20260505T1120Z/report.json`.
+- Result: rejected and not applied to the shared worktree. The insert ratio
+  summary looked better (`avg_ratio 2.283x -> 2.097x`, weighted score
+  `1.6279 -> 1.4773`), but the absolute FrankenSQLite medians were worse:
+  geomean time ratio `1.107x`, average time ratio `1.127x`, with `17/25`
+  insert rows slower. Notable regressions included small_3col 10K autocommit
+  `13.09 ms -> 21.48 ms`, small_3col 1K autocommit
+  `1.52 ms -> 2.24 ms`, 100-row batched `218.9 us -> 323.6 us`, and
+  large_10col 10K single transaction `42.18 ms -> 44.28 ms`.
+- Do not retry private `:memory:` WAL bypass as a standalone pager shortcut.
+  Revisit only with a same-window proof that improves absolute FrankenSQLite
+  medians and the insert-section score; ratio-only gains are suspect because
+  the C SQLite denominator can move enough to hide FrankenSQLite regressions.
