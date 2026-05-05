@@ -1931,3 +1931,39 @@ CASS evidence:
   standalone micro-optimization. The per-row char-to-affinity match is not the
   bottleneck; future affinity work should remove or fuse value coercion itself
   and must improve the same-window insert matrix.
+
+## 2026-05-05 - WAL checksum one-chunk header transform
+
+- Target: `WalChecksumTransform::for_wal_frame` self-time under large INSERT
+  WAL frame preparation.
+- Touched during rejected candidate: `crates/fsqlite-wal/src/checksum.rs`;
+  source was reverted after measurement.
+- Candidate shape: replace the generic
+  `WalChecksumTransform::from_aligned_bytes(&frame[..8], ...)` call for the
+  8-byte WAL frame header prefix with the closed-form affine transform for
+  exactly one checksum chunk. The page payload transform stayed on the generic
+  path.
+- Correctness smoke passed:
+  `cargo fmt --check` and
+  `env CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p fsqlite-wal checksum_transform -- --nocapture`
+  (`2` matching tests). The first release-perf build attempt in the shared
+  `/data/tmp/cargo-target` failed with a missing bytecode file, so the
+  candidate benchmark was built in the unique target dir
+  `/data/tmp/frankensqlite-cyangorge-walchk-target`.
+- Evidence artifacts:
+  baseline
+  `tests/artifacts/perf/direct-insert-precomputed-affinity-cyangorge-20260505T1525Z/baseline-report.json`
+  and candidate
+  `tests/artifacts/perf/wal-checksum-header-transform-cyangorge-20260505T1535Z/candidate-report.json`.
+  Summary:
+  `tests/artifacts/perf/wal-checksum-header-transform-cyangorge-20260505T1535Z/summary.md`.
+- Result: rejected. The primary weighted insert score regressed
+  `1.5606 -> 1.7049`, avg/geomean ratios regressed
+  `2.3295x -> 2.4746x` and `2.2311x -> 2.3800x`, write_bulk geomean
+  regressed `2.3883x -> 2.5361x`, and write_single geomean regressed
+  `1.3542x -> 1.4935x`. Several absolute FSQLite 10K medians improved, but
+  the ratio-weighted matrix and category scores failed the keep gate.
+- Do not retry a special one-chunk header transform inside
+  `WalChecksumTransform::for_wal_frame` as a standalone micro-optimization.
+  Future WAL checksum work should reduce the payload transform or prepared-frame
+  pipeline cost and must improve the full insert matrix.
