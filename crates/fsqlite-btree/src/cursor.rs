@@ -4418,16 +4418,23 @@ impl<P: PageWriter> BtCursor<P> {
             .pop()
             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
         let leaf_page_no = entry.page_no;
-        let Some((insert_idx, new_cell_offset)) = self.try_append_leaf_page_in_place(
+        let append_result = self.try_append_leaf_page_in_place(
             cx,
             leaf_page_no,
             &mut entry.page_data,
             &mut entry.header,
             cell_data,
-        )?
-        else {
-            self.stack.push(entry);
-            return Ok(false);
+        };
+        let (insert_idx, new_cell_offset) = match append_result {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                self.stack.push(entry);
+                return Ok(false);
+            }
+            Err(error) => {
+                self.stack.push(entry);
+                return Err(error);
+            }
         };
 
         entry.cell_pointers.push(new_cell_offset);
@@ -4453,19 +4460,25 @@ impl<P: PageWriter> BtCursor<P> {
             .pop()
             .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
         let leaf_page_no = entry.page_no;
-        let Some((insert_idx, new_cell_offset)) = self
-            .try_append_table_leaf_payload_in_place_no_overflow_with_writer(
-                cx,
-                leaf_page_no,
-                &mut entry.page_data,
-                &mut entry.header,
-                rowid,
-                payload_len,
-                writer,
-            )?
-        else {
-            self.stack.push(entry);
-            return Ok(false);
+        let append_result = self.try_append_table_leaf_payload_in_place_no_overflow_with_writer(
+            cx,
+            leaf_page_no,
+            &mut entry.page_data,
+            &mut entry.header,
+            rowid,
+            payload_len,
+            writer,
+        );
+        let (insert_idx, new_cell_offset) = match append_result {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                self.stack.push(entry);
+                return Ok(false);
+            }
+            Err(error) => {
+                self.stack.push(entry);
+                return Err(error);
+            }
         };
 
         entry.cell_pointers.push(new_cell_offset);
@@ -13496,6 +13509,8 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("forced direct writer failure"));
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"seed");
         assert!(
             !cursor.table_move_to(&cx, 2).unwrap().is_found(),
             "failed writer append must not publish a new row"
