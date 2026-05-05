@@ -1624,3 +1624,38 @@ commits. Entries already present in this ledger were not duplicated.
   row-build optimization. Reconsider only with a direct serialization design
   that avoids transient text materialization rather than caching its decimal
   representation, and require a full insert-matrix win.
+
+## 2026-05-05 - Dirty WAL prepared-frame direct publication snapshot
+
+- Target: INSERT commit/publish cost on large single-transaction rows, where
+  profiles still show multi-ms `commit_roundtrip_ns`. The measured source diff
+  was peer-owned dirty work in `crates/fsqlite-core/src/wal_adapter.rs`; this
+  entry records an independent dirty-tree A/B, not a source change landed by
+  CyanGorge.
+- Candidate shape: for prepared frame batches with a known commit frame, publish
+  the WAL visibility snapshot directly from `prepared.frame_metas` instead of
+  first recording those frame entries in `pending_publication_frames`.
+- Correctness smoke:
+  `cargo test -p fsqlite-core --lib append -- --nocapture` passed
+  (`17` tests). A broader exploratory
+  `cargo test -p fsqlite-core append -- --nocapture` run passed the WAL adapter
+  append tests but failed
+  `test_v2_plain_execute_sequential_inserts_keep_append_path_hot_across_statements`,
+  so that integration failure must be resolved or shown unrelated before
+  landing.
+- Evidence artifacts:
+  `tests/artifacts/perf/insert-external-qb-hint-owned-cyangorge-baseline-20260505T1318Z/report.json`
+  and
+  `tests/artifacts/perf/insert-wal-publish-direct-current-dirty-cyangorge-20260505T135315Z/report.json`.
+  Summary:
+  `tests/artifacts/perf/insert-wal-publish-direct-current-dirty-cyangorge-20260505T135315Z/summary.md`.
+- Result: mixed and not a keep as-is. Large FSQLite medians improved
+  (`large_10col` single transaction `37.5866 ms` to `35.1876 ms`,
+  record-size `large_10col` `39.4682 ms` to `34.7089 ms`), but the insert
+  matrix did not clear the keep gate: geomean F/C ratio worsened slightly
+  `2.3832x` to `2.3890x`, weighted score worsened `1.6578` to `1.7359`,
+  and write-single geomean worsened `1.4354x` to `1.5293x`.
+- Do not land this exact direct-publish dirty diff from this evidence alone.
+  Retry only with an interleaved clean/candidate A/B that preserves the
+  large-row improvement, restores the weighted score/write-single rows, and
+  explains or fixes the broader append-filter failure.

@@ -1,0 +1,146 @@
+diff --git a/crates/fsqlite-core/src/wal_adapter.rs b/crates/fsqlite-core/src/wal_adapter.rs
+index 0355d0e9..26122534 100644
+--- a/crates/fsqlite-core/src/wal_adapter.rs
++++ b/crates/fsqlite-core/src/wal_adapter.rs
+@@ -645,12 +645,16 @@ impl<F: VfsFile> WalBackendAdapter<F> {
+         last_commit_frame
+     }
+
+-    fn publish_pending_commit_snapshot(
++    fn publish_appended_frame_entries_commit_snapshot<I>(
+         &mut self,
+         cx: &Cx,
++        entries: I,
+         last_commit_frame: usize,
+         scenario_id: &'static str,
+-    ) -> Result<()> {
++    ) -> Result<()>
++    where
++        I: IntoIterator<Item = (u32, usize, bool)>,
++    {
+         let generation = self.wal.generation_identity();
+         let previous_last_commit = self.published_snapshot.last_commit_frame;
+         let can_extend_previous = self.published_snapshot.generation == generation
+@@ -684,10 +688,10 @@ impl<F: VfsFile> WalBackendAdapter<F> {
+
+         let mut frame_delta_count = 0_usize;
+         let mut commit_delta_count = 0_u64;
+-        for frame in &self.pending_publication_frames {
++        for (page_number, frame_index, is_commit) in entries {
+             if previous_last_commit
+-                .is_some_and(|previous_last_commit| frame.frame_index <= previous_last_commit)
+-                || frame.frame_index > last_commit_frame
++                .is_some_and(|previous_last_commit| frame_index <= previous_last_commit)
++                || frame_index > last_commit_frame
+             {
+                 continue;
+             }
+@@ -695,19 +699,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
+             frame_delta_count = frame_delta_count.saturating_add(1);
+             let page_index_map = Arc::make_mut(&mut page_index);
+             if page_index_map.len() < self.page_index_cap
+-                || page_index_map.contains_key(&frame.page_number)
++                || page_index_map.contains_key(&page_number)
+             {
+-                page_index_map.insert(frame.page_number, frame.frame_index);
++                page_index_map.insert(page_number, frame_index);
+             } else {
+                 index_is_partial = true;
+             }
+-            if frame.is_commit {
++            if is_commit {
+                 commit_delta_count = commit_delta_count.saturating_add(1);
+             }
+         }
+
+         if frame_delta_count == 0 {
+-            self.pending_publication_frames.clear();
+             return self.publish_visible_snapshot(cx, Some(last_commit_frame), scenario_id);
+         }
+
+@@ -722,7 +725,6 @@ impl<F: VfsFile> WalBackendAdapter<F> {
+             page_index,
+             index_is_partial,
+         };
+-        self.pending_publication_frames.clear();
+
+         tracing::trace!(
+             target: "fsqlite.wal_publication",
+@@ -747,6 +749,25 @@ impl<F: VfsFile> WalBackendAdapter<F> {
+
+         Ok(())
+     }
++
++    fn publish_pending_commit_snapshot(
++        &mut self,
++        cx: &Cx,
++        last_commit_frame: usize,
++        scenario_id: &'static str,
++    ) -> Result<()> {
++        let pending_frames = std::mem::take(&mut self.pending_publication_frames);
++        let result = self.publish_appended_frame_entries_commit_snapshot(
++            cx,
++            pending_frames
++                .iter()
++                .map(|frame| (frame.page_number, frame.frame_index, frame.is_commit)),
++            last_commit_frame,
++            scenario_id,
++        );
++        self.pending_publication_frames.clear();
++        result
++    }
+ }
+
+ /// Convert pager checkpoint mode to WAL checkpoint mode.
+@@ -978,13 +999,6 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
+             prepared.last_commit_frame_offset,
+         )?;
+         self.refresh_before_append = false;
+-        let last_commit_frame = self.record_appended_frames(
+-            start_frame_index,
+-            prepared
+-                .frame_metas
+-                .iter()
+-                .map(|frame| (frame.page_number, frame.db_size_if_commit)),
+-        );
+
+         #[cfg(not(target_arch = "wasm32"))]
+         if let Some(hook) = &mut self.fec_hook {
+@@ -1015,12 +1029,35 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
+             }
+         }
+
+-        if let Some(last_commit_frame) = last_commit_frame {
+-            self.publish_pending_commit_snapshot(
++        if let Some(last_commit_frame_offset) = prepared.last_commit_frame_offset {
++            let last_commit_frame = start_frame_index.saturating_add(last_commit_frame_offset);
++            self.publish_appended_frame_entries_commit_snapshot(
+                 cx,
++                prepared.frame_metas.iter().enumerate().map(|(offset, frame)| {
++                    (
++                        frame.page_number,
++                        start_frame_index.saturating_add(offset),
++                        frame.db_size_if_commit != 0,
++                    )
++                }),
+                 last_commit_frame,
+                 "append_prepared_frames_commit",
+             )?;
++        } else {
++            let last_commit_frame = self.record_appended_frames(
++                start_frame_index,
++                prepared
++                    .frame_metas
++                    .iter()
++                    .map(|frame| (frame.page_number, frame.db_size_if_commit)),
++            );
++            if let Some(last_commit_frame) = last_commit_frame {
++                self.publish_pending_commit_snapshot(
++                    cx,
++                    last_commit_frame,
++                    "append_prepared_frames_commit",
++                )?;
++            }
+         }
+
+         Ok(())
