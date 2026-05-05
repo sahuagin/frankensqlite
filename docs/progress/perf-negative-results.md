@@ -163,6 +163,14 @@ inspection of only source paths/titles clearly tied to this repo.
   excluded because CASS presented them as accepted or correctness-focused work,
   not as ideas that were tried and abandoned. Add them later only if a commit,
   artifact, or follow-up session shows a measured revert or keep-gate failure.
+- A repeat phrase pass also searched `gave up`, `abandon*`, `no measurable`,
+  and `keep gate`. The only new-looking CASS leads routed back to already
+  recorded March hardcoded-page-size, broad `SmallVec`, and prepared-benchmark
+  fairness work; none added a new benchmark-rejected performance shape. Do not
+  use `rg` over CASS `source_path`s as the primary verification method here:
+  several indexed session paths are archived/virtual and no longer exist on
+  disk, while `cass view <source_path> -n <line> -C <context>` still resolves
+  them from the CASS index.
 
 CASS evidence inspected in this refresh:
 - `cass search '/data/projects/frankensqlite' --days 60 --robot-format sessions --limit 500 --mode lexical`
@@ -178,6 +186,10 @@ CASS evidence inspected in this refresh:
 - `cass search 'frankensqlite worse' --days 60 --json --fields summary --limit 30 --mode lexical`
 - `cass search 'frankensqlite failed to improve' --days 60 --json --fields summary --limit 30 --mode lexical`
 - `cass search 'frankensqlite not worth' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite gave up' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite abandon*' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite no measurable' --days 60 --json --fields summary --limit 30 --mode lexical`
+- `cass search 'frankensqlite keep gate' --days 60 --json --fields summary --limit 30 --mode lexical`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-a1108e5a.json -n 104 -C 60`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json -n 285 -C 24`
 - `cass view /home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T22-55-f0efb944.json -n 219 -C 28`
