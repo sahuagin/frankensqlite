@@ -81,6 +81,61 @@ slower than C SQLite and still carrying a small
   dominant DELETE cost or if a broader measured change removes the retained
   cache scratch dependency entirely.
 
+## 2026-05-05 - Direct DELETE staged-page publication split
+
+Scope: direct DELETE write path after CASS/recent-session follow-up found a
+missing rejected PurpleCoast artifact tied to
+`dml-mutation-profile-purplecoast-20260505T1830Z`, where isolated DELETE was
+about `5.23x` slower than C SQLite.
+
+- Touched during rejected candidate: pager transaction staging internals around
+  `SimpleTransaction::get_page`, `StagedPage::published_page`, and
+  `StagedPageBacking::Owned`; source was reverted after measurement.
+- Candidate shape: when a page already existed in the transaction write set,
+  return a transaction-local immutable clone without marking the staged page as
+  published, and keep allowing owned staged pages to overwrite after their
+  internal immutable snapshot cache had materialized. The theory was that
+  repeated direct DELETE reads of the same leaf disabled same-page overwrite
+  stealing through the publication marker.
+- Correctness proof: focused pager staging tests passed for the candidate.
+- Evidence artifacts:
+  `tests/artifacts/perf/delete-write-path-purplecoast-20260505T1905Z/summary.md`
+  and its `candidate-isolated-compare.log`; baseline comparison came from
+  `tests/artifacts/perf/dml-mutation-profile-purplecoast-20260505T1830Z/exact-isolated-compare.log`.
+- Result: rejected and reverted. FSQLite isolated total regressed
+  `580 ms -> 600 ms`, UPDATE regressed `263 ms -> 273 ms`, DELETE regressed
+  `201 ms -> 209 ms`, and DELETE ratio worsened `5.23x -> 5.39x`.
+- Do not retry this staged-page publication split unless a fresh profile shows
+  a materially different staged-page mechanism, and require an isolated
+  update/delete A/B win before any broader matrix run.
+
+## 2026-05-05 - Direct DELETE top-stack clone removal
+
+Scope: direct table-leaf DELETE after CASS/recent-session follow-up found a
+missing rejected PurpleCoast clean-worktree artifact from
+`/data/tmp/frankensqlite-purplecoast-delete-topclone` at commit `a50dc8ac`.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs`;
+  source was not kept in the shared checkout.
+- Candidate shape: replace the full cloned top `StackEntry` in
+  `BtCursor::delete` with copied scalar metadata for leaf-ness, cell count, and
+  `separator_repair_for_deleted_leaf_max(top)?`, aiming to avoid a
+  PageData/cell-pointer clone before direct table-leaf DELETE.
+- Correctness proof passed in the clean worktree:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-purplecoast-delete-topclone-target cargo test -p fsqlite-btree cursor_delete -- --nocapture`
+  (`7` tests).
+- Evidence artifact:
+  `tests/artifacts/perf/delete-top-clone-purplecoast-20260505T1920Z/summary.md`;
+  baseline comparison came from
+  `tests/artifacts/perf/dml-mutation-profile-purplecoast-20260505T1830Z/exact-isolated-compare.log`.
+- Result: rejected. One isolated `both compare` run improved total
+  `580 ms -> 566 ms` and UPDATE `263 ms -> 252 ms`, but the targeted DELETE
+  row was flat/slightly worse (`201 ms -> 202 ms`, `5.23x -> 5.26x`), and the
+  delete-only confirmation regressed `1011 ms -> 1016 ms`.
+- Do not retry top-stack clone removal as a standalone DELETE optimization.
+  Reconsider only if a future profile shows the clone itself dominating and a
+  same-window delete-only confirmation improves absolute FSQLite time.
+
 ## 2026-05-05 - External quick-balance retained-hint single authority
 
 Scope: prepared direct INSERT external rightmost-leaf append path in
@@ -528,6 +583,43 @@ same-size overwrite work in the hot path.
   `1.02x +/- 0.03` faster. Do not retry this two-helper payload-range patch as
   an UPDATE microcopy optimization unless a fresh profile proves payload copy is
   again dominant and the B-tree helper overhead has been removed or amortized.
+
+## 2026-05-05 - Direct UPDATE fixed-width REAL projected-byte page patch retry
+
+Scope: fresh retry of the fixed-width REAL direct UPDATE payload-range idea
+after a current isolated `perf-update-delete 10000 1200 update` CPU profile
+again showed time in `memmove`, `read_cell_pointers_into`,
+`parse_record_projected_column_offsets`, `write_page_data`, and
+`table_overwrite_current_payload_same_size_no_overflow`.
+
+- Touched during rejected candidate: `crates/fsqlite-btree/src/cursor.rs` and
+  `crates/fsqlite-core/src/connection.rs`; source was reverted after the
+  benchmark section failed the keep bar.
+- Candidate shape: add one B-tree helper to parse the current no-overflow table
+  payload directly from the leaf page and copy only the projected replacement
+  bytes for the updated REAL column, then run the direct fixed-width REAL UPDATE
+  fast path before borrowing generic row/payload scratch buffers.
+- Focused proofs passed:
+  `env CARGO_TARGET_DIR=.rch-target cargo check -p fsqlite-core -p fsqlite-btree`,
+  `env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-btree test_table_patch_current_payload_projected_bytes_no_overflow_updates_column_only -- --nocapture`,
+  `env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-btree table_overwrite_current_payload_same_size_no_overflow -- --nocapture`,
+  and `env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-core direct_simple_update -- --nocapture`.
+- Evidence artifacts:
+  `tests/artifacts/perf/update-payload-range-proudanchor-20260505T2340Z/summary.md`,
+  `candidate-update-section-report.json`, and
+  `baseline-update-section-report.json`.
+- Result: rejected. The narrow isolated harness improved by about `5%`
+  (`880/886 ns` baseline per update in same-window reverse builds versus
+  `838/839 ns` candidate), but the quick `UPDATE/DELETEThroughput` section was
+  mixed: 10K update improved `10.34 ms -> 9.70 ms` and 10K delete improved
+  `9.21 ms -> 8.63 ms`, while 100-row update regressed
+  `451.7 us -> 468.5 us`, 1000-row update regressed `1.26 ms -> 1.32 ms`, and
+  1000-row delete regressed `1.19 ms -> 1.22 ms`. FSQLite geomean for the
+  section moved only `0.993x` candidate/base, below the keep threshold.
+- Do not retry direct UPDATE projected-byte page patching as a standalone
+  microcopy optimization. Reconsider only with a design that improves all
+  UPDATE rows or produces a section-level FSQLite geomean win large enough to
+  overcome the small/mid-row regressions.
 
 ## 2026-05-05 - Additional CASS/artifact-backed rejects to avoid repeating
 
@@ -2426,3 +2518,37 @@ set: sessions found by
   worsen `7.53 ms -> 8.48 ms` with commit roundtrip still about `17.05 ms`.
 - Do not retry caching `page_size` on `SharedTxnPageIo` as a standalone
   optimization. The borrow was visible in code but not a matrix-level bottleneck.
+
+## 2026-05-05 - SharedTxnPageIo staged page-data take/restore forwarding
+
+- Target: retained rightmost-leaf append/write-page cost in the INSERT matrix,
+  after current profiles showed time in B-tree insert, row-build, commit-frame
+  prep, and `TransactionKind::write_page_data`.
+- Candidate shape: expose `try_take_staged_page_data` and
+  `restore_staged_page_data` through `TransactionKind` and `SharedTxnPageIo` so
+  existing B-tree retained-page mutation paths could take an owned staged page
+  image, mutate it, and restore it through the transaction instead of cloning
+  from the shared page path. Source was reverted after measurement.
+- Correctness proof passed in the candidate checkout:
+  `env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-vdbe shared_txn_page_io -- --nocapture`
+  (`15` tests), and
+  `env CARGO_TARGET_DIR=.rch-target cargo test -p fsqlite-btree test_table_try_append_cached_rightmost_leaf_hint -- --nocapture`
+  (`4` tests). The release-perf benchmark binaries were rebuilt with
+  `env CARGO_TARGET_DIR=.rch-target cargo build --profile release-perf -p fsqlite-e2e --bin comprehensive-bench --bin perf-update-delete`.
+- Evidence artifacts:
+  - Baseline:
+    `tests/artifacts/perf/insert-profile-current-20260505T224216Z-proudanchor/report.json`.
+  - Candidate:
+    `tests/artifacts/perf/staged-take-candidate-insert-20260505T225103Z-proudanchor/report.json`
+    plus stdout/stderr logs.
+- Result: rejected. The same-host insert matrix regressed on the target rows:
+  single-transaction `large_10col` 10K FSQLite median worsened
+  `35.246530 ms -> 37.698371 ms`, record-size `large_10col` 10K worsened
+  `33.783470 ms -> 37.346692 ms`, `small_3col` 100 single transaction
+  worsened `0.212037 ms -> 0.295543 ms`, and `tiny_1col` 100 single
+  transaction worsened `0.260568 ms -> 0.280265 ms`.
+- Do not retry staged page-data take/restore forwarding through
+  `TransactionKind` / `SharedTxnPageIo` as a standalone INSERT optimization.
+  Revisit only with a design that mutates in place without remove/restore and
+  write-page round trips, then improves absolute FrankenSQLite medians on the
+  current prepared INSERT matrix.
