@@ -12,6 +12,41 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Staged-page append `Ok(None)` quick-balance suppression
+
+- Target: INSERT single-transaction and record-size `large_10col` 10K rows
+  after the current insert profile showed `4004` B-tree cell assembly calls,
+  `2001` quick-balance attempts, and `2002` conservative reloads on the
+  `large_10col` 10K rows.
+- Candidate shape: in
+  `crates/fsqlite-btree/src/cursor.rs::try_append_on_external_rightmost_leaf_hint`,
+  remove the quick-balance retry from the staged-page `Ok(None)` branch while
+  preserving cell-buffer restoration and overflow-chain cleanup. The source was
+  reverted after measurement.
+- Evidence artifacts:
+  - Baseline insert profile:
+    `tests/artifacts/perf/current-insert-profile-icypike-20260506T0325Z/stderr.log`.
+  - Candidate insert profile:
+    `tests/artifacts/perf/staged-qb-regression-fix-icypike-20260506T0330Z/candidate-stderr.log`.
+- Correctness smoke before measurement:
+  `cargo fmt --check`,
+  `git diff --check`,
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-icypike-staged-qb-fix-tests cargo test -p fsqlite-btree balance_quick -- --nocapture`
+  (`5` tests passed remotely), and
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/frankensqlite-icypike-staged-qb-fix-hint-tests cargo test -p fsqlite-btree table_try_append_cached_rightmost_leaf_hint -- --nocapture`
+  (`4` tests passed).
+- Result: rejected and reverted. The target counters did not move on the
+  `large_10col` 10K rows: `btree_cell_assembly_calls` stayed at `4004` and
+  `btree_conservative_reloads` stayed at `2002`. Absolute FrankenSQLite
+  medians regressed on the target rows: single-transaction `large_10col` 10K
+  worsened `36.33 ms -> 68.22 ms`, and record-size `large_10col` 10K worsened
+  `39.08 ms -> 77.59 ms`. The candidate run's lower average ratio
+  (`2.19x -> 2.05x`) was from C SQLite host variance, not a FrankenSQLite win.
+- Do not retry suppressing only this staged-page quick-balance fallback. Revisit
+  the area only with a profile that proves a different branch owns the duplicate
+  work and with an interleaved A/B that improves absolute FrankenSQLite medians
+  on the current INSERT matrix.
+
 ## 2026-05-06 - CASS strict alias/session-set resweep: broad March bundles are not perf proof
 
 Scope: user-requested CASS expansion of this ledger, restricted to
