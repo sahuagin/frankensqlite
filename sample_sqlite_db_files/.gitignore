@@ -8,6 +8,8 @@
 
 # Working copies are ephemeral — never commit them.
 working/
+!working/
+!working/.gitignore
 
 # Legacy folder (deprecated; do not use).
 work/

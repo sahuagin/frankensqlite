@@ -36,6 +36,10 @@ lcov.info
 tarpaulin-report.html
 coverage/
 
+# Raw Linux perf recordings are machine-local and large. Preserve text/JSON
+# reports or summaries under tests/artifacts/perf/ instead.
+tests/artifacts/perf/**/*.data
+
 # Benchmarking output
 criterion/
 
@@ -83,6 +87,7 @@ storage.sqlite3-*
 # E2E fixture corpus (local only; DB bytes never tracked)
 sample_sqlite_db_files/golden/*
 !sample_sqlite_db_files/golden/.gitignore
+!sample_sqlite_db_files/golden/.gitkeep
 sample_sqlite_db_files/working/*
 !sample_sqlite_db_files/working/.gitignore
 
@@ -150,6 +155,13 @@ visible
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
 proptest-regressions/
+# These checked-in proptest seeds are intentional regression fixtures.
+!crates/fsqlite-btree/proptest-regressions/
+crates/fsqlite-btree/proptest-regressions/*
+!crates/fsqlite-btree/proptest-regressions/cursor.txt
+!crates/fsqlite-parser/proptest-regressions/
+crates/fsqlite-parser/proptest-regressions/*
+!crates/fsqlite-parser/proptest-regressions/parser.txt
 test_meminfo
 
 # Benchmark database files
@@ -199,6 +211,18 @@ clippy_output.*
 
 # Artifacts directories (CI/E2E/validation run outputs)
 artifacts/
+# Tiny replay evidence JSONs with explicit commands are retained; ad hoc
+# artifacts remain ignored unless deliberately force-added.
+!crates/fsqlite-mvcc/artifacts/
+crates/fsqlite-mvcc/artifacts/*
+!crates/fsqlite-mvcc/artifacts/bd-2g5.1/
+crates/fsqlite-mvcc/artifacts/bd-2g5.1/*
+!crates/fsqlite-mvcc/artifacts/bd-2g5.1/txn_slots_e2e_artifact.json
+!crates/fsqlite-planner/artifacts/
+crates/fsqlite-planner/artifacts/*
+!crates/fsqlite-planner/artifacts/bd-1as.4/
+crates/fsqlite-planner/artifacts/bd-1as.4/*
+!crates/fsqlite-planner/artifacts/bd-1as.4/planner_index_selection_e2e_artifact.json
 
 # One-off test shell scripts at repo root
 /run_test.sh
