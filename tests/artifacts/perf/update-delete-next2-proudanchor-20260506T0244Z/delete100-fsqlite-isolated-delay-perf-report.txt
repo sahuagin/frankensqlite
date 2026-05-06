@@ -1,0 +1,104 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 228  of event 'cycles:P'
+# Event count (approx.): 556482582
+#
+# Overhead  Symbol                                                                                                                                                            IPC   [IPC Coverage]
+# ........  ................................................................................................................................................................  ....................
+#
+    15.90%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::get_page                                                                -      -
+    12.49%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::write_page_data                                                         -      -
+    10.17%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo> as fsqlite_btree::traits::BtreeCursorOps>::delete                                     -      -
+     6.36%  [.] __memmove_avx_unaligned_erms                                                                                                                                  -      -
+     6.05%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::table_seek_for_insert                                                               -      -
+     3.89%  [.] fsqlite_btree::cell::read_cell_pointers_into                                                                                                                  -      -
+     3.70%  [.] cfree@GLIBC_2.2.5                                                                                                                                             -      -
+     3.20%  [.] _int_malloc                                                                                                                                                   -      -
+     2.63%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::load_page                                                                           -      -
+     2.28%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::write_page_internal                                                                                                  -      -
+     2.03%  [.] <fsqlite_btree::cell::BtreePageHeader>::write                                                                                                                 -      -
+     1.67%  [.] _int_free_chunk                                                                                                                                               -      -
+     1.60%  [.] <fsqlite_btree::cell::BtreePageHeader>::parse                                                                                                                 -      -
+     1.52%  [.] <fsqlite_core::connection::Connection>::reset_prepared_direct_insert_statement_scratch                                                                        -      -
+     1.44%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo>::clear_stale_synthetic_pending_commit_surface                                                                         -      -
+     1.42%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_delete_with_cursor::<fsqlite_vdbe::engine::SharedTxnPageIo>                            -      -
+     1.27%  [k] 0xffffffff94222c78                                                                                                                                            -      -
+     1.04%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::record_point_witness               -      -
+     0.95%  [.] <std::sys::pal::unix::time::Timespec>::now                                                                                                                    -      -
+     0.86%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::write_page_data                                                                 -      -
+     0.85%  [.] malloc                                                                                                                                                        -      -
+     0.83%  [.] <fsqlite_mvcc::begin_concurrent::ConcurrentHandle>::record_read                                                                                               -      -
+     0.80%  [.] 0x0000000000000983                                                                                                                                            -      -
+     0.79%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_btree::cursor::TransactionPageIo<dyn fsqlite_pager::traits::TransactionHandle>>>::remember_table_seek                -      -
+     0.78%  [.] <fsqlite_vdbe::engine::SharedTxnPageIo as fsqlite_btree::cursor::PageWriter>::free_page                                                                       -      -
+     0.77%  [.] <fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>::finish_btree_op_postlude                                                            -      -
+     0.77%  [k] 0xffffffff93081732                                                                                                                                            -      -
+     0.76%  [.] <fsqlite_core::connection::Connection>::txn_metrics_note_write                                                                                                -      -
+     0.74%  [.] <fsqlite_pager::pager::SimpleTransaction<fsqlite_vfs::memory::MemoryVfs>>::ensure_writer                                                                      -      -
+     0.74%  [.] fsqlite_btree::balance::compute_distribution                                                                                                                  -      -
+     0.71%  [.] <fsqlite_core::connection::Connection>::qf_maybe_short_circuit_for_rowid::<fsqlite_btree::cursor::TransactionPageIo<fsqlite_pager::traits::TransactionKind>>  -      -
+     0.71%  [.] fsqlite_mvcc::begin_concurrent::concurrent_stage_prepared_write_marker                                                                                        -      -
+     0.71%  [.] core::ptr::drop_in_place::<alloc::vec::Vec<fsqlite_btree::balance::GatheredCell>>                                                                             -      -
+     0.71%  [.] <fsqlite_btree::cursor::StackEntry as core::clone::Clone>::clone                                                                                              -      -
+     0.71%  [.] <fsqlite_core::connection::Connection>::concurrent_session_handle                                                                                             -      -
+     0.71%  [.] core::ptr::drop_in_place::<fsqlite_btree::cursor::StackEntry>                                                                                                 -      -
+     0.71%  [.] malloc_consolidate                                                                                                                                            -      -
+     0.71%  [.] __libc_malloc2                                                                                                                                                -      -
+     0.71%  [.] fsqlite_btree::balance::apply_child_replacement::<fsqlite_vdbe::engine::SharedTxnPageIo>                                                                      -      -
+     0.71%  [.] <std::sys::sync::once::futex::Once>::call                                                                                                                     -      -
+     0.71%  [.] <alloc::rc::Rc<core::cell::RefCell<core::option::Option<fsqlite_vdbe::engine::ConcurrentContext>>>>::drop_slow                                                -      -
+     0.71%  [.] <fsqlite_btree::cell::CellRef>::parse                                                                                                                         -      -
+     0.71%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::free_page                                                               -      -
+     0.70%  [.] core::ptr::drop_in_place::<fsqlite_btree::cursor::BtCursor<fsqlite_vdbe::engine::SharedTxnPageIo>>                                                            -      -
+     0.66%  [.] fsqlite_btree::cursor::recycle_cell_pointers                                                                                                                  -      -
+     0.62%  [.] fsqlite_mvcc::begin_concurrent::concurrent_page_state                                                                                                         -      -
+     0.15%  [k] 0xffffffff933a50b8                                                                                                                                            -      -
+     0.13%  [.] fsqlite_btree::balance::validate_distribution                                                                                                                 -      -
+     0.10%  [k] 0xffffffff92d04109                                                                                                                                            -      -
+     0.02%  [.] <fsqlite_core::connection::Connection>::coerce_explicit_rowid_value                                                                                           -      -
+     0.01%  [.] <fsqlite_pager::traits::TransactionKind as fsqlite_pager::traits::TransactionHandle>::page_size                                                               -      -
+     0.01%  [.] <fsqlite_core::connection::Connection>::qf_record_delete                                                                                                      -      -
+     0.01%  [.] <fsqlite_core::connection::Connection>::execute_prepared_direct_simple_delete                                                                                 -      -
+     0.01%  [k] 0xffffffff9421b6a9                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff92c01192                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff930a714a                                                                                                                                            -      -
+     0.00%  [.] <fsqlite_core::connection::Connection>::execute_prepared_with_params_after_background_status                                                                  -      -
+     0.00%  [.] fsqlite_btree::balance::balance_nonroot::<fsqlite_vdbe::engine::SharedTxnPageIo>                                                                              -      -
+     0.00%  [k] 0xffffffff92d04104                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9422e2b8                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff92f8c991                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff94222c8e                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9422e227                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff92f8c946                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9308179f                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff942241b4                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff934563fe                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff93326655                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff93326056                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff942278a5                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9307ef16                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff942241d0                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff92fdedcb                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330ce14                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff930c2930                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff92d0410b                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff933006a6                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330cdfc                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330ce03                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff942241b1                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff930c2926                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff933006a5                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff933006bc                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330cdcb                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330ce0c                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330ce17                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff9330ce1b                                                                                                                                            -      -
+     0.00%  [k] 0xffffffff942241ec                                                                                                                                            -      -
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

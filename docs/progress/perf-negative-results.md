@@ -12,6 +12,40 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - Direct DELETE tier0 already-staged MVCC marker skip
+
+Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row
+`100 rows / delete 5 rows` after `7d6117e1`, where FrankenSQLite measured
+`0.425427 ms` vs C SQLite `0.092583 ms` (`4.595x`).
+
+- Touched during rejected candidate: `crates/fsqlite-vdbe/src/engine.rs` in a
+  clean detached worktree; source was not applied to the shared checkout.
+- Candidate shape: add a `Tier0AlreadyStaged` concurrent write tier for
+  `SharedTxnPageIo` so writes to an active page that already has a staged-write
+  marker skip redundant MVCC marker restaging and write directly into the pager
+  transaction.
+- Profile evidence: fresh delayed `perf record` on
+  `perf-update-delete 100 20000 delete fsqlite isolated` showed
+  `TransactionKind::get_page` (`15.90%`),
+  `TransactionKind::write_page_data` (`12.49%`),
+  `BtCursor<SharedTxnPageIo>::delete` (`10.17%`),
+  `__memmove_avx_unaligned_erms` (`6.36%`), and
+  `BtCursor<SharedTxnPageIo>::table_seek_for_insert` (`6.05%`).
+- Evidence artifacts:
+  `tests/artifacts/perf/update-delete-next2-proudanchor-20260506T0244Z/summary.md`,
+  `candidate-tier0-staged.diff`,
+  `delete100-fsqlite-isolated-delay-perf-report.txt`,
+  `hyperfine-tier0-staged-isolated-fsqlite.json`, and
+  `hyperfine-tier0-staged-standard-fsqlite.json`.
+- Result: rejected. Interleaved clean-worktree A/B had baseline faster on both
+  probes: isolated delete baseline `227.7 ms +/- 2.6 ms` vs candidate
+  `229.7 ms +/- 3.1 ms` (`1.01x` baseline faster), and standard-row proxy
+  baseline `29.6 ms +/- 0.6 ms` vs candidate `30.7 ms +/- 0.9 ms` (`1.04x`
+  baseline faster).
+- Do not retry this exact tier0 already-staged marker skip as a standalone
+  UPDATE/DELETE optimization. The repeated marker-stage work is not large
+  enough to offset the extra tier classification branch/probe on this workload.
+
 ## 2026-05-06 - Direct UPDATE/DELETE reusable SharedTxnPageIo shell
 
 Scope: `UPDATE/DELETEThroughput`, especially the current worst full-matrix row

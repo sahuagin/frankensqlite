@@ -1,0 +1,57 @@
+diff --git a/crates/fsqlite-vdbe/src/engine.rs b/crates/fsqlite-vdbe/src/engine.rs
+index cc169c87..60e19f7e 100644
+--- a/crates/fsqlite-vdbe/src/engine.rs
++++ b/crates/fsqlite-vdbe/src/engine.rs
+@@ -1729,6 +1729,7 @@ pub struct SharedTxnPageIo {
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ enum ConcurrentWriteTier {
+     Tier0AlreadyOwned,
++    Tier0AlreadyStaged,
+     Tier1FirstTouch,
+     Tier2CommitSurfaceRare,
+ }
+@@ -1871,7 +1872,12 @@ impl SharedTxnPageIo {
+         ctx: &ConcurrentContext,
+         page_no: PageNumber,
+     ) -> ConcurrentWriteTier {
+-        if ctx.handle.lock().holds_page_lock(page_no) {
++        let handle = ctx.handle.lock();
++        if handle.holds_page_lock(page_no) {
++            let (is_freed, has_staged_write) = concurrent_page_read_status(&handle, page_no);
++            if handle.is_active() && has_staged_write && !is_freed {
++                return ConcurrentWriteTier::Tier0AlreadyStaged;
++            }
+             return ConcurrentWriteTier::Tier0AlreadyOwned;
+         }
+
+@@ -1928,6 +1934,20 @@ impl SharedTxnPageIo {
+         Ok(())
+     }
+
++    fn write_page_tier0_already_staged(
++        &self,
++        cx: &Cx,
++        page_no: PageNumber,
++        page_data_base: PageData,
++    ) -> Result<()> {
++        add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL, 1);
++        self.txn
++            .borrow_mut()
++            .write_page_data(cx, page_no, page_data_base)?;
++        self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_fast_staged")?;
++        Ok(())
++    }
++
+     fn write_page_tier1_first_touch(
+         &self,
+         cx: &Cx,
+@@ -2353,6 +2373,9 @@ impl SharedTxnPageIo {
+             ConcurrentWriteTier::Tier0AlreadyOwned => {
+                 self.write_page_tier0_already_owned(cx, &ctx, page_no, page_data_base)
+             }
++            ConcurrentWriteTier::Tier0AlreadyStaged => {
++                self.write_page_tier0_already_staged(cx, page_no, page_data_base)
++            }
+             ConcurrentWriteTier::Tier1FirstTouch => {
+                 self.write_page_tier1_first_touch(cx, &ctx, page_no, page_data_base)
+             }
