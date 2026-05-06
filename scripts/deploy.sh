@@ -65,8 +65,8 @@ cp "$SITE_DIR/og-image.png" dist/
 cp "$SITE_DIR/twitter-image.png" dist/
 cp "$SITE_DIR/frankensqlite_illustration.webp" dist/
 cp "$SITE_DIR/frankensqlite_diagram.webp" dist/
-cp _headers dist/
-cp _routes.json dist/
+cp "$SITE_DIR/_headers" dist/
+cp "$SITE_DIR/_routes.json" dist/
 health_payload=$(build_health_payload)
 printf '%s\n' "$health_payload" > "dist/$HEALTH_JSON_PATH"
 printf '%s\n' "$health_payload" > "dist/$HEALTH_PATH"

@@ -12,5 +12,7 @@ cp "$SITE_DIR/og-image.png" dist/
 cp "$SITE_DIR/twitter-image.png" dist/
 cp "$SITE_DIR/frankensqlite_illustration.webp" dist/
 cp "$SITE_DIR/frankensqlite_diagram.webp" dist/
+cp "$SITE_DIR/_headers" dist/
+cp "$SITE_DIR/_routes.json" dist/
 npx wrangler pages deploy dist --project-name frankensqlite-spec-evolution --branch main --commit-dirty=true
 echo "Deployment sequence completed."
