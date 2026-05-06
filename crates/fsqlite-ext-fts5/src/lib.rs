@@ -582,18 +582,97 @@ impl Fts5Tokenizer for TrigramTokenizer {
     }
 }
 
-/// Create a tokenizer by name with optional arguments.
-#[must_use]
-pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
-    match name.to_ascii_lowercase().as_str() {
-        "unicode61" => Some(Box::new(Unicode61Tokenizer::new())),
+fn split_fts5_tokenizer_spec(spec: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = spec.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                if chars.peek() == Some(&quote_ch) {
+                    let _ = chars.next();
+                    current.push(quote_ch);
+                } else {
+                    quote = None;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_ascii_whitespace() {
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+
+    if !current.is_empty() {
+        parts.push(current);
+    }
+
+    parts
+}
+
+fn take_tokenizer_option<'a>(parts: &'a [String], index: &mut usize) -> Option<(&'a str, &'a str)> {
+    let raw = parts.get(*index)?;
+    *index += 1;
+    if let Some((key, value)) = raw.split_once('=') {
+        return Some((key, value));
+    }
+
+    let value = parts.get(*index)?;
+    *index += 1;
+    Some((raw.as_str(), value.as_str()))
+}
+
+fn unicode61_tokenizer_from_args(args: &[String]) -> Unicode61Tokenizer {
+    let mut tokenizer = Unicode61Tokenizer::new();
+    let mut index = 0;
+
+    while let Some((key, value)) = take_tokenizer_option(args, &mut index) {
+        match key.to_ascii_lowercase().as_str() {
+            "tokenchars" | "token_chars" => tokenizer.token_chars = value.to_owned(),
+            "separators" => tokenizer.separators = value.to_owned(),
+            "remove_diacritics" => {
+                tokenizer.remove_diacritics = value.parse().unwrap_or(tokenizer.remove_diacritics);
+            }
+            _ => {}
+        }
+    }
+
+    tokenizer
+}
+
+fn create_tokenizer_from_parts(parts: &[String]) -> Option<Box<dyn Fts5Tokenizer>> {
+    let name = parts.first()?.to_ascii_lowercase();
+    let args = &parts[1..];
+
+    match name.as_str() {
+        "unicode61" => Some(Box::new(unicode61_tokenizer_from_args(args))),
         "ascii" => Some(Box::new(AsciiTokenizer)),
-        "porter" => Some(Box::new(PorterTokenizer::new(Box::new(
-            Unicode61Tokenizer::new(),
-        )))),
+        "porter" => {
+            let inner = if args.is_empty() {
+                Box::new(Unicode61Tokenizer::new()) as Box<dyn Fts5Tokenizer>
+            } else {
+                create_tokenizer_from_parts(args)?
+            };
+            Some(Box::new(PorterTokenizer::new(inner)))
+        }
         "trigram" => Some(Box::new(TrigramTokenizer::default())),
         _ => None,
     }
+}
+
+/// Create a tokenizer by name with optional arguments.
+#[must_use]
+pub fn create_tokenizer(name: &str) -> Option<Box<dyn Fts5Tokenizer>> {
+    let parts = split_fts5_tokenizer_spec(name);
+    create_tokenizer_from_parts(&parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,13 +1533,89 @@ fn evaluate_expr_for_columns(
     evaluate_expr_impl(index, expr, columns, None)
 }
 
+fn tokenize_query_leaf(tokenizer: &dyn Fts5Tokenizer, text: &str) -> Vec<String> {
+    tokenizer
+        .tokenize(text)
+        .into_iter()
+        .map(|token| token.term)
+        .collect()
+}
+
+fn normalize_query_term_expr(term: String, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
+    let mut terms = tokenize_query_leaf(tokenizer, &term).into_iter();
+    let Some(first) = terms.next() else {
+        return Fts5Expr::Term(term.to_lowercase());
+    };
+
+    terms.fold(Fts5Expr::Term(first), |left, right| {
+        Fts5Expr::And(Box::new(left), Box::new(Fts5Expr::Term(right)))
+    })
+}
+
+fn normalize_query_phrase_terms(phrase: &[String], tokenizer: &dyn Fts5Tokenizer) -> Vec<String> {
+    let joined = phrase.join(" ");
+    let terms = tokenize_query_leaf(tokenizer, &joined);
+    if terms.is_empty() {
+        phrase.iter().map(|term| term.to_lowercase()).collect()
+    } else {
+        terms
+    }
+}
+
+fn normalize_query_expr_with_tokenizer(expr: Fts5Expr, tokenizer: &dyn Fts5Tokenizer) -> Fts5Expr {
+    match expr {
+        Fts5Expr::Term(term) => normalize_query_term_expr(term, tokenizer),
+        Fts5Expr::Prefix(prefix) => {
+            let terms = tokenize_query_leaf(tokenizer, &prefix);
+            let normalized = terms
+                .first()
+                .cloned()
+                .unwrap_or_else(|| prefix.to_lowercase());
+            Fts5Expr::Prefix(normalized)
+        }
+        Fts5Expr::Phrase(words) => {
+            Fts5Expr::Phrase(normalize_query_phrase_terms(&words, tokenizer))
+        }
+        Fts5Expr::And(left, right) => Fts5Expr::And(
+            Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
+            Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
+        ),
+        Fts5Expr::Or(left, right) => Fts5Expr::Or(
+            Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
+            Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
+        ),
+        Fts5Expr::Not(left, right) => Fts5Expr::Not(
+            Box::new(normalize_query_expr_with_tokenizer(*left, tokenizer)),
+            Box::new(normalize_query_expr_with_tokenizer(*right, tokenizer)),
+        ),
+        Fts5Expr::Near(terms, distance) => {
+            let normalized = terms
+                .iter()
+                .flat_map(|term| tokenize_query_leaf(tokenizer, term))
+                .collect();
+            Fts5Expr::Near(normalized, distance)
+        }
+        Fts5Expr::ColumnFilter(column_name, inner) => Fts5Expr::ColumnFilter(
+            column_name,
+            Box::new(normalize_query_expr_with_tokenizer(*inner, tokenizer)),
+        ),
+        Fts5Expr::InitialToken(inner) => Fts5Expr::InitialToken(Box::new(
+            normalize_query_expr_with_tokenizer(*inner, tokenizer),
+        )),
+    }
+}
+
 fn evaluate_query_string(
     index: &InvertedIndex,
     columns: &[String],
     query: &str,
+    tokenizer: Option<&dyn Fts5Tokenizer>,
 ) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
     let tokens = parse_fts5_query(query)?;
-    let expr = build_expr(&tokens)?;
+    let mut expr = build_expr(&tokens)?;
+    if let Some(tokenizer) = tokenizer {
+        expr = normalize_query_expr_with_tokenizer(expr, tokenizer);
+    }
     validate_detail_mode(&expr, index.detail_mode())?;
     validate_column_filters(&expr, columns)?;
     let matching_docs = evaluate_expr_for_columns(index, &expr, columns);
@@ -1472,12 +1627,13 @@ fn evaluate_query_strings(
     index: &InvertedIndex,
     columns: &[String],
     queries: &[&str],
+    tokenizer: Option<&dyn Fts5Tokenizer>,
 ) -> std::result::Result<(Vec<i64>, Vec<String>), Fts5QueryError> {
     let mut combined_docs: Option<Vec<i64>> = None;
     let mut query_terms = Vec::new();
 
     for query in queries {
-        let (matching_docs, match_terms) = evaluate_query_string(index, columns, query)?;
+        let (matching_docs, match_terms) = evaluate_query_string(index, columns, query, tokenizer)?;
         query_terms.extend(match_terms);
         combined_docs = Some(match combined_docs {
             Some(existing) => intersect_sorted(&existing, &matching_docs),
@@ -1494,8 +1650,9 @@ fn search_rows_with_weights_from_parts(
     documents: &HashMap<i64, Vec<String>>,
     queries: &[&str],
     weights: &[f64],
+    tokenizer: Option<&dyn Fts5Tokenizer>,
 ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
-    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries)?;
+    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries, tokenizer)?;
 
     let mut results: Vec<(i64, f64, Vec<String>)> = matching_docs
         .into_iter()
@@ -1515,8 +1672,9 @@ fn search_docids_with_weights_from_parts(
     columns: &[String],
     queries: &[&str],
     weights: &[f64],
+    tokenizer: Option<&dyn Fts5Tokenizer>,
 ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries)?;
+    let (matching_docs, query_terms) = evaluate_query_strings(index, columns, queries, tokenizer)?;
 
     let mut results: Vec<(i64, f64)> = matching_docs
         .into_iter()
@@ -2100,7 +2258,14 @@ impl Fts5Table {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64)>, Fts5QueryError> {
-        search_docids_with_weights_from_parts(&self.index, &self.columns, queries, weights)
+        let tokenizer = self.create_tokenizer_instance();
+        search_docids_with_weights_from_parts(
+            &self.index,
+            &self.columns,
+            queries,
+            weights,
+            Some(tokenizer.as_ref()),
+        )
     }
 
     pub fn search_rows(
@@ -2116,12 +2281,14 @@ impl Fts5Table {
         queries: &[&str],
         weights: &[f64],
     ) -> std::result::Result<Vec<(i64, f64, Vec<String>)>, Fts5QueryError> {
+        let tokenizer = self.create_tokenizer_instance();
         search_rows_with_weights_from_parts(
             &self.index,
             &self.columns,
             &self.documents,
             queries,
             weights,
+            Some(tokenizer.as_ref()),
         )
     }
 
@@ -2129,7 +2296,14 @@ impl Fts5Table {
         &self,
         queries: &[&str],
     ) -> std::result::Result<Vec<String>, Fts5QueryError> {
-        evaluate_query_strings(&self.index, &self.columns, queries).map(|(_docs, terms)| terms)
+        let tokenizer = self.create_tokenizer_instance();
+        evaluate_query_strings(
+            &self.index,
+            &self.columns,
+            queries,
+            Some(tokenizer.as_ref()),
+        )
+        .map(|(_docs, terms)| terms)
     }
 
     #[must_use]
@@ -2220,14 +2394,11 @@ impl VirtualTable for Fts5Table {
 
                 if let Some((key, value)) = parse_option_assignment(trimmed) {
                     let key_lower = key.to_ascii_lowercase();
-                    let value_unquoted = unquote_fts_arg(value).to_ascii_lowercase();
+                    let value_unquoted_raw = unquote_fts_arg(value);
+                    let value_unquoted = value_unquoted_raw.to_ascii_lowercase();
                     match key_lower.as_str() {
                         "tokenize" => {
-                            let tok = value_unquoted
-                                .split_whitespace()
-                                .next()
-                                .unwrap_or("unicode61");
-                            tok.clone_into(&mut tokenizer_name);
+                            tokenizer_name = value_unquoted_raw.to_owned();
                         }
                         "content" => {
                             if value_unquoted.is_empty() {
@@ -2349,6 +2520,7 @@ impl VirtualTable for Fts5Table {
             results: Vec::new(),
             position: 0,
             columns: self.columns.clone(),
+            tokenizer_name: self.tokenizer_name.clone(),
             index: self.index.clone(),
             documents: self.documents.clone(),
         })
@@ -2469,6 +2641,8 @@ pub struct Fts5Cursor {
     position: usize,
     /// Column names.
     columns: Vec<String>,
+    /// Tokenizer spec copied from the table at cursor-open time.
+    tokenizer_name: String,
     /// Snapshot of the inverted index at cursor-open time.
     index: InvertedIndex,
     /// Snapshot of stored documents at cursor-open time.
@@ -2493,11 +2667,14 @@ impl VirtualTableCursor for Fts5Cursor {
                 let weights: Vec<f64> = self.columns.iter().map(|_| 1.0).collect();
                 let queries: Vec<String> = args.iter().map(SqliteValue::to_text).collect();
                 let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+                let tokenizer = create_tokenizer(&self.tokenizer_name)
+                    .unwrap_or_else(|| Box::new(Unicode61Tokenizer::new()));
                 self.results = search_docids_with_weights_from_parts(
                     &self.index,
                     &self.columns,
                     &query_refs,
                     &weights,
+                    Some(tokenizer.as_ref()),
                 )
                 .map_err(|e| FrankenError::function_error(format!("fts5 query error: {e}")))?;
             }
@@ -3979,6 +4156,15 @@ mod tests {
     }
 
     #[test]
+    fn test_tokenizer_spec_preserves_unicode61_tokenchars() {
+        let tok = create_tokenizer("unicode61 tokenchars '-_./:@#$%'").unwrap();
+        let tokens = tok.tokenize("AuthController.ts my_function");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+
+        assert_eq!(terms, vec!["authcontroller.ts", "my_function"]);
+    }
+
+    #[test]
     fn test_unicode61_empty_input() {
         let tok = Unicode61Tokenizer::new();
         assert!(tok.tokenize("").is_empty());
@@ -4425,6 +4611,65 @@ mod tests {
     }
 
     #[test]
+    fn test_fts5_table_search_normalizes_query_with_porter_tokenizer() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "content",
+                "tokenize='porter unicode61 remove_diacritics 2'",
+            ],
+        )
+        .unwrap();
+        table.insert_document(1, &["I am running the tests".to_owned()]);
+
+        let results = table.search("\"running\"").unwrap();
+
+        assert_eq!(
+            results.iter().map(|(rowid, _)| *rowid).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_fts5_table_search_normalizes_query_with_code_tokenchars() {
+        let cx = Cx::new();
+        let mut table = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "content",
+                "tokenize=\"unicode61 tokenchars '-_./:@#$%'\"",
+            ],
+        )
+        .unwrap();
+        table.insert_document(1, &["Call my_function in AuthController.ts".to_owned()]);
+
+        let identifier_results = table.search("\"my_function\"").unwrap();
+        let filename_results = table.search("\"AuthController.ts\"").unwrap();
+
+        assert_eq!(
+            identifier_results
+                .iter()
+                .map(|(rowid, _)| *rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            filename_results
+                .iter()
+                .map(|(rowid, _)| *rowid)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn test_fts5_table_auto_rowid() {
         let cx = Cx::new();
         let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
@@ -4648,6 +4893,7 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            tokenizer_name: "unicode61".to_owned(),
             index: InvertedIndex::new(),
             documents: HashMap::new(),
         };
@@ -4678,6 +4924,7 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            tokenizer_name: "unicode61".to_owned(),
             index: InvertedIndex::new(),
             documents: HashMap::new(),
         };
@@ -4703,6 +4950,7 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            tokenizer_name: "unicode61".to_owned(),
             index: InvertedIndex::new(),
             documents: HashMap::new(),
         };
@@ -4724,6 +4972,7 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            tokenizer_name: "unicode61".to_owned(),
             index: InvertedIndex::new(),
             documents: HashMap::new(),
         };
@@ -4741,6 +4990,7 @@ mod tests {
             results: Vec::new(),
             position: 0,
             columns: vec!["content".to_owned()],
+            tokenizer_name: "unicode61".to_owned(),
             index: InvertedIndex::new(),
             documents: HashMap::new(),
         };
