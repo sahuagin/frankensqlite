@@ -152,9 +152,9 @@ use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
     MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
     concurrent_clear_page_state, concurrent_free_page, concurrent_has_page_state,
-    concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status,
-    concurrent_page_state, concurrent_prepare_write_page, concurrent_restore_page_state,
-    concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
+    concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status, concurrent_page_state,
+    concurrent_prepare_write_page, concurrent_restore_page_state,
+    concurrent_stage_prepared_write_marker, concurrent_track_write_conflict_page,
     create_time_travel_snapshot,
 };
 #[cfg(test)]
@@ -1904,13 +1904,7 @@ impl SharedTxnPageIo {
         add_vdbe_counter(&FSQLITE_VDBE_MVCC_TIER0_ALREADY_OWNED_WRITES_TOTAL, 1);
         let mut handle = ctx.handle.lock();
         let prior_state = concurrent_page_state(&handle, page_no);
-        if let Err(stage_error) =
-            concurrent_stage_prepared_write_page(
-                &mut handle,
-                page_no,
-                concurrent_tracking_page_snapshot(&page_data_base),
-            )
-        {
+        if let Err(stage_error) = concurrent_stage_prepared_write_marker(&mut handle, page_no) {
             return Err(FrankenError::Internal(format!(
                 "MVCC fast-path staging failed: {stage_error}"
             )));
@@ -2081,13 +2075,7 @@ impl SharedTxnPageIo {
 
         {
             let mut handle = ctx.handle.lock();
-            if let Err(stage_error) =
-                concurrent_stage_prepared_write_page(
-                    &mut handle,
-                    page_no,
-                    concurrent_tracking_page_snapshot(&page_data_base),
-                )
-            {
+            if let Err(stage_error) = concurrent_stage_prepared_write_marker(&mut handle, page_no) {
                 Self::restore_concurrent_page_state(
                     ctx,
                     &prior_page_state,
@@ -2301,11 +2289,7 @@ impl SharedTxnPageIo {
 
         let stage_result = {
             let mut handle = ctx.handle.lock();
-            concurrent_stage_prepared_write_page(
-                &mut handle,
-                page_no,
-                concurrent_tracking_page_snapshot(&page_data_base),
-            )
+            concurrent_stage_prepared_write_marker(&mut handle, page_no)
         };
         if let Err(stage_error) = stage_result {
             let error = FrankenError::Internal(format!("MVCC write staging failed: {stage_error}"));
@@ -2381,14 +2365,6 @@ impl SharedTxnPageIo {
 
 const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
 const PAGE_LOCK_WAIT_FULL_CHECKPOINT_POLL: Duration = Duration::from_millis(50);
-
-fn concurrent_tracking_page_snapshot(data: &PageData) -> PageData {
-    if data.is_single_owner_owned() {
-        PageData::from_vec(data.as_bytes().to_vec())
-    } else {
-        data.clone()
-    }
-}
 
 fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
     let metrics_enabled = vdbe_metrics_enabled();
@@ -31697,7 +31673,15 @@ mod tests {
             .write_page(&cx, target_page, &second_bytes)
             .expect("already-owned page should bypass stale-snapshot rejection");
 
-        let expected = PageData::from_vec(second_bytes);
+        let read_back = page_io
+            .read_page_data(&cx, target_page)
+            .expect("pager must keep marker-backed read-your-writes data");
+        assert_eq!(
+            read_back.as_bytes(),
+            second_bytes.as_slice(),
+            "rewrite after savepoint rollback should remain readable through the pager"
+        );
+
         let guard = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -31705,9 +31689,13 @@ mod tests {
             .get(session_id)
             .expect("writer session should remain registered");
         assert_eq!(
-            concurrent_read_page(&writer, target_page),
-            Some(&expected),
-            "rewrite after savepoint rollback should restage the owned page"
+            concurrent_page_read_status(&writer, target_page),
+            (false, true),
+            "rewrite after savepoint rollback should restage the owned page in the MVCC surface"
+        );
+        assert!(
+            concurrent_read_page(&writer, target_page).is_none(),
+            "marker-backed VDBE writes keep payload bytes in the pager, not MVCC"
         );
     }
 

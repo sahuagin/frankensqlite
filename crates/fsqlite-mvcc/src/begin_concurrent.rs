@@ -111,6 +111,7 @@ pub struct ConcurrentHandle {
 #[derive(Debug, Clone, Default)]
 struct PageTxnState {
     staged_data: Option<PageData>,
+    has_staged_write: bool,
     is_freed: bool,
     is_conflict_only: bool,
     held_lock: bool,
@@ -128,7 +129,7 @@ impl PageTxnState {
         if self.metadata_exempt {
             return false;
         }
-        self.staged_data.is_some() || self.is_freed || self.is_conflict_only
+        self.has_staged_write || self.is_freed || self.is_conflict_only
     }
 
     #[must_use]
@@ -146,21 +147,21 @@ impl WriteSetView<'_> {
     pub fn contains_key(&self, page: &PageNumber) -> bool {
         self.page_states
             .get(page)
-            .is_some_and(|state| state.staged_data.is_some())
+            .is_some_and(|state| state.has_staged_write)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.page_states
             .values()
-            .all(|state| state.staged_data.is_none())
+            .all(|state| !state.has_staged_write)
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
         self.page_states
             .values()
-            .filter(|state| state.staged_data.is_some())
+            .filter(|state| state.has_staged_write)
             .count()
     }
 }
@@ -197,10 +198,12 @@ impl HeldLocksView<'_> {
 /// pager rejects a write/free after we already updated the concurrent handle.
 /// SSI witnesses are intentionally not rolled back; that remains a safe
 /// overapproximation just like savepoint rollback.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct ConcurrentPageState {
     page: PageNumber,
     staged_data: Option<PageData>,
+    had_staged_write: bool,
     was_freed: bool,
     was_conflict_only: bool,
     held_lock: bool,
@@ -209,13 +212,15 @@ pub struct ConcurrentPageState {
 impl ConcurrentPageState {
     #[must_use]
     pub fn is_synthetic_conflict_only(&self) -> bool {
-        self.was_conflict_only && self.staged_data.is_none() && !self.was_freed
+        self.was_conflict_only && !self.had_staged_write && !self.was_freed
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 struct SavepointPageState {
     staged_data: Option<PageData>,
+    has_staged_write: bool,
     is_freed: bool,
     is_conflict_only: bool,
     metadata_exempt: bool,
@@ -299,7 +304,7 @@ impl ConcurrentHandle {
     pub fn write_set_len(&self) -> usize {
         self.page_states
             .values()
-            .filter(|state| state.staged_data.is_some())
+            .filter(|state| state.has_staged_write)
             .count()
     }
 
@@ -1199,18 +1204,18 @@ pub fn concurrent_prepare_write_page(
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let (holds_lock, was_freed, was_conflict_only, has_staged_data) = handle
+    let (holds_lock, was_freed, was_conflict_only, has_staged_write) = handle
         .page_state(page)
         .map_or((false, false, false, false), |state| {
             (
                 state.held_lock,
                 state.is_freed,
                 state.is_conflict_only,
-                state.staged_data.is_some(),
+                state.has_staged_write,
             )
         });
 
-    if has_staged_data {
+    if has_staged_write {
         debug_assert!(holds_lock, "staged write pages must retain their page lock");
         debug_assert!(!was_freed, "staged write pages cannot also be marked freed");
         debug_assert!(
@@ -1247,11 +1252,10 @@ pub fn concurrent_prepare_write_page(
     Ok(())
 }
 
-/// Stage payload bytes for a page that is already prepared for writing.
-pub fn concurrent_stage_prepared_write_page(
+fn concurrent_stage_prepared_write_state(
     handle: &mut ConcurrentHandle,
     page: PageNumber,
-    data: PageData,
+    data: Option<PageData>,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
@@ -1272,8 +1276,32 @@ pub fn concurrent_stage_prepared_write_page(
         "prepared write staging must clear freed-page tracking first"
     );
 
-    handle.ensure_page_state(page).staged_data = Some(data);
+    let state = handle.ensure_page_state(page);
+    state.staged_data = data;
+    state.has_staged_write = true;
     Ok(())
+}
+
+/// Stage payload bytes for a page that is already prepared for writing.
+pub fn concurrent_stage_prepared_write_page(
+    handle: &mut ConcurrentHandle,
+    page: PageNumber,
+    data: PageData,
+) -> Result<(), MvccError> {
+    concurrent_stage_prepared_write_state(handle, page, Some(data))
+}
+
+/// Mark a page as staged for conflict/read-status tracking without copying its bytes.
+///
+/// This is for upper layers that keep the authoritative same-transaction page
+/// image in the pager write-set. The page remains in the MVCC write-conflict
+/// surface, but `concurrent_read_page` intentionally returns `None` because
+/// MVCC does not own a payload snapshot for marker-only writes.
+pub fn concurrent_stage_prepared_write_marker(
+    handle: &mut ConcurrentHandle,
+    page: PageNumber,
+) -> Result<(), MvccError> {
+    concurrent_stage_prepared_write_state(handle, page, None)
 }
 
 /// Write a page within a concurrent transaction.
@@ -1299,6 +1327,7 @@ pub fn concurrent_page_state(handle: &ConcurrentHandle, page: PageNumber) -> Con
     ConcurrentPageState {
         page,
         staged_data: state.and_then(|state| state.staged_data.clone()),
+        had_staged_write: state.is_some_and(|state| state.has_staged_write),
         was_freed: state.is_some_and(|state| state.is_freed),
         was_conflict_only: state.is_some_and(|state| state.is_conflict_only),
         held_lock: state.is_some_and(|state| state.held_lock),
@@ -1315,9 +1344,9 @@ pub fn concurrent_page_is_synthetic_conflict_only(
     handle: &ConcurrentHandle,
     page: PageNumber,
 ) -> bool {
-    handle.page_state(page).is_some_and(|state| {
-        state.is_conflict_only && state.staged_data.is_none() && !state.is_freed
-    })
+    handle
+        .page_state(page)
+        .is_some_and(|state| state.is_conflict_only && !state.has_staged_write && !state.is_freed)
 }
 
 /// Restore a page's local concurrent tracking state after a failed pager write.
@@ -1335,6 +1364,7 @@ pub fn concurrent_restore_page_state(
     {
         let restored = handle.ensure_page_state(state.page);
         restored.staged_data.clone_from(&state.staged_data);
+        restored.has_staged_write = state.had_staged_write;
         restored.is_freed = state.was_freed;
         restored.is_conflict_only = state.was_conflict_only;
         restored.held_lock = state.held_lock;
@@ -1394,7 +1424,7 @@ pub fn concurrent_track_write_conflict_page(
     }
     if holds_lock {
         let state = handle.ensure_page_state(page);
-        if state.staged_data.is_none() && !state.is_freed {
+        if !state.has_staged_write && !state.is_freed {
             state.is_conflict_only = true;
         }
         if !already_tracked {
@@ -1410,7 +1440,7 @@ pub fn concurrent_track_write_conflict_page(
     }
     let state = handle.ensure_page_state(page);
     state.held_lock = true;
-    if state.staged_data.is_none() && !state.is_freed {
+    if !state.has_staged_write && !state.is_freed {
         state.is_conflict_only = true;
     }
     if !already_tracked {
@@ -1440,8 +1470,8 @@ pub fn concurrent_free_page(
         debug_assert!(
             handle
                 .page_state(page)
-                .is_none_or(|state| state.staged_data.is_none()),
-            "freed pages cannot retain staged page bytes"
+                .is_none_or(|state| !state.has_staged_write && state.staged_data.is_none()),
+            "freed pages cannot retain staged write state"
         );
         return Ok(());
     }
@@ -1449,6 +1479,7 @@ pub fn concurrent_free_page(
         let already_tracked = handle.tracks_write_conflict_page(page);
         let state = handle.ensure_page_state(page);
         state.staged_data = None;
+        state.has_staged_write = false;
         state.is_conflict_only = false;
         state.is_freed = true;
         if !already_tracked {
@@ -1466,6 +1497,7 @@ pub fn concurrent_free_page(
     let state = handle.ensure_page_state(page);
     state.held_lock = true;
     state.staged_data = None;
+    state.has_staged_write = false;
     state.is_conflict_only = false;
     state.is_freed = true;
     if !already_tracked {
@@ -1476,9 +1508,11 @@ pub fn concurrent_free_page(
 
 /// Read a page within a concurrent transaction.
 ///
-/// Returns the page from the local write set if it was modified by this
-/// transaction, otherwise returns `None` (caller should resolve via MVCC
-/// version store using the handle's snapshot).
+/// Returns locally staged page bytes when MVCC owns a payload snapshot.
+///
+/// Marker-only staged writes still participate in write-conflict tracking and
+/// [`concurrent_page_read_status`], but return `None` here because their
+/// authoritative read-your-writes image lives in the caller's pager write-set.
 #[must_use]
 pub fn concurrent_read_page(handle: &ConcurrentHandle, page: PageNumber) -> Option<&PageData> {
     handle
@@ -1518,7 +1552,7 @@ pub fn concurrent_page_read_state(
 #[must_use]
 pub fn concurrent_page_read_status(handle: &ConcurrentHandle, page: PageNumber) -> (bool, bool) {
     match handle.page_state(page) {
-        Some(state) => (state.is_freed, state.staged_data.is_some()),
+        Some(state) => (state.is_freed, state.has_staged_write),
         None => (false, false),
     }
 }
@@ -3447,6 +3481,7 @@ pub fn concurrent_savepoint(
                 page,
                 SavepointPageState {
                     staged_data: state.staged_data.clone(),
+                    has_staged_write: state.has_staged_write,
                     is_freed: state.is_freed,
                     is_conflict_only: state.is_conflict_only,
                     metadata_exempt: state.metadata_exempt,
@@ -3502,6 +3537,7 @@ pub fn concurrent_rollback_to_savepoint(
             page,
             PageTxnState {
                 staged_data: snapshot_state.staged_data.clone(),
+                has_staged_write: snapshot_state.has_staged_write,
                 is_freed: snapshot_state.is_freed,
                 is_conflict_only: snapshot_state.is_conflict_only,
                 held_lock: true,
@@ -3548,8 +3584,9 @@ mod tests {
         concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
         concurrent_free_page, concurrent_is_metadata_exempt, concurrent_mark_metadata_exempt,
         concurrent_page_is_freed, concurrent_page_is_synthetic_conflict_only,
-        concurrent_page_state, concurrent_read_page, concurrent_restore_page_state,
-        concurrent_rollback_to_savepoint, concurrent_savepoint,
+        concurrent_page_read_status, concurrent_page_state, concurrent_prepare_write_page,
+        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
+        concurrent_savepoint, concurrent_stage_prepared_write_marker,
         concurrent_track_write_conflict_page, concurrent_write_metadata_page,
         concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
         prepare_concurrent_commit_with_ssi, summarize_witness_keys, validate_first_committer_wins,
@@ -3874,6 +3911,86 @@ mod tests {
             assert!(concurrent_read_page(&handle, test_page(5)).is_some());
             assert!(concurrent_read_page(&handle, test_page(6)).is_none());
         }
+    }
+
+    #[test]
+    fn test_marker_staged_write_tracks_conflict_without_payload_bytes() -> Result<(), MvccError> {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let session_id = registry.begin_concurrent(test_snapshot(10))?;
+        let page = test_page(5);
+        let mut handle = registry
+            .get_mut(session_id)
+            .ok_or(MvccError::InvalidState)?;
+
+        concurrent_prepare_write_page(&mut handle, &lock_table, session_id, page)?;
+        concurrent_stage_prepared_write_marker(&mut handle, page)?;
+
+        assert_eq!(concurrent_page_read_status(&handle, page), (false, true));
+        assert!(
+            concurrent_read_page(&handle, page).is_none(),
+            "marker-only writes must not manufacture an MVCC payload snapshot"
+        );
+        assert_eq!(handle.write_set_len(), 1);
+        assert_eq!(handle.write_set_pages().as_slice(), &[page]);
+        assert!(handle.write_set().contains_key(&page));
+        assert!(handle.held_locks().contains(&page));
+        assert_eq!(
+            validate_first_committer_wins(&handle, &commit_index),
+            FcwResult::Clean
+        );
+
+        commit_index.update(page, CommitSeq::new(11));
+        assert_eq!(
+            validate_first_committer_wins(&handle, &commit_index),
+            FcwResult::Conflict {
+                conflicting_pages: vec![page],
+                conflicting_commit_seq: CommitSeq::new(11),
+            },
+            "marker-only writes must remain in the FCW conflict surface"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_marker_staged_write_survives_savepoint_rollback() -> Result<(), MvccError> {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let session_id = registry.begin_concurrent(test_snapshot(10))?;
+        let page = test_page(5);
+        let other_page = test_page(6);
+        let savepoint = {
+            let mut handle = registry
+                .get_mut(session_id)
+                .ok_or(MvccError::InvalidState)?;
+            concurrent_prepare_write_page(&mut handle, &lock_table, session_id, page)?;
+            concurrent_stage_prepared_write_marker(&mut handle, page)?;
+            concurrent_savepoint(&handle, "sp1")?
+        };
+
+        {
+            let mut handle = registry
+                .get_mut(session_id)
+                .ok_or(MvccError::InvalidState)?;
+            concurrent_prepare_write_page(&mut handle, &lock_table, session_id, other_page)?;
+            concurrent_stage_prepared_write_marker(&mut handle, other_page)?;
+            concurrent_free_page(&mut handle, &lock_table, session_id, page)?;
+
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, session_id, &savepoint)?;
+
+            assert_eq!(concurrent_page_read_status(&handle, page), (false, true));
+            assert!(concurrent_read_page(&handle, page).is_none());
+            assert!(!handle.write_set().contains_key(&other_page));
+            assert!(
+                handle.held_locks().contains(&other_page),
+                "rollback preserves locks acquired after the savepoint"
+            );
+            assert_eq!(handle.write_set_pages().as_slice(), &[page]);
+        }
+        Ok(())
     }
 
     #[test]
