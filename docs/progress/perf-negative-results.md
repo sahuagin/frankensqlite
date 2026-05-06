@@ -12,6 +12,42 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-05 - Recursive CTE direct SUM streaming did not close the gap
+
+Scope: `Subquery & CTE Performance`, specifically
+`Recursive CTE (1..1000 SUM)`, after the quick matrix at `c1d2fe19` showed
+FrankenSQLite slower than C SQLite on the only remaining subquery/CTE loser.
+
+- Touched during kept candidate:
+  `crates/fsqlite-core/src/connection.rs` in commit `1b3b93fc`, followed by
+  dead-helper cleanup in `5cee5c6c`.
+- Candidate shape: replace the direct recursive CTE SUM consumer's full
+  `Vec<Vec<SqliteValue>>` materialization with a streaming evaluator that steps
+  the registered `sum` aggregate as each base or recursive frontier row is
+  generated, while keeping the existing `UNION` dedup and `INTERSECT`/`EXCEPT`
+  fallback behavior.
+- Correctness proof:
+  `env CARGO_TARGET_DIR=/data/tmp/frankensqlite-proudanchor-reccte-local cargo test -p fsqlite-core recursive_cte -- --nocapture`
+  passed (`28` core recursive tests plus filtered conformance recursive CTE
+  tests).
+- Evidence artifacts:
+  `tests/artifacts/perf/current-quick-matrix-20260506T0005Z-proudanchor/report.json`,
+  `tests/artifacts/perf/recursive-cte-stream-head-20260506T003108Z-proudanchor/report.json`,
+  and
+  `tests/artifacts/perf/full-quick-head-20260506T003556Z-proudanchor/report.json`.
+- Result: kept for memory/clarity, but not a gap-closing performance win. The
+  focused same-head subquery run measured recursive CTE at C SQLite
+  `194.9 us` vs FrankenSQLite `227.0 us` (`1.16x` slower), and the full quick
+  matrix measured C SQLite `205.5 us` vs FrankenSQLite `254.9 us`
+  (`1.24x` slower). Compared with the prior matrix's FrankenSQLite median
+  `234.3 us`, the movement is within a noisy envelope and does not remove the
+  row from the gap list.
+- Do not retry "stream the direct SUM consumer instead of materializing all
+  rows" as a standalone recursive CTE optimization. Future work on this row
+  should profile the per-iteration direct expression evaluation/frontier loop
+  itself, or compare against C SQLite's recursive VM loop, not revisit the
+  now-landed materialization removal.
+
 ## 2026-05-05 - Quick-balance staged-parent handoff
 
 Scope: `comprehensive-bench --quick --filter insert`, targeting rightmost
