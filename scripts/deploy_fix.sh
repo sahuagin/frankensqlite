@@ -5,12 +5,13 @@ SITE_DIR="site/spec-evolution"
 
 echo "Starting manual deployment..."
 mkdir -p dist
+mkdir -p dist/data
 echo "Copying HTML..."
 cp "$SITE_DIR/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html" dist/index.html
 echo "Copying SQLite..."
-cp "$SITE_DIR/spec_evolution_v1.sqlite3" dist/
+cp "$SITE_DIR/data/spec_evolution_v1.sqlite3" dist/data/
 echo "Copying Config..."
-cp "$SITE_DIR/spec_evolution_v1.sqlite3.config.json" dist/
+cp "$SITE_DIR/data/spec_evolution_v1.sqlite3.config.json" dist/data/
 echo "Copying Images..."
 cp "$SITE_DIR/og-image.png" dist/
 cp "$SITE_DIR/twitter-image.png" dist/

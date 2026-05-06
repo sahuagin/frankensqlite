@@ -607,8 +607,8 @@ ORIGINAL_JS = r'''
       // HOWEVER, the "worker" source code is essential. I will include the worker source generator.
 
       const STATE = { q: "", minImpact: 0, bucketMode: "primary", bucketEnabled: new Set(BUCKETS.map(b => b.id)) };
-      const SPEC_EVOLUTION_DB_URL = "spec_evolution_v1.sqlite3";
-      const SPEC_EVOLUTION_DB_CONFIG_URL = "spec_evolution_v1.sqlite3.config.json";
+      const SPEC_EVOLUTION_DB_URL = "data/spec_evolution_v1.sqlite3";
+      const SPEC_EVOLUTION_DB_CONFIG_URL = "data/spec_evolution_v1.sqlite3.config.json";
       const DB_STATE = { sql: null, cacheKey: null, source: "none" };
       const DATASET = { db: null, meta: null, baseDoc: "", loaded: false, error: null };
       const DOC = { idx: 0, tab: "spec", rawSpec: false, diffMode: "pretty", compareMode: false, compareFromIdx: 0, compareToIdx: 0, diffLayout: "side-by-side", diffCollapse: true, abViewMode: "diff", sbsSyncScroll: true, sbsMobilePane: "a", inlineHighlights: false };
@@ -932,7 +932,7 @@ REAL_CONTENT = """<!doctype html>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 
 <script type="module">
-    const DB_URL = "spec_evolution_v1.sqlite3";
+    const DB_URL = "data/spec_evolution_v1.sqlite3";
     const COLORS = ["#39ff14", "#adff2f", "#00ff00", "#ff003c", "#94a3b8", "#d946ef", "#00f2ff", "#bf00ff", "#00ffcc", "#475569"];
     const BUCKETS = [
         { id: 1, name: "Logic/Math", color: COLORS[0] }, { id: 2, name: "SQLite Legacy", color: COLORS[1] },

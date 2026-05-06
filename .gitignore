@@ -58,6 +58,10 @@ fuzz/artifacts/
 !site/spec-evolution/og-image.png
 !site/spec-evolution/twitter-image.png
 
+# Python tool caches
+.ruff_cache/
+__pycache__/
+
 # Claude Code / AI agent ephemeral files
 .claude/
 

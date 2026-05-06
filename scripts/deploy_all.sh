@@ -5,9 +5,10 @@ SITE_DIR="site/spec-evolution"
 
 echo "Starting deployment sequence..."
 mkdir -p dist
+mkdir -p dist/data
 cp "$SITE_DIR/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html" dist/index.html
-cp "$SITE_DIR/spec_evolution_v1.sqlite3" dist/
-cp "$SITE_DIR/spec_evolution_v1.sqlite3.config.json" dist/
+cp "$SITE_DIR/data/spec_evolution_v1.sqlite3" dist/data/
+cp "$SITE_DIR/data/spec_evolution_v1.sqlite3.config.json" dist/data/
 cp "$SITE_DIR/og-image.png" dist/
 cp "$SITE_DIR/twitter-image.png" dist/
 cp "$SITE_DIR/frankensqlite_illustration.webp" dist/

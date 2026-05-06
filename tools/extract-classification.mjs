@@ -6,7 +6,7 @@
  * Usage:
  *   node tools/extract-classification.mjs \
  *     --html site/spec-evolution/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html \
- *     --out site/spec-evolution/spec_evolution_classification_v1.json
+ *     --out site/spec-evolution/data/spec_evolution_classification_v1.json
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
@@ -16,7 +16,7 @@ import vm from "node:vm";
 const args = process.argv.slice(2);
 const flags = {
   html: "site/spec-evolution/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html",
-  out: "site/spec-evolution/spec_evolution_classification_v1.json",
+  out: "site/spec-evolution/data/spec_evolution_classification_v1.json",
 };
 
 for (let i = 0; i < args.length; i++) {

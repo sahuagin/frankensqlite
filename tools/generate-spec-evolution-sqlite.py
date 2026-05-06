@@ -6,12 +6,12 @@ This moves the heavy data blobs out of the HTML and into a queryable DB, using
 the same "sql.js WASM loads a .sqlite3 file" approach used in /dp/beads_viewer.
 
 Inputs:
-  - site/spec-evolution/spec_evolution_data_v1.json.gz (commits/base_doc/patches)
-  - site/spec-evolution/spec_evolution_classification_v1.json (CLASS_EARLY/MIDDLE/LATE extracted)
+  - site/spec-evolution/data/spec_evolution_data_v1.json.gz (commits/base_doc/patches)
+  - site/spec-evolution/data/spec_evolution_classification_v1.json (CLASS_EARLY/MIDDLE/LATE extracted)
 
 Outputs (defaults):
-  - site/spec-evolution/spec_evolution_v1.sqlite3
-  - site/spec-evolution/spec_evolution_v1.sqlite3.config.json  (hash for OPFS caching / cache busting)
+  - site/spec-evolution/data/spec_evolution_v1.sqlite3
+  - site/spec-evolution/data/spec_evolution_v1.sqlite3.config.json  (hash for OPFS caching / cache busting)
 """
 
 from __future__ import annotations
@@ -199,10 +199,10 @@ def normalize_classification(classification: dict[str, Any]) -> dict[str, dict[s
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="site/spec-evolution/spec_evolution_data_v1.json.gz")
-    ap.add_argument("--classification", default="site/spec-evolution/spec_evolution_classification_v1.json")
-    ap.add_argument("--out-db", default="site/spec-evolution/spec_evolution_v1.sqlite3")
-    ap.add_argument("--out-config", default="site/spec-evolution/spec_evolution_v1.sqlite3.config.json")
+    ap.add_argument("--dataset", default="site/spec-evolution/data/spec_evolution_data_v1.json.gz")
+    ap.add_argument("--classification", default="site/spec-evolution/data/spec_evolution_classification_v1.json")
+    ap.add_argument("--out-db", default="site/spec-evolution/data/spec_evolution_v1.sqlite3")
+    ap.add_argument("--out-config", default="site/spec-evolution/data/spec_evolution_v1.sqlite3.config.json")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -451,7 +451,7 @@ def main() -> int:
         "classification_hash": cls_hash,
         "commit_count": len(commits),
         "patch_count": len(patches),
-        "db_file": os.path.basename(args.out_db),
+        "db_file": os.path.relpath(args.out_db, "site/spec-evolution"),
     }
     with open(args.out_config, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, sort_keys=True)

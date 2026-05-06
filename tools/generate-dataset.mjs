@@ -2,7 +2,7 @@
 /**
  * Dataset generation tool for FrankenSQLite spec evolution visualization (bd-24q.6.3).
  *
- * Produces deterministic gzipped JSON: site/spec-evolution/spec_evolution_data_v1.json.gz
+ * Produces deterministic gzipped JSON: site/spec-evolution/data/spec_evolution_data_v1.json.gz
  *
  * Features:
  *   - Deterministic output (sorted keys, no gzip timestamp, stable ordering)
@@ -15,7 +15,7 @@
  *
  * Options:
  *   --spec-path PATH   Path to spec file (default: COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md)
- *   --output PATH      Output file (default: site/spec-evolution/spec_evolution_data_v1.json.gz)
+ *   --output PATH      Output file (default: site/spec-evolution/data/spec_evolution_data_v1.json.gz)
  *   --append           Append new commits to existing dataset
  *   --dry-run          Print stats without writing
  *   --help             Show this help
@@ -44,7 +44,7 @@ const SCHEMA_VERSION = 1;
 const args = process.argv.slice(2);
 const flags = {
   specPath: "COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md",
-  output: "site/spec-evolution/spec_evolution_data_v1.json.gz",
+  output: "site/spec-evolution/data/spec_evolution_data_v1.json.gz",
   append: false,
   dryRun: false,
   help: false,
