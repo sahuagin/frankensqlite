@@ -1,6 +1,0 @@
-TEST_BIN=/tmp/rch_target_fsqlite_cod3/release-perf/deps/fast_path_separation-752d3a6dadfbb964
-UPDATE_BIN=/tmp/rch_target_fsqlite_cod3/release-perf/perf-update-delete
-MT_BIN=/tmp/rch_target_fsqlite_cod3/release-perf/mt-mvcc-bench
--rwxrwxr-x 1 ubuntu ubuntu 62M Apr 22 21:46 /tmp/rch_target_fsqlite_cod3/release-perf/deps/fast_path_separation-752d3a6dadfbb964
--rwxrwxr-x 2 ubuntu ubuntu 54M Apr 22 21:43 /tmp/rch_target_fsqlite_cod3/release-perf/mt-mvcc-bench
--rwxrwxr-x 2 ubuntu ubuntu 41M Apr 22 21:43 /tmp/rch_target_fsqlite_cod3/release-perf/perf-update-delete

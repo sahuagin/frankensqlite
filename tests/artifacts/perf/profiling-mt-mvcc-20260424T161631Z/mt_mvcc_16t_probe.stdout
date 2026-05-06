@@ -1,3 +1,0 @@
-# 16-thread probe command
-/data/tmp/rch_target_tanivy_profile_current2/release-perf/mt-mvcc-bench --rows-per-thread=500 --threads=16 --iters=10
-threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed

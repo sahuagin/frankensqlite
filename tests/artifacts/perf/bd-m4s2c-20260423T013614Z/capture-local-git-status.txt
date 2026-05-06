@@ -1,5 +1,0 @@
- M .beads/issues.jsonl
- M crates/fsqlite-e2e/src/bin/comprehensive_bench.rs
- M scripts/pgo_build.sh
-?? .swarm_marching_orders.md
-?? crates/fsqlite-core/tests/conformance_oracle_s82.rs

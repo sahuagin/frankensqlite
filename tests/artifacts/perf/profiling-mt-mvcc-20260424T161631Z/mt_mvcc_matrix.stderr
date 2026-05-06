@@ -1,4 +1,0 @@
-mt-mvcc-bench: rows_per_thread=500 threads=[1, 2, 4, 8, 12, 16] iters=10 apples_to_apples=false
-mt-mvcc-bench: wrote json report /data/projects/frankensqlite/tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/mt_mvcc_matrix.json
-mt-mvcc-bench: wrote markdown summary /data/projects/frankensqlite/tests/artifacts/perf/profiling-mt-mvcc-20260424T161631Z/mt_mvcc_matrix.md
-error: pass-over-pass ratio gate failed: 1t 0.38x -> 0.35x (6.79% drop), 2t 0.36x -> 0.02x (94.53% drop), 4t 0.09x -> 0.05x (45.48% drop), 16t 1.39x -> 1.16x (16.54% drop)

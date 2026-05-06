@@ -1,9 +1,0 @@
-# perf stat matrix
-perf stat -d -d -d -- /data/tmp/rch_target_whitebirch_profile_20260424T161631Z/release-perf/mt-mvcc-bench --rows-per-thread=500 --threads=1,2,4,8,12 --iters=5 ...
-
-threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
-      1 |      239279 |     757938 |             0.32x |          245567 |          246610 |         796865 |         802559 |           2.09 |           2.98 |           2.98 |          0.66 |          0.95 |          1.01 |       3.17x |              0 |             0
-      2 |      175114 |     458747 |             0.38x |          232415 |          240181 |         523510 |         535912 |           5.71 |         105.69 |         105.76 |          2.18 |          2.21 |          2.21 |       2.62x |              0 |             0
-      4 |        9429 |     205043 |             0.05x |           16168 |           17515 |         209385 |         209633 |         212.11 |         213.86 |         214.17 |          9.75 |          9.80 |          9.81 |      21.75x |              0 |             0
-      8 |       12275 |      49552 |             0.25x |           12377 |           12397 |          49619 |          49620 |         325.88 |         328.50 |         328.85 |         80.72 |         81.19 |         81.26 |       4.04x |              0 |             0
-     12 |       13456 |      45041 |             0.30x |           17464 |           17469 |          45363 |          45381 |         445.89 |         520.23 |         533.58 |        133.21 |        222.28 |        230.21 |       3.35x |              0 |             0

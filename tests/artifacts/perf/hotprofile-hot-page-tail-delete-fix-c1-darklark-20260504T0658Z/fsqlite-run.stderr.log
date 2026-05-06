@@ -1,4 +1,0 @@
-Running: engine=fsqlite mode=mvcc db=frankensqlite workload=hot_page_contention concurrency=1 rep=0/1
-  golden: sample_sqlite_db_files/golden/frankensqlite.db
-  working: /tmp/.tmpkBNtAu/work.db
-  ops: 131

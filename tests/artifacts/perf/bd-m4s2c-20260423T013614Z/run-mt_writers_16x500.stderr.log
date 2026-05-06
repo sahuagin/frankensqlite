@@ -1,3 +1,0 @@
-mt-mvcc-bench: rows_per_thread=500 threads=[16] iters=1
-[ perf record: Woken up 2 times to write data ]
-[ perf record: Captured and wrote 0.034 MB tests/artifacts/perf/bd-m4s2c-20260423T013614Z/perf-cpu-mt_writers_16x500.data (97 samples) ]

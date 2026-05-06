@@ -36,8 +36,8 @@ lcov.info
 tarpaulin-report.html
 coverage/
 
-# Raw Linux perf recordings are machine-local and large. Preserve text/JSON
-# reports or summaries under tests/artifacts/perf/ instead.
+# Raw Linux perf recordings are machine-local and large. The curated
+# tests/artifacts/perf policy lives with the artifacts/ rules below.
 tests/artifacts/perf/**/*.data
 
 # Benchmarking output
@@ -211,6 +211,14 @@ clippy_output.*
 
 # Artifacts directories (CI/E2E/validation run outputs)
 artifacts/
+# Perf evidence should stay compact in Git. Existing curated summaries/reports
+# remain tracked, but new run artifacts under tests/artifacts/perf/ stay local
+# by default. Force-add the rare Markdown or JSON artifact that is worth
+# preserving.
+!tests/artifacts/
+!tests/artifacts/perf/
+tests/artifacts/perf/**/*
+!tests/artifacts/perf/**/
 # Tiny replay evidence JSONs with explicit commands are retained; ad hoc
 # artifacts remain ignored unless deliberately force-added.
 !crates/fsqlite-mvcc/artifacts/

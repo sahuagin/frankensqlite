@@ -1,4 +1,0 @@
-  [2m2026-04-22T21:09:47.396110Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: ls -l /home/ubuntu/rch_target_fsqlite_cod4/release-perf/mt-mvcc-bench[0m
-    [2;3mat[0m rch/src/hook.rs:172 [2;3mon[0m ThreadId(1)
-
-ls: cannot access '/home/ubuntu/rch_target_fsqlite_cod4/release-perf/mt-mvcc-bench': No such file or directory

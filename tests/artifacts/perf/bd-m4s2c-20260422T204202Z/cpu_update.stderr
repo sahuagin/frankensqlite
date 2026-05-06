@@ -1,4 +1,0 @@
-  [2m2026-04-22T21:10:03.366883Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: bash -lc env CARGO_TARGET_DIR=/home/ubuntu/rch_target_fsqlite_cod4 cargo build --profile release-perf -p fsqlite-e2e --bin perf-update-delete && samply record --save-only -o tests/artifacts/perf/bd-m4s2c-20260422T204202Z/cpu-update-100-of-1000.json.gz -- /home/ubuntu/rch_target_fsqlite_cod4/release-perf/perf-update-delete 1000 20 update[0m
-    [2;3mat[0m rch/src/hook.rs:172 [2;3mon[0m ThreadId(1)
-
-Error: Could not find an executable with the name /home/ubuntu/rch_target_fsqlite_cod4/release-perf/perf-update-delete.

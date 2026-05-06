@@ -1,2 +1,0 @@
-mt-mvcc-bench: rows_per_thread=500 threads=[16] iters=10 apples_to_apples=false
-error: fsqlite startup failed before synchronized start: t5=fsqlite open (worker): database is busy (recovery in progress)

@@ -1,3 +1,0 @@
-perf-update-delete: rows=10000 iters=50 which=both (do_update=true do_delete=true update_count=1000 delete_count=500)
-  (first iter complete)
-total=1381ms populate=558ms update=431ms delete=311ms  |  per-row-update=8629ns  per-row-delete=12461ns

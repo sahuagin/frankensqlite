@@ -1,3 +1,0 @@
-# strace syscall sketch
-threads | fsqlite_wps | sqlite_wps | throughput_ratio | fsqlite_wps_p95 | fsqlite_wps_p99 | sqlite_wps_p95 | sqlite_wps_p99 | fsqlite_ms_p50 | fsqlite_ms_p95 | fsqlite_ms_p99 | sqlite_ms_p50 | sqlite_ms_p95 | sqlite_ms_p99 | time_ratio | fsqlite_failed | sqlite_failed
-      8 |        1284 |      18020 |             0.07x |            1358 |            1365 |          22239 |          22614 |         625.58 |         661.60 |         664.80 |         47.62 |         58.77 |         59.76 |      13.14x |              0 |             0

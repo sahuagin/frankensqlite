@@ -1,1228 +1,0 @@
-  [2m2026-05-05T17:40:02.772084Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts2 at ubuntu@192.168.1.124 (28 slots, speed 50.0)[0m
-    [2;3mat[0m rch/src/hook.rs:314 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:03.106159Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: 0b776983b4e1a2da)[0m
-    [2;3mat[0m rch/src/hook.rs:4933 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:03.106252Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 28 roots[0m
-    [2;3mat[0m rch/src/hook.rs:4955 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:03.697377Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ts2...[0m
-    [2;3mat[0m rch/src/hook.rs:4982 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:03.697493Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 1 pattern(s) from .rchignore (total: 51)[0m
-    [2;3mat[0m rch/src/transfer.rs:574 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:03.697507Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:04.544292Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 846ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:04.544426Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:04.861990Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:04.862121Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.180208Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 318ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.180322Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.497955Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.498088Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-c-api -> /data/projects/frankensqlite/crates/fsqlite-c-api on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.822505Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 324ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:05.822628Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.137932Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 315ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.138050Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.454390Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 316ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.454510Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.809686Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 355ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:06.809821Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.114775Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 304ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.114940Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.437079Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 322ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.437246Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.754249Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 316ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:07.754416Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.072181Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.072323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.396754Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 324ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.396948Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.705901Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:08.706080Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.020564Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 314ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.020717Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.331773Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 311ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.331951Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.643807Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 311ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.644057Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.969836Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:09.969995Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.278798Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.278905Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.603855Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 324ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.604030Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.927468Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 323ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:10.927616Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.248744Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 321ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.248892Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.566759Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.566944Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.885307Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 318ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:11.885445Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.200532Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 315ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.200680Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.517824Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.517987Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.840436Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 322ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:12.840564Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wasm -> /data/projects/frankensqlite/crates/fsqlite-wasm on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1031 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:13.152265Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 311ms[0m
-    [2;3mat[0m rch/src/transfer.rs:1100 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:13.152333Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 18410 files, 1429545 bytes in 9436ms[0m
-    [2;3mat[0m rch/src/hook.rs:5142 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:13.438280Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env 'FSQLITE_BENCH_PROFILE_INSERT=1' cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --quick --filter insert --json-stdout[0m
-    [2;3mat[0m rch/src/hook.rs:5169 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:13.438333Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/frankensqlite-current-insert-profile-target -> /data/projects/frankensqlite/.rch-target[0m
-    [2;3mat[0m rch/src/transfer.rs:499 [2;3mon[0m ThreadId(1)
-
-    Finished `release-perf` profile [optimized] target(s) in 0.22s
-     Running `.rch-target/release-perf/comprehensive-bench --quick --filter insert --json-stdout`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-23-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 247.2 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (f53b654a8 2026-04-30)
-  Cargo: cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)
-  Git: main @ 0092a2bfe74f8f2ececc186cf1f0a7bc937182e0
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: insert
-================================================================================
-
-
-[1/10] INSERT throughput by row count
-  Benchmarking single-txn insert 100 rows (tiny_1col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_100] insert_profile setup_us=29.1 begin_us=31.4 prepare_us=17.4 insert_us=155.6 commit_us=24.9 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=40 begin_ns=27362 execute_body_ns=185432 commit_pre_ns=1123 commit_roundtrip_ns=15189 commit_finalize_ns=1253 commit_handle_ns=1863 post_write_ns=201 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2 row_build_ns=7275 cursor_setup_ns=8342 serialize_ns=0 btree_insert_ns=64514 memdb_apply_ns=2982 schema_validation_ns=4869 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2604 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2 btree_cell_assembly_bytes=71 btree_leaf_payload_appends=99 btree_leaf_payload_mutate_ns=17822 btree_leaf_payload_stage_ns=21918 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=670 btree_leaf_full_cell_stage_ns=1995 btree_quick_balance_attempts=0 btree_quick_balance_hits=0 btree_quick_balance_ns=0 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=0 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=131.0 us F=273.4 us
-  Benchmarking single-txn insert 1000 rows (tiny_1col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_1000] insert_profile setup_us=23.6 begin_us=26.6 prepare_us=14.1 insert_us=1056.5 commit_us=34.5 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=23455 execute_body_ns=884823 commit_pre_ns=1313 commit_roundtrip_ns=23865 commit_finalize_ns=1182 commit_handle_ns=2084 post_write_ns=221 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=5 row_build_ns=36315 cursor_setup_ns=49433 serialize_ns=0 btree_insert_ns=442722 memdb_apply_ns=24806 schema_validation_ns=31800 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=24002 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=3 btree_cell_assembly_bytes=76 btree_leaf_payload_appends=998 btree_leaf_payload_mutate_ns=89917 btree_leaf_payload_stage_ns=153291 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=561 btree_leaf_full_cell_stage_ns=1693 btree_quick_balance_attempts=0 btree_quick_balance_hits=0 btree_quick_balance_ns=0 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=396.4 us F=899.3 us
-  Benchmarking single-txn insert 10000 rows (tiny_1col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.0s)        [fsqlite_10000] iter 6/10 (total: 0.0s)        [fsqlite_10000] iter 7/10 (total: 0.0s)        [fsqlite_10000] iter 8/10 (total: 0.0s)        [fsqlite_10000] iter 9/10 (total: 0.0s)        [fsqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_10000] insert_profile setup_us=64.4 begin_us=98.4 prepare_us=40.2 insert_us=12568.0 commit_us=147.4 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=50 begin_ns=93076 execute_body_ns=9848595 commit_pre_ns=7054 commit_roundtrip_ns=107333 commit_finalize_ns=4087 commit_handle_ns=8155 post_write_ns=902 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=21 row_build_ns=459923 cursor_setup_ns=597554 serialize_ns=0 btree_insert_ns=4782300 memdb_apply_ns=308111 schema_validation_ns=413148 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=297087 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=19 btree_cell_assembly_bytes=156 btree_leaf_payload_appends=9982 btree_leaf_payload_mutate_ns=1241442 btree_leaf_payload_stage_ns=1651575 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=1152 btree_leaf_full_cell_stage_ns=5651 btree_quick_balance_attempts=16 btree_quick_balance_hits=16 btree_quick_balance_ns=59623 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=2.67 ms F=5.09 ms
-  Benchmarking single-txn insert 100 rows (small_3col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_small_3col_100] insert_profile setup_us=31.6 begin_us=32.1 prepare_us=18.8 insert_us=125.3 commit_us=20.1 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=28793 execute_body_ns=166053 commit_pre_ns=932 commit_roundtrip_ns=13065 commit_finalize_ns=1102 commit_handle_ns=1723 post_write_ns=171 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2 row_build_ns=16505 cursor_setup_ns=6559 serialize_ns=6874 btree_insert_ns=38273 memdb_apply_ns=2773 schema_validation_ns=3264 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2354 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2 btree_cell_assembly_bytes=129 btree_leaf_payload_appends=99 btree_leaf_payload_mutate_ns=10529 btree_leaf_payload_stage_ns=11444 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=602 btree_leaf_full_cell_stage_ns=1663 btree_quick_balance_attempts=0 btree_quick_balance_hits=0 btree_quick_balance_ns=0 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=0 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=99.4 us F=597.9 us
-  Benchmarking single-txn insert 1000 rows (small_3col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_small_3col_1000] insert_profile setup_us=31.7 begin_us=30.7 prepare_us=21.8 insert_us=1530.1 commit_us=83.2 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=27011 execute_body_ns=1347638 commit_pre_ns=4029 commit_roundtrip_ns=56266 commit_finalize_ns=2845 commit_handle_ns=6973 post_write_ns=491 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=11 row_build_ns=225734 cursor_setup_ns=57206 serialize_ns=69127 btree_insert_ns=484396 memdb_apply_ns=41755 schema_validation_ns=37198 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=27640 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=8 btree_cell_assembly_bytes=267 btree_leaf_payload_appends=993 btree_leaf_payload_mutate_ns=103944 btree_leaf_payload_stage_ns=167730 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=681 btree_leaf_full_cell_stage_ns=2045 btree_quick_balance_attempts=5 btree_quick_balance_hits=5 btree_quick_balance_ns=23455 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=535.4 us F=1.11 ms
-  Benchmarking single-txn insert 10000 rows (small_3col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.0s)        [fsqlite_10000] iter 6/10 (total: 0.0s)        [fsqlite_10000] iter 7/10 (total: 0.0s)        [fsqlite_10000] iter 8/10 (total: 0.1s)        [fsqlite_10000] iter 9/10 (total: 0.1s)        [fsqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_single_txn_small_3col_10000] insert_profile setup_us=72.9 begin_us=56.0 prepare_us=44.1 insert_us=13462.7 commit_us=568.1 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=40 begin_ns=50916 execute_body_ns=11505432 commit_pre_ns=8195 commit_roundtrip_ns=528829 commit_finalize_ns=3848 commit_handle_ns=7404 post_write_ns=762 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=68 row_build_ns=1715318 cursor_setup_ns=542545 serialize_ns=620019 btree_insert_ns=4298566 memdb_apply_ns=296348 schema_validation_ns=346646 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=261462 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=65 btree_cell_assembly_bytes=1635 btree_leaf_payload_appends=9936 btree_leaf_payload_mutate_ns=1016386 btree_leaf_payload_stage_ns=1436201 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=732 btree_leaf_full_cell_stage_ns=2956 btree_quick_balance_attempts=62 btree_quick_balance_hits=62 btree_quick_balance_ns=275910 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=3.50 ms F=7.93 ms
-  Benchmarking single-txn insert 100 rows (medium_6col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_medium_6col_100] insert_profile setup_us=34.0 begin_us=32.4 prepare_us=27.5 insert_us=205.0 commit_us=38.0 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=41 begin_ns=28193 execute_body_ns=254293 commit_pre_ns=1823 commit_roundtrip_ns=28073 commit_finalize_ns=1382 commit_handle_ns=2445 post_write_ns=210 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=9 row_build_ns=37962 cursor_setup_ns=8029 serialize_ns=16211 btree_insert_ns=69518 memdb_apply_ns=4427 schema_validation_ns=4302 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=3007 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=6 btree_cell_assembly_bytes=1043 btree_leaf_payload_appends=95 btree_leaf_payload_mutate_ns=13153 btree_leaf_payload_stage_ns=15558 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=711 btree_leaf_full_cell_stage_ns=1964 btree_quick_balance_attempts=3 btree_quick_balance_hits=3 btree_quick_balance_ns=5700 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=134.8 us F=444.4 us
-  Benchmarking single-txn insert 1000 rows (medium_6col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_medium_6col_1000] insert_profile setup_us=106.6 begin_us=34.6 prepare_us=35.2 insert_us=1860.5 commit_us=484.5 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=171 begin_ns=33123 execute_body_ns=2089981 commit_pre_ns=4829 commit_roundtrip_ns=463566 commit_finalize_ns=2414 commit_handle_ns=4839 post_write_ns=260 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=50 row_build_ns=341460 cursor_setup_ns=76546 serialize_ns=147185 btree_insert_ns=552789 memdb_apply_ns=44423 schema_validation_ns=39267 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=29493 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=47 btree_cell_assembly_bytes=8340 btree_leaf_payload_appends=954 btree_leaf_payload_mutate_ns=109920 btree_leaf_payload_stage_ns=156332 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=1102 btree_leaf_full_cell_stage_ns=2685 btree_quick_balance_attempts=44 btree_quick_balance_hits=44 btree_quick_balance_ns=104557 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=890.9 us F=2.02 ms
-  Benchmarking single-txn insert 10000 rows (medium_6col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.1s)        [fsqlite_10000] iter 6/10 (total: 0.1s)        [fsqlite_10000] iter 7/10 (total: 0.1s)        [fsqlite_10000] iter 8/10 (total: 0.1s)        [fsqlite_10000] iter 9/10 (total: 0.1s)        [fsqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_single_txn_medium_6col_10000] insert_profile setup_us=56.6 begin_us=32.9 prepare_us=42.6 insert_us=15062.2 commit_us=3357.9 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=29335 execute_body_ns=16105720 commit_pre_ns=18725 commit_roundtrip_ns=3302191 commit_finalize_ns=5751 commit_handle_ns=9989 post_write_ns=1212 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=459 row_build_ns=2786997 cursor_setup_ns=473347 serialize_ns=1196447 btree_insert_ns=4902063 memdb_apply_ns=361829 schema_validation_ns=315789 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=237587 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=456 btree_cell_assembly_bytes=83020 btree_leaf_payload_appends=9545 btree_leaf_payload_mutate_ns=863230 btree_leaf_payload_stage_ns=1271257 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=842 btree_leaf_full_cell_stage_ns=2484 btree_quick_balance_attempts=453 btree_quick_balance_hits=453 btree_quick_balance_ns=1426864 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=5.85 ms F=15.11 ms
-  Benchmarking single-txn insert 100 rows (large_10col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_large_10col_100] insert_profile setup_us=32.3 begin_us=26.8 prepare_us=32.5 insert_us=220.7 commit_us=53.6 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=23144 execute_body_ns=285815 commit_pre_ns=2124 commit_roundtrip_ns=44705 commit_finalize_ns=1162 commit_handle_ns=2034 post_write_ns=180 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=25 row_build_ns=59409 cursor_setup_ns=6215 serialize_ns=17804 btree_insert_ns=75495 memdb_apply_ns=5630 schema_validation_ns=3436 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2352 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=22 btree_cell_assembly_bytes=15207 btree_leaf_payload_appends=79 btree_leaf_payload_mutate_ns=10873 btree_leaf_payload_stage_ns=12606 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=571 btree_leaf_full_cell_stage_ns=1502 btree_quick_balance_attempts=19 btree_quick_balance_hits=19 btree_quick_balance_ns=24053 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=259.1 us F=510.6 us
-  Benchmarking single-txn insert 1000 rows (large_10col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_large_10col_1000] insert_profile setup_us=77.3 begin_us=47.2 prepare_us=71.5 insert_us=2842.9 commit_us=611.2 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=40 begin_ns=43051 execute_body_ns=3221207 commit_pre_ns=12743 commit_roundtrip_ns=568876 commit_finalize_ns=4990 commit_handle_ns=8105 post_write_ns=762 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=204 row_build_ns=769746 cursor_setup_ns=66304 serialize_ns=215440 btree_insert_ns=1023404 memdb_apply_ns=69208 schema_validation_ns=40426 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=29761 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=202 btree_cell_assembly_bytes=144768 btree_leaf_payload_appends=799 btree_leaf_payload_mutate_ns=154817 btree_leaf_payload_stage_ns=155351 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=881 btree_leaf_full_cell_stage_ns=3287 btree_quick_balance_attempts=199 btree_quick_balance_hits=199 btree_quick_balance_ns=505291 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=979.2 us F=2.42 ms
-  Benchmarking single-txn insert 10000 rows (large_10col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.1s)        [csqlite_10000] iter 7/10 (total: 0.1s)        [csqlite_10000] iter 8/10 (total: 0.1s)        [csqlite_10000] iter 9/10 (total: 0.1s)        [csqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.1s)        [fsqlite_10000] iter 4/10 (total: 0.1s)        [fsqlite_10000] iter 5/10 (total: 0.2s)        [fsqlite_10000] iter 6/10 (total: 0.2s)        [fsqlite_10000] iter 7/10 (total: 0.2s)        [fsqlite_10000] iter 8/10 (total: 0.3s)        [fsqlite_10000] iter 9/10 (total: 0.3s)        [fsqlite_10000] iter 10/10 (total: 0.3s)                                                                                        [fs_insert_single_txn_large_10col_10000] insert_profile setup_us=78.6 begin_us=50.8 prepare_us=72.2 insert_us=24988.7 commit_us=18654.3 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=46328 execute_body_ns=41030690 commit_pre_ns=69741 commit_roundtrip_ns=18532101 commit_finalize_ns=14487 commit_handle_ns=14929 post_write_ns=1172 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2013 row_build_ns=6715635 cursor_setup_ns=533518 serialize_ns=1931837 btree_insert_ns=9138156 memdb_apply_ns=658174 schema_validation_ns=390320 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=263601 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2004 btree_cell_assembly_bytes=1454068 btree_leaf_payload_appends=7997 btree_leaf_payload_mutate_ns=1136357 btree_leaf_payload_stage_ns=1265151 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=1482 btree_leaf_full_cell_stage_ns=5790 btree_quick_balance_attempts=2007 btree_quick_balance_hits=1995 btree_quick_balance_ns=4664089 btree_local_split_attempts=6 btree_local_split_hits=0 btree_local_split_ns=1082 btree_nonroot_balance_calls=6 btree_nonroot_balance_ns=379216 btree_no_split_reuse_hits=0 btree_conservative_reloads=7 btree_page_header_rebuilds=6 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=10.94 ms F=37.66 ms
-
-[2/10] Transaction strategy comparison
-  Benchmarking autocommit 100 rows...     [cs_auto_100] warmup 1/2...    [cs_auto_100] warmup 2/2...    [cs_auto_100] iter 1/10 (total: 0.0s)        [cs_auto_100] iter 2/10 (total: 0.0s)        [cs_auto_100] iter 3/10 (total: 0.0s)        [cs_auto_100] iter 4/10 (total: 0.0s)        [cs_auto_100] iter 5/10 (total: 0.0s)        [cs_auto_100] iter 6/10 (total: 0.0s)        [cs_auto_100] iter 7/10 (total: 0.0s)        [cs_auto_100] iter 8/10 (total: 0.0s)        [cs_auto_100] iter 9/10 (total: 0.0s)        [cs_auto_100] iter 10/10 (total: 0.0s)                                                                                        [fs_auto_100] warmup 1/2...    [fs_auto_100] warmup 2/2...    [fs_auto_100] iter 1/10 (total: 0.0s)        [fs_auto_100] iter 2/10 (total: 0.0s)        [fs_auto_100] iter 3/10 (total: 0.0s)        [fs_auto_100] iter 4/10 (total: 0.0s)        [fs_auto_100] iter 5/10 (total: 0.0s)        [fs_auto_100] iter 6/10 (total: 0.0s)        [fs_auto_100] iter 7/10 (total: 0.0s)        [fs_auto_100] iter 8/10 (total: 0.0s)        [fs_auto_100] iter 9/10 (total: 0.0s)        [fs_auto_100] iter 10/10 (total: 0.0s)                                                                                    C=211.1 us F=236.6 us
-  Benchmarking batched 100 rows (100/txn)...     [cs_batch_100] warmup 1/2...    [cs_batch_100] warmup 2/2...    [cs_batch_100] iter 1/10 (total: 0.0s)        [cs_batch_100] iter 2/10 (total: 0.0s)        [cs_batch_100] iter 3/10 (total: 0.0s)        [cs_batch_100] iter 4/10 (total: 0.0s)        [cs_batch_100] iter 5/10 (total: 0.0s)        [cs_batch_100] iter 6/10 (total: 0.0s)        [cs_batch_100] iter 7/10 (total: 0.0s)        [cs_batch_100] iter 8/10 (total: 0.0s)        [cs_batch_100] iter 9/10 (total: 0.0s)        [cs_batch_100] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_100] warmup 1/2...    [fs_batch_100] warmup 2/2...    [fs_batch_100] iter 1/10 (total: 0.0s)        [fs_batch_100] iter 2/10 (total: 0.0s)        [fs_batch_100] iter 3/10 (total: 0.0s)        [fs_batch_100] iter 4/10 (total: 0.0s)        [fs_batch_100] iter 5/10 (total: 0.0s)        [fs_batch_100] iter 6/10 (total: 0.0s)        [fs_batch_100] iter 7/10 (total: 0.0s)        [fs_batch_100] iter 8/10 (total: 0.0s)        [fs_batch_100] iter 9/10 (total: 0.0s)        [fs_batch_100] iter 10/10 (total: 0.0s)                                                                                    C=117.6 us F=282.1 us
-  Benchmarking single-txn 100 rows...     [cs_txn_100] warmup 1/2...    [cs_txn_100] warmup 2/2...    [cs_txn_100] iter 1/10 (total: 0.0s)        [cs_txn_100] iter 2/10 (total: 0.0s)        [cs_txn_100] iter 3/10 (total: 0.0s)        [cs_txn_100] iter 4/10 (total: 0.0s)        [cs_txn_100] iter 5/10 (total: 0.0s)        [cs_txn_100] iter 6/10 (total: 0.0s)        [cs_txn_100] iter 7/10 (total: 0.0s)        [cs_txn_100] iter 8/10 (total: 0.0s)        [cs_txn_100] iter 9/10 (total: 0.0s)        [cs_txn_100] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_100] warmup 1/2...    [fs_txn_100] warmup 2/2...    [fs_txn_100] iter 1/10 (total: 0.0s)        [fs_txn_100] iter 2/10 (total: 0.0s)        [fs_txn_100] iter 3/10 (total: 0.0s)        [fs_txn_100] iter 4/10 (total: 0.0s)        [fs_txn_100] iter 5/10 (total: 0.0s)        [fs_txn_100] iter 6/10 (total: 0.0s)        [fs_txn_100] iter 7/10 (total: 0.0s)        [fs_txn_100] iter 8/10 (total: 0.0s)        [fs_txn_100] iter 9/10 (total: 0.0s)        [fs_txn_100] iter 10/10 (total: 0.0s)                                                                                    C=109.5 us F=231.9 us
-  Benchmarking autocommit 1000 rows...     [cs_auto_1000] warmup 1/2...    [cs_auto_1000] warmup 2/2...    [cs_auto_1000] iter 1/10 (total: 0.0s)        [cs_auto_1000] iter 2/10 (total: 0.0s)        [cs_auto_1000] iter 3/10 (total: 0.0s)        [cs_auto_1000] iter 4/10 (total: 0.0s)        [cs_auto_1000] iter 5/10 (total: 0.0s)        [cs_auto_1000] iter 6/10 (total: 0.0s)        [cs_auto_1000] iter 7/10 (total: 0.0s)        [cs_auto_1000] iter 8/10 (total: 0.0s)        [cs_auto_1000] iter 9/10 (total: 0.0s)        [cs_auto_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_auto_1000] warmup 1/2...    [fs_auto_1000] warmup 2/2...    [fs_auto_1000] iter 1/10 (total: 0.0s)        [fs_auto_1000] iter 2/10 (total: 0.0s)        [fs_auto_1000] iter 3/10 (total: 0.0s)        [fs_auto_1000] iter 4/10 (total: 0.0s)        [fs_auto_1000] iter 5/10 (total: 0.0s)        [fs_auto_1000] iter 6/10 (total: 0.0s)        [fs_auto_1000] iter 7/10 (total: 0.0s)        [fs_auto_1000] iter 8/10 (total: 0.0s)        [fs_auto_1000] iter 9/10 (total: 0.0s)        [fs_auto_1000] iter 10/10 (total: 0.0s)                                                                                    C=1.14 ms F=1.38 ms
-  Benchmarking batched 1000 rows (1000/txn)...     [cs_batch_1000] warmup 1/2...    [cs_batch_1000] warmup 2/2...    [cs_batch_1000] iter 1/10 (total: 0.0s)        [cs_batch_1000] iter 2/10 (total: 0.0s)        [cs_batch_1000] iter 3/10 (total: 0.0s)        [cs_batch_1000] iter 4/10 (total: 0.0s)        [cs_batch_1000] iter 5/10 (total: 0.0s)        [cs_batch_1000] iter 6/10 (total: 0.0s)        [cs_batch_1000] iter 7/10 (total: 0.0s)        [cs_batch_1000] iter 8/10 (total: 0.0s)        [cs_batch_1000] iter 9/10 (total: 0.0s)        [cs_batch_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_1000] warmup 1/2...    [fs_batch_1000] warmup 2/2...    [fs_batch_1000] iter 1/10 (total: 0.0s)        [fs_batch_1000] iter 2/10 (total: 0.0s)        [fs_batch_1000] iter 3/10 (total: 0.0s)        [fs_batch_1000] iter 4/10 (total: 0.0s)        [fs_batch_1000] iter 5/10 (total: 0.0s)        [fs_batch_1000] iter 6/10 (total: 0.0s)        [fs_batch_1000] iter 7/10 (total: 0.0s)        [fs_batch_1000] iter 8/10 (total: 0.0s)        [fs_batch_1000] iter 9/10 (total: 0.0s)        [fs_batch_1000] iter 10/10 (total: 0.0s)                                                                                    C=397.7 us F=890.5 us
-  Benchmarking single-txn 1000 rows...     [cs_txn_1000] warmup 1/2...    [cs_txn_1000] warmup 2/2...    [cs_txn_1000] iter 1/10 (total: 0.0s)        [cs_txn_1000] iter 2/10 (total: 0.0s)        [cs_txn_1000] iter 3/10 (total: 0.0s)        [cs_txn_1000] iter 4/10 (total: 0.0s)        [cs_txn_1000] iter 5/10 (total: 0.0s)        [cs_txn_1000] iter 6/10 (total: 0.0s)        [cs_txn_1000] iter 7/10 (total: 0.0s)        [cs_txn_1000] iter 8/10 (total: 0.0s)        [cs_txn_1000] iter 9/10 (total: 0.0s)        [cs_txn_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_1000] warmup 1/2...    [fs_txn_1000] warmup 2/2...    [fs_txn_1000] iter 1/10 (total: 0.0s)        [fs_txn_1000] iter 2/10 (total: 0.0s)        [fs_txn_1000] iter 3/10 (total: 0.0s)        [fs_txn_1000] iter 4/10 (total: 0.0s)        [fs_txn_1000] iter 5/10 (total: 0.0s)        [fs_txn_1000] iter 6/10 (total: 0.0s)        [fs_txn_1000] iter 7/10 (total: 0.0s)        [fs_txn_1000] iter 8/10 (total: 0.0s)        [fs_txn_1000] iter 9/10 (total: 0.0s)        [fs_txn_1000] iter 10/10 (total: 0.0s)                                                                                    C=589.7 us F=859.7 us
-  Benchmarking autocommit 10000 rows...     [cs_auto_10000] warmup 1/2...    [cs_auto_10000] warmup 2/2...    [cs_auto_10000] iter 1/10 (total: 0.0s)        [cs_auto_10000] iter 2/10 (total: 0.0s)        [cs_auto_10000] iter 3/10 (total: 0.0s)        [cs_auto_10000] iter 4/10 (total: 0.0s)        [cs_auto_10000] iter 5/10 (total: 0.0s)        [cs_auto_10000] iter 6/10 (total: 0.0s)        [cs_auto_10000] iter 7/10 (total: 0.1s)        [cs_auto_10000] iter 8/10 (total: 0.1s)        [cs_auto_10000] iter 9/10 (total: 0.1s)        [cs_auto_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_auto_10000] warmup 1/2...    [fs_auto_10000] warmup 2/2...    [fs_auto_10000] iter 1/10 (total: 0.0s)        [fs_auto_10000] iter 2/10 (total: 0.0s)        [fs_auto_10000] iter 3/10 (total: 0.0s)        [fs_auto_10000] iter 4/10 (total: 0.0s)        [fs_auto_10000] iter 5/10 (total: 0.1s)        [fs_auto_10000] iter 6/10 (total: 0.1s)        [fs_auto_10000] iter 7/10 (total: 0.1s)        [fs_auto_10000] iter 8/10 (total: 0.1s)        [fs_auto_10000] iter 9/10 (total: 0.1s)        [fs_auto_10000] iter 10/10 (total: 0.1s)                                                                                    C=8.58 ms F=12.54 ms
-  Benchmarking batched 10000 rows (1000/txn)...     [cs_batch_10000] warmup 1/2...    [cs_batch_10000] warmup 2/2...    [cs_batch_10000] iter 1/10 (total: 0.0s)        [cs_batch_10000] iter 2/10 (total: 0.0s)        [cs_batch_10000] iter 3/10 (total: 0.0s)        [cs_batch_10000] iter 4/10 (total: 0.0s)        [cs_batch_10000] iter 5/10 (total: 0.0s)        [cs_batch_10000] iter 6/10 (total: 0.0s)        [cs_batch_10000] iter 7/10 (total: 0.0s)        [cs_batch_10000] iter 8/10 (total: 0.0s)        [cs_batch_10000] iter 9/10 (total: 0.0s)        [cs_batch_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_10000] warmup 1/2...    [fs_batch_10000] warmup 2/2...    [fs_batch_10000] iter 1/10 (total: 0.0s)        [fs_batch_10000] iter 2/10 (total: 0.0s)        [fs_batch_10000] iter 3/10 (total: 0.0s)        [fs_batch_10000] iter 4/10 (total: 0.0s)        [fs_batch_10000] iter 5/10 (total: 0.0s)        [fs_batch_10000] iter 6/10 (total: 0.0s)        [fs_batch_10000] iter 7/10 (total: 0.0s)        [fs_batch_10000] iter 8/10 (total: 0.1s)        [fs_batch_10000] iter 9/10 (total: 0.1s)        [fs_batch_10000] iter 10/10 (total: 0.1s)                                                                                    C=3.70 ms F=7.67 ms
-  Benchmarking single-txn 10000 rows...     [cs_txn_10000] warmup 1/2...    [cs_txn_10000] warmup 2/2...    [cs_txn_10000] iter 1/10 (total: 0.0s)        [cs_txn_10000] iter 2/10 (total: 0.0s)        [cs_txn_10000] iter 3/10 (total: 0.0s)        [cs_txn_10000] iter 4/10 (total: 0.0s)        [cs_txn_10000] iter 5/10 (total: 0.0s)        [cs_txn_10000] iter 6/10 (total: 0.0s)        [cs_txn_10000] iter 7/10 (total: 0.0s)        [cs_txn_10000] iter 8/10 (total: 0.0s)        [cs_txn_10000] iter 9/10 (total: 0.0s)        [cs_txn_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_10000] warmup 1/2...    [fs_txn_10000] warmup 2/2...    [fs_txn_10000] iter 1/10 (total: 0.0s)        [fs_txn_10000] iter 2/10 (total: 0.0s)        [fs_txn_10000] iter 3/10 (total: 0.0s)        [fs_txn_10000] iter 4/10 (total: 0.0s)        [fs_txn_10000] iter 5/10 (total: 0.0s)        [fs_txn_10000] iter 6/10 (total: 0.0s)        [fs_txn_10000] iter 7/10 (total: 0.0s)        [fs_txn_10000] iter 8/10 (total: 0.1s)        [fs_txn_10000] iter 9/10 (total: 0.1s)        [fs_txn_10000] iter 10/10 (total: 0.1s)                                                                                    C=3.76 ms F=7.94 ms
-
-[3/10] Record size comparison
-  Benchmarking 10K rows record size tiny_1col...     [cs_tiny_1col] warmup 1/2...    [cs_tiny_1col] warmup 2/2...    [cs_tiny_1col] iter 1/10 (total: 0.0s)        [cs_tiny_1col] iter 2/10 (total: 0.0s)        [cs_tiny_1col] iter 3/10 (total: 0.0s)        [cs_tiny_1col] iter 4/10 (total: 0.0s)        [cs_tiny_1col] iter 5/10 (total: 0.0s)        [cs_tiny_1col] iter 6/10 (total: 0.0s)        [cs_tiny_1col] iter 7/10 (total: 0.0s)        [cs_tiny_1col] iter 8/10 (total: 0.0s)        [cs_tiny_1col] iter 9/10 (total: 0.0s)        [cs_tiny_1col] iter 10/10 (total: 0.0s)                                                                                        [fs_tiny_1col] warmup 1/2...    [fs_tiny_1col] warmup 2/2...    [fs_tiny_1col] iter 1/10 (total: 0.0s)        [fs_tiny_1col] iter 2/10 (total: 0.0s)        [fs_tiny_1col] iter 3/10 (total: 0.0s)        [fs_tiny_1col] iter 4/10 (total: 0.0s)        [fs_tiny_1col] iter 5/10 (total: 0.0s)        [fs_tiny_1col] iter 6/10 (total: 0.0s)        [fs_tiny_1col] iter 7/10 (total: 0.0s)        [fs_tiny_1col] iter 8/10 (total: 0.0s)        [fs_tiny_1col] iter 9/10 (total: 0.0s)        [fs_tiny_1col] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_record_size_tiny_1col_10000] insert_profile setup_us=25.4 begin_us=26.4 prepare_us=17.9 insert_us=9556.8 commit_us=101.7 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=23224 execute_body_ns=7335103 commit_pre_ns=4519 commit_roundtrip_ns=76164 commit_finalize_ns=3276 commit_handle_ns=5881 post_write_ns=741 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=21 row_build_ns=353253 cursor_setup_ns=471529 serialize_ns=0 btree_insert_ns=3516851 memdb_apply_ns=246419 schema_validation_ns=313529 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=237434 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=19 btree_cell_assembly_bytes=156 btree_leaf_payload_appends=9982 btree_leaf_payload_mutate_ns=940287 btree_leaf_payload_stage_ns=1221660 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=471 btree_leaf_full_cell_stage_ns=1694 btree_quick_balance_attempts=16 btree_quick_balance_hits=16 btree_quick_balance_ns=25779 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=2.59 ms F=5.00 ms
-  Benchmarking 10K rows record size small_3col...     [cs_small_3col] warmup 1/2...    [cs_small_3col] warmup 2/2...    [cs_small_3col] iter 1/10 (total: 0.0s)        [cs_small_3col] iter 2/10 (total: 0.0s)        [cs_small_3col] iter 3/10 (total: 0.0s)        [cs_small_3col] iter 4/10 (total: 0.0s)        [cs_small_3col] iter 5/10 (total: 0.0s)        [cs_small_3col] iter 6/10 (total: 0.0s)        [cs_small_3col] iter 7/10 (total: 0.0s)        [cs_small_3col] iter 8/10 (total: 0.0s)        [cs_small_3col] iter 9/10 (total: 0.0s)        [cs_small_3col] iter 10/10 (total: 0.0s)                                                                                        [fs_small_3col] warmup 1/2...    [fs_small_3col] warmup 2/2...    [fs_small_3col] iter 1/10 (total: 0.0s)        [fs_small_3col] iter 2/10 (total: 0.0s)        [fs_small_3col] iter 3/10 (total: 0.0s)        [fs_small_3col] iter 4/10 (total: 0.0s)        [fs_small_3col] iter 5/10 (total: 0.0s)        [fs_small_3col] iter 6/10 (total: 0.0s)        [fs_small_3col] iter 7/10 (total: 0.0s)        [fs_small_3col] iter 8/10 (total: 0.1s)        [fs_small_3col] iter 9/10 (total: 0.1s)        [fs_small_3col] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_record_size_small_3col_10000] insert_profile setup_us=31.5 begin_us=25.6 prepare_us=23.6 insert_us=11834.0 commit_us=197.3 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=22742 execute_body_ns=9716489 commit_pre_ns=6883 commit_roundtrip_ns=163189 commit_finalize_ns=4398 commit_handle_ns=8045 post_write_ns=1122 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=68 row_build_ns=1519194 cursor_setup_ns=480841 serialize_ns=565752 btree_insert_ns=3709249 memdb_apply_ns=268800 schema_validation_ns=329490 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=237097 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=65 btree_cell_assembly_bytes=1635 btree_leaf_payload_appends=9936 btree_leaf_payload_mutate_ns=986732 btree_leaf_payload_stage_ns=1301711 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=550 btree_leaf_full_cell_stage_ns=1674 btree_quick_balance_attempts=62 btree_quick_balance_hits=62 btree_quick_balance_ns=77477 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=4.06 ms F=7.09 ms
-  Benchmarking 10K rows record size medium_6col...     [cs_medium_6col] warmup 1/2...    [cs_medium_6col] warmup 2/2...    [cs_medium_6col] iter 1/10 (total: 0.0s)        [cs_medium_6col] iter 2/10 (total: 0.0s)        [cs_medium_6col] iter 3/10 (total: 0.0s)        [cs_medium_6col] iter 4/10 (total: 0.0s)        [cs_medium_6col] iter 5/10 (total: 0.0s)        [cs_medium_6col] iter 6/10 (total: 0.0s)        [cs_medium_6col] iter 7/10 (total: 0.0s)        [cs_medium_6col] iter 8/10 (total: 0.0s)        [cs_medium_6col] iter 9/10 (total: 0.0s)        [cs_medium_6col] iter 10/10 (total: 0.1s)                                                                                        [fs_medium_6col] warmup 1/2...    [fs_medium_6col] warmup 2/2...    [fs_medium_6col] iter 1/10 (total: 0.0s)        [fs_medium_6col] iter 2/10 (total: 0.0s)        [fs_medium_6col] iter 3/10 (total: 0.0s)        [fs_medium_6col] iter 4/10 (total: 0.0s)        [fs_medium_6col] iter 5/10 (total: 0.0s)        [fs_medium_6col] iter 6/10 (total: 0.1s)        [fs_medium_6col] iter 7/10 (total: 0.1s)        [fs_medium_6col] iter 8/10 (total: 0.1s)        [fs_medium_6col] iter 9/10 (total: 0.1s)        [fs_medium_6col] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_record_size_medium_6col_10000] insert_profile setup_us=59.0 begin_us=34.3 prepare_us=45.3 insert_us=16290.6 commit_us=1061.9 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=140 begin_ns=31049 execute_body_ns=14627255 commit_pre_ns=21631 commit_roundtrip_ns=1006933 commit_finalize_ns=6443 commit_handle_ns=9207 post_write_ns=1012 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=459 row_build_ns=3163320 cursor_setup_ns=574050 serialize_ns=1451434 btree_insert_ns=4581049 memdb_apply_ns=394874 schema_validation_ns=440119 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=273659 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=456 btree_cell_assembly_bytes=83020 btree_leaf_payload_appends=9545 btree_leaf_payload_mutate_ns=955888 btree_leaf_payload_stage_ns=1410184 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=812 btree_leaf_full_cell_stage_ns=2544 btree_quick_balance_attempts=453 btree_quick_balance_hits=453 btree_quick_balance_ns=695703 btree_local_split_attempts=0 btree_local_split_hits=0 btree_local_split_ns=0 btree_nonroot_balance_calls=0 btree_nonroot_balance_ns=0 btree_no_split_reuse_hits=0 btree_conservative_reloads=1 btree_page_header_rebuilds=1 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=5.46 ms F=10.83 ms
-  Benchmarking 10K rows record size large_10col...     [cs_large_10col] warmup 1/2...    [cs_large_10col] warmup 2/2...    [cs_large_10col] iter 1/10 (total: 0.0s)        [cs_large_10col] iter 2/10 (total: 0.0s)        [cs_large_10col] iter 3/10 (total: 0.0s)        [cs_large_10col] iter 4/10 (total: 0.0s)        [cs_large_10col] iter 5/10 (total: 0.0s)        [cs_large_10col] iter 6/10 (total: 0.0s)        [cs_large_10col] iter 7/10 (total: 0.1s)        [cs_large_10col] iter 8/10 (total: 0.1s)        [cs_large_10col] iter 9/10 (total: 0.1s)        [cs_large_10col] iter 10/10 (total: 0.1s)                                                                                        [fs_large_10col] warmup 1/2...    [fs_large_10col] warmup 2/2...    [fs_large_10col] iter 1/10 (total: 0.0s)        [fs_large_10col] iter 2/10 (total: 0.0s)        [fs_large_10col] iter 3/10 (total: 0.1s)        [fs_large_10col] iter 4/10 (total: 0.1s)        [fs_large_10col] iter 5/10 (total: 0.2s)        [fs_large_10col] iter 6/10 (total: 0.2s)        [fs_large_10col] iter 7/10 (total: 0.2s)        [fs_large_10col] iter 8/10 (total: 0.3s)        [fs_large_10col] iter 9/10 (total: 0.3s)        [fs_large_10col] iter 10/10 (total: 0.4s)                                                                                        [fs_insert_record_size_large_10col_10000] insert_profile setup_us=91.5 begin_us=58.9 prepare_us=85.4 insert_us=28028.9 commit_us=19971.2 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=201 begin_ns=52890 execute_body_ns=45377344 commit_pre_ns=68640 commit_roundtrip_ns=19840654 commit_finalize_ns=16211 commit_handle_ns=17844 post_write_ns=1613 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2013 row_build_ns=7114465 cursor_setup_ns=544442 serialize_ns=1909855 btree_insert_ns=11578960 memdb_apply_ns=620040 schema_validation_ns=357662 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=263105 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2004 btree_cell_assembly_bytes=1454068 btree_leaf_payload_appends=7997 btree_leaf_payload_mutate_ns=1101134 btree_leaf_payload_stage_ns=1344607 btree_leaf_full_cell_appends=2 btree_leaf_full_cell_mutate_ns=1133 btree_leaf_full_cell_stage_ns=9076 btree_quick_balance_attempts=2007 btree_quick_balance_hits=1995 btree_quick_balance_ns=6825520 btree_local_split_attempts=6 btree_local_split_hits=0 btree_local_split_ns=1143 btree_nonroot_balance_calls=6 btree_nonroot_balance_ns=522217 btree_no_split_reuse_hits=0 btree_conservative_reloads=7 btree_page_header_rebuilds=6 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=10.34 ms F=40.21 ms
-
-Benchmark complete in 3.3s. Generating reports...
-HTML report written to: benchmark_report_20260505_1740.html
-{
-  "schema_version": "fsqlite-e2e.comprehensive-bench-report.v3",
-  "generated_at_utc": "2026-05-05 17:40:17 UTC",
-  "total_elapsed_ms": 3285,
-  "config": {
-    "quick": true,
-    "filter": "insert",
-    "warmup_iterations": 2,
-    "min_iterations": 3,
-    "max_iterations": 10,
-    "target_duration_secs": 5,
-    "row_counts": [
-      100,
-      1000,
-      10000
-    ],
-    "html_output_path": "benchmark_report_20260505_1740.html",
-    "json_output_path": null,
-    "json_stdout": true
-  },
-  "environment": {
-    "os": "Ubuntu 25.10",
-    "arch": "x86_64",
-    "kernel_release": "6.17.0-23-generic",
-    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
-    "cpu_cores": 128,
-    "ram_gb": 247.24681091308594,
-    "active_toolchain": "nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)",
-    "rust_version": "rustc 1.97.0-nightly (f53b654a8 2026-04-30)",
-    "cargo_version": "cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)",
-    "git_commit_sha": "0092a2bfe74f8f2ececc186cf1f0a7bc937182e0",
-    "git_branch": "main",
-    "build_profile": "release-perf"
-  },
-  "summary": {
-    "total_scenarios": 25,
-    "franken_faster": 0,
-    "comparable": 0,
-    "csqlite_faster": 25,
-    "avg_ratio": 2.335574214944325,
-    "average_ratio": 2.335574214944325,
-    "geomean_ratio": 2.1859542615646865,
-    "median_ratio": 2.1150624723904867,
-    "p90_ratio": 3.442905043868772,
-    "p99_ratio": 6.016120268067379,
-    "primary_metric": "per_category_weighted.score",
-    "per_category": {
-      "concurrent_writers": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "mixed": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "read_aggregate": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "read_single": {
-        "n": 0,
-        "avg_ratio": null,
-        "geomean_ratio": null,
-        "median_ratio": null,
-        "p90_ratio": null,
-        "p99_ratio": null
-      },
-      "write_bulk": {
-        "n": 22,
-        "avg_ratio": 2.481404812108387,
-        "geomean_ratio": 2.3569461396624463,
-        "median_ratio": 2.2392274598253463,
-        "p90_ratio": 3.442905043868772,
-        "p99_ratio": 6.016120268067379
-      },
-      "write_single": {
-        "n": 3,
-        "avg_ratio": 1.266149835741204,
-        "geomean_ratio": 1.2582823208356666,
-        "median_ratio": 1.216661369824905,
-        "p90_ratio": 1.4611016673761124,
-        "p99_ratio": 1.4611016673761124
-      }
-    },
-    "per_category_weighted": {
-      "primary": true,
-      "score": 1.4720446580937008,
-      "weights": {
-        "concurrent_writers": 0.05,
-        "mixed": 0.05,
-        "read_aggregate": 0.15,
-        "read_single": 0.35,
-        "write_bulk": 0.1,
-        "write_single": 0.3
-      },
-      "observed_weight": 0.4,
-      "missing_categories": [
-        "concurrent_writers",
-        "mixed",
-        "read_aggregate",
-        "read_single"
-      ]
-    }
-  },
-  "ci_regression_gate": {
-    "schema_version": "fsqlite-e2e.comprehensive-bench-ci-regression-gate.v2",
-    "bead_id": "bd-m4tju",
-    "depends_on_bead_id": "bd-0winn",
-    "status": "rich_scorecard_schema_ready",
-    "thresholds": {
-      "avg_ratio_baseline": 2.74,
-      "avg_ratio_max": null,
-      "mt_p95_ratio_max": null,
-      "primary_score_max_regression_pct": 0.03,
-      "geomean_max_regression_pct": 0.05,
-      "per_category_geomean_max_regression_pct": 0.1,
-      "p90_max_regression_pct": 0.15,
-      "threshold_source": "bd-d4m5k rich scorecard: primary gate is per_category_weighted.score"
-    },
-    "observed": {
-      "avg_ratio": 2.335574214944325,
-      "primary_score": 1.4720446580937008,
-      "geomean_ratio": 2.1859542615646865,
-      "median_ratio": 2.1150624723904867,
-      "p90_ratio": 3.442905043868772,
-      "max_mt_p95_ratio": null,
-      "max_mt_p95_scenario_id": null
-    }
-  },
-  "sections": [
-    {
-      "section_id": "insertthroughput-single-transaction-tiny-1col",
-      "title": "INSERTThroughput — Single Transaction — tiny_1col",
-      "description": "Record: 1 col (INTEGER PK only). All rows inserted in a single BEGIN..COMMIT.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-single-transaction-tiny-1col__100-rows",
-          "scenario": "100 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.131027,
-            "mean_ms": 0.160221,
-            "min_ms": 0.09647299999999999,
-            "p95_ms": 0.409184,
-            "p99_ms": 0.409184,
-            "stddev_ms": 0.08925200000000001,
-            "cv_pct": 55.70555669980839,
-            "rows_per_sec": 763201.4775580605,
-            "us_per_row": 1.31027,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.273356,
-            "mean_ms": 0.334291,
-            "min_ms": 0.25932,
-            "p95_ms": 0.7140099999999999,
-            "p99_ms": 0.7140099999999999,
-            "stddev_ms": 0.135945,
-            "cv_pct": 40.66666467239621,
-            "rows_per_sec": 365823.32196842215,
-            "us_per_row": 2.7335599999999998,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.086257030993612
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-tiny-1col__1000-rows",
-          "scenario": "1000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.39645,
-            "mean_ms": 0.444207,
-            "min_ms": 0.355092,
-            "p95_ms": 0.6055550000000001,
-            "p99_ms": 0.6055550000000001,
-            "stddev_ms": 0.09742999999999999,
-            "cv_pct": 21.933467955255097,
-            "rows_per_sec": 2522386.1773237484,
-            "us_per_row": 0.39644999999999997,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.8993,
-            "mean_ms": 0.960036,
-            "min_ms": 0.749637,
-            "p95_ms": 1.493193,
-            "p99_ms": 1.493193,
-            "stddev_ms": 0.231173,
-            "cv_pct": 24.079617847664046,
-            "rows_per_sec": 1111975.9813188035,
-            "us_per_row": 0.8993000000000001,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.2683818892672467
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-tiny-1col__10000-rows",
-          "scenario": "10000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 2.668494,
-            "mean_ms": 2.754194,
-            "min_ms": 2.530944,
-            "p95_ms": 3.444501,
-            "p99_ms": 3.444501,
-            "stddev_ms": 0.284127,
-            "cv_pct": 10.316157830566764,
-            "rows_per_sec": 3747432.072172544,
-            "us_per_row": 0.2668494,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 5.089841000000001,
-            "mean_ms": 5.322669,
-            "min_ms": 4.794974,
-            "p95_ms": 6.440875,
-            "p99_ms": 6.440875,
-            "stddev_ms": 0.574968,
-            "cv_pct": 10.802249773562849,
-            "rows_per_sec": 1964697.9149250437,
-            "us_per_row": 0.5089841,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.9073833405658773
-        }
-      ]
-    },
-    {
-      "section_id": "insertthroughput-single-transaction-small-3col",
-      "title": "INSERTThroughput — Single Transaction — small_3col",
-      "description": "Record: 3 cols (~30B: id, name, value). All rows inserted in a single BEGIN..COMMIT.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-single-transaction-small-3col__100-rows",
-          "scenario": "100 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.099378,
-            "mean_ms": 0.127809,
-            "min_ms": 0.077216,
-            "p95_ms": 0.21891400000000003,
-            "p99_ms": 0.21891400000000003,
-            "stddev_ms": 0.053013000000000005,
-            "cv_pct": 41.47829965025937,
-            "rows_per_sec": 1006258.9305480086,
-            "us_per_row": 0.99378,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.59787,
-            "mean_ms": 0.542987,
-            "min_ms": 0.389606,
-            "p95_ms": 0.6966169999999999,
-            "p99_ms": 0.6966169999999999,
-            "stddev_ms": 0.11210899999999999,
-            "cv_pct": 20.64671898222241,
-            "rows_per_sec": 167260.44123304397,
-            "us_per_row": 5.9787,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 6.016120268067379
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-small-3col__1000-rows",
-          "scenario": "1000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.535382,
-            "mean_ms": 0.513913,
-            "min_ms": 0.38852400000000004,
-            "p95_ms": 0.798199,
-            "p99_ms": 0.798199,
-            "stddev_ms": 0.12163900000000001,
-            "cv_pct": 23.66918135949081,
-            "rows_per_sec": 1867825.216387551,
-            "us_per_row": 0.535382,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 1.112994,
-            "mean_ms": 1.119612,
-            "min_ms": 0.845559,
-            "p95_ms": 1.528359,
-            "p99_ms": 1.528359,
-            "stddev_ms": 0.196764,
-            "cv_pct": 17.5743025262323,
-            "rows_per_sec": 898477.4401299558,
-            "us_per_row": 1.1129939999999998,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.078878258888046
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-small-3col__10000-rows",
-          "scenario": "10000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 3.503592,
-            "mean_ms": 3.732199,
-            "min_ms": 3.442527,
-            "p95_ms": 4.889723,
-            "p99_ms": 4.889723,
-            "stddev_ms": 0.44254,
-            "cv_pct": 11.857352729583818,
-            "rows_per_sec": 2854213.6184806908,
-            "us_per_row": 0.3503592,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 7.927145,
-            "mean_ms": 8.045306,
-            "min_ms": 7.341458,
-            "p95_ms": 8.988831,
-            "p99_ms": 8.988831,
-            "stddev_ms": 0.601047,
-            "cv_pct": 7.4707786130198155,
-            "rows_per_sec": 1261488.215492463,
-            "us_per_row": 0.7927145,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.2625765214671114
-        }
-      ]
-    },
-    {
-      "section_id": "insertthroughput-single-transaction-medium-6col",
-      "title": "INSERTThroughput — Single Transaction — medium_6col",
-      "description": "Record: 6 cols (~180B: id, name, email, bio, category, score). All rows inserted in a single BEGIN..COMMIT.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-single-transaction-medium-6col__100-rows",
-          "scenario": "100 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.134794,
-            "mean_ms": 0.135592,
-            "min_ms": 0.11254299999999999,
-            "p95_ms": 0.181393,
-            "p99_ms": 0.181393,
-            "stddev_ms": 0.019474,
-            "cv_pct": 14.362204259838338,
-            "rows_per_sec": 741872.7836550588,
-            "us_per_row": 1.3479400000000001,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.44442,
-            "mean_ms": 0.446847,
-            "min_ms": 0.346825,
-            "p95_ms": 0.6994119999999999,
-            "p99_ms": 0.6994119999999999,
-            "stddev_ms": 0.095648,
-            "cv_pct": 21.405089437771764,
-            "rows_per_sec": 225012.37568066243,
-            "us_per_row": 4.4442,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 3.2970310251198125
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-medium-6col__1000-rows",
-          "scenario": "1000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.890935,
-            "mean_ms": 0.879289,
-            "min_ms": 0.739257,
-            "p95_ms": 1.015279,
-            "p99_ms": 1.015279,
-            "stddev_ms": 0.086921,
-            "cv_pct": 9.885373295924321,
-            "rows_per_sec": 1122416.3378922143,
-            "us_per_row": 0.890935,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 2.016331,
-            "mean_ms": 1.9896760000000002,
-            "min_ms": 1.550931,
-            "p95_ms": 2.341055,
-            "p99_ms": 2.341055,
-            "stddev_ms": 0.227046,
-            "cv_pct": 11.411204638343127,
-            "rows_per_sec": 495950.31768097595,
-            "us_per_row": 2.016331,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.2631628569985467
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-medium-6col__10000-rows",
-          "scenario": "10000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 5.847033,
-            "mean_ms": 5.857397000000001,
-            "min_ms": 5.214015,
-            "p95_ms": 6.571913,
-            "p99_ms": 6.571913,
-            "stddev_ms": 0.49622299999999997,
-            "cv_pct": 8.471732409464478,
-            "rows_per_sec": 1710269.1228183594,
-            "us_per_row": 0.5847032999999999,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 15.1141,
-            "mean_ms": 15.038160999999999,
-            "min_ms": 13.821375999999999,
-            "p95_ms": 17.773026,
-            "p99_ms": 17.773026,
-            "stddev_ms": 1.1226630000000002,
-            "cv_pct": 7.465427454859673,
-            "rows_per_sec": 661633.8386010414,
-            "us_per_row": 1.5114100000000001,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.5849178549188965
-        }
-      ]
-    },
-    {
-      "section_id": "insertthroughput-single-transaction-large-10col",
-      "title": "INSERTThroughput — Single Transaction — large_10col",
-      "description": "Record: 10 cols (~600B: includes long text fields). All rows inserted in a single BEGIN..COMMIT.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-single-transaction-large-10col__100-rows",
-          "scenario": "100 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.25915,
-            "mean_ms": 0.311499,
-            "min_ms": 0.195119,
-            "p95_ms": 0.551643,
-            "p99_ms": 0.551643,
-            "stddev_ms": 0.114489,
-            "cv_pct": 36.75421108896016,
-            "rows_per_sec": 385876.90526721976,
-            "us_per_row": 2.5915,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.5105860000000001,
-            "mean_ms": 0.520393,
-            "min_ms": 0.39462600000000003,
-            "p95_ms": 0.839467,
-            "p99_ms": 0.839467,
-            "stddev_ms": 0.13685999999999998,
-            "cv_pct": 26.299354526290706,
-            "rows_per_sec": 195853.39198489577,
-            "us_per_row": 5.105860000000001,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.9702334555276866
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-large-10col__1000-rows",
-          "scenario": "1000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.979171,
-            "mean_ms": 1.046562,
-            "min_ms": 0.940397,
-            "p95_ms": 1.246676,
-            "p99_ms": 1.246676,
-            "stddev_ms": 0.117385,
-            "cv_pct": 11.216249013436377,
-            "rows_per_sec": 1021272.0760725144,
-            "us_per_row": 0.979171,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 2.421157,
-            "mean_ms": 2.40992,
-            "min_ms": 1.894511,
-            "p95_ms": 3.404416,
-            "p99_ms": 3.404416,
-            "stddev_ms": 0.522491,
-            "cv_pct": 21.68084417740008,
-            "rows_per_sec": 413025.6732628243,
-            "us_per_row": 2.421157,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.472660035887501
-        },
-        {
-          "scenario_id": "insertthroughput-single-transaction-large-10col__10000-rows",
-          "scenario": "10000 rows",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 10.937735,
-            "mean_ms": 10.794026,
-            "min_ms": 9.949196,
-            "p95_ms": 12.049126000000001,
-            "p99_ms": 12.049126000000001,
-            "stddev_ms": 0.723163,
-            "cv_pct": 6.699659608009097,
-            "rows_per_sec": 914266.0706261396,
-            "us_per_row": 1.0937735,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 37.657583,
-            "mean_ms": 38.146206,
-            "min_ms": 36.104206,
-            "p95_ms": 41.164161,
-            "p99_ms": 41.164161,
-            "stddev_ms": 1.717546,
-            "cv_pct": 4.502534275623636,
-            "rows_per_sec": 265550.7656983721,
-            "us_per_row": 3.7657583,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 3.442905043868772
-        }
-      ]
-    },
-    {
-      "section_id": "insertthroughput-transaction-strategy-comparison-small-3col",
-      "title": "INSERTThroughput — Transaction Strategy Comparison (small_3col)",
-      "description": "Compares autocommit, batched (1K/txn), and single-txn strategies.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-autocommit",
-          "scenario": "100 rows / autocommit",
-          "category": "write_single",
-          "csqlite": {
-            "median_ms": 0.211109,
-            "mean_ms": 0.21567799999999998,
-            "min_ms": 0.160684,
-            "p95_ms": 0.299867,
-            "p99_ms": 0.299867,
-            "stddev_ms": 0.04578,
-            "cv_pct": 21.226087037157242,
-            "rows_per_sec": 473688.94741579,
-            "us_per_row": 2.11109,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.236587,
-            "mean_ms": 0.248302,
-            "min_ms": 0.214706,
-            "p95_ms": 0.310226,
-            "p99_ms": 0.310226,
-            "stddev_ms": 0.030794,
-            "cv_pct": 12.401833251443806,
-            "rows_per_sec": 422677.4928461835,
-            "us_per_row": 2.3658699999999997,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.120686470022595
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-batched-100-txn",
-          "scenario": "100 rows / batched (100/txn)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.117622,
-            "mean_ms": 0.119511,
-            "min_ms": 0.092645,
-            "p95_ms": 0.153189,
-            "p99_ms": 0.153189,
-            "stddev_ms": 0.018079,
-            "cv_pct": 15.1274778053903,
-            "rows_per_sec": 850181.0885718658,
-            "us_per_row": 1.17622,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.282053,
-            "mean_ms": 0.35090400000000005,
-            "min_ms": 0.224114,
-            "p95_ms": 0.609692,
-            "p99_ms": 0.609692,
-            "stddev_ms": 0.147183,
-            "cv_pct": 41.94395048218316,
-            "rows_per_sec": 354543.2950544756,
-            "us_per_row": 2.8205299999999998,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.3979612657496046
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__100-rows-single-txn",
-          "scenario": "100 rows / single txn",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.109547,
-            "mean_ms": 0.116829,
-            "min_ms": 0.09011000000000001,
-            "p95_ms": 0.160293,
-            "p99_ms": 0.160293,
-            "stddev_ms": 0.020942,
-            "cv_pct": 17.925343878660264,
-            "rows_per_sec": 912850.1921549655,
-            "us_per_row": 1.09547,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.23194900000000002,
-            "mean_ms": 0.242468,
-            "min_ms": 0.21573799999999999,
-            "p95_ms": 0.31483500000000003,
-            "p99_ms": 0.31483500000000003,
-            "stddev_ms": 0.033049,
-            "cv_pct": 13.630252239470774,
-            "rows_per_sec": 431129.2568624999,
-            "us_per_row": 2.31949,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.1173468922015206
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-autocommit",
-          "scenario": "1000 rows / autocommit",
-          "category": "write_single",
-          "csqlite": {
-            "median_ms": 1.1358970000000002,
-            "mean_ms": 1.103201,
-            "min_ms": 0.896705,
-            "p95_ms": 1.411358,
-            "p99_ms": 1.411358,
-            "stddev_ms": 0.173335,
-            "cv_pct": 15.712005337196032,
-            "rows_per_sec": 880361.5116511444,
-            "us_per_row": 1.1358970000000002,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 1.382002,
-            "mean_ms": 1.4973269999999999,
-            "min_ms": 1.276012,
-            "p95_ms": 2.134094,
-            "p99_ms": 2.134094,
-            "stddev_ms": 0.302209,
-            "cv_pct": 20.183233188208053,
-            "rows_per_sec": 723587.9542866074,
-            "us_per_row": 1.382002,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.216661369824905
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-batched-1000-txn",
-          "scenario": "1000 rows / batched (1000/txn)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.39770099999999997,
-            "mean_ms": 0.419299,
-            "min_ms": 0.38571900000000003,
-            "p95_ms": 0.529501,
-            "p99_ms": 0.529501,
-            "stddev_ms": 0.050671,
-            "cv_pct": 12.084693738835533,
-            "rows_per_sec": 2514451.811788253,
-            "us_per_row": 0.39770099999999997,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.8905430000000001,
-            "mean_ms": 0.9820420000000001,
-            "min_ms": 0.826202,
-            "p95_ms": 1.533018,
-            "p99_ms": 1.533018,
-            "stddev_ms": 0.22865,
-            "cv_pct": 23.283118237305533,
-            "rows_per_sec": 1122910.404101767,
-            "us_per_row": 0.890543,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.2392274598253463
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__1000-rows-single-txn",
-          "scenario": "1000 rows / single txn",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 0.589704,
-            "mean_ms": 0.5729609999999999,
-            "min_ms": 0.421406,
-            "p95_ms": 0.691216,
-            "p99_ms": 0.691216,
-            "stddev_ms": 0.09054,
-            "cv_pct": 15.80212265756308,
-            "rows_per_sec": 1695766.0114226798,
-            "us_per_row": 0.5897040000000001,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 0.8597049999999999,
-            "mean_ms": 0.863024,
-            "min_ms": 0.835329,
-            "p95_ms": 0.912565,
-            "p99_ms": 0.912565,
-            "stddev_ms": 0.02108,
-            "cv_pct": 2.442574018799014,
-            "rows_per_sec": 1163189.6987920275,
-            "us_per_row": 0.859705,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.457858518850135
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-autocommit",
-          "scenario": "10000 rows / autocommit",
-          "category": "write_single",
-          "csqlite": {
-            "median_ms": 8.579468,
-            "mean_ms": 8.850463,
-            "min_ms": 8.384779,
-            "p95_ms": 10.589717,
-            "p99_ms": 10.589717,
-            "stddev_ms": 0.645767,
-            "cv_pct": 7.296420537547019,
-            "rows_per_sec": 1165573.4364881366,
-            "us_per_row": 0.8579467999999999,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 12.535475,
-            "mean_ms": 12.981373,
-            "min_ms": 12.007237,
-            "p95_ms": 14.607622000000001,
-            "p99_ms": 14.607622000000001,
-            "stddev_ms": 0.97194,
-            "cv_pct": 7.487189529181544,
-            "rows_per_sec": 797736.0251605941,
-            "us_per_row": 1.2535475,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.4611016673761124
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-batched-1000-txn",
-          "scenario": "10000 rows / batched (1000/txn)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 3.704102,
-            "mean_ms": 3.859435,
-            "min_ms": 3.53419,
-            "p95_ms": 5.017133,
-            "p99_ms": 5.017133,
-            "stddev_ms": 0.424702,
-            "cv_pct": 11.004253213229397,
-            "rows_per_sec": 2699709.673221742,
-            "us_per_row": 0.37041019999999997,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 7.674076,
-            "mean_ms": 8.109682999999999,
-            "min_ms": 7.05193,
-            "p95_ms": 10.76597,
-            "p99_ms": 10.76597,
-            "stddev_ms": 1.354417,
-            "cv_pct": 16.701232341634068,
-            "rows_per_sec": 1303088.4760588766,
-            "us_per_row": 0.7674076,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.071777721023881
-        },
-        {
-          "scenario_id": "insertthroughput-transaction-strategy-comparison-small-3col__10000-rows-single-txn",
-          "scenario": "10000 rows / single txn",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 3.755499,
-            "mean_ms": 3.7988560000000002,
-            "min_ms": 3.471221,
-            "p95_ms": 4.3721749999999995,
-            "p99_ms": 4.3721749999999995,
-            "stddev_ms": 0.274417,
-            "cv_pct": 7.223674706279996,
-            "rows_per_sec": 2662761.9924808927,
-            "us_per_row": 0.3755499,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 7.943115000000001,
-            "mean_ms": 8.008423,
-            "min_ms": 6.923006,
-            "p95_ms": 9.687071,
-            "p99_ms": 9.687071,
-            "stddev_ms": 0.862634,
-            "cv_pct": 10.77158386863431,
-            "rows_per_sec": 1258951.9351035457,
-            "us_per_row": 0.7943115000000001,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 2.1150624723904867
-        }
-      ]
-    },
-    {
-      "section_id": "insertthroughput-record-size-comparison-10k-rows-single-txn",
-      "title": "INSERTThroughput — Record Size Comparison (10K rows, single txn)",
-      "description": "Fixed 10K rows in a single transaction, varying payload size.",
-      "rows": [
-        {
-          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__tiny-1col-1-col-integer-pk-only",
-          "scenario": "tiny_1col — 1 col (INTEGER PK only)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 2.594795,
-            "mean_ms": 2.827053,
-            "min_ms": 2.53922,
-            "p95_ms": 3.6992930000000004,
-            "p99_ms": 3.6992930000000004,
-            "stddev_ms": 0.401373,
-            "cv_pct": 14.197576062422602,
-            "rows_per_sec": 3853868.9954312383,
-            "us_per_row": 0.25947950000000003,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 4.998518000000001,
-            "mean_ms": 5.08418,
-            "min_ms": 4.447877,
-            "p95_ms": 6.102575,
-            "p99_ms": 6.102575,
-            "stddev_ms": 0.526204,
-            "cv_pct": 10.349830257780015,
-            "rows_per_sec": 2000592.9757580145,
-            "us_per_row": 0.4998518,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.9263633543304963
-        },
-        {
-          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__small-3col-3-cols-30b-id-name-value",
-          "scenario": "small_3col — 3 cols (~30B: id, name, value)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 4.064764,
-            "mean_ms": 4.042913,
-            "min_ms": 3.425876,
-            "p95_ms": 4.813849,
-            "p99_ms": 4.813849,
-            "stddev_ms": 0.46705599999999997,
-            "cv_pct": 11.55246229636898,
-            "rows_per_sec": 2460167.4291545586,
-            "us_per_row": 0.4064764,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 7.092176,
-            "mean_ms": 7.602715000000001,
-            "min_ms": 6.737726,
-            "p95_ms": 10.688554,
-            "p99_ms": 10.688554,
-            "stddev_ms": 1.1923920000000001,
-            "cv_pct": 15.6837656021566,
-            "rows_per_sec": 1410004.4894542943,
-            "us_per_row": 0.7092176,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.744794039703166
-        },
-        {
-          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__medium-6col-6-cols-180b-id-name-email-bio-category-score",
-          "scenario": "medium_6col — 6 cols (~180B: id, name, email, bio, category, score)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 5.461424,
-            "mean_ms": 5.5568409999999995,
-            "min_ms": 5.2568470000000005,
-            "p95_ms": 6.515176,
-            "p99_ms": 6.515176,
-            "stddev_ms": 0.364367,
-            "cv_pct": 6.557088820788646,
-            "rows_per_sec": 1831024.2896358166,
-            "us_per_row": 0.5461424,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 10.829721000000001,
-            "mean_ms": 11.061992,
-            "min_ms": 9.997888,
-            "p95_ms": 12.541205999999999,
-            "p99_ms": 12.541205999999999,
-            "stddev_ms": 0.8620099999999999,
-            "cv_pct": 7.792538631378508,
-            "rows_per_sec": 923384.8221944036,
-            "us_per_row": 1.0829721,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 1.9829482200979085
-        },
-        {
-          "scenario_id": "insertthroughput-record-size-comparison-10k-rows-single-txn__large-10col-10-cols-600b-includes-long-text-fields",
-          "scenario": "large_10col — 10 cols (~600B: includes long text fields)",
-          "category": "write_bulk",
-          "csqlite": {
-            "median_ms": 10.344624,
-            "mean_ms": 10.361473,
-            "min_ms": 9.221361000000002,
-            "p95_ms": 12.823971,
-            "p99_ms": 12.823971,
-            "stddev_ms": 0.974718,
-            "cv_pct": 9.407137382879828,
-            "rows_per_sec": 966685.6910410663,
-            "us_per_row": 1.0344624,
-            "iterations": 10
-          },
-          "fsqlite": {
-            "median_ms": 40.210157,
-            "mean_ms": 40.551541,
-            "min_ms": 37.385419000000006,
-            "p95_ms": 46.833386999999995,
-            "p99_ms": 46.833386999999995,
-            "stddev_ms": 2.851156,
-            "cv_pct": 7.030943657603542,
-            "rows_per_sec": 248693.3836144932,
-            "us_per_row": 4.0210157,
-            "iterations": 10
-          },
-          "ratio_fsqlite_over_csqlite": 3.8870583406414774
-        }
-      ]
-    }
-  ]
-}
-  [2m2026-05-05T17:40:17.302230Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 3863ms[0m
-    [2;3mat[0m rch/src/hook.rs:5290 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.302736Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
-    [2;3mat[0m rch/src/hook.rs:5339 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.302769Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1716 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.302802Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 1 retrieval exclude pattern(s) from .rchignore (total: 4)[0m
-    [2;3mat[0m rch/src/transfer.rs:612 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.699294Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 396ms (2037 files, 245 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:1755 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.699335Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 2037 files, 245 bytes in 396ms[0m
-    [2;3mat[0m rch/src/hook.rs:5372 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:40:17.699447Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite/.rch-target on ts2[0m
-    [2;3mat[0m rch/src/transfer.rs:1716 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:41:28.286375Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 70586ms (11651 files, 200249 bytes)[0m
-    [2;3mat[0m rch/src/transfer.rs:1755 [2;3mon[0m ThreadId(1)
-
-  [2m2026-05-05T17:41:28.286405Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 11651 files, 200249 bytes in 70586ms[0m
-    [2;3mat[0m rch/src/hook.rs:5490 [2;3mon[0m ThreadId(1)
-
-[RCH] remote ts2 (85.5s)

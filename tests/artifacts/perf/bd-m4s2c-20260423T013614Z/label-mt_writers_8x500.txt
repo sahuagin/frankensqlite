@@ -1,1 +1,0 @@
-Concurrent writers: 8 threads, 500 rows/thread, 1 iteration

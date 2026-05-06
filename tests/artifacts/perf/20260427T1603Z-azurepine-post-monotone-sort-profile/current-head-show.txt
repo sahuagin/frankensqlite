@@ -1,3 +1,0 @@
-132b3c33 perf(bench): suppress time-travel snapshot clone in perf_update_delete + propagate pragma errors
- crates/fsqlite-e2e/src/bin/perf_update_delete.rs | 49 +++++++++++++++++-------
- 1 file changed, 36 insertions(+), 13 deletions(-)

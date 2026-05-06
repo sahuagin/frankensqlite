@@ -1,321 +1,0 @@
-   Compiling cfg-if v1.0.4
-   Compiling typenum v1.20.0
-   Compiling allocator-api2 v0.2.21
-   Compiling once_cell v1.21.4
-   Compiling foldhash v0.2.0
-   Compiling equivalent v1.0.2
-   Compiling memchr v2.8.0
-   Compiling cmov v0.5.3
-   Compiling smallvec v1.15.1
-   Compiling const-oid v0.10.2
-   Compiling regex-syntax v0.8.10
-   Compiling itoa v1.0.18
-   Compiling cpufeatures v0.3.0
-   Compiling num-traits v0.2.19
-   Compiling scopeguard v1.2.0
-   Compiling pin-project-lite v0.2.17
-   Compiling linux-raw-sys v0.12.1
-   Compiling libc v0.2.185
-   Compiling serde_core v1.0.228
-   Compiling zmij v1.0.21
-   Compiling crossbeam-utils v0.8.21
-   Compiling fastrand v2.4.1
-   Compiling lazy_static v1.5.0
-   Compiling log v0.4.29
-   Compiling lock_api v0.4.14
-   Compiling memoffset v0.9.1
-   Compiling thread_local v1.1.9
-   Compiling unty-next v0.1.1
-   Compiling bytes v1.11.1
-   Compiling nu-ansi-term v0.50.3
-   Compiling parking v2.2.1
-   Compiling futures-core v0.3.32
-   Compiling futures-io v0.3.32
-   Compiling crc32fast v1.5.0
-   Compiling tracing-core v0.1.36
-   Compiling thiserror v2.0.18
-   Compiling sharded-slab v0.1.7
-   Compiling pin-project v1.1.11
-   Compiling constant_time_eq v0.4.2
-   Compiling slab v0.4.12
-   Compiling arrayref v0.3.9
-   Compiling base64 v0.22.1
-   Compiling ctutils v0.4.2
-   Compiling arrayvec v0.7.6
-   Compiling fsqlite-error v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-error)
-   Compiling zerocopy v0.8.48
-   Compiling xxhash-rust v0.8.15
-   Compiling simdutf8 v0.1.5
-   Compiling subtle v2.6.1
-   Compiling iana-time-zone v0.1.65
-   Compiling cpufeatures v0.2.17
-   Compiling zeroize v1.8.2
-   Compiling futures-lite v2.6.1
-   Compiling base64ct v1.8.3
-   Compiling pollster v0.4.0
-   Compiling opaque-debug v0.3.1
-   Compiling crc32c v0.6.8
-   Compiling bumpalo v3.20.2
-   Compiling ucd-trie v0.1.7
-   Compiling winnow v0.7.15
-   Compiling toml_write v0.1.2
-   Compiling libsqlite3-sys v0.30.1
-   Compiling hashbrown v0.17.0
-   Compiling hashbrown v0.16.1
-   Compiling fallible-streaming-iterator v0.1.9
-   Compiling fallible-iterator v0.3.0
-   Compiling blake3 v1.8.4
-   Compiling aho-corasick v1.1.4
-   Compiling tracing v0.1.44
-   Compiling tracing-log v0.2.0
-   Compiling crossbeam-epoch v0.9.18
-   Compiling crossbeam-queue v0.3.12
-   Compiling prost v0.13.5
-   Compiling crossbeam-deque v0.8.6
-   Compiling hybrid-array v0.4.10
-   Compiling generic-array v0.14.7
-   Compiling rmp v0.8.15
-   Compiling chrono v0.4.44
-   Compiling indexmap v2.14.0
-   Compiling lru v0.16.4
-   Compiling crypto-common v0.2.1
-   Compiling block-buffer v0.12.0
-   Compiling block-buffer v0.10.4
-   Compiling inout v0.1.4
-   Compiling getrandom v0.2.17
-   Compiling parking_lot_core v0.9.12
-   Compiling errno v0.3.14
-   Compiling getrandom v0.4.2
-   Compiling socket2 v0.6.3
-   Compiling signal-hook-registry v1.4.8
-   Compiling rand_core v0.6.4
-   Compiling parking_lot v0.12.5
-   Compiling signal-hook v0.4.4
-   Compiling crypto-common v0.1.7
-   Compiling password-hash v0.5.0
-   Compiling digest v0.10.7
-   Compiling cipher v0.4.4
-   Compiling universal-hash v0.5.1
-   Compiling aead v0.5.2
-   Compiling poly1305 v0.8.0
-   Compiling regex-automata v0.4.14
-   Compiling chacha20 v0.9.1
-   Compiling blake2 v0.10.6
-   Compiling sha2 v0.10.9
-   Compiling digest v0.11.2
-   Compiling sha1 v0.11.0
-   Compiling sha2 v0.11.0
-   Compiling hmac v0.13.0
-   Compiling chacha20poly1305 v0.10.1
-   Compiling argon2 v0.5.3
-   Compiling serde v1.0.228
-   Compiling bitflags v2.11.1
-   Compiling serde_json v1.0.149
-   Compiling rustix v1.1.4
-   Compiling io-uring v0.7.12
-   Compiling nix v0.31.2
-   Compiling nix v0.29.0
-   Compiling tracing-serde v0.2.0
-   Compiling franken-kernel v0.3.1
-   Compiling rmp-serde v1.3.1
-   Compiling json5 v1.3.1
-   Compiling serde_spanned v0.6.9
-   Compiling toml_datetime v0.6.11
-   Compiling bincode-next v2.1.0
-   Compiling toml_edit v0.22.27
-   Compiling franken-evidence v0.3.1
-   Compiling franken-decision v0.3.1
-   Compiling ahash v0.8.12
-   Compiling ppv-lite86 v0.2.21
-   Compiling hashbrown v0.14.5
-   Compiling rand_chacha v0.3.1
-   Compiling rand v0.8.6
-   Compiling toml v0.8.23
-   Compiling dashmap v6.1.0
-   Compiling hashlink v0.9.1
-   Compiling matchers v0.2.0
-   Compiling regex v1.12.3
-   Compiling tempfile v3.27.0
-   Compiling polling v3.11.0
-   Compiling tracing-subscriber v0.3.23
-   Compiling rusqlite v0.32.1
-   Compiling asupersync v0.3.1
-   Compiling fsqlite-types v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-types)
-   Compiling fsqlite-func v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-func)
-   Compiling fsqlite-observability v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-observability)
-   Compiling fsqlite-ast v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ast)
-   Compiling fsqlite-vfs v0.1.4 (/data/projects/frankensqlite/crates/fsqlite-vfs)
-   Compiling fsqlite-parser v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-parser)
-   Compiling fsqlite-ext-icu v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-icu)
-   Compiling fsqlite-ext-rtree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-rtree)
-   Compiling fsqlite-ext-json v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-json)
-   Compiling fsqlite-ext-misc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-misc)
-   Compiling fsqlite-ext-fts5 v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-ext-fts5)
-   Compiling fsqlite-wal v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-wal)
-   Compiling fsqlite-planner v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-planner)
-   Compiling fsqlite-pager v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-pager)
-   Compiling fsqlite-btree v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-btree)
-   Compiling fsqlite-mvcc v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-mvcc)
-   Compiling fsqlite-vdbe v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-vdbe)
-   Compiling fsqlite-core v0.1.3 (/data/projects/frankensqlite/crates/fsqlite-core)
-   Compiling fsqlite v0.1.3 (/data/projects/frankensqlite/crates/fsqlite)
-   Compiling fsqlite-harness v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-harness)
-   Compiling fsqlite-e2e v0.1.0 (/data/projects/frankensqlite/crates/fsqlite-e2e)
-    Finished `release-perf` profile [optimized] target(s) in 4m 14s
-     Running `/data/tmp/frankensqlite-purplecoast-local-target/release-perf/comprehensive-bench --quick --filter insert --json-out tests/artifacts/perf/direct-insert-text-pool-purplecoast-20260505T063845Z/report.json --no-html`
-
-================================================================================
-  Comprehensive FrankenSQLite vs C SQLite Benchmark
-================================================================================
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-19-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 499.3 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (ad3a598ca 2026-05-03)
-  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
-  Git: main @ 5b5212f59b03dec8ce255341ba780d46c3127dcc
-  Build: release-perf (opt-level 3, LTO)
-  Mode: quick
-  Row counts: [100, 1000, 10000]
-  Measurement: 2 warmup, 3-10 iters, target 5s
-  Filter: insert
-================================================================================
-
-
-[1/10] INSERT throughput by row count
-  Benchmarking single-txn insert 100 rows (tiny_1col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_100] insert_profile setup_us=20.5 begin_us=102.0 prepare_us=13.1 insert_us=94.0 commit_us=89.4 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=31 begin_ns=99015 execute_body_ns=265309 commit_pre_ns=871 commit_roundtrip_ns=82365 commit_finalize_ns=1052 commit_handle_ns=1563 post_write_ns=190 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2 row_build_ns=3754 cursor_setup_ns=5620 serialize_ns=0 btree_insert_ns=33973 memdb_apply_ns=2604 schema_validation_ns=3373 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2285 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2 btree_cell_assembly_bytes=71 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=69.6 us F=408.8 us
-  Benchmarking single-txn insert 1000 rows (tiny_1col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_1000] insert_profile setup_us=20.9 begin_us=99.8 prepare_us=14.1 insert_us=1141.3 commit_us=176.6 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=96501 execute_body_ns=1156580 commit_pre_ns=1482 commit_roundtrip_ns=162385 commit_finalize_ns=1713 commit_handle_ns=3016 post_write_ns=261 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=5 row_build_ns=62519 cursor_setup_ns=44679 serialize_ns=0 btree_insert_ns=482223 memdb_apply_ns=26001 schema_validation_ns=33823 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=25023 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=3 btree_cell_assembly_bytes=76 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=271.9 us F=940.0 us
-  Benchmarking single-txn insert 10000 rows (tiny_1col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.0s)        [fsqlite_10000] iter 6/10 (total: 0.0s)        [fsqlite_10000] iter 7/10 (total: 0.0s)        [fsqlite_10000] iter 8/10 (total: 0.0s)        [fsqlite_10000] iter 9/10 (total: 0.0s)        [fsqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_tiny_1col_10000] insert_profile setup_us=38.6 begin_us=113.9 prepare_us=26.5 insert_us=9674.1 commit_us=243.8 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=41 begin_ns=110467 execute_body_ns=7561068 commit_pre_ns=5209 commit_roundtrip_ns=208150 commit_finalize_ns=3316 commit_handle_ns=6843 post_write_ns=952 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=21 row_build_ns=366671 cursor_setup_ns=424045 serialize_ns=0 btree_insert_ns=3649280 memdb_apply_ns=251882 schema_validation_ns=325422 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=244819 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=19 btree_cell_assembly_bytes=156 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=2.53 ms F=5.28 ms
-  Benchmarking single-txn insert 100 rows (small_3col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_small_3col_100] insert_profile setup_us=22.7 begin_us=100.1 prepare_us=17.2 insert_us=145.6 commit_us=92.5 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=97142 execute_body_ns=318599 commit_pre_ns=952 commit_roundtrip_ns=84578 commit_finalize_ns=1062 commit_handle_ns=1864 post_write_ns=200 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2 row_build_ns=38913 cursor_setup_ns=5745 serialize_ns=6612 btree_insert_ns=37916 memdb_apply_ns=3176 schema_validation_ns=3350 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2392 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2 btree_cell_assembly_bytes=129 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=76.9 us F=451.7 us
-  Benchmarking single-txn insert 1000 rows (small_3col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_small_3col_1000] insert_profile setup_us=23.2 begin_us=99.9 prepare_us=17.1 insert_us=1168.9 commit_us=108.9 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=96651 execute_body_ns=1146497 commit_pre_ns=1372 commit_roundtrip_ns=100058 commit_finalize_ns=1172 commit_handle_ns=1964 post_write_ns=190 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=11 row_build_ns=163483 cursor_setup_ns=43038 serialize_ns=55086 btree_insert_ns=361606 memdb_apply_ns=29763 schema_validation_ns=32458 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=23760 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=8 btree_cell_assembly_bytes=267 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=359.4 us F=1.00 ms
-  Benchmarking single-txn insert 10000 rows (small_3col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.0s)        [fsqlite_10000] iter 6/10 (total: 0.0s)        [fsqlite_10000] iter 7/10 (total: 0.1s)        [fsqlite_10000] iter 8/10 (total: 0.1s)        [fsqlite_10000] iter 9/10 (total: 0.1s)        [fsqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_single_txn_small_3col_10000] insert_profile setup_us=45.2 begin_us=128.4 prepare_us=34.0 insert_us=11953.6 commit_us=723.9 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=124783 execute_body_ns=10356876 commit_pre_ns=7515 commit_roundtrip_ns=685804 commit_finalize_ns=4729 commit_handle_ns=8646 post_write_ns=691 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=68 row_build_ns=1527401 cursor_setup_ns=415982 serialize_ns=615915 btree_insert_ns=3771785 memdb_apply_ns=302505 schema_validation_ns=322557 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=261970 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=65 btree_cell_assembly_bytes=1635 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=3.27 ms F=7.95 ms
-  Benchmarking single-txn insert 100 rows (medium_6col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_medium_6col_100] insert_profile setup_us=25.3 begin_us=99.9 prepare_us=20.8 insert_us=161.7 commit_us=104.9 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=96151 execute_body_ns=347400 commit_pre_ns=1333 commit_roundtrip_ns=96561 commit_finalize_ns=1082 commit_handle_ns=2144 post_write_ns=190 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=9 row_build_ns=31878 cursor_setup_ns=5740 serialize_ns=12812 btree_insert_ns=53142 memdb_apply_ns=4374 schema_validation_ns=3301 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2344 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=6 btree_cell_assembly_bytes=1043 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=103.8 us F=453.6 us
-  Benchmarking single-txn insert 1000 rows (medium_6col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_medium_6col_1000] insert_profile setup_us=28.2 begin_us=102.5 prepare_us=22.4 insert_us=1441.2 commit_us=385.1 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=99206 execute_body_ns=1697966 commit_pre_ns=3226 commit_roundtrip_ns=371736 commit_finalize_ns=1953 commit_handle_ns=3297 post_write_ns=230 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=50 row_build_ns=302481 cursor_setup_ns=42752 serialize_ns=132067 btree_insert_ns=398842 memdb_apply_ns=41819 schema_validation_ns=32591 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=23974 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=47 btree_cell_assembly_bytes=8340 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=573.9 us F=1.60 ms
-  Benchmarking single-txn insert 10000 rows (medium_6col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.0s)        [csqlite_10000] iter 7/10 (total: 0.0s)        [csqlite_10000] iter 8/10 (total: 0.0s)        [csqlite_10000] iter 9/10 (total: 0.0s)        [csqlite_10000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.0s)        [fsqlite_10000] iter 4/10 (total: 0.0s)        [fsqlite_10000] iter 5/10 (total: 0.1s)        [fsqlite_10000] iter 6/10 (total: 0.1s)        [fsqlite_10000] iter 7/10 (total: 0.1s)        [fsqlite_10000] iter 8/10 (total: 0.1s)        [fsqlite_10000] iter 9/10 (total: 0.1s)        [fsqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_single_txn_medium_6col_10000] insert_profile setup_us=51.5 begin_us=163.5 prepare_us=52.0 insert_us=17286.5 commit_us=4222.2 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=71 begin_ns=159960 execute_body_ns=19073107 commit_pre_ns=17512 commit_roundtrip_ns=4165322 commit_finalize_ns=6863 commit_handle_ns=11792 post_write_ns=901 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=459 row_build_ns=3492182 cursor_setup_ns=460692 serialize_ns=1302044 btree_insert_ns=5609805 memdb_apply_ns=457867 schema_validation_ns=376840 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=260890 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=456 btree_cell_assembly_bytes=83020 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=5.36 ms F=16.11 ms
-  Benchmarking single-txn insert 100 rows (large_10col)...     [csqlite_100] warmup 1/2...    [csqlite_100] warmup 2/2...    [csqlite_100] iter 1/10 (total: 0.0s)        [csqlite_100] iter 2/10 (total: 0.0s)        [csqlite_100] iter 3/10 (total: 0.0s)        [csqlite_100] iter 4/10 (total: 0.0s)        [csqlite_100] iter 5/10 (total: 0.0s)        [csqlite_100] iter 6/10 (total: 0.0s)        [csqlite_100] iter 7/10 (total: 0.0s)        [csqlite_100] iter 8/10 (total: 0.0s)        [csqlite_100] iter 9/10 (total: 0.0s)        [csqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_100] warmup 1/2...    [fsqlite_100] warmup 2/2...    [fsqlite_100] iter 1/10 (total: 0.0s)        [fsqlite_100] iter 2/10 (total: 0.0s)        [fsqlite_100] iter 3/10 (total: 0.0s)        [fsqlite_100] iter 4/10 (total: 0.0s)        [fsqlite_100] iter 5/10 (total: 0.0s)        [fsqlite_100] iter 6/10 (total: 0.0s)        [fsqlite_100] iter 7/10 (total: 0.0s)        [fsqlite_100] iter 8/10 (total: 0.0s)        [fsqlite_100] iter 9/10 (total: 0.0s)        [fsqlite_100] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_large_10col_100] insert_profile setup_us=63.8 begin_us=152.1 prepare_us=48.4 insert_us=233.1 commit_us=134.5 rows=100 direct_insert=100 fast=100 slow=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=148048 execute_body_ns=514713 commit_pre_ns=2635 commit_roundtrip_ns=124593 commit_finalize_ns=1263 commit_handle_ns=2424 post_write_ns=210 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=25 row_build_ns=67691 cursor_setup_ns=6508 serialize_ns=19025 btree_insert_ns=78143 memdb_apply_ns=6248 schema_validation_ns=3436 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=2363 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=22 btree_cell_assembly_bytes=15207 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=150.3 us F=696.7 us
-  Benchmarking single-txn insert 1000 rows (large_10col)...     [csqlite_1000] warmup 1/2...    [csqlite_1000] warmup 2/2...    [csqlite_1000] iter 1/10 (total: 0.0s)        [csqlite_1000] iter 2/10 (total: 0.0s)        [csqlite_1000] iter 3/10 (total: 0.0s)        [csqlite_1000] iter 4/10 (total: 0.0s)        [csqlite_1000] iter 5/10 (total: 0.0s)        [csqlite_1000] iter 6/10 (total: 0.0s)        [csqlite_1000] iter 7/10 (total: 0.0s)        [csqlite_1000] iter 8/10 (total: 0.0s)        [csqlite_1000] iter 9/10 (total: 0.0s)        [csqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fsqlite_1000] warmup 1/2...    [fsqlite_1000] warmup 2/2...    [fsqlite_1000] iter 1/10 (total: 0.0s)        [fsqlite_1000] iter 2/10 (total: 0.0s)        [fsqlite_1000] iter 3/10 (total: 0.0s)        [fsqlite_1000] iter 4/10 (total: 0.0s)        [fsqlite_1000] iter 5/10 (total: 0.0s)        [fsqlite_1000] iter 6/10 (total: 0.0s)        [fsqlite_1000] iter 7/10 (total: 0.0s)        [fsqlite_1000] iter 8/10 (total: 0.0s)        [fsqlite_1000] iter 9/10 (total: 0.0s)        [fsqlite_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_single_txn_large_10col_1000] insert_profile setup_us=31.6 begin_us=102.3 prepare_us=33.4 insert_us=2015.5 commit_us=325.5 rows=1000 direct_insert=1000 fast=1000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=98474 execute_body_ns=2210184 commit_pre_ns=7013 commit_roundtrip_ns=309971 commit_finalize_ns=1843 commit_handle_ns=2164 post_write_ns=181 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=204 row_build_ns=642123 cursor_setup_ns=43815 serialize_ns=171141 btree_insert_ns=559006 memdb_apply_ns=59878 schema_validation_ns=32444 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=23704 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=202 btree_cell_assembly_bytes=144768 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=973.0 us F=2.16 ms
-  Benchmarking single-txn insert 10000 rows (large_10col)...     [csqlite_10000] warmup 1/2...    [csqlite_10000] warmup 2/2...    [csqlite_10000] iter 1/10 (total: 0.0s)        [csqlite_10000] iter 2/10 (total: 0.0s)        [csqlite_10000] iter 3/10 (total: 0.0s)        [csqlite_10000] iter 4/10 (total: 0.0s)        [csqlite_10000] iter 5/10 (total: 0.0s)        [csqlite_10000] iter 6/10 (total: 0.1s)        [csqlite_10000] iter 7/10 (total: 0.1s)        [csqlite_10000] iter 8/10 (total: 0.1s)        [csqlite_10000] iter 9/10 (total: 0.1s)        [csqlite_10000] iter 10/10 (total: 0.1s)                                                                                        [fsqlite_10000] warmup 1/2...    [fsqlite_10000] warmup 2/2...    [fsqlite_10000] iter 1/10 (total: 0.0s)        [fsqlite_10000] iter 2/10 (total: 0.0s)        [fsqlite_10000] iter 3/10 (total: 0.1s)        [fsqlite_10000] iter 4/10 (total: 0.1s)        [fsqlite_10000] iter 5/10 (total: 0.2s)        [fsqlite_10000] iter 6/10 (total: 0.2s)        [fsqlite_10000] iter 7/10 (total: 0.2s)        [fsqlite_10000] iter 8/10 (total: 0.3s)        [fsqlite_10000] iter 9/10 (total: 0.3s)        [fsqlite_10000] iter 10/10 (total: 0.4s)                                                                                        [fs_insert_single_txn_large_10col_10000] insert_profile setup_us=76.9 begin_us=177.4 prepare_us=53.8 insert_us=27029.6 commit_us=17261.6 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=31 begin_ns=173435 execute_body_ns=41843471 commit_pre_ns=60434 commit_roundtrip_ns=17153389 commit_finalize_ns=13375 commit_handle_ns=12464 post_write_ns=1242 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2015 row_build_ns=7088181 cursor_setup_ns=434403 serialize_ns=1899796 btree_insert_ns=11092656 memdb_apply_ns=638165 schema_validation_ns=340881 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=244587 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2011 btree_cell_assembly_bytes=1459159 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=10.52 ms F=40.09 ms
-
-[2/10] Transaction strategy comparison
-  Benchmarking autocommit 100 rows...     [cs_auto_100] warmup 1/2...    [cs_auto_100] warmup 2/2...    [cs_auto_100] iter 1/10 (total: 0.0s)        [cs_auto_100] iter 2/10 (total: 0.0s)        [cs_auto_100] iter 3/10 (total: 0.0s)        [cs_auto_100] iter 4/10 (total: 0.0s)        [cs_auto_100] iter 5/10 (total: 0.0s)        [cs_auto_100] iter 6/10 (total: 0.0s)        [cs_auto_100] iter 7/10 (total: 0.0s)        [cs_auto_100] iter 8/10 (total: 0.0s)        [cs_auto_100] iter 9/10 (total: 0.0s)        [cs_auto_100] iter 10/10 (total: 0.0s)                                                                                        [fs_auto_100] warmup 1/2...    [fs_auto_100] warmup 2/2...    [fs_auto_100] iter 1/10 (total: 0.0s)        [fs_auto_100] iter 2/10 (total: 0.0s)        [fs_auto_100] iter 3/10 (total: 0.0s)        [fs_auto_100] iter 4/10 (total: 0.0s)        [fs_auto_100] iter 5/10 (total: 0.0s)        [fs_auto_100] iter 6/10 (total: 0.0s)        [fs_auto_100] iter 7/10 (total: 0.0s)        [fs_auto_100] iter 8/10 (total: 0.0s)        [fs_auto_100] iter 9/10 (total: 0.0s)        [fs_auto_100] iter 10/10 (total: 0.0s)                                                                                    C=123.8 us F=328.7 us
-  Benchmarking batched 100 rows (100/txn)...     [cs_batch_100] warmup 1/2...    [cs_batch_100] warmup 2/2...    [cs_batch_100] iter 1/10 (total: 0.0s)        [cs_batch_100] iter 2/10 (total: 0.0s)        [cs_batch_100] iter 3/10 (total: 0.0s)        [cs_batch_100] iter 4/10 (total: 0.0s)        [cs_batch_100] iter 5/10 (total: 0.0s)        [cs_batch_100] iter 6/10 (total: 0.0s)        [cs_batch_100] iter 7/10 (total: 0.0s)        [cs_batch_100] iter 8/10 (total: 0.0s)        [cs_batch_100] iter 9/10 (total: 0.0s)        [cs_batch_100] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_100] warmup 1/2...    [fs_batch_100] warmup 2/2...    [fs_batch_100] iter 1/10 (total: 0.0s)        [fs_batch_100] iter 2/10 (total: 0.0s)        [fs_batch_100] iter 3/10 (total: 0.0s)        [fs_batch_100] iter 4/10 (total: 0.0s)        [fs_batch_100] iter 5/10 (total: 0.0s)        [fs_batch_100] iter 6/10 (total: 0.0s)        [fs_batch_100] iter 7/10 (total: 0.0s)        [fs_batch_100] iter 8/10 (total: 0.0s)        [fs_batch_100] iter 9/10 (total: 0.0s)        [fs_batch_100] iter 10/10 (total: 0.0s)                                                                                    C=80.6 us F=388.0 us
-  Benchmarking single-txn 100 rows...     [cs_txn_100] warmup 1/2...    [cs_txn_100] warmup 2/2...    [cs_txn_100] iter 1/10 (total: 0.0s)        [cs_txn_100] iter 2/10 (total: 0.0s)        [cs_txn_100] iter 3/10 (total: 0.0s)        [cs_txn_100] iter 4/10 (total: 0.0s)        [cs_txn_100] iter 5/10 (total: 0.0s)        [cs_txn_100] iter 6/10 (total: 0.0s)        [cs_txn_100] iter 7/10 (total: 0.0s)        [cs_txn_100] iter 8/10 (total: 0.0s)        [cs_txn_100] iter 9/10 (total: 0.0s)        [cs_txn_100] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_100] warmup 1/2...    [fs_txn_100] warmup 2/2...    [fs_txn_100] iter 1/10 (total: 0.0s)        [fs_txn_100] iter 2/10 (total: 0.0s)        [fs_txn_100] iter 3/10 (total: 0.0s)        [fs_txn_100] iter 4/10 (total: 0.0s)        [fs_txn_100] iter 5/10 (total: 0.0s)        [fs_txn_100] iter 6/10 (total: 0.0s)        [fs_txn_100] iter 7/10 (total: 0.0s)        [fs_txn_100] iter 8/10 (total: 0.0s)        [fs_txn_100] iter 9/10 (total: 0.0s)        [fs_txn_100] iter 10/10 (total: 0.0s)                                                                                    C=76.8 us F=367.5 us
-  Benchmarking autocommit 1000 rows...     [cs_auto_1000] warmup 1/2...    [cs_auto_1000] warmup 2/2...    [cs_auto_1000] iter 1/10 (total: 0.0s)        [cs_auto_1000] iter 2/10 (total: 0.0s)        [cs_auto_1000] iter 3/10 (total: 0.0s)        [cs_auto_1000] iter 4/10 (total: 0.0s)        [cs_auto_1000] iter 5/10 (total: 0.0s)        [cs_auto_1000] iter 6/10 (total: 0.0s)        [cs_auto_1000] iter 7/10 (total: 0.0s)        [cs_auto_1000] iter 8/10 (total: 0.0s)        [cs_auto_1000] iter 9/10 (total: 0.0s)        [cs_auto_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_auto_1000] warmup 1/2...    [fs_auto_1000] warmup 2/2...    [fs_auto_1000] iter 1/10 (total: 0.0s)        [fs_auto_1000] iter 2/10 (total: 0.0s)        [fs_auto_1000] iter 3/10 (total: 0.0s)        [fs_auto_1000] iter 4/10 (total: 0.0s)        [fs_auto_1000] iter 5/10 (total: 0.0s)        [fs_auto_1000] iter 6/10 (total: 0.0s)        [fs_auto_1000] iter 7/10 (total: 0.0s)        [fs_auto_1000] iter 8/10 (total: 0.0s)        [fs_auto_1000] iter 9/10 (total: 0.0s)        [fs_auto_1000] iter 10/10 (total: 0.0s)                                                                                    C=930.0 us F=1.75 ms
-  Benchmarking batched 1000 rows (1000/txn)...     [cs_batch_1000] warmup 1/2...    [cs_batch_1000] warmup 2/2...    [cs_batch_1000] iter 1/10 (total: 0.0s)        [cs_batch_1000] iter 2/10 (total: 0.0s)        [cs_batch_1000] iter 3/10 (total: 0.0s)        [cs_batch_1000] iter 4/10 (total: 0.0s)        [cs_batch_1000] iter 5/10 (total: 0.0s)        [cs_batch_1000] iter 6/10 (total: 0.0s)        [cs_batch_1000] iter 7/10 (total: 0.0s)        [cs_batch_1000] iter 8/10 (total: 0.0s)        [cs_batch_1000] iter 9/10 (total: 0.0s)        [cs_batch_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_1000] warmup 1/2...    [fs_batch_1000] warmup 2/2...    [fs_batch_1000] iter 1/10 (total: 0.0s)        [fs_batch_1000] iter 2/10 (total: 0.0s)        [fs_batch_1000] iter 3/10 (total: 0.0s)        [fs_batch_1000] iter 4/10 (total: 0.0s)        [fs_batch_1000] iter 5/10 (total: 0.0s)        [fs_batch_1000] iter 6/10 (total: 0.0s)        [fs_batch_1000] iter 7/10 (total: 0.0s)        [fs_batch_1000] iter 8/10 (total: 0.0s)        [fs_batch_1000] iter 9/10 (total: 0.0s)        [fs_batch_1000] iter 10/10 (total: 0.0s)                                                                                    C=404.6 us F=1.06 ms
-  Benchmarking single-txn 1000 rows...     [cs_txn_1000] warmup 1/2...    [cs_txn_1000] warmup 2/2...    [cs_txn_1000] iter 1/10 (total: 0.0s)        [cs_txn_1000] iter 2/10 (total: 0.0s)        [cs_txn_1000] iter 3/10 (total: 0.0s)        [cs_txn_1000] iter 4/10 (total: 0.0s)        [cs_txn_1000] iter 5/10 (total: 0.0s)        [cs_txn_1000] iter 6/10 (total: 0.0s)        [cs_txn_1000] iter 7/10 (total: 0.0s)        [cs_txn_1000] iter 8/10 (total: 0.0s)        [cs_txn_1000] iter 9/10 (total: 0.0s)        [cs_txn_1000] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_1000] warmup 1/2...    [fs_txn_1000] warmup 2/2...    [fs_txn_1000] iter 1/10 (total: 0.0s)        [fs_txn_1000] iter 2/10 (total: 0.0s)        [fs_txn_1000] iter 3/10 (total: 0.0s)        [fs_txn_1000] iter 4/10 (total: 0.0s)        [fs_txn_1000] iter 5/10 (total: 0.0s)        [fs_txn_1000] iter 6/10 (total: 0.0s)        [fs_txn_1000] iter 7/10 (total: 0.0s)        [fs_txn_1000] iter 8/10 (total: 0.0s)        [fs_txn_1000] iter 9/10 (total: 0.0s)        [fs_txn_1000] iter 10/10 (total: 0.0s)                                                                                    C=358.6 us F=1.38 ms
-  Benchmarking autocommit 10000 rows...     [cs_auto_10000] warmup 1/2...    [cs_auto_10000] warmup 2/2...    [cs_auto_10000] iter 1/10 (total: 0.0s)        [cs_auto_10000] iter 2/10 (total: 0.0s)        [cs_auto_10000] iter 3/10 (total: 0.0s)        [cs_auto_10000] iter 4/10 (total: 0.0s)        [cs_auto_10000] iter 5/10 (total: 0.0s)        [cs_auto_10000] iter 6/10 (total: 0.0s)        [cs_auto_10000] iter 7/10 (total: 0.1s)        [cs_auto_10000] iter 8/10 (total: 0.1s)        [cs_auto_10000] iter 9/10 (total: 0.1s)        [cs_auto_10000] iter 10/10 (total: 0.1s)                                                                                        [fs_auto_10000] warmup 1/2...    [fs_auto_10000] warmup 2/2...    [fs_auto_10000] iter 1/10 (total: 0.0s)        [fs_auto_10000] iter 2/10 (total: 0.0s)        [fs_auto_10000] iter 3/10 (total: 0.0s)        [fs_auto_10000] iter 4/10 (total: 0.0s)        [fs_auto_10000] iter 5/10 (total: 0.1s)        [fs_auto_10000] iter 6/10 (total: 0.1s)        [fs_auto_10000] iter 7/10 (total: 0.1s)        [fs_auto_10000] iter 8/10 (total: 0.1s)        [fs_auto_10000] iter 9/10 (total: 0.1s)        [fs_auto_10000] iter 10/10 (total: 0.1s)                                                                                    C=8.81 ms F=16.44 ms
-  Benchmarking batched 10000 rows (1000/txn)...     [cs_batch_10000] warmup 1/2...    [cs_batch_10000] warmup 2/2...    [cs_batch_10000] iter 1/10 (total: 0.0s)        [cs_batch_10000] iter 2/10 (total: 0.0s)        [cs_batch_10000] iter 3/10 (total: 0.0s)        [cs_batch_10000] iter 4/10 (total: 0.0s)        [cs_batch_10000] iter 5/10 (total: 0.0s)        [cs_batch_10000] iter 6/10 (total: 0.0s)        [cs_batch_10000] iter 7/10 (total: 0.0s)        [cs_batch_10000] iter 8/10 (total: 0.0s)        [cs_batch_10000] iter 9/10 (total: 0.0s)        [cs_batch_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_batch_10000] warmup 1/2...    [fs_batch_10000] warmup 2/2...    [fs_batch_10000] iter 1/10 (total: 0.0s)        [fs_batch_10000] iter 2/10 (total: 0.0s)        [fs_batch_10000] iter 3/10 (total: 0.0s)        [fs_batch_10000] iter 4/10 (total: 0.0s)        [fs_batch_10000] iter 5/10 (total: 0.0s)        [fs_batch_10000] iter 6/10 (total: 0.0s)        [fs_batch_10000] iter 7/10 (total: 0.1s)        [fs_batch_10000] iter 8/10 (total: 0.1s)        [fs_batch_10000] iter 9/10 (total: 0.1s)        [fs_batch_10000] iter 10/10 (total: 0.1s)                                                                                    C=3.48 ms F=8.32 ms
-  Benchmarking single-txn 10000 rows...     [cs_txn_10000] warmup 1/2...    [cs_txn_10000] warmup 2/2...    [cs_txn_10000] iter 1/10 (total: 0.0s)        [cs_txn_10000] iter 2/10 (total: 0.0s)        [cs_txn_10000] iter 3/10 (total: 0.0s)        [cs_txn_10000] iter 4/10 (total: 0.0s)        [cs_txn_10000] iter 5/10 (total: 0.0s)        [cs_txn_10000] iter 6/10 (total: 0.0s)        [cs_txn_10000] iter 7/10 (total: 0.0s)        [cs_txn_10000] iter 8/10 (total: 0.0s)        [cs_txn_10000] iter 9/10 (total: 0.0s)        [cs_txn_10000] iter 10/10 (total: 0.0s)                                                                                        [fs_txn_10000] warmup 1/2...    [fs_txn_10000] warmup 2/2...    [fs_txn_10000] iter 1/10 (total: 0.0s)        [fs_txn_10000] iter 2/10 (total: 0.0s)        [fs_txn_10000] iter 3/10 (total: 0.0s)        [fs_txn_10000] iter 4/10 (total: 0.0s)        [fs_txn_10000] iter 5/10 (total: 0.0s)        [fs_txn_10000] iter 6/10 (total: 0.0s)        [fs_txn_10000] iter 7/10 (total: 0.0s)        [fs_txn_10000] iter 8/10 (total: 0.1s)        [fs_txn_10000] iter 9/10 (total: 0.1s)        [fs_txn_10000] iter 10/10 (total: 0.1s)                                                                                    C=3.27 ms F=7.17 ms
-
-[3/10] Record size comparison
-  Benchmarking 10K rows record size tiny_1col...     [cs_tiny_1col] warmup 1/2...    [cs_tiny_1col] warmup 2/2...    [cs_tiny_1col] iter 1/10 (total: 0.0s)        [cs_tiny_1col] iter 2/10 (total: 0.0s)        [cs_tiny_1col] iter 3/10 (total: 0.0s)        [cs_tiny_1col] iter 4/10 (total: 0.0s)        [cs_tiny_1col] iter 5/10 (total: 0.0s)        [cs_tiny_1col] iter 6/10 (total: 0.0s)        [cs_tiny_1col] iter 7/10 (total: 0.0s)        [cs_tiny_1col] iter 8/10 (total: 0.0s)        [cs_tiny_1col] iter 9/10 (total: 0.0s)        [cs_tiny_1col] iter 10/10 (total: 0.0s)                                                                                        [fs_tiny_1col] warmup 1/2...    [fs_tiny_1col] warmup 2/2...    [fs_tiny_1col] iter 1/10 (total: 0.0s)        [fs_tiny_1col] iter 2/10 (total: 0.0s)        [fs_tiny_1col] iter 3/10 (total: 0.0s)        [fs_tiny_1col] iter 4/10 (total: 0.0s)        [fs_tiny_1col] iter 5/10 (total: 0.0s)        [fs_tiny_1col] iter 6/10 (total: 0.0s)        [fs_tiny_1col] iter 7/10 (total: 0.0s)        [fs_tiny_1col] iter 8/10 (total: 0.0s)        [fs_tiny_1col] iter 9/10 (total: 0.0s)        [fs_tiny_1col] iter 10/10 (total: 0.0s)                                                                                        [fs_insert_record_size_tiny_1col_10000] insert_profile setup_us=38.1 begin_us=116.7 prepare_us=25.5 insert_us=9373.3 commit_us=253.5 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=90 begin_ns=113271 execute_body_ns=7401361 commit_pre_ns=5611 commit_roundtrip_ns=217367 commit_finalize_ns=3656 commit_handle_ns=7804 post_write_ns=832 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=21 row_build_ns=343275 cursor_setup_ns=456724 serialize_ns=0 btree_insert_ns=3543296 memdb_apply_ns=266978 schema_validation_ns=319251 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=239270 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=19 btree_cell_assembly_bytes=156 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=2.59 ms F=5.17 ms
-  Benchmarking 10K rows record size small_3col...     [cs_small_3col] warmup 1/2...    [cs_small_3col] warmup 2/2...    [cs_small_3col] iter 1/10 (total: 0.0s)        [cs_small_3col] iter 2/10 (total: 0.0s)        [cs_small_3col] iter 3/10 (total: 0.0s)        [cs_small_3col] iter 4/10 (total: 0.0s)        [cs_small_3col] iter 5/10 (total: 0.0s)        [cs_small_3col] iter 6/10 (total: 0.0s)        [cs_small_3col] iter 7/10 (total: 0.0s)        [cs_small_3col] iter 8/10 (total: 0.0s)        [cs_small_3col] iter 9/10 (total: 0.0s)        [cs_small_3col] iter 10/10 (total: 0.0s)                                                                                        [fs_small_3col] warmup 1/2...    [fs_small_3col] warmup 2/2...    [fs_small_3col] iter 1/10 (total: 0.0s)        [fs_small_3col] iter 2/10 (total: 0.0s)        [fs_small_3col] iter 3/10 (total: 0.0s)        [fs_small_3col] iter 4/10 (total: 0.0s)        [fs_small_3col] iter 5/10 (total: 0.0s)        [fs_small_3col] iter 6/10 (total: 0.0s)        [fs_small_3col] iter 7/10 (total: 0.0s)        [fs_small_3col] iter 8/10 (total: 0.1s)        [fs_small_3col] iter 9/10 (total: 0.1s)        [fs_small_3col] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_record_size_small_3col_10000] insert_profile setup_us=44.1 begin_us=106.0 prepare_us=32.9 insert_us=12781.8 commit_us=246.3 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=30 begin_ns=102672 execute_body_ns=10586698 commit_pre_ns=6593 commit_roundtrip_ns=223749 commit_finalize_ns=2164 commit_handle_ns=3416 post_write_ns=230 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=68 row_build_ns=1617561 cursor_setup_ns=554024 serialize_ns=573146 btree_insert_ns=4021810 memdb_apply_ns=334289 schema_validation_ns=340932 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=248236 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=65 btree_cell_assembly_bytes=1635 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=3.41 ms F=7.36 ms
-  Benchmarking 10K rows record size medium_6col...     [cs_medium_6col] warmup 1/2...    [cs_medium_6col] warmup 2/2...    [cs_medium_6col] iter 1/10 (total: 0.0s)        [cs_medium_6col] iter 2/10 (total: 0.0s)        [cs_medium_6col] iter 3/10 (total: 0.0s)        [cs_medium_6col] iter 4/10 (total: 0.0s)        [cs_medium_6col] iter 5/10 (total: 0.0s)        [cs_medium_6col] iter 6/10 (total: 0.0s)        [cs_medium_6col] iter 7/10 (total: 0.0s)        [cs_medium_6col] iter 8/10 (total: 0.0s)        [cs_medium_6col] iter 9/10 (total: 0.0s)        [cs_medium_6col] iter 10/10 (total: 0.0s)                                                                                        [fs_medium_6col] warmup 1/2...    [fs_medium_6col] warmup 2/2...    [fs_medium_6col] iter 1/10 (total: 0.0s)        [fs_medium_6col] iter 2/10 (total: 0.0s)        [fs_medium_6col] iter 3/10 (total: 0.0s)        [fs_medium_6col] iter 4/10 (total: 0.0s)        [fs_medium_6col] iter 5/10 (total: 0.0s)        [fs_medium_6col] iter 6/10 (total: 0.1s)        [fs_medium_6col] iter 7/10 (total: 0.1s)        [fs_medium_6col] iter 8/10 (total: 0.1s)        [fs_medium_6col] iter 9/10 (total: 0.1s)        [fs_medium_6col] iter 10/10 (total: 0.1s)                                                                                        [fs_insert_record_size_medium_6col_10000] insert_profile setup_us=49.4 begin_us=150.0 prepare_us=38.6 insert_us=14572.1 commit_us=1152.5 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=91 begin_ns=146664 execute_body_ns=13466506 commit_pre_ns=18093 commit_roundtrip_ns=1102095 commit_finalize_ns=6603 commit_handle_ns=8616 post_write_ns=821 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=459 row_build_ns=2946957 cursor_setup_ns=422250 serialize_ns=1165149 btree_insert_ns=4218054 memdb_apply_ns=416687 schema_validation_ns=322498 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=238497 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=456 btree_cell_assembly_bytes=83020 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=5.39 ms F=10.94 ms
-  Benchmarking 10K rows record size large_10col...     [cs_large_10col] warmup 1/2...    [cs_large_10col] warmup 2/2...    [cs_large_10col] iter 1/10 (total: 0.0s)        [cs_large_10col] iter 2/10 (total: 0.0s)        [cs_large_10col] iter 3/10 (total: 0.0s)        [cs_large_10col] iter 4/10 (total: 0.0s)        [cs_large_10col] iter 5/10 (total: 0.0s)        [cs_large_10col] iter 6/10 (total: 0.1s)        [cs_large_10col] iter 7/10 (total: 0.1s)        [cs_large_10col] iter 8/10 (total: 0.1s)        [cs_large_10col] iter 9/10 (total: 0.1s)        [cs_large_10col] iter 10/10 (total: 0.1s)                                                                                        [fs_large_10col] warmup 1/2...    [fs_large_10col] warmup 2/2...    [fs_large_10col] iter 1/10 (total: 0.0s)        [fs_large_10col] iter 2/10 (total: 0.0s)        [fs_large_10col] iter 3/10 (total: 0.1s)        [fs_large_10col] iter 4/10 (total: 0.1s)        [fs_large_10col] iter 5/10 (total: 0.2s)        [fs_large_10col] iter 6/10 (total: 0.2s)        [fs_large_10col] iter 7/10 (total: 0.3s)        [fs_large_10col] iter 8/10 (total: 0.3s)        [fs_large_10col] iter 9/10 (total: 0.3s)        [fs_large_10col] iter 10/10 (total: 0.4s)                                                                                        [fs_insert_record_size_large_10col_10000] insert_profile setup_us=73.2 begin_us=185.5 prepare_us=62.3 insert_us=25921.3 commit_us=17962.3 rows=10000 direct_insert=10000 fast=10000 slow=0 schema_refreshes=1 schema_refresh_ns=20 begin_ns=180800 execute_body_ns=41562404 commit_pre_ns=69320 commit_roundtrip_ns=17844003 commit_finalize_ns=13315 commit_handle_ns=12033 post_write_ns=1022 memdb_refresh=1 cached_write_reuses=0 cached_write_parks=0 page_pool_hits=1 page_pool_misses=2015 row_build_ns=6864614 cursor_setup_ns=436849 serialize_ns=1825464 btree_insert_ns=10508378 memdb_apply_ns=646582 schema_validation_ns=329893 autocommit_begin_ns=0 autocommit_resolve_ns=0 autocommit_executions=0 change_tracking_ns=239757 record_parse_into=0 record_decode_ns=0 btree_payload_copy_calls=0 btree_payload_copy_bytes=0 btree_cell_assembly_calls=2011 btree_cell_assembly_bytes=1459159 vdbe_opcodes=0 vdbe_statements=0 vdbe_make_record=0
-C=10.46 ms F=42.54 ms
-
-Benchmark complete in 3.3s. Generating reports...
-
-============================================================================================================================================
-  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite
-  2026-05-05 06:43:03 UTC
-  OS: Ubuntu 25.10
-  Arch: x86_64
-  Kernel: 6.17.0-19-generic
-  CPU: AMD Ryzen Threadripper PRO 5995WX 64-Cores (128 cores)
-  RAM: 499.3 GB
-  Toolchain: nightly-x86_64-unknown-linux-gnu (overridden by environment variable RUSTUP_TOOLCHAIN)
-  Rust: rustc 1.97.0-nightly (ad3a598ca 2026-05-03)
-  Cargo: cargo 1.97.0-nightly (4f9b52075 2026-05-01)
-  Git: main @ 5b5212f59b03dec8ce255341ba780d46c3127dcc
-  Build: release-perf (opt-level 3, LTO)
-  Total benchmark time: 3.3s
-============================================================================================================================================
-
-
-## INSERTThroughput — Single Transaction — tiny_1col
-   Record: 1 col (INTEGER PK only). All rows inserted in a single BEGIN..COMMIT.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows                                        69.6 us     408.8 us      1.44M/s     244.6K/s 5.87x [31mslower[0m     5.0%     5.4%
-  1000 rows                                      271.9 us     940.0 us      3.68M/s      1.06M/s 3.46x [31mslower[0m     1.8%    15.2%
-  10000 rows                                      2.53 ms      5.28 ms      3.96M/s      1.89M/s 2.09x [31mslower[0m     1.8%     8.2%
-
-## INSERTThroughput — Single Transaction — small_3col
-   Record: 3 cols (~30B: id, name, value). All rows inserted in a single BEGIN..COMMIT.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows                                        76.9 us     451.7 us      1.30M/s     221.4K/s 5.88x [31mslower[0m     7.8%     2.4%
-  1000 rows                                      359.4 us      1.00 ms      2.78M/s     999.2K/s 2.78x [31mslower[0m     2.6%     2.0%
-  10000 rows                                      3.27 ms      7.95 ms      3.06M/s      1.26M/s 2.43x [31mslower[0m     0.5%     9.6%
-
-## INSERTThroughput — Single Transaction — medium_6col
-   Record: 6 cols (~180B: id, name, email, bio, category, score). All rows inserted in a single BEGIN..COMMIT.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows                                       103.8 us     453.6 us     963.1K/s     220.5K/s 4.37x [31mslower[0m     3.9%     3.4%
-  1000 rows                                      573.9 us      1.60 ms      1.74M/s     624.2K/s 2.79x [31mslower[0m     2.0%     2.1%
-  10000 rows                                      5.36 ms     16.11 ms      1.87M/s     620.9K/s 3.00x [31mslower[0m     0.4%     5.3%
-
-## INSERTThroughput — Single Transaction — large_10col
-   Record: 10 cols (~600B: includes long text fields). All rows inserted in a single BEGIN..COMMIT.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows                                       150.3 us     696.7 us     665.2K/s     143.5K/s 4.63x [31mslower[0m     3.1%    36.4%
-  1000 rows                                      973.0 us      2.16 ms      1.03M/s     462.4K/s 2.22x [31mslower[0m     8.5%    17.7%
-  10000 rows                                     10.52 ms     40.09 ms     950.4K/s     249.4K/s 3.81x [31mslower[0m     6.1%     5.0%
-
-## INSERTThroughput — Transaction Strategy Comparison (small_3col)
-   Compares autocommit, batched (1K/txn), and single-txn strategies.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  100 rows / autocommit                          123.8 us     328.7 us     807.5K/s     304.2K/s 2.65x [31mslower[0m     8.8%    39.1%
-  100 rows / batched (100/txn)                    80.6 us     388.0 us      1.24M/s     257.7K/s 4.82x [31mslower[0m     7.7%    16.6%
-  100 rows / single txn                           76.8 us     367.5 us      1.30M/s     272.1K/s 4.79x [31mslower[0m     6.8%     2.3%
-  1000 rows / autocommit                         930.0 us      1.75 ms      1.08M/s     569.9K/s 1.89x [31mslower[0m     5.4%     8.4%
-  1000 rows / batched (1000/txn)                 404.6 us      1.06 ms      2.47M/s     939.0K/s 2.63x [31mslower[0m    14.2%    17.3%
-  1000 rows / single txn                         358.6 us      1.38 ms      2.79M/s     726.5K/s 3.84x [31mslower[0m     2.7%    30.2%
-  10000 rows / autocommit                         8.81 ms     16.44 ms      1.13M/s     608.4K/s 1.87x [31mslower[0m     6.9%     4.9%
-  10000 rows / batched (1000/txn)                 3.48 ms      8.32 ms      2.87M/s      1.20M/s 2.39x [31mslower[0m     6.3%     6.1%
-  10000 rows / single txn                         3.27 ms      7.17 ms      3.05M/s      1.40M/s 2.19x [31mslower[0m     1.3%     1.0%
-
-## INSERTThroughput — Record Size Comparison (10K rows, single txn)
-   Fixed 10K rows in a single transaction, varying payload size.
-
-  Scenario                                       C SQLite FrankenSQLite     C rows/s     F rows/s            Ratio   CV%(C)   CV%(F)
-  ----------------------------------------------------------------------------------------------------------------------------------------
-  tiny_1col — 1 col (INTEGER PK only)             2.59 ms      5.17 ms      3.87M/s      1.93M/s 2.00x [31mslower[0m     7.5%    10.1%
-  small_3col — 3 cols (~30B: id, name, value)      3.41 ms      7.36 ms      2.94M/s      1.36M/s 2.16x [31mslower[0m     8.2%     3.6%
-  medium_6col — 6 cols (~180B: id, name, email, bio, category, score)      5.39 ms     10.94 ms      1.85M/s     913.9K/s 2.03x [31mslower[0m     0.7%     0.6%
-  large_10col — 10 cols (~600B: includes long text fields)     10.46 ms     42.54 ms     956.4K/s     235.1K/s 4.07x [31mslower[0m     9.4%     4.5%
-
-========================================================================================================================
-  SUMMARY STATISTICS
-========================================================================================================================
-
-  Total scenarios: 25  |  FrankenSQLite faster: 0  |  Comparable: 0  |  C SQLite faster: 25
-  Average time ratio (FrankenSQLite / C SQLite): 3.23x
-
-JSON report written to: tests/artifacts/perf/direct-insert-text-pool-purplecoast-20260505T063845Z/report.json

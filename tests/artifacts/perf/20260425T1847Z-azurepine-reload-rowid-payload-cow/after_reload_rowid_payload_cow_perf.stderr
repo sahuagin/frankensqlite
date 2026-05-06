@@ -1,23 +1,0 @@
-WARNING: Kernel address maps (/proc/{kallsyms,modules}) are restricted,
-check /proc/sys/kernel/kptr_restrict and /proc/sys/kernel/perf_event_paranoid.
-
-Samples in kernel functions may not be resolved if a suitable vmlinux
-file is not found in the buildid cache or in the vmlinux path.
-
-Samples in kernel modules won't be resolved at all.
-
-If some relocation was applied (e.g. kexec) symbols may be misresolved
-even with a suitable vmlinux or kallsyms file.
-
-Couldn't record kernel reference relocation symbol
-Symbol resolution may be skewed if relocation was used (e.g. kexec).
-Check /proc/kallsyms permission or run as root.
-
-[1/10] Mixed OLTP workload
-  Benchmarking mixed OLTP C SQLite...     [cs_oltp] warmup 1/2...    [cs_oltp] warmup 2/2...    [cs_oltp] iter 1/10 (total: 0.0s)        [cs_oltp] iter 2/10 (total: 0.2s)        [cs_oltp] iter 3/10 (total: 0.5s)        [cs_oltp] iter 4/10 (total: 0.7s)        [cs_oltp] iter 5/10 (total: 1.0s)        [cs_oltp] iter 6/10 (total: 1.2s)        [cs_oltp] iter 7/10 (total: 1.5s)        [cs_oltp] iter 8/10 (total: 1.7s)        [cs_oltp] iter 9/10 (total: 1.9s)        [cs_oltp] iter 10/10 (total: 2.2s)                                                                                    C=242.66 ms
-  Benchmarking mixed OLTP FrankenSQLite...     [fs_oltp] warmup 1/2...    [fs_oltp] warmup 2/2...    [fs_oltp] iter 1/10 (total: 0.0s)        [fs_oltp] iter 2/10 (total: 0.2s)        [fs_oltp] iter 3/10 (total: 0.4s)        [fs_oltp] iter 4/10 (total: 0.6s)        [fs_oltp] iter 5/10 (total: 0.9s)        [fs_oltp] iter 6/10 (total: 1.1s)        [fs_oltp] iter 7/10 (total: 1.3s)        [fs_oltp] iter 8/10 (total: 1.5s)        [fs_oltp] iter 9/10 (total: 1.7s)        [fs_oltp] iter 10/10 (total: 1.9s)                                                                                    F=215.45 ms
-
-Benchmark complete in 5.6s. Generating reports...
-JSON report written to: tests/artifacts/perf/20260425T1847Z-optimization-pass/after_reload_rowid_payload_cow_perf.json
-[ perf record: Woken up 6 times to write data ]
-[ perf record: Captured and wrote 3.440 MB tests/artifacts/perf/20260425T1847Z-optimization-pass/perf_after_reload_rowid_payload_cow.data (23737 samples) ]

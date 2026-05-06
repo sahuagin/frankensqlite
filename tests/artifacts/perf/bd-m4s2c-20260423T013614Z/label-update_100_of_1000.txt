@@ -1,1 +1,0 @@
-UPDATE 100 rows of a 1000-row table; 20 built-in iterations for sampling
