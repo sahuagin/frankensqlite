@@ -6,7 +6,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.4.5.8"
-CONTRACT_PATH="${WORKSPACE_ROOT}/db300_low_tax_verification_contract.toml"
+CONTRACT_PATH="${WORKSPACE_ROOT}/docs/contracts/db300_low_tax_verification_contract.toml"
 SCENARIO_ID="${SCENARIO_ID:-D5-8-LOW-TAX-VERIFICATION}"
 SEED="${SEED:-458}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"

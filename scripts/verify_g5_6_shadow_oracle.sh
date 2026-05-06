@@ -7,7 +7,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.7.5.6"
-CONTRACT_PATH="${WORKSPACE_ROOT}/db300_shadow_oracle_contract.toml"
+CONTRACT_PATH="${WORKSPACE_ROOT}/docs/contracts/db300_shadow_oracle_contract.toml"
 SCENARIO_ID="${SCENARIO_ID:-G5-6-SHADOW-ORACLE}"
 SEED="${SEED:-756}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"

@@ -141,6 +141,19 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn contracts_dir() -> PathBuf {
+    workspace_root().join("docs/contracts")
+}
+
+fn resolve_contract_reference(path: &str) -> PathBuf {
+    let rel = Path::new(path);
+    if rel.components().count() == 1 && path.ends_with(".toml") {
+        contracts_dir().join(rel)
+    } else {
+        workspace_root().join(rel)
+    }
+}
+
 fn read_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| {
         panic!("failed to read {}: {error}", path.display());
@@ -148,14 +161,14 @@ fn read_text(path: &Path) -> String {
 }
 
 fn read_contract() -> ParityScoreContractDocument {
-    let contract_path = workspace_root().join("parity_score_contract.toml");
+    let contract_path = contracts_dir().join("parity_score_contract.toml");
     toml::from_str(&read_text(&contract_path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", contract_path.display());
     })
 }
 
 fn read_taxonomy(path: &str) -> TaxonomyDocument {
-    let taxonomy_path = workspace_root().join(path);
+    let taxonomy_path = resolve_contract_reference(path);
     toml::from_str(&read_text(&taxonomy_path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", taxonomy_path.display());
     })

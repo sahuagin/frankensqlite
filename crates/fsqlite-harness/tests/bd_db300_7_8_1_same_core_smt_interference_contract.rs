@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-db300.7.8.1";
-const CONTRACT_PATH: &str = "db300_topology_interference_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_topology_interference_contract.toml";
 const ENTRYPOINT_PATH: &str = "scripts/verify_g8_1_same_core_smt_interference.sh";
 const TOPOLOGY_BUNDLE_SCRIPT: &str = "scripts/verify_bd_db300_1_6_1_topology_bundle.sh";
 const REQUIRED_CASE_IDS: [&str; 3] = [

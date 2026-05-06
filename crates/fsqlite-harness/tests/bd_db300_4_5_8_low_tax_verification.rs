@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.4.5.8";
-const CONTRACT_PATH: &str = "db300_low_tax_verification_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_low_tax_verification_contract.toml";
 const ENTRYPOINT_PATH: &str = "scripts/verify_d5_8_low_tax_verification.sh";
 
 const EXPECTED_COVERED_BEADS: [&str; 5] = [

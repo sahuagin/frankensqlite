@@ -1,7 +1,7 @@
 //! Canonical fixture-root contract loader for Track C corpus gates.
 //!
 //! This module enforces a single source of truth for fixture roots and
-//! cardinality floors, rooted in `corpus_manifest.toml`.
+//! cardinality floors, rooted in `docs/contracts/corpus_manifest.toml`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Default canonical fixture-root manifest path relative to workspace root.
-pub const DEFAULT_FIXTURE_ROOT_MANIFEST_PATH: &str = "corpus_manifest.toml";
+pub const DEFAULT_FIXTURE_ROOT_MANIFEST_PATH: &str = "docs/contracts/corpus_manifest.toml";
 /// Expected schema version for `[fixture_roots]`.
 pub const FIXTURE_ROOT_SCHEMA_VERSION: &str = "1.0.0";
 

@@ -20,7 +20,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-MANIFEST="supported_surface_matrix.toml"
+MANIFEST="docs/contracts/supported_surface_matrix.toml"
+export MANIFEST
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -51,10 +52,11 @@ emit_event "manifest_presence" "pass" "pass" "${MANIFEST} exists"
 emit_event "manifest_schema" "start" "running" "validating manifest schema with python tomllib"
 python3 - <<'PY'
 import sys
+import os
 import tomllib
 from pathlib import Path
 
-manifest_path = Path("supported_surface_matrix.toml")
+manifest_path = Path(os.environ["MANIFEST"])
 doc = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
 
 meta = doc.get("meta", {})

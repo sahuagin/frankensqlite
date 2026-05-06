@@ -10,13 +10,13 @@ surface.
 This document is the human-readable interpretation of the Track A contract.
 The machine-readable sources of truth are:
 
-1. [`sqlite_version_contract.toml`](../sqlite_version_contract.toml)  
+1. [`docs/contracts/sqlite_version_contract.toml`](contracts/sqlite_version_contract.toml)
    Version target and report contract.
-2. [`supported_surface_matrix.toml`](../supported_surface_matrix.toml)  
+2. [`docs/contracts/supported_surface_matrix.toml`](contracts/supported_surface_matrix.toml)
    Supported vs partial vs excluded surface.
-3. [`feature_universe_ledger.toml`](../feature_universe_ledger.toml)  
+3. [`docs/contracts/feature_universe_ledger.toml`](contracts/feature_universe_ledger.toml)
    Per-component feature decomposition, lifecycle, and evidence links.
-4. [`parity_score_contract.toml`](../parity_score_contract.toml)  
+4. [`docs/contracts/parity_score_contract.toml`](contracts/parity_score_contract.toml)
    Exact meaning of a "100% parity" claim.
 5. [`crates/fsqlite-harness/src/canonical_parity_contract.rs`](../crates/fsqlite-harness/src/canonical_parity_contract.rs)  
    Executable bundle loader and drift validator for the four Track A authority files.
@@ -65,7 +65,7 @@ This contract does **not** apply to:
 ## Scope States
 
 The contract uses three states from
-[`supported_surface_matrix.toml`](../supported_surface_matrix.toml):
+[`supported_surface_matrix.toml`](contracts/supported_surface_matrix.toml):
 
 - `supported`: in scope for parity promises.
 - `partial`: in scope for implementation and differential closure, but not yet
@@ -73,14 +73,14 @@ The contract uses three states from
 - `excluded`: out of scope until explicitly promoted.
 
 `partial` and `excluded` are not harmless bookkeeping. Under
-[`parity_score_contract.toml`](../parity_score_contract.toml), partial features
+[`parity_score_contract.toml`](contracts/parity_score_contract.toml), partial features
 lower the parity score and excluded features count as coverage debt, which means
 they block a strict "100% parity" claim until closed out.
 
 ## Version Contract
 
 The declared Track A target is SQLite `3.52.0`, as pinned in
-[`sqlite_version_contract.toml`](../sqlite_version_contract.toml) and mirrored
+[`sqlite_version_contract.toml`](contracts/sqlite_version_contract.toml) and mirrored
 by `FRANKENSQLITE_SQLITE_VERSION`.
 
 Contract rule:
@@ -187,10 +187,10 @@ The following are insufficient on their own:
 Track A is split into four contract artifacts. This document is the narrative
 entry point; the files below carry the enforceable machine-readable details:
 
-- `bd-2yqp6.1.1`: [`supported_surface_matrix.toml`](../supported_surface_matrix.toml)
-- `bd-2yqp6.1.2`: [`feature_universe_ledger.toml`](../feature_universe_ledger.toml)
-- `bd-2yqp6.1.3`: [`sqlite_version_contract.toml`](../sqlite_version_contract.toml)
-- `bd-2yqp6.1.4`: [`parity_score_contract.toml`](../parity_score_contract.toml)
+- `bd-2yqp6.1.1`: [`supported_surface_matrix.toml`](contracts/supported_surface_matrix.toml)
+- `bd-2yqp6.1.2`: [`feature_universe_ledger.toml`](contracts/feature_universe_ledger.toml)
+- `bd-2yqp6.1.3`: [`sqlite_version_contract.toml`](contracts/sqlite_version_contract.toml)
+- `bd-2yqp6.1.4`: [`parity_score_contract.toml`](contracts/parity_score_contract.toml)
 
 Any downstream parity, conformance, or release-gating work should cite these
 artifacts rather than restating the scope from memory.

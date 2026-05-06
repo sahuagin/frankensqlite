@@ -16,7 +16,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-INVENTORY_FILE="runtime_stub_inventory.toml"
+INVENTORY_FILE="docs/contracts/runtime_stub_inventory.toml"
+export INVENTORY_FILE
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -46,10 +47,11 @@ emit_event "inventory_presence" "pass" "pass" "${INVENTORY_FILE} exists"
 
 emit_event "inventory_schema" "start" "running" "validating runtime stub inventory schema"
 python3 - <<'PY'
+import os
 import tomllib
 from pathlib import Path
 
-doc = tomllib.loads(Path("runtime_stub_inventory.toml").read_text(encoding="utf-8"))
+doc = tomllib.loads(Path(os.environ["INVENTORY_FILE"]).read_text(encoding="utf-8"))
 meta = doc.get("meta", {})
 required_meta = [
     "schema_version",

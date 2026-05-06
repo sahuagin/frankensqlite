@@ -6,7 +6,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.7.5.5"
-CONTRACT_PATH="${WORKSPACE_ROOT}/db300_regime_atlas_contract.toml"
+CONTRACT_PATH="${WORKSPACE_ROOT}/docs/contracts/db300_regime_atlas_contract.toml"
 SCENARIO_ID="${SCENARIO_ID:-G5-5-REGIME-ATLAS}"
 SEED="${SEED:-755}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"

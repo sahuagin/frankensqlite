@@ -96,14 +96,14 @@ fn read_toml(path: &Path) -> String {
 }
 
 fn load_inventory() -> InventoryDocument {
-    let path = workspace_root().join("runtime_stub_inventory.toml");
+    let path = workspace_root().join("docs/contracts/runtime_stub_inventory.toml");
     toml::from_str(&read_toml(&path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", path.display());
     })
 }
 
 fn load_surface_ids() -> BTreeSet<String> {
-    let path = workspace_root().join("supported_surface_matrix.toml");
+    let path = workspace_root().join("docs/contracts/supported_surface_matrix.toml");
     let matrix: SurfaceMatrix = toml::from_str(&read_toml(&path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", path.display());
     });

@@ -42,7 +42,7 @@ const REFERENCE_IDENTITY_LABEL: &str = "csqlite-oracle";
 /// Canonical C SQLite target version for parity reports.
 pub const TARGET_SQLITE_VERSION: &str = fsqlite_types::FRANKENSQLITE_SQLITE_VERSION;
 /// Canonical version contract path embedded in parity report metadata.
-pub const SQLITE_VERSION_CONTRACT_PATH: &str = "sqlite_version_contract.toml";
+pub const SQLITE_VERSION_CONTRACT_PATH: &str = "docs/contracts/sqlite_version_contract.toml";
 
 /// Current envelope format version.
 pub const FORMAT_VERSION: u32 = 1;

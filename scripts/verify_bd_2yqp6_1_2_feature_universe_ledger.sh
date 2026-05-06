@@ -16,7 +16,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-LEDGER_FILE="feature_universe_ledger.toml"
+LEDGER_FILE="docs/contracts/feature_universe_ledger.toml"
+export LEDGER_FILE
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -46,11 +47,14 @@ emit_event "ledger_presence" "pass" "pass" "${LEDGER_FILE} exists"
 
 emit_event "ledger_schema" "start" "running" "validating ledger schema with python tomllib"
 python3 - <<'PY'
+import os
 import tomllib
 from pathlib import Path
 
-ledger = tomllib.loads(Path("feature_universe_ledger.toml").read_text(encoding="utf-8"))
-surface = tomllib.loads(Path("supported_surface_matrix.toml").read_text(encoding="utf-8"))
+ledger_path = Path(os.environ["LEDGER_FILE"])
+contracts_dir = ledger_path.parent
+ledger = tomllib.loads(ledger_path.read_text(encoding="utf-8"))
+surface = tomllib.loads((contracts_dir / "supported_surface_matrix.toml").read_text(encoding="utf-8"))
 
 meta = ledger.get("meta", {})
 for key in ("schema_version", "bead_id", "track_id", "sqlite_target", "generated_at", "contract_owner"):

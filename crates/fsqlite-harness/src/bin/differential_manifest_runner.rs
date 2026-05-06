@@ -427,7 +427,7 @@ USAGE:
 
 OPTIONS:
   --workspace-root <PATH>        Workspace root (default: auto-detected)
-  --fixture-root-manifest <PATH> Canonical fixture-root manifest (default: <workspace-root>/corpus_manifest.toml)
+  --fixture-root-manifest <PATH> Canonical fixture-root manifest (default: <workspace-root>/docs/contracts/corpus_manifest.toml)
   --output-dir <PATH>            Output directory (default: artifacts/differential-manifest)
   --output-json <PATH>           Output JSON path (default: <output-dir>/differential_manifest.json)
   --output-human <PATH>          Output Markdown summary path (default: <output-dir>/differential_manifest.md)

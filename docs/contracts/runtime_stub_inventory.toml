@@ -10,7 +10,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "Err(FrankenError::NotImplemented("
 
-[[runtime_stubs]]
+[[resolved_runtime_stubs]]
 stub_id = "RSTUB-0009"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 4708
@@ -24,7 +24,7 @@ anchor = "trigger_when_matches(connection, when_clause, frame)"
 resolved_date = "2026-04-23"
 resolved_by = "NavyCreek"
 
-[[runtime_stubs]]
+[[resolved_runtime_stubs]]
 stub_id = "RSTUB-0010"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3175
@@ -42,7 +42,7 @@ resolved_by = "BrightForge"
 stub_id = "RSTUB-0011"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3240
-kind = "partial"
+kind = "not_implemented"
 kind_description = "WITH clause now supported; UPSERT/RETURNING still guarded"
 severity = "medium"
 feature_id = "SURF-SQL-CORE-001"
@@ -53,7 +53,7 @@ partial_date = "2026-03-06"
 partial_by = "BrightForge"
 partial_note = "WITH (CTE) support added by transferring WITH clause to SELECT; UPSERT and RETURNING remain unimplemented"
 
-[[runtime_stubs]]
+[[resolved_runtime_stubs]]
 stub_id = "RSTUB-0013"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 3489
@@ -619,7 +619,7 @@ owner = "track-d-engine-runtime"
 closure_strategy = "implement"
 anchor = "return Err(FrankenError::NotImplemented("
 
-[[runtime_stubs]]
+[[resolved_runtime_stubs]]
 stub_id = "RSTUB-1002"
 file = "crates/fsqlite-core/src/connection.rs"
 line = 17614

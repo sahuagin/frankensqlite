@@ -91,6 +91,15 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn resolve_reference_path(path: &str) -> PathBuf {
+    let rel = Path::new(path);
+    if rel.components().count() == 1 && path.ends_with(".toml") {
+        workspace_root().join("docs/contracts").join(rel)
+    } else {
+        workspace_root().join(rel)
+    }
+}
+
 fn read_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| {
         panic!("failed to read {}: {error}", path.display());
@@ -98,17 +107,10 @@ fn read_text(path: &Path) -> String {
 }
 
 fn load_version_contract() -> VersionContractDocument {
-    let path = workspace_root().join("sqlite_version_contract.toml");
+    let path = workspace_root().join("docs/contracts/sqlite_version_contract.toml");
     toml::from_str(&read_text(&path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", path.display());
     })
-}
-
-fn extract_runtime_pragma_sqlite_version(connection_source: &str) -> Option<String> {
-    let marker = "\"sqlite_version\" => SqliteValue::Text(\"";
-    let after_marker = connection_source.split_once(marker)?.1;
-    let version = after_marker.split_once("\".to_owned())")?.0;
-    Some(version.to_owned())
 }
 
 #[test]
@@ -123,16 +125,15 @@ fn contract_meta_and_schema_are_valid() {
     assert_eq!(doc.contract.runtime_pragma_sqlite_version, "3.52.0");
     assert_eq!(
         doc.contract.contract_reference_path,
-        "sqlite_version_contract.toml"
+        "docs/contracts/sqlite_version_contract.toml"
     );
 }
 
 #[test]
 fn matrix_and_ledger_are_pinned_to_contract_target() {
     let contract = load_version_contract();
-    let root = workspace_root();
 
-    let matrix_path = root.join(&contract.references.surface_matrix);
+    let matrix_path = resolve_reference_path(&contract.references.surface_matrix);
     let matrix: SurfaceMatrix = toml::from_str(&read_text(&matrix_path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", matrix_path.display());
     });
@@ -142,7 +143,7 @@ fn matrix_and_ledger_are_pinned_to_contract_target() {
         contract.contract.contract_reference_path
     );
 
-    let ledger_path = root.join(&contract.references.feature_ledger);
+    let ledger_path = resolve_reference_path(&contract.references.feature_ledger);
     let ledger: LedgerDocument = toml::from_str(&read_text(&ledger_path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", ledger_path.display());
     });
@@ -158,13 +159,14 @@ fn runtime_pragma_sqlite_version_matches_contract() {
     let contract = load_version_contract();
     let path = workspace_root().join(&contract.references.runtime_source);
     let source = read_text(&path);
-    let extracted = extract_runtime_pragma_sqlite_version(&source).unwrap_or_else(|| {
-        panic!(
-            "failed to extract sqlite_version pragma value from {}",
-            path.display()
-        )
-    });
-    assert_eq!(extracted, contract.contract.runtime_pragma_sqlite_version);
+    assert!(
+        source.contains("FRANKENSQLITE_SQLITE_VERSION"),
+        "runtime source should route sqlite_version through the canonical version constant"
+    );
+    assert_eq!(
+        fsqlite_types::FRANKENSQLITE_SQLITE_VERSION,
+        contract.contract.runtime_pragma_sqlite_version
+    );
 }
 
 #[test]

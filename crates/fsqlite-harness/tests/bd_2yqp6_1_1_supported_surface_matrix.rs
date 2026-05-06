@@ -48,7 +48,8 @@ struct SurfaceEntry {
 }
 
 fn load_manifest() -> SurfaceManifest {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../supported_surface_matrix.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/contracts/supported_surface_matrix.toml");
     let content = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "failed to read supported_surface_matrix.toml at {}: {e}",

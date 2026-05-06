@@ -1,0 +1,380 @@
+# DB300 Log Emission Map v1.0.0
+#
+# Bead: bd-db300.7.6.2
+# Purpose: pin the exact unit, e2e, perf, failure, and decision-plane
+# entrypoints that must emit structured logging so later suites and runtime
+# rewrites cannot silently bypass observability.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.6.2"
+track_id = "bd-db300.7.6"
+generated_at = "2026-03-24"
+contract_owner = "db300-track-g-emission-map"
+structured_logging_contract_ref = "docs/contracts/db300_structured_logging_contract.toml"
+verification_matrix_contract_ref = "db300_verification_matrix.toml"
+validation_matrix_contract_ref = "db300_validation_matrix.toml"
+artifact_bundle_contract_ref = "scripts/verify_g6_3_artifact_bundle_shape.sh"
+
+[global_defaults]
+default_operator_manifest = "scripts/verify_g6_2_log_emission_map.sh"
+missing_event_policy = "If a required emitter family or event family is absent for a named execution path, treat the run as an observability_gap blocker rather than a soft warning."
+missing_field_policy = "If a required field is missing from a structured log emitted by a mapped entrypoint, fail the validation surface and attach first-failure diagnostics."
+gap_conversion_rule = "Any newly discovered execution path that does not match an emitter family here must add or revise a contract row before it can be treated as compliant."
+failure_bundle_rule = "Failure-producing paths must emit failure_bundle_summary plus first-failure diagnostics even when a run aborts early or only partial artifacts exist."
+concurrent_writer_requirement = "Concurrent-writer mode stays ON by default; no logging, rerun, or failure-packaging entrypoint may disable MVCC defaults or serialize writers for convenience."
+
+[coverage_log_fields]
+required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+]
+
+[artifact_linkage_fields]
+required_fields = [
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+]
+
+[surface_class_policy]
+required_classes = ["unit", "e2e", "perf", "failure", "decision_plane"]
+
+[[emitter_family]]
+emitter_family_id = "unit_prepared_invalidation_helpers"
+surface_class = "unit"
+entrypoint_name = "cargo test -p fsqlite-core --test prepared_hit_rate_proof -- --nocapture"
+source_path = "crates/fsqlite-core/tests/prepared_hit_rate_proof.rs"
+source_symbol = "prepared_hit_rate_proof"
+artifact_manifest_key = "prepared_hit_rate_proof"
+bundle_kind = "unit_proof_bundle"
+replay_command = "cargo test -p fsqlite-core --test prepared_hit_rate_proof -- --nocapture"
+mode_scope = ["mvcc", "single_writer"]
+mandatory_when = [
+  "Any prepared-cache invalidation, full reload, restart, rollback, or retry helper is used as closure evidence.",
+  "Any ad-hoc single-statement reuse claim depends on prepared-path fast-lane counters or stale-cache negative proofs.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "cache_hit_ledger",
+  "retry_cause_histogram",
+  "allocator_lease_delta",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "log_family",
+]
+expected_artifacts = ["nocapture_stdout", "fresh_eyes_review_note"]
+negative_path_expectation = "Prepared-path wins are invalid if the helper fails to emit stale-cache or invalidation diagnostics when a failure occurs."
+gap_conversion_rule = "Any new prepared-cache or schema-reload helper must either join this emitter family or add a new unit family before it can close a bead."
+notes = "This family is the operator-facing map for unit helpers that prove cache-hit, invalidation, and retry semantics behind D-track low-tax changes."
+
+[[emitter_family]]
+emitter_family_id = "unit_publish_visibility_helpers"
+surface_class = "unit"
+entrypoint_name = "scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh"
+source_path = "scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh"
+source_symbol = "verify_bd_db300_4_3_3_storage_cursor_reset_safety"
+artifact_manifest_key = "storage_cursor_reset_safety"
+bundle_kind = "unit_failure_bundle"
+replay_command = "scripts/verify_bd_db300_4_3_3_storage_cursor_reset_safety.sh"
+mode_scope = ["mvcc"]
+mandatory_when = [
+  "Any publish/visibility mismatch, cursor ownership reset, or scratch decode safety proof is used as evidence.",
+  "Any helper claims allocator or copy-churn improvements across storage cursor reset paths.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "copy_alloc_churn",
+  "allocator_lease_delta",
+  "parent_micro_publish",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "log_family",
+]
+expected_artifacts = ["verification_bundle_summary.json", "copy_alloc_churn.json", "events.jsonl"]
+negative_path_expectation = "Scratch-decode or publish fixes are invalid if a failure path omits allocator/copy churn or parent publish diagnostics."
+gap_conversion_rule = "Any new publish/visibility safety helper must extend this family or add a new family before it can count as logging-complete."
+notes = "This family covers the narrow unit helpers that expose publish/visibility mismatches and ownership reset regressions."
+
+[[emitter_family]]
+emitter_family_id = "e2e_mode_matrix_entrypoints"
+surface_class = "e2e"
+entrypoint_name = "scripts/capture_c1_evidence_pack.sh"
+source_path = "scripts/capture_c1_evidence_pack.sh"
+source_symbol = "capture_c1_evidence_pack"
+artifact_manifest_key = "c1_evidence_pack"
+bundle_kind = "e2e_matrix_bundle"
+replay_command = "scripts/capture_c1_evidence_pack.sh"
+mode_scope = ["sqlite3", "mvcc", "single_writer"]
+mandatory_when = [
+  "Any canonical c1/c4/c8 matrix rerun is used to claim fixed-tax movement or cross-mode parity.",
+  "Any operator wants one-command evidence across SQLite reference, MVCC, and forced single-writer modes.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "cache_hit_ledger",
+  "page_touch_class",
+  "split_path_summary",
+  "hold_wait_distribution",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "mode_id",
+  "placement_profile_id",
+  "compatibility_surface",
+]
+expected_artifacts = ["build_metadata.json", "summary.md", "events.jsonl", "manifest.json"]
+negative_path_expectation = "The canonical matrix is observability-incomplete if a mode run can finish without naming the missing event family and first-failure diagnostics."
+gap_conversion_rule = "Any new canonical matrix wrapper or mode selector must join this family or add a new e2e family before it is treated as compliant."
+notes = "This is the main user-facing e2e family; it keeps mode-comparison suites from quietly dropping cache, split, wait, or failure evidence."
+
+[[emitter_family]]
+emitter_family_id = "perf_persistent_phase_entrypoints"
+surface_class = "perf"
+entrypoint_name = "scripts/capture_persistent_phase_pack.sh"
+source_path = "scripts/capture_persistent_phase_pack.sh"
+source_symbol = "capture_persistent_phase_pack"
+artifact_manifest_key = "persistent_phase_pack"
+bundle_kind = "perf_phase_bundle"
+replay_command = "scripts/capture_persistent_phase_pack.sh"
+mode_scope = ["sqlite3", "mvcc"]
+mandatory_when = [
+  "Any persistent 8t or 16t rerun is used to attribute commit-path collapse or turnaround progress.",
+  "Any partial or failed persistent run is attached to an operator report and therefore must still emit first-failure and topology-sensitive evidence.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "hold_wait_distribution",
+  "retry_cause_histogram",
+  "page_touch_class",
+  "parent_micro_publish",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "mode_id",
+  "placement_profile_id",
+  "hardware_signature",
+]
+expected_artifacts = ["samples.jsonl", "criterion_stdout.log", "events.jsonl", "provenance/environment.yaml"]
+negative_path_expectation = "Persistent reruns are invalid if they report throughput without naming the missing wait/publish/failure evidence family when capture is partial or red."
+gap_conversion_rule = "Any new persistent performance harness or focused rerun path must either emit through this family or add a new perf family first."
+notes = "This family exists because the flagship 8t/16t commit-path surface is where tail failures hide behind averages."
+
+[[emitter_family]]
+emitter_family_id = "failure_regime_atlas_entrypoints"
+surface_class = "failure"
+entrypoint_name = "scripts/verify_g5_5_regime_atlas.sh"
+source_path = "scripts/verify_g5_5_regime_atlas.sh"
+source_symbol = "verify_g5_5_regime_atlas"
+artifact_manifest_key = "regime_atlas"
+bundle_kind = "failure_regime_bundle"
+replay_command = "scripts/verify_g5_5_regime_atlas.sh"
+mode_scope = ["sqlite3", "mvcc", "single_writer"]
+mandatory_when = [
+  "Any crash, fault-injection, topology, or compatibility failure is being classified into a named regime.",
+  "Any operator needs a first-failure bundle that explains which observability family went missing and how to rerun it.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "retry_cause_histogram",
+  "page_touch_class",
+  "hold_wait_distribution",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "compatibility_surface",
+]
+expected_artifacts = ["regime_atlas_manifest.json", "events.jsonl", "summary.md"]
+negative_path_expectation = "Failure classification is not trustworthy if the regime atlas can be produced without concrete failure-bundle or wait/retry evidence."
+gap_conversion_rule = "Any new failure classifier or replay helper must extend this family or add a sibling family before it can close a failure bead."
+notes = "This family is the bridge between raw failures and the named regimes operators use to understand rerun obligations."
+
+[[emitter_family]]
+emitter_family_id = "failure_shadow_oracle_entrypoints"
+surface_class = "failure"
+entrypoint_name = "scripts/verify_g5_6_shadow_oracle.sh"
+source_path = "scripts/verify_g5_6_shadow_oracle.sh"
+source_symbol = "verify_g5_6_shadow_oracle"
+artifact_manifest_key = "shadow_oracle"
+bundle_kind = "failure_shadow_bundle"
+replay_command = "scripts/verify_g5_6_shadow_oracle.sh"
+mode_scope = ["sqlite3", "mvcc", "single_writer"]
+mandatory_when = [
+  "Any replay compares live behavior to a shadow oracle or reference expectation.",
+  "Any negative-path proof needs to explain where publish or retry semantics diverged from the oracle.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "retry_cause_histogram",
+  "parent_micro_publish",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "oracle",
+]
+expected_artifacts = ["shadow_manifest.json", "events.jsonl", "failure_bundle.json"]
+negative_path_expectation = "Shadow-oracle comparisons are invalid if publish or retry mismatches fail to surface in structured logs."
+gap_conversion_rule = "Any new oracle-backed failure replay must extend this family or add a sibling family before it counts as compliant."
+notes = "This family makes sure oracle comparisons remain mechanically comparable instead of collapsing into prose-only failure notes."
+
+[[emitter_family]]
+emitter_family_id = "decision_plane_policy_snapshot_entrypoints"
+surface_class = "decision_plane"
+entrypoint_name = "scripts/verify_g6_4_policy_snapshot_contract.sh"
+source_path = "scripts/verify_g6_4_policy_snapshot_contract.sh"
+source_symbol = "verify_g6_4_policy_snapshot_contract"
+artifact_manifest_key = "policy_runtime_snapshot"
+bundle_kind = "decision_plane_bundle"
+replay_command = "scripts/verify_g6_4_policy_snapshot_contract.sh"
+mode_scope = ["mvcc"]
+mandatory_when = [
+  "Any adaptive batching, write-tier, or conservative fallback path is active or shadowed during validation.",
+  "Any policy snapshot or decision-plane artifact is attached to a failure or performance bundle.",
+]
+required_event_families = [
+  "verification_bundle_summary",
+  "failure_bundle_summary",
+  "write_tier_selection",
+]
+minimum_required_fields = [
+  "trace_id",
+  "scenario_id",
+  "bead_id",
+  "run_id",
+  "emitter_family",
+  "entrypoint_name",
+  "required_event_family",
+  "required_field_count",
+  "missing_field_count",
+  "unexpected_field_count",
+  "artifact_manifest_key",
+  "bundle_kind",
+  "replay_command",
+  "first_failure_summary",
+  "first_failure_stage",
+  "first_failure_artifact",
+  "diagnostic_json_pointer",
+  "policy_id",
+  "decision_id",
+]
+expected_artifacts = ["policy_snapshot.json", "events.jsonl", "summary.md"]
+negative_path_expectation = "Decision-plane evidence is invalid if fallback or write-tier decisions are attached to a run without structured policy-selection fields."
+gap_conversion_rule = "Any new controller snapshot or policy-shadow surface must join this family or add a new decision-plane family before it can close."
+notes = "This family keeps adaptive or budgeted paths from becoming an observability blind spot once they start influencing validation suites; the underlying runtime surface is crates/fsqlite-core/src/policy_controller.rs."

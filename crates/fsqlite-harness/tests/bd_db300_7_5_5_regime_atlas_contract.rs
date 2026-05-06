@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.7.5.5";
-const CONTRACT_PATH: &str = "db300_regime_atlas_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_regime_atlas_contract.toml";
 
 const EXPECTED_AXIS_IDS: [&str; 13] = [
     "concurrency_level",

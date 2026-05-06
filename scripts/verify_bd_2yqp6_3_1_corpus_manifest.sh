@@ -22,7 +22,8 @@ ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
 TEST_LOG="${ARTIFACT_DIR}/cargo-test.log"
-MANIFEST="corpus_manifest.toml"
+MANIFEST="docs/contracts/corpus_manifest.toml"
+export MANIFEST
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -58,10 +59,11 @@ emit_event "manifest_presence" "pass" "pass" "${MANIFEST} exists"
 
 emit_event "manifest_schema" "start" "running" "validating manifest schema with python tomllib"
 python3 - <<'PY'
+import os
 import tomllib
 from pathlib import Path
 
-manifest = tomllib.loads(Path("corpus_manifest.toml").read_text(encoding="utf-8"))
+manifest = tomllib.loads(Path(os.environ["MANIFEST"]).read_text(encoding="utf-8"))
 
 meta = manifest.get("meta", {})
 for key in ("schema_version", "bead_id", "track_id", "sqlite_target", "generated_at", "contract_owner", "root_seed"):

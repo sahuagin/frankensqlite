@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.7.6.1";
-const CONTRACT_PATH: &str = "db300_structured_logging_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_structured_logging_contract.toml";
 
 const REQUIRED_EVENT_FAMILIES: [&str; 11] = [
     "allocator_lease_delta",

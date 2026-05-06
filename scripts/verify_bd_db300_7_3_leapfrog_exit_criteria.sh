@@ -23,7 +23,7 @@ TMP_REPORT_JSON="${REPORT_JSON}.tmp"
 TMP_METRIC_DICTIONARY_JSON="${METRIC_DICTIONARY_JSON}.tmp"
 TMP_THRESHOLDS_JSON="${THRESHOLDS_JSON}.tmp"
 TEST_LOG="${ARTIFACT_DIR}/cargo-test.log"
-CONTRACT_FILE="leapfrog_exit_criteria.toml"
+CONTRACT_FILE="docs/contracts/leapfrog_exit_criteria.toml"
 TEST_FILE="crates/fsqlite-harness/tests/bd_db300_7_3_leapfrog_exit_criteria.rs"
 
 mkdir -p "${ARTIFACT_DIR}"
@@ -72,7 +72,7 @@ import os
 import tomllib
 from pathlib import Path
 
-contract = tomllib.loads(Path("leapfrog_exit_criteria.toml").read_text(encoding="utf-8"))
+contract = tomllib.loads(Path(os.environ["CONTRACT_FILE"]).read_text(encoding="utf-8"))
 
 required_meta = {
     "schema_version": "fsqlite-harness.leapfrog_exit_criteria.v1",

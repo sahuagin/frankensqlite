@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.7.6.2";
-const CONTRACT_PATH: &str = "db300_log_emission_map.toml";
-const STRUCTURED_LOGGING_CONTRACT_PATH: &str = "db300_structured_logging_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_log_emission_map.toml";
+const STRUCTURED_LOGGING_CONTRACT_PATH: &str =
+    "docs/contracts/db300_structured_logging_contract.toml";
 const ENTRYPOINT_PATH: &str = "scripts/verify_g6_2_log_emission_map.sh";
 
 const REQUIRED_EMITTER_FAMILIES: [&str; 7] = [

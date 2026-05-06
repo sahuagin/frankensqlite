@@ -255,7 +255,7 @@ OPTIONS:
   --trace-id <ID>              Deterministic trace identifier
   --scenario-id <ID>           Scenario identifier (default: QUALITY-351)
   --fixture-root-manifest <PATH>
-                               Canonical fixture-root manifest path (default: <workspace-root>/corpus_manifest.toml)
+                               Canonical fixture-root manifest path (default: <workspace-root>/docs/contracts/corpus_manifest.toml)
   --root-seed <U64>            Deterministic orchestrator root seed (default: 424242)
   --no-root-seed               Use canonical orchestrator default seed source
   --generated-unix-ms <U128>   Deterministic timestamp for manifest and gate records

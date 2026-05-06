@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.7.5.6";
-const CONTRACT_PATH: &str = "db300_shadow_oracle_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_shadow_oracle_contract.toml";
 
 const EXPECTED_SCOPE_IDS: [&str; 4] = [
     "decision_equivalence",

@@ -6,7 +6,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.7.6.2"
-CONTRACT_PATH="${WORKSPACE_ROOT}/db300_log_emission_map.toml"
+CONTRACT_PATH="${WORKSPACE_ROOT}/docs/contracts/db300_log_emission_map.toml"
 SCENARIO_ID="${SCENARIO_ID:-G6-2-LOG-EMISSION-MAP}"
 SEED="${SEED:-762}"
 TIMESTAMP_UTC="$(date -u +%Y%m%dT%H%M%SZ)"

@@ -1,0 +1,125 @@
+# DB300 Low-Tax Verification Contract v1.0.0
+#
+# Bead: bd-db300.4.5.8
+# Purpose: pin the exact unit and proof surfaces that must remain green for the
+# low-concurrency hot-path rewrites before c1 gains are treated as trustworthy.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.4.5.8"
+track_id = "bd-db300.4.5"
+generated_at = "2026-03-24"
+contract_owner = "db300-track-d-low-tax-verification"
+verification_matrix_contract_ref = "db300_verification_matrix.toml"
+validation_matrix_contract_ref = "db300_validation_matrix.toml"
+provenance_contract_ref = "db300_log_emission_map.toml"
+
+[global_defaults]
+default_operator_manifest = "scripts/verify_d5_8_low_tax_verification.sh"
+behavior_preservation_rule = "Every covered rewrite must preserve row semantics, invalidation semantics, refresh correctness, and conservative fallback behavior; benchmark wins alone never satisfy this contract."
+gap_conversion_rule = "If a future low-tax rewrite introduces a new semantic fast path, it must extend this contract with a named test family and proof note before the bead that owns it may close."
+optional_specialization_rule = "D5.6 remains evidence-gated; if specialization activates later, extend this contract rather than treating the current family set as sufficient forever."
+structured_diagnostics_rule = "Verification logs must capture enough counters or row-level detail to explain whether a failure came from prepared reuse, publication refresh, row materialization, or decode scratch behavior."
+
+[[covered_bead]]
+bead_id = "bd-db300.4.5.1"
+title = "D5.1: prove actual prepared-artifact hit rates and fast-lane usage on c1 micro-workloads"
+
+[[covered_bead]]
+bead_id = "bd-db300.4.5.2"
+title = "D5.2: eliminate redundant schema and publication refresh churn in steady-state begin, commit, and read paths"
+
+[[covered_bead]]
+bead_id = "bd-db300.4.5.3"
+title = "D5.3: cut parser, compile, and dispatch cost for repetitive tiny statements"
+
+[[covered_bead]]
+bead_id = "bd-db300.4.5.4"
+title = "D5.4: reduce ResultRow heap churn and register-to-row copying in hot c1 paths"
+
+[[covered_bead]]
+bead_id = "bd-db300.4.5.5"
+title = "D5.5: reduce record decode cost with scope-specific scratch reuse and cache discipline"
+
+[[deferred_extension]]
+bead_id = "bd-db300.4.5.6"
+title = "D5.6: add measured hot-family fast lanes only where the c1 profiles justify them"
+reason = "Optional evidence-gated specialization card. It is not activated by the current contract, but if it lands later it must add a new verification family before closure."
+
+[[test_family]]
+family_id = "prepared_reuse_and_refresh"
+owner_crate = "fsqlite-core"
+source_path = "crates/fsqlite-core/tests/prepared_hit_rate_proof.rs"
+runner = "cargo test -p fsqlite-core --test prepared_hit_rate_proof -- --nocapture"
+supports_beads = ["bd-db300.4.5.1", "bd-db300.4.5.2", "bd-db300.4.5.3"]
+test_names = [
+  "test_prepared_fast_lane_hit_rate_on_c1_workload",
+  "test_prepared_full_reload_reuses_publication_after_cross_connection_ddl",
+]
+diagnostic_keys = [
+  "prepared_insert_fast_lane_hits",
+  "prepared_schema_refreshes",
+  "prepared_schema_full_reloads",
+  "pager_publication_refreshes",
+]
+behavior_preservation_scope = "Prepared fast-lane usage must remain visible in counters and full reload after cross-connection DDL must preserve invalidation correctness while avoiding duplicate publication refresh."
+proof_note_requirement = "Name the conservative prepared path and the invalidation boundary being checked. State whether statement ordering or schema visibility changed; if not, say so explicitly."
+
+[[test_family]]
+family_id = "boundary_duplication_census"
+owner_crate = "fsqlite-core"
+source_path = "crates/fsqlite-core/tests/boundary_duplication_census.rs"
+runner = "cargo test -p fsqlite-core --test boundary_duplication_census -- --test-threads=1 --nocapture"
+supports_beads = ["bd-db300.4.5.1", "bd-db300.4.5.2", "bd-db300.4.5.3"]
+test_names = [
+  "test_census_single_prepared_insert_autocommit",
+  "test_census_file_backed_prepared_insert",
+  "test_census_explicit_transaction_prepared_insert",
+  "test_census_schema_invalidation_spike",
+  "test_census_full_scorecard",
+]
+diagnostic_keys = [
+  "publication_bind",
+  "prepared_hits",
+  "fast_lane_hits",
+  "schema_invalidation",
+]
+behavior_preservation_scope = "The census must continue to expose duplicate publication binds, schema invalidation spikes, and prepared reuse regressions in a machine-readable way."
+proof_note_requirement = "Name the scorecard or census thresholds being relied on and the exact duplication or invalidation symptom the family would catch."
+
+[[test_family]]
+family_id = "result_row_register_reuse"
+owner_crate = "fsqlite-vdbe"
+source_path = "crates/fsqlite-vdbe/src/engine.rs"
+runner = "cargo test -p fsqlite-vdbe --lib -- --nocapture"
+supports_beads = ["bd-db300.4.5.4"]
+test_names = [
+  "test_disabling_result_row_collection_still_clears_result_registers",
+  "test_multiple_result_rows",
+  "test_result_row_negative_start_register_stays_null",
+]
+diagnostic_keys = [
+  "row_count",
+  "register_clear_semantics",
+  "negative_register_handling",
+]
+behavior_preservation_scope = "ResultRow reuse must preserve cleared-register semantics, repeated row emission correctness, and null behavior for invalid register spans."
+proof_note_requirement = "State the conservative reference semantics for ResultRow materialization and register clearing, and whether row ordering or null handling changed."
+
+[[test_family]]
+family_id = "record_decode_scratch"
+owner_crate = "fsqlite-types"
+source_path = "crates/fsqlite-types/src/record.rs"
+runner = "cargo test -p fsqlite-types --lib -- --nocapture"
+supports_beads = ["bd-db300.4.5.5"]
+test_names = [
+  "record_decode_scratch_reuses_small_record_state",
+  "record_decode_scratch_eagerly_materializes_wide_records",
+]
+diagnostic_keys = [
+  "scratch_record_calls",
+  "legacy_parse_record_calls",
+  "wide_record_materialization",
+]
+behavior_preservation_scope = "Scratch decode must preserve value equivalence while reusing state for small records and materializing wide records conservatively."
+proof_note_requirement = "Name the reference decode path and describe whether ownership, allocation strategy, or materialization threshold changed."

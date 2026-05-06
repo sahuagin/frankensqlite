@@ -16,7 +16,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-CONTRACT_FILE="parity_score_contract.toml"
+CONTRACT_FILE="docs/contracts/parity_score_contract.toml"
+export CONTRACT_FILE
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -46,13 +47,15 @@ emit_event "contract_presence" "pass" "pass" "${CONTRACT_FILE} exists"
 
 emit_event "contract_schema" "start" "running" "validating parity score contract schema"
 python3 - <<'PY'
+import os
 import tomllib
 from pathlib import Path
 
-contract_path = Path("parity_score_contract.toml")
-taxonomy_path = Path("parity_taxonomy.toml")
-surface_path = Path("supported_surface_matrix.toml")
-ledger_path = Path("feature_universe_ledger.toml")
+contract_path = Path(os.environ["CONTRACT_FILE"])
+contracts_dir = contract_path.parent
+taxonomy_path = contracts_dir / "parity_taxonomy.toml"
+surface_path = contracts_dir / "supported_surface_matrix.toml"
+ledger_path = contracts_dir / "feature_universe_ledger.toml"
 
 doc = tomllib.loads(contract_path.read_text(encoding="utf-8"))
 meta = doc.get("meta", {})

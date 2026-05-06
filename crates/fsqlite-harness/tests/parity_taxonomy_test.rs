@@ -26,8 +26,9 @@ struct Exclusion {
 }
 
 fn load_taxonomy() -> (Vec<Feature>, Vec<Exclusion>, toml::Value) {
-    // CARGO_MANIFEST_DIR points to crates/fsqlite-harness; taxonomy is at workspace root
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../parity_taxonomy.toml");
+    // CARGO_MANIFEST_DIR points to crates/fsqlite-harness.
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/contracts/parity_taxonomy.toml");
     let content = fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "Failed to read parity_taxonomy.toml at {}: {e}",

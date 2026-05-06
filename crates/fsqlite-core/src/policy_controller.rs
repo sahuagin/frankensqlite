@@ -446,8 +446,9 @@ const POLICY_CONTROLLER_BASELINE_ID: &str = "manual_pragma_baseline_v1";
 const POLICY_CONTROLLER_FALLBACK_POLICY: &str =
     "retain_prior_setting_and_emit_fail_closed_decision_record";
 const POLICY_CONTROLLER_SHADOW_CONTRACT_REF: &str =
-    "db300_shadow_oracle_contract.toml#e4_controller_decisions";
-const POLICY_CONTROLLER_PROVENANCE_ROOT: &str = "db300_policy_snapshot_contract.toml";
+    "docs/contracts/db300_shadow_oracle_contract.toml#e4_controller_decisions";
+const POLICY_CONTROLLER_PROVENANCE_ROOT: &str =
+    "docs/contracts/db300_policy_snapshot_contract.toml";
 const POLICY_CONTROLLER_ARTIFACT_GRAPH_ID: &str = "db300-track-g-controller-artifacts";
 const POLICY_CONTROLLER_EVIDENCE_ROOT: &str = "policy_controller.evidence_ledger";
 const POLICY_CONTROLLER_CALIBRATION: &str = "expected_loss_tables_v1";

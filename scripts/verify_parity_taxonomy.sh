@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-TAXONOMY_FILE="parity_taxonomy.toml"
+TAXONOMY_FILE="docs/contracts/parity_taxonomy.toml"
 RUN_ID="parity-taxonomy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 JSON_OUTPUT=false
 

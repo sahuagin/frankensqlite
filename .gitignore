@@ -262,6 +262,7 @@ tmp_rch_probe/
 
 # Remote compilation helper local cache
 .rch/
+.rch-target/
 
 # Session extension binary test artifacts
 __CHANGESET__
@@ -272,7 +273,7 @@ __PATCHSET__
 .beads_recovery/
 /C[0-9]*
 /D[0-9]*
-db300_*.toml
+/db300_*.toml
 librust_out.rlib
 
 # Codex scratch directory — self-documenting "do not commit" marker, appears during codex sessions

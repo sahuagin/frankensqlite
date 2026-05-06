@@ -14,7 +14,7 @@ contract_owner = "track-a-version-owner"
 [contract]
 sqlite_target = "3.52.0"
 runtime_pragma_sqlite_version = "3.52.0"
-contract_reference_path = "sqlite_version_contract.toml"
+contract_reference_path = "docs/contracts/sqlite_version_contract.toml"
 
 [references]
 runtime_source = "crates/fsqlite-core/src/connection.rs"

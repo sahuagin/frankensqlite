@@ -16,7 +16,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-POLICY_FILE="parity_release_threshold_policy.toml"
+POLICY_FILE="docs/contracts/parity_release_threshold_policy.toml"
+export POLICY_FILE
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -47,10 +48,11 @@ emit_event "policy_presence" "pass" "pass" "${POLICY_FILE} exists"
 emit_event "policy_schema" "start" "running" "validating policy schema and signature"
 python3 - <<'PY'
 import hashlib
+import os
 import tomllib
 from pathlib import Path
 
-policy_path = Path("parity_release_threshold_policy.toml")
+policy_path = Path(os.environ["POLICY_FILE"])
 doc = tomllib.loads(policy_path.read_text(encoding="utf-8"))
 
 meta = doc.get("meta", {})

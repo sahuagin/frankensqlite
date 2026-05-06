@@ -60,7 +60,7 @@ SUMMARY_B="$RUN_B/validation_manifest.md"
 RUN_A_LOG="$RUN_A/validation_manifest_runner.log"
 RUN_B_LOG="$RUN_B/validation_manifest_runner.log"
 ARTIFACT_URI_PREFIX="artifacts/validation-manifest-e2e/shared"
-FIXTURE_ROOT_MANIFEST="$WORKSPACE_ROOT/corpus_manifest.toml"
+FIXTURE_ROOT_MANIFEST="$WORKSPACE_ROOT/docs/contracts/corpus_manifest.toml"
 
 mkdir -p "$RUN_A" "$RUN_B"
 

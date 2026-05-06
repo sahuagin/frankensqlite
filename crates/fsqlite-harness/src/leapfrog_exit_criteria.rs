@@ -22,7 +22,7 @@ pub const SCORECARD_METRIC_DICTIONARY_SCHEMA_V1: &str =
 /// leapfrog contract.
 pub const TRANSFERABILITY_RUBRIC_SCHEMA_V1: &str = "fsqlite-harness.transferability_rubric.v1";
 /// Workspace-relative path to the canonical exit-criteria contract.
-pub const LEAPFROG_EXIT_CRITERIA_PATH: &str = "leapfrog_exit_criteria.toml";
+pub const LEAPFROG_EXIT_CRITERIA_PATH: &str = "docs/contracts/leapfrog_exit_criteria.toml";
 const CANONICAL_CAMPAIGN_MANIFEST_PATH: &str =
     "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json";
 
@@ -771,7 +771,14 @@ impl LeapfrogExitCriteria {
             &REQUIRED_OPERATOR_REPORT_UPSTREAM_CONTRACT_PATHS,
         )?;
         for path in &self.operator_report_contract.upstream_contract_paths {
-            let candidate = workspace_root.join(path);
+            let root_candidate = workspace_root.join(path);
+            let contract_candidate = workspace_root.join("docs/contracts").join(path);
+            let candidate = if root_candidate.exists() || Path::new(path).components().count() != 1
+            {
+                root_candidate
+            } else {
+                contract_candidate
+            };
             if !candidate.exists() {
                 return Err(format!(
                     "operator_report_contract references missing upstream contract path={}",

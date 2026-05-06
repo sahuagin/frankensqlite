@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const BEAD_ID: &str = "bd-db300.7.6.4";
-const CONTRACT_PATH: &str = "db300_policy_snapshot_contract.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_policy_snapshot_contract.toml";
 
 const EXPECTED_ROLLOUT_STAGES: [&str; 5] = ["canary", "default", "fallback_only", "ramp", "shadow"];
 const EXPECTED_ACTIVATION_STATES: [&str; 5] = [

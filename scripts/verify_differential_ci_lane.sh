@@ -98,7 +98,7 @@ DOCTOR_DIR="${RUN_ROOT}/doctor"
 DOCTOR_JSON="${DOCTOR_DIR}/oracle_preflight_doctor.json"
 DOCTOR_MD="${DOCTOR_DIR}/oracle_preflight_doctor.md"
 DOCTOR_LOG="${DOCTOR_DIR}/oracle_preflight_doctor_runner.log"
-FIXTURE_ROOT_MANIFEST="${WORKSPACE_ROOT}/corpus_manifest.toml"
+FIXTURE_ROOT_MANIFEST="${WORKSPACE_ROOT}/docs/contracts/corpus_manifest.toml"
 
 mkdir -p "${RUN_A}" "${RUN_B}" "${DOCTOR_DIR}"
 

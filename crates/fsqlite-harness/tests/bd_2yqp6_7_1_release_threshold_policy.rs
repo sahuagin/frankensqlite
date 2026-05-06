@@ -79,6 +79,15 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn resolve_reference_path(path: &str) -> PathBuf {
+    let rel = Path::new(path);
+    if rel.components().count() == 1 && path.ends_with(".toml") {
+        workspace_root().join("docs/contracts").join(rel)
+    } else {
+        workspace_root().join(rel)
+    }
+}
+
 fn read_text(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|error| {
         panic!("failed to read {}: {error}", path.display());
@@ -86,7 +95,7 @@ fn read_text(path: &Path) -> String {
 }
 
 fn load_threshold_policy() -> ThresholdPolicyDocument {
-    let path = workspace_root().join("parity_release_threshold_policy.toml");
+    let path = workspace_root().join("docs/contracts/parity_release_threshold_policy.toml");
     toml::from_str(&read_text(&path)).unwrap_or_else(|error| {
         panic!("failed to parse {}: {error}", path.display());
     })
@@ -180,7 +189,6 @@ fn defaults_match_policy_thresholds() {
 #[test]
 fn policy_references_exist_and_align_with_parity_contract() {
     let policy = load_threshold_policy();
-    let root = workspace_root();
 
     for rel in [
         policy.references.parity_score_contract.as_str(),
@@ -189,7 +197,7 @@ fn policy_references_exist_and_align_with_parity_contract() {
         policy.references.confidence_gates_module.as_str(),
         policy.references.ratchet_policy_module.as_str(),
     ] {
-        let path = root.join(rel);
+        let path = resolve_reference_path(rel);
         assert!(
             path.exists(),
             "referenced file does not exist: {}",
@@ -197,7 +205,7 @@ fn policy_references_exist_and_align_with_parity_contract() {
         );
     }
 
-    let contract_path = root.join(&policy.references.parity_score_contract);
+    let contract_path = resolve_reference_path(&policy.references.parity_score_contract);
     let parity_contract: ParityScoreContractDocument = toml::from_str(&read_text(&contract_path))
         .unwrap_or_else(|error| {
             panic!("failed to parse {}: {error}", contract_path.display());

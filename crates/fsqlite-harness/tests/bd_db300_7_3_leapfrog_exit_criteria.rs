@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use fsqlite_harness::leapfrog_exit_criteria::{BEAD_ID, LeapfrogExitCriteria};
 
-const CONTRACT_PATH: &str = "leapfrog_exit_criteria.toml";
+const CONTRACT_PATH: &str = "docs/contracts/leapfrog_exit_criteria.toml";
 const REQUIRED_TESTS: [&str; 7] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
@@ -516,7 +516,14 @@ fn test_bd_db300_7_3_operator_report_contract_is_actionable() -> Result<(), Stri
         ));
     }
     for contract_path in &operator_report.upstream_contract_paths {
-        let resolved = root.join(contract_path);
+        let root_candidate = root.join(contract_path);
+        let contract_candidate = root.join("docs/contracts").join(contract_path);
+        let resolved =
+            if root_candidate.exists() || Path::new(contract_path).components().count() != 1 {
+                root_candidate
+            } else {
+                contract_candidate
+            };
         if !resolved.exists() {
             return Err(format!(
                 "operator upstream contract missing path={}",

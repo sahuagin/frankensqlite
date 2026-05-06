@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub const SQLITE_VERSION_CONTRACT_PATH: &str = "sqlite_version_contract.toml";
-pub const SUPPORTED_SURFACE_MATRIX_PATH: &str = "supported_surface_matrix.toml";
-pub const FEATURE_UNIVERSE_LEDGER_PATH: &str = "feature_universe_ledger.toml";
-pub const PARITY_SCORE_CONTRACT_PATH: &str = "parity_score_contract.toml";
+pub const SQLITE_VERSION_CONTRACT_PATH: &str = "docs/contracts/sqlite_version_contract.toml";
+pub const SUPPORTED_SURFACE_MATRIX_PATH: &str = "docs/contracts/supported_surface_matrix.toml";
+pub const FEATURE_UNIVERSE_LEDGER_PATH: &str = "docs/contracts/feature_universe_ledger.toml";
+pub const PARITY_SCORE_CONTRACT_PATH: &str = "docs/contracts/parity_score_contract.toml";
 
 #[derive(Debug)]
 pub enum CanonicalParityContractError {
@@ -490,7 +490,13 @@ fn validate_reference_exists(
     let Some(path_text) = reference_target_path(reference) else {
         return;
     };
-    let candidate = workspace_root.join(path_text);
+    let root_candidate = workspace_root.join(path_text);
+    let contract_candidate = workspace_root.join("docs/contracts").join(path_text);
+    let candidate = if root_candidate.exists() || Path::new(path_text).components().count() != 1 {
+        root_candidate
+    } else {
+        contract_candidate
+    };
     if !candidate.exists() {
         diagnostics.push(ContractDiagnostic {
             code: "missing_reference_path",

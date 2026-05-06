@@ -1871,7 +1871,7 @@ mod tests {
             trace_id: "trace-424242".to_owned(),
             scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
             generated_unix_ms: 1_700_000_000_000,
-            fixture_root_manifest_path: "corpus_manifest.toml".to_owned(),
+            fixture_root_manifest_path: "docs/contracts/corpus_manifest.toml".to_owned(),
             fixture_root_manifest_sha256:
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             root_seed: Some(424_242),

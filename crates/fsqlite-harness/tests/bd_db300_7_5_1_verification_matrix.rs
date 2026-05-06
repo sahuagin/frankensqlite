@@ -11,7 +11,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 const BEAD_ID: &str = "bd-db300.7.5.1";
-const CONTRACT_PATH: &str = "db300_verification_matrix.toml";
+const CONTRACT_PATH: &str = "docs/contracts/db300_verification_matrix.toml";
 
 const INCLUDED_BEADS: [&str; 12] = [
     "bd-db300.10.1",

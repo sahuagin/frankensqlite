@@ -7,7 +7,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.7.8.1"
-CONTRACT_PATH="${WORKSPACE_ROOT}/db300_topology_interference_contract.toml"
+CONTRACT_PATH="${WORKSPACE_ROOT}/docs/contracts/db300_topology_interference_contract.toml"
 TOPOLOGY_BUNDLE_SCRIPT="${WORKSPACE_ROOT}/scripts/verify_bd_db300_1_6_1_topology_bundle.sh"
 SCENARIO_ID="${SCENARIO_ID:-G8-1-TOPOLOGY-INTERFERENCE}"
 SEED="${SEED:-781}"
@@ -415,7 +415,7 @@ manifest = {
     "trace_id": trace_id,
     "scenario_id": scenario_id,
     "operator_entrypoint": contract["meta"]["operator_entrypoint"],
-    "contract_path": str(contract_path.name),
+    "contract_path": f"docs/contracts/{contract_path.name}",
     "topology_bundle_script": contract["meta"]["topology_bundle_contract_ref"],
     "case_matrix_path": case_matrix_path.name,
     "structured_logs_path": logs_path.name,

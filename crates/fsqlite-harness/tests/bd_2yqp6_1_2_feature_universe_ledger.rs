@@ -63,13 +63,15 @@ fn read_toml(path: &Path) -> String {
 }
 
 fn load_ledger() -> LedgerDocument {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../feature_universe_ledger.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/contracts/feature_universe_ledger.toml");
     toml::from_str(&read_toml(&path))
         .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()))
 }
 
 fn load_surface_ids() -> BTreeSet<String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../supported_surface_matrix.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/contracts/supported_surface_matrix.toml");
     let matrix: SurfaceMatrix = toml::from_str(&read_toml(&path))
         .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
     matrix

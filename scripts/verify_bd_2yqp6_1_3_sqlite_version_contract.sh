@@ -16,7 +16,8 @@ TRACE_ID="trace-${RUN_ID}"
 ARTIFACT_DIR="artifacts/${BEAD_ID}/${RUN_ID}"
 EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/report.json"
-CONTRACT_FILE="sqlite_version_contract.toml"
+CONTRACT_FILE="docs/contracts/sqlite_version_contract.toml"
+export CONTRACT_FILE
 
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -46,12 +47,14 @@ emit_event "contract_presence" "pass" "pass" "${CONTRACT_FILE} exists"
 
 emit_event "contract_schema" "start" "running" "validating sqlite version contract + drift checks"
 python3 - <<'PY'
+import os
 import tomllib
 from pathlib import Path
 
-contract_path = Path("sqlite_version_contract.toml")
-surface_path = Path("supported_surface_matrix.toml")
-ledger_path = Path("feature_universe_ledger.toml")
+contract_path = Path(os.environ["CONTRACT_FILE"])
+contracts_dir = contract_path.parent
+surface_path = contracts_dir / "supported_surface_matrix.toml"
+ledger_path = contracts_dir / "feature_universe_ledger.toml"
 runtime_path = Path("crates/fsqlite-core/src/connection.rs")
 parity_module_path = Path("crates/fsqlite-harness/src/differential_v2.rs")
 readme_path = Path("README.md")
