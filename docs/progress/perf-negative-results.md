@@ -12,6 +12,53 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-05-06 - CASS last-two-month failure-vocabulary addendum
+
+Scope: user-requested CASS resweep restricted to FrankenSQLite history from
+the last two months, looking for terms such as `rejected`, `reverted`,
+`slower`, `regressed`, `didn't help`, `did not help`, `abandoned`,
+`abandones`, `within noise`, `no improvement`, `rollback`, `worse`,
+`failed to improve`, `not worth`, `gave up`, `no measurable`, and
+`keep gate`.
+
+- Search method: the exact `--workspace /data/projects/frankensqlite` filter
+  is too sparse and can include false-positive titles from other repos, so this
+  pass used both the explicit path session set and global
+  `frankensqlite <term>` searches. The explicit path seed command
+  `cass search '/data/projects/frankensqlite' --days 60 --robot-format sessions --limit 1000 --mode lexical`
+  returned `51` session paths in the usable-but-stale CASS index. A fresh
+  `timeout 120 cass index --json` refresh stayed in `preparing total=0`, so the
+  sweep used the existing index plus targeted `cass view` inspection.
+- High-signal sessions opened:
+  `/home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-9581ae40.json`
+  around lines `80` and `210`,
+  `/home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-09-1bf54aa9.json`
+  around lines `210` and `285`,
+  `/home/ubuntu/.gemini/tmp/frankensqlite/chats/session-2026-03-09T05-08-84f3c374.json`
+  around line `38`, and recent commit-manager summaries under
+  `/home/ubuntu/.claude/projects/-data-projects/026c17f8-4543-415c-9a12-6eb30204a189.jsonl`,
+  `/home/ubuntu/.claude/projects/-data-projects/16128d2b-9c1f-4615-85ec-babcb706a4a8.jsonl`,
+  and
+  `/home/ubuntu/.claude/projects/-data-projects/45256a1f-8025-445a-8a4c-4f68bc208028.jsonl`.
+- New practical guardrail from the March Gemini sessions: do not repeat a broad
+  coupled "optimize everything" patch that mixes VDBE page-size plumbing,
+  `SmallVec` register/program rewrites, hot register helper rewrites, B-tree
+  seek changes, `SqliteValue` `Arc` conversion, and benchmark fairness changes
+  in one pass. Those sessions show repeated partial reverts, stale file views,
+  compile/borrow failures, and confusion over which benchmark file was current.
+  Split any surviving idea into a narrow patch with one target row, one proof
+  test set, and a same-window matrix comparison.
+- Confirmed already-recorded no-retry themes: `SqliteValue` `Arc<str>` /
+  `Arc<[u8]>` broke serde/cross-crate type constraints; broad `SmallVec`
+  sweeps around VDBE ops/registers and `Opcode::MakeRecord` hit borrow and
+  dependency failures; prepared-statement benchmark rewrites were benchmark
+  fairness fixes, not proof that FrankenSQLite engine rows closed C SQLite
+  gaps; and async-VFS / true-asupersync migration remains architecture
+  plan-space, not a rejected micro-optimization.
+- Recent commit-manager CASS hits were mostly summaries of landed commits,
+  correctness work, or ephemeral-file triage. They did not add a new
+  artifact-backed performance reject beyond the entries already below.
+
 ## 2026-05-05 - Recursive CTE direct SUM streaming did not close the gap
 
 Scope: `Subquery & CTE Performance`, specifically
