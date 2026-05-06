@@ -85,6 +85,32 @@ Each entry should include:
   row-shape/row-count predictor or an interleaved A/B that improves absolute
   FrankenSQLite medians on the target rows without p90/p99 regressions.
 
+## 2026-05-06 - Direct UPDATE lazy decoded-row scratch borrow
+
+- Target: isolated prepared direct UPDATE on the fixed-width REAL fast path
+  used by `UPDATE/DELETEThroughput`, after the current profile showed VDBE
+  bypass was active and the remaining mutation cost was sub-microsecond
+  ceremony plus B-tree page work.
+- Candidate shape: in
+  `crates/fsqlite-core/src/connection.rs::execute_prepared_direct_simple_update`,
+  borrow `prepared_direct_update_row_scratch` only after
+  `try_execute_prepared_direct_simple_update_fixed_width_real` declined, so the
+  hot fixed-width overwrite lane avoided one per-row RefCell borrow. Source was
+  reverted after measurement.
+- Evidence commands:
+  `hyperfine --warmup 2 --runs 15 "/data/tmp/frankensqlite-baseline-target/release-perf/perf-update-delete 100 20000 update fsqlite isolated" "/data/tmp/frankensqlite-violetlotus-target/release-perf/perf-update-delete 100 20000 update fsqlite isolated"`
+  and the same command for `delete`. Baseline was detached HEAD `f3180709`;
+  candidate was the local diff on top of `f3180709`.
+- Result: rejected. UPDATE improved only within noise:
+  baseline `138.7 ms +/- 3.0 ms`, candidate `137.2 ms +/- 3.6 ms`
+  (`1.01x +/- 0.03`). DELETE, used as a non-target regression probe, was flat:
+  baseline `218.8 ms +/- 5.4 ms`, candidate `219.3 ms +/- 3.7 ms`, with
+  baseline nominally `1.00x +/- 0.03` faster.
+- Do not retry lazy-borrowing the UPDATE decoded-row scratch as a standalone
+  optimization. Revisit only if a profile shows `prepared_direct_update_row_scratch`
+  borrowing/clearing as a material fraction of direct UPDATE time and an
+  interleaved same-window A/B moves absolute UPDATE medians outside noise.
+
 ## 2026-05-06 - CASS strict alias/session-set resweep: broad March bundles are not perf proof
 
 Scope: user-requested CASS expansion of this ledger, restricted to
